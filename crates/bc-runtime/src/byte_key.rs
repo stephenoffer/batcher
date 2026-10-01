@@ -91,27 +91,39 @@ pub fn is_byte_key(dt: &DataType) -> bool {
 #[must_use]
 #[inline]
 pub fn pack_word(key: &[u8], from: usize) -> u64 {
+    // A full word is one fixed-width load. The variable-length copy below is the same value
+    // for it, but a `copy_from_slice` of a runtime length compiles to a `memmove` *call*, and
+    // on a string top-N that call was 23% of the operator (`perf`, `ORDER BY l_comment LIMIT
+    // 100`): every row packs once, and most keys are longer than eight bytes.
+    if let Some(word) = key.get(from..).and_then(|rest| rest.first_chunk::<8>()) {
+        return u64::from_be_bytes(*word);
+    }
     let mut buf = [0u8; 8];
     if from < key.len() {
-        let take = (key.len() - from).min(8);
-        buf[..take].copy_from_slice(&key[from..from + take]);
+        for (b, &k) in buf.iter_mut().zip(&key[from..]) {
+            *b = k;
+        }
     }
     u64::from_be_bytes(buf)
 }
 
 impl<T: ByteArrayType> ByteKeys for GenericByteArray<T> {
+    #[inline]
     fn len(&self) -> usize {
         Array::len(self)
     }
 
+    #[inline]
     fn is_null(&self, i: usize) -> bool {
         Array::is_null(self, i)
     }
 
+    #[inline]
     fn null_buffer(&self) -> Option<&NullBuffer> {
         Array::nulls(self)
     }
 
+    #[inline]
     fn key(&self, i: usize) -> &[u8] {
         self.value(i).as_ref()
     }
@@ -145,18 +157,22 @@ impl<T: ByteArrayType> ByteKeys for GenericByteArray<T> {
 }
 
 impl ByteKeys for FixedSizeBinaryArray {
+    #[inline]
     fn len(&self) -> usize {
         Array::len(self)
     }
 
+    #[inline]
     fn is_null(&self, i: usize) -> bool {
         Array::is_null(self, i)
     }
 
+    #[inline]
     fn null_buffer(&self) -> Option<&NullBuffer> {
         Array::nulls(self)
     }
 
+    #[inline]
     fn key(&self, i: usize) -> &[u8] {
         self.value(i)
     }
@@ -217,22 +233,27 @@ impl<'a> ByteKeyColumn<'a> {
 }
 
 impl ByteKeys for ByteKeyColumn<'_> {
+    #[inline]
     fn len(&self) -> usize {
         on_arm!(self, len)
     }
 
+    #[inline]
     fn is_null(&self, i: usize) -> bool {
         on_arm!(self, is_null, i)
     }
 
+    #[inline]
     fn null_buffer(&self) -> Option<&NullBuffer> {
         on_arm!(self, null_buffer)
     }
 
+    #[inline]
     fn key(&self, i: usize) -> &[u8] {
         on_arm!(self, key, i)
     }
 
+    #[inline]
     fn exact_pack_width(&self, max: usize) -> Option<usize> {
         on_arm!(self, exact_pack_width, max)
     }
@@ -319,5 +340,24 @@ mod tests {
 
         let wide: ArrayRef = Arc::new(BinaryArray::from(vec![Some(b"0123456789".as_ref())]));
         assert_eq!(ByteKeyColumn::new(&wide).unwrap().exact_pack_width(8), None);
+    }
+
+    /// The word is the key's bytes `[from, from + 8)`, big-endian, zero-padded past the end --
+    /// for keys shorter than, exactly and longer than a word, and every offset into them,
+    /// including one past the end. The full-word load and the short copy are two spellings of
+    /// that one value, so both are held to the same reference.
+    #[test]
+    fn a_pack_is_the_zero_padded_big_endian_window() {
+        let bytes: Vec<u8> = (1..=20u8).map(|b| b.wrapping_mul(37)).collect();
+        for len in 0..=bytes.len() {
+            let key = &bytes[..len];
+            for from in 0..=len + 2 {
+                let mut want = 0u64;
+                for j in 0..8 {
+                    want = (want << 8) | u64::from(key.get(from + j).copied().unwrap_or(0));
+                }
+                assert_eq!(pack_word(key, from), want, "len {len} from {from}");
+            }
+        }
     }
 }

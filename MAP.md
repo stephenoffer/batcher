@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1554 Python modules across 220 packages and 317 Rust files across 14 crates.
+Covering 1554 Python modules across 220 packages and 319 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -3073,23 +3073,24 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join_par/sideways.rs` | 243 | Restrict a join's build-side aggregate to the keys its (already materialized) probe side holds. |
 | `lib.rs` | 736 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 387 | Per-operator execution metrics — the measure half of the adaptive loop. |
-| `ops/byte_sort.rs` | 644 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
+| `ops/byte_sort.rs` | 704 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `ops/external_sort.rs` | 465 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 578 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1792 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1846 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
 | `ops/quantile_spill/mod.rs` | 750 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
-| `ops/radix_sort/mod.rs` | 389 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
-| `ops/radix_sort/packed.rs` | 498 | The **composite** packed key: several sort columns narrowed into one integer. |
+| `ops/radix_sort/mod.rs` | 500 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
+| `ops/radix_sort/msd.rs` | 95 | A comparison sort for records ordered by a `u64` key, cut first into buckets by the key's live high bits. |
+| `ops/radix_sort/packed.rs` | 578 | The **composite** packed key: several sort columns narrowed into one integer. |
 | `ops/repartition.rs` | 441 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 548 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/run_sort.rs` | 275 | Natural-run detection for the fixed-width sort permutations. |
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
-| `ops/sample_sort/mod.rs` | 746 | Single-node parallel full sort by **sample-sort**. |
+| `ops/sample_sort/mod.rs` | 772 | Single-node parallel full sort by **sample-sort**. |
 | `ops/window_stream.rs` | 687 | Bounded-memory window execution for a partition that does not fit the envelope. |
 | `par.rs` | 3598 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
@@ -3143,7 +3144,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/spill/store.rs` | 800 | The two spill stores and the codec that writes them. |
 | `agg/stats.rs` | 463 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 335 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
-| `byte_key.rs` | 240 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
+| `byte_key.rs` | 261 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `error.rs` | 131 | The crate's error type: how the stateful runtime structures report failure. |
 | `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 753 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
@@ -3173,7 +3174,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `window/fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window/frame/bounds.rs` | 439 | Which rows a window frame covers — the geometry, with no arithmetic over them. |
 | `window/frame/mod.rs` | 749 | Explicit window frames — the sliding aggregates computed over them. |
-| `window/mod.rs` | 1685 | Window functions — partition, order, and append one column per function. |
+| `window/mod.rs` | 1704 | Window functions — partition, order, and append one column per function. |
+| `window/packed_order.rs` | 225 | Window ordering for a key tuple narrow enough to pack into one `u64`. |
 | `window/parallel.rs` | 385 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
 | `window/partition_agg.rs` | 352 | Whole-partition window aggregates (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT` with no ORDER BY and no frame): one value per partition, broadcast to every row of that… |
 | `window/running_par.rs` | 163 | Parallel prefix scan for *running* (frameless, ordered) window aggregates. |

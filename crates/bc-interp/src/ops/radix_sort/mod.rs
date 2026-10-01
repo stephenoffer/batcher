@@ -18,9 +18,10 @@ use arrow::array::{
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, TimeUnit};
 
+mod msd;
 mod packed;
 
-pub(crate) use packed::packed_multi_sort_indices;
+pub(crate) use packed::{packed_multi_sort_indices, packed_multi_sorted_values};
 
 /// Above this row count a **float** key stops permuting an index array and sorts `(key, row)`
 /// pairs instead ([`pair_sort_indices`]). Sized to ~L2: a `u64` key array of 2^18 rows is 2 MiB.
@@ -107,6 +108,106 @@ pub(crate) fn radix_sort_indices(values: &ArrayRef, opts: SortOptions) -> Option
     Some(UInt32Array::from(out))
 }
 
+/// The column itself, sorted, for a single fixed-width key whose sort output *is* that key —
+/// `SELECT x FROM t ORDER BY x` — or `None` for a column [`ordered_keys`] does not encode.
+///
+/// The index path builds `(rank, position)` pairs, sorts them, maps the positions back to rows
+/// and then gathers the column by that permutation. When the only output is the key, the
+/// permutation is never needed: rows equal on the key carry *identical* values (the rank is a
+/// bijection on the value's bits, and the caller passes a key nothing has rewritten), so which of
+/// them lands first is invisible and sorting the ranks themselves produces the same column. That
+/// sorts 8-byte records instead of 16 and drops the final gather, which `perf` put at 13% of a
+/// 6M-row `ORDER BY <float>`.
+///
+/// Nulls form one block at the end `nulls_first` names, as in [`radix_sort_indices`]; a
+/// descending sort reverses the ascending sequence, which is exact because ties are identical.
+pub(crate) fn sorted_values(values: &ArrayRef, opts: SortOptions) -> Option<ArrayRef> {
+    use arrow::buffer::{BooleanBuffer, NullBuffer};
+
+    let keys = ordered_keys(values)?;
+    let n = values.len();
+    let mut live: Vec<u64> = match values.nulls().filter(|nb| nb.null_count() > 0) {
+        Some(nb) => keys
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| nb.is_valid(i))
+            .map(|(_, &k)| k)
+            .collect(),
+        None => keys,
+    };
+    if !is_ordered(&live, false) {
+        msd::sort_by_high_bits(&mut live, |k| *k);
+    }
+    if opts.descending {
+        live.reverse();
+    }
+    let null_count = n - live.len();
+    let leading = if opts.nulls_first { null_count } else { 0 };
+    let nulls = (null_count > 0).then(|| {
+        let valid = (0..n).map(|i| i >= leading && i < leading + live.len());
+        NullBuffer::new(BooleanBuffer::from_iter(valid))
+    });
+
+    let mut ranks = Vec::with_capacity(n);
+    ranks.resize(leading, 0);
+    ranks.extend_from_slice(&live);
+    ranks.resize(n, 0);
+    array_from_ranks(values.data_type(), &ranks, nulls)
+}
+
+/// A `dt` column whose row `i` holds the value with ascending rank `ranks[i]` — the inverse of
+/// [`ordered_keys`] (and of [`ranks`] without `descending`), or `None` for a type neither
+/// encodes. Rows `nulls` marks are null and their rank is never read for meaning.
+///
+/// Each arm undoes its encoding: restore the sign bit (signed), take the value as is (unsigned),
+/// or undo the IEEE total-order transform (floats). The transforms are bijections on the value's
+/// bits, so a value decodes to exactly the bits it was ranked from.
+pub(super) fn array_from_ranks(
+    dt: &DataType,
+    ranks: &[u64],
+    nulls: Option<arrow::buffer::NullBuffer>,
+) -> Option<ArrayRef> {
+    use std::sync::Arc;
+
+    const SIGN: u64 = 1 << 63;
+    macro_rules! rebuild {
+        ($arr:ty, $decode:expr) => {{
+            let decode = $decode;
+            let values: Vec<_> = ranks.iter().map(|&k| decode(k)).collect();
+            let arr = <$arr>::new(values.into(), nulls).with_data_type(dt.clone());
+            Some(Arc::new(arr) as ArrayRef)
+        }};
+    }
+    let float = |k: u64| f64::from_bits(if k & SIGN != 0 { k ^ SIGN } else { !k });
+    match dt {
+        DataType::Float64 => rebuild!(Float64Array, float),
+        DataType::Float32 => rebuild!(Float32Array, |k| float(k) as f32),
+        DataType::Int8 => rebuild!(Int8Array, |k: u64| (k ^ SIGN) as i64 as i8),
+        DataType::Int16 => rebuild!(Int16Array, |k: u64| (k ^ SIGN) as i64 as i16),
+        DataType::Int32 => rebuild!(Int32Array, |k: u64| (k ^ SIGN) as i64 as i32),
+        DataType::Int64 => rebuild!(Int64Array, |k: u64| (k ^ SIGN) as i64),
+        DataType::UInt8 => rebuild!(UInt8Array, |k: u64| k as u8),
+        DataType::UInt16 => rebuild!(UInt16Array, |k: u64| k as u16),
+        DataType::UInt32 => rebuild!(UInt32Array, |k: u64| k as u32),
+        DataType::UInt64 => rebuild!(UInt64Array, |k: u64| k),
+        DataType::Date32 => rebuild!(Date32Array, |k: u64| (k ^ SIGN) as i64 as i32),
+        DataType::Date64 => rebuild!(Date64Array, |k: u64| (k ^ SIGN) as i64),
+        DataType::Timestamp(TimeUnit::Second, _) => {
+            rebuild!(TimestampSecondArray, |k: u64| (k ^ SIGN) as i64)
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, _) => {
+            rebuild!(TimestampMillisecondArray, |k: u64| (k ^ SIGN) as i64)
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
+            rebuild!(TimestampMicrosecondArray, |k: u64| (k ^ SIGN) as i64)
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            rebuild!(TimestampNanosecondArray, |k: u64| (k ^ SIGN) as i64)
+        }
+        _ => None,
+    }
+}
+
 /// Order-preserving `u64` key per row (ascending order of the original values). Null
 /// slots get an arbitrary key (their indices are handled separately). `None` for any
 /// type radix does not support, so the caller falls back to the comparison sort.
@@ -189,11 +290,21 @@ fn ordered_keys(values: &ArrayRef) -> Option<Vec<u64>> {
 /// limits are properties of the counting sort — an unrepresentable numeric position and a random
 /// scatter that leaves cache — and neither applies to a sequential scan against a heap. See
 /// [`float_rank`] for why a NaN needs no special case here.
-pub(super) fn top_k_live(values: &ArrayRef, descending: bool, k: usize) -> Option<Vec<u32>> {
+///
+/// Rows ranking strictly above `bound` are skipped, and a full selection publishes its `k`-th
+/// rank to it — see [`super::RankBound`].
+pub(super) fn top_k_live(
+    values: &ArrayRef,
+    descending: bool,
+    k: usize,
+    bound: &super::RankBound,
+) -> Option<Vec<u32>> {
     let ranks = ranks(values, descending)?;
-    Some(super::heap_select_k(values.len(), values.nulls(), k, |i| {
-        ranks[i]
-    }))
+    let kept = super::heap_select_k(values.len(), values.nulls(), k, bound.get(), |i| ranks[i]);
+    if let Some(&last) = kept.last().filter(|_| kept.len() == k) {
+        bound.publish(ranks[last as usize]);
+    }
+    Some(kept)
 }
 
 /// An order-preserving `u64` per row: ordering these integers orders the rows, exactly as a
@@ -334,7 +445,7 @@ fn pair_sort_indices(idx: Vec<u32>, keys: &[u64], descending: bool) -> Vec<u32> 
             (if descending { !k } else { k }, pos as u32)
         })
         .collect();
-    pairs.sort_unstable();
+    msd::sort_by_high_bits(&mut pairs, |p| p.0);
     pairs
         .into_iter()
         .map(|(_, pos)| idx[pos as usize])
@@ -670,5 +781,79 @@ mod tests {
         let v: ArrayRef = Arc::new(U32::from(vec![7u32, 7, 7, 7]));
         let idx = radix_sort_indices(&v, SortOptions::default()).unwrap();
         assert_eq!(idx.values(), &[0, 1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod sorted_values_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Date32Array, Float64Array, Int32Array, Int64Array, StringArray};
+    use arrow::compute::take;
+
+    use super::*;
+
+    /// Sorting the values must give exactly the column the permutation path gathers — values,
+    /// nulls and type — in every direction, for every width of each family of encoding.
+    fn check(values: ArrayRef) {
+        for descending in [false, true] {
+            for nulls_first in [false, true] {
+                let opts = SortOptions {
+                    descending,
+                    nulls_first,
+                };
+                let got = sorted_values(&values, opts).expect("encodable");
+                let idx = radix_sort_indices(&values, opts).expect("encodable");
+                let want = take(values.as_ref(), &idx, None).unwrap();
+                assert_eq!(got.data_type(), want.data_type());
+                assert_eq!(
+                    got.to_data(),
+                    want.to_data(),
+                    "desc={descending} nf={nulls_first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sorting_the_values_matches_gathering_by_the_permutation() {
+        let n = 20_000usize;
+        check(Arc::new(Float64Array::from_iter((0..n).map(|i| {
+            (i % 11 != 0).then_some(match i % 7 {
+                0 => -0.0,
+                1 => f64::INFINITY,
+                2 => f64::NEG_INFINITY,
+                _ => ((i * 7919) % 1000) as f64 / 8.0 - 60.0,
+            })
+        }))));
+        check(Arc::new(Int64Array::from_iter((0..n as i64).map(|i| {
+            (i % 13 != 0).then_some((i * 104_729) % 5_000 - 2_500)
+        }))));
+        check(Arc::new(Int64Array::from(vec![
+            i64::MIN,
+            i64::MAX,
+            0,
+            -1,
+            i64::MIN,
+        ])));
+        check(Arc::new(Int32Array::from_iter_values(
+            (0..n as i32).map(|i| (i * 31) % 97 - 40),
+        )));
+        check(Arc::new(Date32Array::from_iter(
+            (0..n as i32).map(|i| (i % 5 != 0).then_some(18_000 + (i * 3) % 700)),
+        )));
+        // Already ordered, all null, one row and empty.
+        check(Arc::new(Int64Array::from_iter_values(0..5_000)));
+        check(Arc::new(Int64Array::from(vec![None::<i64>; 4])));
+        check(Arc::new(Float64Array::from(vec![Some(2.5)])));
+        check(Arc::new(Float64Array::from(Vec::<f64>::new())));
+    }
+
+    #[test]
+    fn a_nan_or_a_non_fixed_width_key_declines() {
+        let nan: ArrayRef = Arc::new(Float64Array::from(vec![1.0, f64::NAN]));
+        assert!(sorted_values(&nan, SortOptions::default()).is_none());
+        let s: ArrayRef = Arc::new(StringArray::from(vec!["b", "a"]));
+        assert!(sorted_values(&s, SortOptions::default()).is_none());
     }
 }
