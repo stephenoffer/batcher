@@ -191,3 +191,38 @@ def test_a_rollup_over_a_real_cross_product_matches_duckdb(duck, tables):
     got = _session(tables).sql(_ROLLUP_OVER_PRODUCT).collect()
     assert got.num_rows > 20
     assert_same(got, duck.sql(_ROLLUP_OVER_PRODUCT))
+
+
+# TPC-DS q14: the shared ROLLUP input itself reads a CTE once per channel.
+_NESTED_REPEAT = """
+WITH hot AS (SELECT k, sum(v) t FROM fact GROUP BY k HAVING sum(v) > 0)
+SELECT channel, s, sum(v) sv, count(*) n FROM (
+  SELECT 'a' channel, s, v FROM fact WHERE k IN (SELECT k FROM hot) AND s < 4
+  UNION ALL SELECT 'b' channel, s, v FROM fact WHERE k IN (SELECT k FROM hot) AND s >= 8
+  UNION ALL SELECT 'c' channel, s, v FROM fact WHERE k IN (SELECT k FROM hot) AND s = 5
+) u GROUP BY ROLLUP(channel, s)
+"""
+
+
+def test_a_repeat_inside_a_shared_subplan_matches_duckdb(duck, tables):
+    _register(duck, tables)
+    assert_same(_session(tables).sql(_NESTED_REPEAT).collect(), duck.sql(_NESTED_REPEAT))
+
+
+def test_a_repeat_inside_a_shared_subplan_runs_once(tables, monkeypatch):
+    """The control: the CTE inside the shared ROLLUP input is itself materialized once."""
+    from batcher.api import subplan_reuse
+
+    materialized = []
+    real = subplan_reuse._materialize
+
+    def counting(target, sources, ctx, distributed):
+        materialized.append(type(target).__name__)
+        return real(target, sources, ctx, distributed)
+
+    monkeypatch.setattr(subplan_reuse, "_materialize", counting)
+    _rewritten(_session(tables).sql(_NESTED_REPEAT))
+    assert len(materialized) >= 2, (
+        f"only the outer shared input was materialized ({materialized}); the CTE it reads "
+        "three times ran once per read"
+    )

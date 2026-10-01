@@ -572,6 +572,12 @@ def _materialize(
 
     sub_ctx = dataclasses.replace(ctx, columns=target.available_columns(), cache=False)
     cluster = distributed and resolve_distributed("auto", target, sources)
+    # The target is a plan in its own right, and what repeats *inside* it is invisible from
+    # the outer analysis: a subtree nested in an accepted candidate is dropped there, because
+    # materializing the outer one runs it -- but once per appearance within it. TPC-DS q14
+    # shares its ROLLUP's finest aggregate, which reads `cross_items` and `avg_sales` three
+    # times each; materialized flat, each CTE ran three times inside the one shared run.
+    target, sources = reuse_common_subplans(target, sources, sub_ctx, distributed=cluster)
     for on_cluster in (True, False) if cluster else (False,):
         try:
             table, _decisions = run_relational(target, sources, sub_ctx, distributed=on_cluster)

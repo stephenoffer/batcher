@@ -178,7 +178,7 @@ The public, fluent, lazy, expression-first API surface.
 | `multi_group.py` | 408 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 737 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
-| `subplan_reuse.py` | 614 | Compute a repeated subplan once and read it back (control plane, `api`). |
+| `subplan_reuse.py` | 620 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
 ### `batcher/api/adaptive/` — 5 · conductor
 
@@ -1291,7 +1291,7 @@ Aggregate-through-join pushdown: pre-aggregate a join side to shrink its input.
 | module | lines | what it is |
 |---|---|---|
 | `gates.py` | 240 | The cost gates the aggregate-through-join pushdown rules consult. |
-| `reassociate.py` | 415 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
+| `reassociate.py` | 503 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
 | `rules.py` | 533 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
