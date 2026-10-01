@@ -137,10 +137,84 @@ pub fn bucket_of_rows_salted(
     // groups where the single-node oracle returns one (invariant #7). See `crate::keys`.
     let canon = crate::keys::canonicalize_float_keys(keys);
     let keys: &[ArrayRef] = canon.as_deref().unwrap_or(keys);
+    if let [only] = keys {
+        if only.null_count() == 0 {
+            if let Some(col) = int_col(only) {
+                return Ok(int_key_buckets(&col, rows, num_partitions, salt));
+            }
+        }
+    }
     let hasher = KeyHash::build(keys)?;
     Ok(map_rows(rows, |i| {
         bucket_of_salted(hasher.hash(i), num_partitions, salt)
     }))
+}
+
+/// [`bucket_of_rows_salted`] for one null-free integer key: the same bucket for every row, from
+/// a loop specialized to the column's width, that hashes a run of equal keys once.
+///
+/// The general loop pays, per row, a dispatch on the hasher's shape, a null test, a walk over a
+/// one-element column list and a dispatch on the column's type before it reaches the hash. On
+/// a single integer key — the shape of nearly every join and `GROUP BY` on a surrogate key —
+/// that bookkeeping costs as much as the hash. And a clustered key repeats: `lineitem` in
+/// `l_orderkey` order carries four rows per order, so three hashes in four recomputed the
+/// bucket of the row before. Both are removed here and nothing else changes: the hash is
+/// [`IntCol::write`] into a fresh [`SEED`] hasher, exactly as [`KeyHash::hash`] computes it, so a
+/// key lands in the same bucket on either path and co-partitioning (invariant #7) is untouched.
+fn int_key_buckets(col: &IntCol<'_>, rows: usize, num_partitions: usize, salt: u64) -> Vec<u32> {
+    /// Rows one parallel task buckets; each task keeps its own run cache.
+    const CHUNK: usize = 1 << 14;
+    fn run<T: Copy + PartialEq + Sync>(
+        vals: &[T],
+        bucket: impl Fn(usize) -> u32 + Sync,
+        out: &mut [u32],
+        base: usize,
+    ) {
+        let mut prev: Option<(T, u32)> = None;
+        for (j, slot) in out.iter_mut().enumerate() {
+            let i = base + j;
+            let v = vals[i];
+            *slot = match prev {
+                Some((pv, pb)) if pv == v => pb,
+                _ => {
+                    let b = bucket(i);
+                    prev = Some((v, b));
+                    b
+                }
+            };
+        }
+    }
+    fn go<T: Copy + PartialEq + Sync>(
+        vals: &[T],
+        rows: usize,
+        bucket: impl Fn(usize) -> u32 + Sync,
+    ) -> Vec<u32> {
+        let mut out = vec![0u32; rows];
+        if rows >= PAR_HASH_MIN_ROWS {
+            out.par_chunks_mut(CHUNK)
+                .enumerate()
+                .for_each(|(c, chunk)| run(vals, &bucket, chunk, c * CHUNK));
+        } else {
+            run(vals, &bucket, &mut out, 0);
+        }
+        out
+    }
+    let bucket = |i: usize| {
+        use std::hash::Hasher;
+        let mut h = SEED.build_hasher();
+        col.write(&mut h, i);
+        bucket_of_salted(h.finish(), num_partitions, salt)
+    };
+    match col {
+        IntCol::I8(v) => go(v, rows, bucket),
+        IntCol::I16(v) => go(v, rows, bucket),
+        IntCol::I32(v) => go(v, rows, bucket),
+        IntCol::I64(v) => go(v, rows, bucket),
+        IntCol::U8(v) => go(v, rows, bucket),
+        IntCol::U16(v) => go(v, rows, bucket),
+        IntCol::U32(v) => go(v, rows, bucket),
+        IntCol::U64(v) => go(v, rows, bucket),
+    }
 }
 
 /// Compute a per-row bucket id across every core on a large input.
@@ -1261,6 +1335,54 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
     use std::sync::Arc;
+
+    /// The single-integer-key fast path must bucket every row exactly as the general
+    /// [`KeyHash`] loop does — that agreement *is* co-partitioning — on clustered and scattered
+    /// keys, every native width, a salt, both bucket-mapping arms, and both sides of the
+    /// parallel threshold (where each chunk keeps its own run cache).
+    #[test]
+    fn single_int_key_fast_path_matches_the_general_hash() {
+        use arrow::array::{Int32Array, Int8Array, UInt64Array};
+        let general = |keys: &[ArrayRef], parts: usize, salt: u64| -> Vec<u32> {
+            let h = KeyHash::build(keys).unwrap();
+            (0..keys[0].len())
+                .map(|i| bucket_of_salted(h.hash(i), parts, salt))
+                .collect()
+        };
+        for n in [0usize, 1, 7, 1000, PAR_HASH_MIN_ROWS + 12_345] {
+            let clustered: Vec<i64> = (0..n as i64).map(|i| (i / 4) * 7 - 3).collect();
+            let scattered: Vec<i64> = (0..n as i64)
+                .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64))
+                .collect();
+            let cols: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(clustered.clone())),
+                Arc::new(Int64Array::from(scattered)),
+                Arc::new(Int32Array::from_iter_values(
+                    clustered.iter().map(|&v| v as i32),
+                )),
+                Arc::new(Int8Array::from_iter_values(
+                    clustered.iter().map(|&v| v as i8),
+                )),
+                Arc::new(UInt64Array::from_iter_values(
+                    clustered.iter().map(|&v| v as u64),
+                )),
+            ];
+            for col in &cols {
+                let keys = std::slice::from_ref(col);
+                for parts in [7usize, 64] {
+                    for salt in [0u64, 11] {
+                        let fast = bucket_of_rows_salted(keys, n, parts, salt).unwrap();
+                        assert_eq!(
+                            fast,
+                            general(keys, parts, salt),
+                            "n={n} type={} parts={parts} salt={salt}",
+                            col.data_type()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn partitions_are_disjoint_and_complete() {

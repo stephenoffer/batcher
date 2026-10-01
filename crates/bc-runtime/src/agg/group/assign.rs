@@ -570,6 +570,17 @@ where
     // path's — so a table sized for the final group count scatters every probe from row zero,
     // where doubling into it keeps the live set compact for most of the pass. See
     // `competitor_technique_review.md` item 26.
+    //
+    // **A run of equal keys is looked up once.** The row before is the one group id this loop
+    // can know without a probe, and a clustered key — a fact table in its surrogate-key order,
+    // `lineitem` by `l_orderkey`, the output of a stable hash shuffle of such a table — repeats
+    // it for most rows: TPC-H `GROUP BY l_orderkey` averages four rows per order, so three
+    // probes in four were a hash, a random load into a 15M-group table and a compare, to learn
+    // the id the previous row already had. The reuse is exact (the id of an equal key *is*
+    // that id, and first-seen order is unchanged because the run's first row assigned it), and
+    // on an unclustered key it costs one compare against a register per row, a branch that
+    // predicts "different" every time.
+    let mut prev: Option<(T::Native, u32)> = None;
     for i in 0..num_rows {
         if a.is_null(i) {
             let gid = *null_gid.get_or_insert_with(|| {
@@ -578,9 +589,16 @@ where
                 g
             });
             group_ids.push(gid);
+            prev = None;
             continue;
         }
         let v = a.value(i);
+        if let Some((pv, pg)) = prev {
+            if pv == v {
+                group_ids.push(pg);
+                continue;
+            }
+        }
         let hash = state.hash_one(v);
         let gid = match table.entry(hash, |&(k, _)| k == v, |&(k, _)| state.hash_one(k)) {
             Entry::Occupied(e) => e.get().1,
@@ -592,6 +610,7 @@ where
             }
         };
         group_ids.push(gid);
+        prev = Some((v, gid));
     }
     (group_ids, reps)
 }
@@ -2045,6 +2064,35 @@ mod tests {
     fn sparse_keys_fall_back_and_match_reference() {
         let vals: Vec<Option<i64>> = (0..500).map(|i| Some(i64::from(i) * 1_000_003)).collect();
         check_i64(vals);
+    }
+
+    /// Runs of equal keys on the hash path reuse the previous row's id; the reuse must give the
+    /// reference's ids exactly, across a null breaking a run, a key recurring after its run
+    /// ended, and runs of one.
+    #[test]
+    fn clustered_sparse_keys_reuse_the_run_and_match_reference() {
+        let vals: Vec<Option<i64>> = (0..2000)
+            .map(|i: i64| match i % 37 {
+                5 | 6 => None,
+                // Runs of 1..4 rows over a sparse key, a key revisited every 300 rows.
+                _ => Some((i / ((i % 4) + 1)) % 300 * 1_000_003 - 7),
+            })
+            .collect();
+        check_i64(vals.clone());
+        // A pure run structure: every key repeated 4 times, consecutively.
+        let runs: Vec<Option<i64>> = (0..4000).map(|i: i64| Some((i / 4) * 999_983)).collect();
+        check_i64(runs);
+        // A key equal to the previous one only across a null — must not merge with the null.
+        let across: Vec<Option<i64>> = (0..900)
+            .map(|i: i64| {
+                if i % 3 == 1 {
+                    None
+                } else {
+                    Some((i / 3) * 1_000_003)
+                }
+            })
+            .collect();
+        check_i64(across);
     }
 
     /// Two far-apart values: span is huge but only 2 groups — must NOT build a giant map.
