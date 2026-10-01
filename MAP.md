@@ -2622,11 +2622,11 @@ String free functions, in two halves: building text and reading structure out of
 |---|---|---|
 | `_setops.py` | 84 | What makes two set-operation branches compatible. |
 | `aggregate.py` | 313 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
-| `base.py` | 444 | `LogicalPlan` — the base class for declarative plan nodes. |
+| `base.py` | 449 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 666 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
-| `transforms.py` | 738 | Plan transforms and predicates over `LogicalPlan` trees. |
+| `transforms.py` | 743 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 522 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract

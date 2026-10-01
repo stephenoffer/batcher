@@ -267,8 +267,13 @@ def share_sources(
 
 
 #: A `Scan`'s per-node memos that are functions of its `schema` alone (see
-#: `base._memoize_noarg`). `to_ir` is not one: it carries the `source_id` a move changes.
-_SCHEMA_MEMOS = ("_c_available_schema", "_c_available_columns", "_c_available_column_set")
+#: `LogicalPlan.__init_subclass__`). `to_ir` is not one: it carries the `source_id` a move changes.
+_SCHEMA_MEMOS = (
+    "_c_available_schema",
+    "_c_available_columns",
+    "_c_available_column_set",
+    "_c_identity_suffix",
+)
 
 
 def _carry_schema_memos(old: Scan, new: Scan) -> None:

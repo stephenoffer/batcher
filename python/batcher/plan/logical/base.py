@@ -273,7 +273,12 @@ class LogicalPlan:
         # references, so building an N-node plan asked N times and each answer rebuilt a
         # list of the node's output names — O(width) per call on a wide relation, which
         # is exactly where `with_columns` already does the most work.
-        for name in ("to_ir", "available_schema", "available_columns"):
+        #
+        # `identity_suffix` too: it is `Scan`'s schema rendered as text for `content_key`,
+        # and a scan outlives every query built over it. Rendering it per fresh plan also
+        # dropped the GIL in pyarrow, which let the event-log writer take it mid-planning
+        # (profiled at ~0.2 ms of a 1.6 ms query) instead of during the engine call.
+        for name in ("to_ir", "available_schema", "available_columns", "identity_suffix"):
             fn = cls.__dict__.get(name)
             if fn is not None and not getattr(fn, "_memoized", False):
                 setattr(cls, name, _memoize_noarg(fn, f"_c_{name}"))

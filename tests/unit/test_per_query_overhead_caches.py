@@ -216,6 +216,18 @@ def test_a_moved_scan_inherits_only_the_schema_memos():
     assert moved.content_key() == fresh.content_key()
 
 
+def test_the_identity_suffix_is_memoized_and_still_distinguishes_schemas():
+    a = bt.from_pydict({"k": [1, 2]})._plan
+    b = bt.from_pydict({"k": [1.5, 2.5]})._plan
+    assert a.identity_suffix() is a.identity_suffix()
+    assert a.identity_suffix() != b.identity_suffix()
+    assert a.content_key() != b.content_key()
+    # Carried to a renumbered copy, like the other schema-only memos.
+    from batcher.plan.logical.transforms import remap_sources
+
+    assert remap_sources(a, 3).identity_suffix() is a.identity_suffix()
+
+
 def test_filter_still_refuses_udf_options_without_a_callable():
     from batcher._internal.errors import PlanError
     from batcher.api.dataset._udf import build
