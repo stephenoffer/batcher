@@ -199,12 +199,23 @@ fn packs_discriminate<A: ByteKeys>(arr: &A) -> bool {
         return true; // too small for the difference to matter; the packed path is no worse
     }
     let step = (live / PREFIX_SAMPLE_ROWS).max(1);
-    let (mut packs, mut values): (Vec<u64>, Vec<&[u8]>) = (0..arr.len())
-        .filter(|&i| nulls.is_none_or(|nb| nb.is_valid(i)))
-        .step_by(step)
-        .take(PREFIX_SAMPLE_ROWS)
-        .map(|i| (pack_word(arr.key(i), 0), arr.key(i)))
-        .unzip();
+    let sample = |i: usize| (pack_word(arr.key(i), 0), arr.key(i));
+    // The same rows either way: with no null to skip the filter is the identity, and indexing
+    // directly keeps `step_by` from walking every row of the morsel through it.
+    let (mut packs, mut values): (Vec<u64>, Vec<&[u8]>) =
+        match nulls.filter(|nb| nb.null_count() > 0) {
+            None => (0..arr.len())
+                .step_by(step)
+                .take(PREFIX_SAMPLE_ROWS)
+                .map(sample)
+                .unzip(),
+            Some(nb) => (0..arr.len())
+                .filter(|&i| nb.is_valid(i))
+                .step_by(step)
+                .take(PREFIX_SAMPLE_ROWS)
+                .map(sample)
+                .unzip(),
+        };
     packs.sort_unstable();
     packs.dedup();
     // The sample holds at most `sample` distinct values, so a pack already distinct that often

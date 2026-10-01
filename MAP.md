@@ -3073,7 +3073,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join_par/sideways.rs` | 243 | Restrict a join's build-side aggregate to the keys its (already materialized) probe side holds. |
 | `lib.rs` | 736 | `bc-interp` — the Tier-0 interpreter. |
 | `metrics.rs` | 387 | Per-operator execution metrics — the measure half of the adaptive loop. |
-| `ops/byte_sort.rs` | 704 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
+| `ops/byte_sort.rs` | 715 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `ops/external_sort.rs` | 465 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
 | `ops/joins.rs` | 578 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
