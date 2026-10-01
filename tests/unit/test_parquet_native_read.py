@@ -162,6 +162,52 @@ def test_native_predicate_translation_pushable_and_not():
     assert to_native_predicate(temporal) is None
 
 
+def test_native_predicate_drops_only_conjuncts_it_cannot_express():
+    """A conjunct with no translation is dropped from its `AND`; nothing is dropped elsewhere.
+
+    Dropping a conjunct widens the predicate, which every consumer of the native form is
+    sound on. Dropping a disjunct, or a conjunct beneath a negation, would narrow it -- so a
+    disjunction with an untranslatable side, and a negated conjunction with one, push nothing.
+    """
+    from batcher.io.predicate import to_native_predicate
+    from batcher.plan.expr_ir import col
+
+    key = (col("a") >= 500).to_ir()
+    date = {
+        "e": "binary",
+        "op": "ge",
+        "left": col("d").to_ir(),
+        "right": {"e": "lit", "value": {"date": 100}},
+    }
+    conj = {"e": "binary", "op": "and", "left": key, "right": date}
+    disj = {"e": "binary", "op": "or", "left": key, "right": date}
+    assert to_native_predicate(conj) == {"node": "cmp", "col": "a", "op": "ge", "lit": 500}
+    assert to_native_predicate({"e": "binary", "op": "and", "left": date, "right": key}) == {
+        "node": "cmp",
+        "col": "a",
+        "op": "ge",
+        "lit": 500,
+    }
+    assert to_native_predicate(disj) is None
+    # NOT (a >= 500 AND d >= ...) is (a < 500 OR d < ...): an OR, so it may not lose a side.
+    assert to_native_predicate({"e": "not", "input": conj}) is None
+    # NOT (a >= 500 OR d >= ...) is (a < 500 AND d < ...): the date conjunct can go.
+    assert to_native_predicate({"e": "not", "input": disj}) == {
+        "node": "cmp",
+        "col": "a",
+        "op": "lt",
+        "lit": 500,
+    }
+    # Nested: the dropped conjunct sits under an OR whose other side survives whole.
+    nested = {"e": "binary", "op": "or", "left": conj, "right": (col("b") == 1).to_ir()}
+    assert to_native_predicate(nested) == {
+        "node": "or",
+        "left": {"node": "cmp", "col": "a", "op": "ge", "lit": 500},
+        "right": {"node": "cmp", "col": "b", "op": "eq", "lit": 1},
+    }
+    assert to_native_predicate({"e": "binary", "op": "and", "left": date, "right": date}) is None
+
+
 def test_native_predicate_null_test_uses_the_tag_rust_deserializes():
     """`IS [NOT] NULL` must be tagged `is_null` — the name `bc_io`'s `Pred` enum spells.
 

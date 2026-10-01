@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1554 Python modules across 220 packages and 323 Rust files across 14 crates.
+Covering 1554 Python modules across 220 packages and 325 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -346,7 +346,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 124 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `chunked.py` | 243 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
+| `chunked.py` | 254 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
 | `chunked_sideways.py` | 251 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
@@ -2124,7 +2124,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 |---|---|---|
 | `_csv_diagnostics.py` | 169 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
 | `_csv_ranges.py` | 110 | Where a CSV file may be cut into byte ranges without cutting a record in half. |
-| `_parquet_native.py` | 224 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
+| `_parquet_native.py` | 225 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
 | `arrow_ipc.py` | 280 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
 | `avro.py` | 417 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
 | `csv.py` | 617 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
@@ -2154,7 +2154,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | `partitions.py` | 219 | What a Hive ``col=value`` directory segment means, and what it proves. |
 | `routing.py` | 160 | How a predicated Parquet read spends its work: skip row groups on the footers, decode the rest. |
 | `sink.py` | 167 | `ParquetSink` — the Parquet writer. |
-| `source.py` | 749 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
+| `source.py` | 750 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
 | `units.py` | 108 | Hand a Parquet scan to the engine to read row group by row group, when that reads the same rows. |
 
 ### `batcher/io/formats/unstructured/` — 2 · neutral IO
@@ -2193,7 +2193,7 @@ Predicate translation for source-side pushdown.
 | `arrow.py` | 223 | IR to a `pyarrow.dataset.Expression`, for every file-format and lakehouse reader. |
 | `iceberg.py` | 92 | IR to a `pyiceberg` row filter, for Iceberg scans and ``replace_where``. |
 | `mongo.py` | 92 | IR to a MongoDB filter document, for the Mongo source. |
-| `native.py` | 146 | IR to the native parquet reader's compact predicate, for row-group pruning in Rust. |
+| `native.py` | 162 | IR to the native parquet reader's compact predicate, for row-group pruning in Rust. |
 | `sql.py` | 155 | IR to a SQL ``WHERE`` fragment, for the warehouse and JDBC-style connectors. |
 
 ### `batcher/io/schema/` — 2 · neutral IO
@@ -3034,12 +3034,12 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module.
 
-**depends on:** `bc-arrow`, `bc-interp`, `bc-io`, `bc-ir`, `bc-resource`, `bc-runtime`, `bc-sketches`, `bc-transport`
+**depends on:** `bc-arrow`, `bc-expr`, `bc-interp`, `bc-io`, `bc-ir`, `bc-resource`, `bc-runtime`, `bc-sketches`, `bc-transport`
 
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `chunked.rs` | 325 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked.rs` | 649 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
@@ -3098,10 +3098,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 631 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 667 | Preparing a hash join's build side once, for every worker that will probe it. |
-| `stream/chunked/mod.rs` | 713 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
+| `stream/chunked/mod.rs` | 738 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
-| `stream/chunked/units.rs` | 34 | The driving relation as a sequence of units read on demand by the workers that scan it. |
+| `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
+| `stream/chunked/units.rs` | 57 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 403 | Per-operator metrics for the streaming executor. |
@@ -3403,13 +3404,14 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
-| `lib.rs` | 764 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `late.rs` | 249 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
+| `lib.rs` | 781 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `mapped.rs` | 130 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
-| `projection.rs` | 67 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns. |
-| `row_filter.rs` | 523 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
-| `row_groups.rs` | 64 | Reading a Parquet relation one row group at a time, for a caller that schedules the row groups itself. |
+| `projection.rs` | 109 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns, and put a decoded batch's columns back in the order they were requested. |
+| `row_filter.rs` | 524 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
+| `row_groups.rs` | 268 | Reading a Parquet relation one row group at a time, for a caller that schedules the row groups itself. |
 | `split_read/block_cache.rs` | 334 | A process-wide cache of remote object bytes, kept in fixed-size blocks: the warm path. |
 | `split_read/mod.rs` | 356 | Split an oversized object-store read into several concurrent range GETs. |
 | `store.rs` | 426 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |

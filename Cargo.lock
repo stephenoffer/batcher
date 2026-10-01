@@ -672,6 +672,7 @@ dependencies = [
  "arrow",
  "arrow-pyarrow",
  "bc-arrow",
+ "bc-expr",
  "bc-interp",
  "bc-io",
  "bc-ir",

@@ -63,7 +63,7 @@ mod breaker;
 mod builds;
 pub mod chunked;
 use chunked::units::LazyScan;
-pub use chunked::units::UnitSource;
+pub use chunked::units::{UnitSource, LOCATOR};
 mod fanout;
 mod folds;
 mod meter;

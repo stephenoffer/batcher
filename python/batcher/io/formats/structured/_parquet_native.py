@@ -116,9 +116,10 @@ def read_row_groups_filtered(
     no row can match — the reader never fetches or decodes those column chunks. The reader
     may *also* apply the predicate row-by-row during decode when it measures that worth doing,
     so the result is anywhere between the exactly-matching rows and every requested row-group.
-    Both are correct: `to_native_predicate` is all-or-nothing, so a predicate that reaches the
-    reader is a complete translation of the `Filter`, and the engine keeps that `Filter`
-    regardless (`core.scan_only` declines its shortcut whenever a predicate was pushed).
+    Both are correct: `to_native_predicate` only widens (it drops a conjunct it cannot express
+    and declines a disjunction it cannot), so a predicate that reaches the reader keeps every
+    row the `Filter` keeps, and the engine keeps that `Filter` regardless (`core.scan_only`
+    declines its shortcut whenever a predicate was pushed).
     Returns ``None`` on any failure (caller falls back to PyArrow).
     """
     _native = engine_or_none()

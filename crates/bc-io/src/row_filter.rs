@@ -19,11 +19,12 @@
 //! row-level form of the same guarantee: **every row the `Filter` above the scan keeps, the
 //! pushed predicate keeps too.** Keeping *more* is fine, because that `Filter` still runs.
 //!
-//! `batcher.io.predicate.to_native_predicate` is all-or-nothing: any term it cannot translate
-//! makes the *whole* expression unpushable and it emits nothing. So a predicate that arrives
-//! here is a complete translation of that `Filter`, and the remaining question is only whether
-//! each comparison is evaluated here at least as permissively as the engine evaluates it.
-//! [`Pred`] has no negation, so a superset at every comparison is a superset of the whole.
+//! `batcher.io.predicate.to_native_predicate` only ever widens: a conjunct it cannot translate
+//! is dropped from its `AND` (once every negation has been carried to the leaves), and a
+//! disjunction with an untranslatable side is not pushed at all. So a predicate that arrives
+//! here keeps every row that `Filter` keeps, and the remaining question is only whether each
+//! comparison is evaluated here at least as permissively as the engine evaluates it. [`Pred`]
+//! has no negation, so a superset at every comparison is a superset of the whole.
 //!
 //! # The subset hazard, and how this avoids it
 //!

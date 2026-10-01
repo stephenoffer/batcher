@@ -90,6 +90,11 @@ def test_rows_match_duckdb(duck, path, sql_pred, expr):
 @pytest.mark.parametrize("sql_pred, expr", _PREDICATES, ids=_IDS)
 def test_the_filtered_fallback_answers_the_same(duck, path, monkeypatch, sql_pred, expr):
     """With no memory to decode survivors whole, the old filtered read must give the same rows."""
+    from batcher.api.orchestration import chunked
+
+    # The control plane's resident read is what this exercises; keep the engine's row-group
+    # read, which now takes inputs this small, from answering first.
+    monkeypatch.setattr(chunked, "units_worthy", lambda _bytes: False)
     monkeypatch.setattr(routing, "MEMORY_FRACTION", 0.0)
     pruned = []
     original = ParquetSource._native_read_pruned

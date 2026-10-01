@@ -29,6 +29,7 @@
 
 mod orient;
 mod partial;
+mod top_n;
 
 pub use partial::partial_aggregate_units;
 pub(crate) mod units;
@@ -84,14 +85,32 @@ fn oriented_core(plan: &RelOp, driving: usize) -> Option<Core<'_>> {
         return Some(Core::Aggregate { path, node });
     }
     // No aggregate over the spine: the spine starts below any global `Sort`/`Limit`, which must
-    // see every chunk's rows at once and so run as post ops over the collected result.
+    // see every chunk's rows at once and so run as post ops over the collected result. A
+    // `Project` *above* one of them runs there too — it reads only the post ops' output — which
+    // is the shape SQL gives every `SELECT a, b ... ORDER BY c LIMIT n`: the sort is planned
+    // under the select list, and stopping at the `Project` left the whole query resident.
+    // A `Project` with no `Sort`/`Limit` beneath it stays in the spine, where it streams.
     let mut node = plan;
     let mut depth = 0;
-    while let RelOp::Sort { input, .. } | RelOp::Limit { input, .. } = node {
-        node = input;
-        depth += 1;
+    let (mut spine, mut spine_depth) = (plan, 0);
+    loop {
+        match node {
+            RelOp::Sort { input, .. } | RelOp::Limit { input, .. } => {
+                node = input;
+                depth += 1;
+                (spine, spine_depth) = (node, depth);
+            }
+            RelOp::Project { input, .. } => {
+                node = input;
+                depth += 1;
+            }
+            _ => break,
+        }
     }
-    probe_spine_reaches(node, driving).then_some(Core::Spine { depth, node })
+    probe_spine_reaches(spine, driving).then_some(Core::Spine {
+        depth: spine_depth,
+        node: spine,
+    })
 }
 
 /// The aggregate whose input is the probe spine reaching `driving`, recording its child-index
@@ -304,6 +323,9 @@ fn units_with(
             crate::par::execute_parallel_with(&rest, &srcs, opts)
         }
         Core::Spine { depth, node } => {
+            if let Some(out) = run.top_n_late(plan, depth, node, &srcs, src, &ranges, meter)? {
+                return Ok(out);
+            }
             let result = run.collect_units(node, &srcs, src, &ranges, meter)?;
             if depth == 0 {
                 return Ok(result);
@@ -314,7 +336,10 @@ fn units_with(
             };
             srcs[driving] = Vec::new();
             srcs.push(result);
-            crate::execute(&post, &srcs)
+            // The parallel executor, not the sequential oracle: a top-N over a spine that kept
+            // a million rows (`SELECT s ... ORDER BY s LIMIT 10`) is the whole query's work, and
+            // sorting it on one core made it 3.9x slower than the resident read it replaced.
+            crate::par::execute_parallel_with(&post, &srcs, opts)
         }
     }
 }
@@ -1046,16 +1071,39 @@ mod tests {
                 .collect(),
             limit: Some(5_000),
         };
+        // The select list above the sort, which is how SQL plans `SELECT v, k ... ORDER BY`:
+        // the `Project` runs as a post op over the sorted rows, not as part of the spine.
+        let selected = RelOp::Project {
+            input: Box::new(sorted.clone()),
+            exprs: ["v", "k"]
+                .iter()
+                .map(|c| ProjectionItem {
+                    expr: Expr::Col { name: (*c).into() },
+                    alias: (*c).into(),
+                })
+                .collect(),
+        };
         let whole: Vec<RecordBatch> = (0..4).map(|c| fact(c * 80_000, (c + 1) * 80_000)).collect();
-        for (p, ordered) in [(*join, false), (projected, false), (sorted, true)] {
+        let sources = vec![vec![fact(0, 0)], vec![dim()]];
+        let src = Units(whole.iter().map(|b| vec![b.clone()]).collect(), None);
+        for (p, ordered) in [
+            (*join, false),
+            (projected, false),
+            (sorted, true),
+            (selected, true),
+        ] {
             assert!(chunkable(&p, 0));
             let mut want = rows(&crate::execute(&p, &[whole.clone(), vec![dim()]]).unwrap());
             let mut got = rows(&run(&p, whole.iter().map(|b| vec![b.clone()]).collect()));
+            let mut units =
+                rows(&execute_units(&p, &sources, 0, &src, 3, 0, &ExecOptions::default()).unwrap());
             if !ordered {
                 want.sort();
                 got.sort();
+                units.sort();
             }
             assert_eq!(got, want, "ordered={ordered}");
+            assert_eq!(units, want, "units, ordered={ordered}");
         }
     }
 

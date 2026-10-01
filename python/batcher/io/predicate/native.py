@@ -3,6 +3,16 @@
 Kept in lockstep with `crates/bc-io/src/predicate.rs`: the tags here are that enum's serde
 spelling, and an unrecognized one makes the reader reject the whole predicate silently.
 That fixed vocabulary is why `IN` and `NOT` are *expressed* in it rather than added to it.
+
+The translation is a **superset**, not an equivalent: a conjunct it cannot express is
+dropped from its conjunction, which only ever admits more rows. Every consumer of the result
+is sound on a superset -- row-group, page and bloom pruning skip only blocks the predicate
+provably rejects, and the reader's row filter removes only rows it provably rejects -- and the
+engine keeps its `Filter` above the scan regardless. Requiring the whole predicate to
+translate instead gave up all of that whenever one term did not: ClickBench's
+``CounterID = 62 AND EventDate >= DATE '2013-07-01'`` pruned nothing, because of the date,
+on a table clustered by ``CounterID`` where the first conjunct alone rules out 84 of its 90
+row groups.
 """
 
 from __future__ import annotations
@@ -74,13 +84,15 @@ def _native_in_list(ir: dict[str, Any], negated: bool) -> dict[str, Any] | None:
 
 
 def to_native_predicate(ir: dict[str, Any], *, negated: bool = False) -> dict[str, Any] | None:
-    """Translate the pushable subset of `ir` to the native reader's compact predicate.
+    """Translate `ir` to the native reader's compact predicate, as a superset of its rows.
 
     The shape `bc_io`'s `predicate` module deserializes: ``{"node":"cmp","col":..,"op":..,
     "lit":..}`` / ``{"node":"and"/"or","left":..,"right":..}`` / ``{"node":"is_null","col":..,
-    "negated":..}``. Comparisons are normalized so the column is on the left. Returns
-    ``None`` if any term is not pushable (a non-column/literal comparison, a temporal
-    literal, or an unsupported node) — the caller then reads without native pruning.
+    "negated":..}``. Comparisons are normalized so the column is on the left. A term that is
+    not pushable (a non-column/literal comparison, a temporal literal, or an unsupported node)
+    is dropped from the conjunction it sits in, which keeps every row it would have kept; one
+    that sits under an ``OR`` makes the whole disjunction unpushable, and ``None`` -- read
+    without native pruning -- is returned when nothing is left.
 
     The ``"is_null"`` tag is load-bearing: `bc_io`'s `Pred` is
     ``#[serde(tag = "node", rename_all = "snake_case")]``, so its `IsNull` variant is spelled
@@ -90,8 +102,10 @@ def to_native_predicate(ir: dict[str, Any], *, negated: bool = False) -> dict[st
 
     `IN` lists and `NOT` are expressed in that same fixed vocabulary rather than added to it:
     a set becomes an ``OR`` of equalities and a negation is carried to the leaves by De
-    Morgan. Both are exact, so neither needs the `exact` flag the other translators thread —
-    this one already declines a partial `AND`.
+    Morgan. Both are exact, which is what lets a conjunct be dropped *after* them: once every
+    negation is at a leaf, ``AND`` and ``OR`` are monotone, so replacing any conjunct of an
+    ``AND`` with "true" can only widen the result. Dropping one *before* carrying a negation
+    down would narrow it, which is why the drop happens on the folded connective.
 
     Args:
         ir: The predicate's IR dictionary.
@@ -99,7 +113,7 @@ def to_native_predicate(ir: dict[str, Any], *, negated: bool = False) -> dict[st
             `not`; callers leave it alone.
 
     Returns:
-        The reader's predicate dictionary, or None when any term is unpushable.
+        The reader's predicate dictionary, or None when nothing is pushable.
     """
     e = ir.get("e")
     if e in ("is_null", "is_not_null"):
@@ -123,7 +137,9 @@ def to_native_predicate(ir: dict[str, Any], *, negated: bool = False) -> dict[st
         left = to_native_predicate(ir["left"], negated=negated)
         right = to_native_predicate(ir["right"], negated=negated)
         if left is None or right is None:
-            return None
+            # An `AND` keeps a superset of its rows without the side it cannot express; an
+            # `OR` without one of its sides would keep a subset, so it is unpushable whole.
+            return (left or right) if folded == "and" else None
         return {"node": folded, "left": left, "right": right}
     if op in COMPARISON_OPS:
         left, right = ir["left"], ir["right"]
