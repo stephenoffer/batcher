@@ -1200,6 +1200,20 @@ impl JoinTable {
             self.bloom_trial.observe(seen, rejected);
             return;
         }
+        if let (Some(dense), Some((_, left))) = (self.dense.as_ref(), keys.dense_keys()) {
+            if right_matched.is_none() && matches!(join_type, JoinType::Inner | JoinType::Semi) {
+                let seen = range.len() as u64;
+                self.probe_range_dense(
+                    dense, left, range, left_null, join_type, left_out, right_out,
+                );
+                // `head_for` answers a dense table before it consults any pre-filter, so the
+                // per-row loop would have tallied no rejections either.
+                if !matches!(pre, Prefilter::None) {
+                    self.bloom_trial.observe(seen, 0);
+                }
+                return;
+            }
+        }
         let mut rejected = 0u64;
         let seen = range.len() as u64;
         for i in range {

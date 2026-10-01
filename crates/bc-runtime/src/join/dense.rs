@@ -306,6 +306,27 @@ impl DenseHeads {
             + self.chunks.capacity() * std::mem::size_of::<Vec<u32>>()
     }
 
+    /// The raw slot for probe key `k` -- `row + 1`, or [`EMPTY`] when no build row carries it
+    /// -- with the range test folded into the load instead of branching around it.
+    ///
+    /// `wrapping_sub` then an unsigned compare is the whole range test: a key below `lo` wraps
+    /// to a value of at least 2^63, past any span, and one above `lo + span` lands at or past
+    /// `span` itself. An out-of-range key loads slot 0 (which always exists) and is masked to
+    /// empty, so the bulk probe ([`super::JoinTable::probe_range_dense`]) selects with no
+    /// unpredictable branch on a probe that mostly misses.
+    #[inline(always)]
+    fn raw(&self, k: i64) -> u32 {
+        let idx = k.wrapping_sub(self.lo) as u64 as usize;
+        let inside = idx < self.span;
+        let at = if inside { idx } else { 0 };
+        let slot = self.chunks[at >> self.shift][at & self.mask];
+        if inside {
+            slot
+        } else {
+            EMPTY
+        }
+    }
+
     /// The chain head for probe key `k`, or `None` when no build row carries it.
     #[inline]
     pub(super) fn head(&self, k: i64) -> Option<u32> {
@@ -326,6 +347,78 @@ impl DenseHeads {
             shift: chunk_len.trailing_zeros(),
             mask: chunk_len - 1,
             span,
+        }
+    }
+}
+
+/// Probe rows per selection pass of [`super::JoinTable::probe_range_dense`]: two 4 KB stack
+/// arrays, small enough to stay in L1 beside the probe keys they index.
+const BLOCK: usize = 1024;
+
+impl super::JoinTable {
+    /// [`super::JoinTable::probe_range`] for an Inner or Semi join over the dense map, one
+    /// block at a time: a branchless pass loads every row's slot and selects the rows that
+    /// hit, then only those are emitted.
+    ///
+    /// The per-row loop reaches the same slots through `head_for`, a call per probe row that
+    /// the compiler does not inline into the generic loop. On a selective star join -- a fact
+    /// table probing a filtered dimension, nearly every row a miss -- that call's prologue and
+    /// epilogue were most of the probe: 2.88M rows against 1,800 dense keys spent 76% of the
+    /// query in `head_for` and `probe_range`, and ran slower than the *same* join over a sparse
+    /// key that took the bitmap's bulk path instead. Rows are emitted in ascending order within
+    /// the range and each key's chain in chain order, exactly as the per-row loop emits them.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn probe_range_dense(
+        &self,
+        dense: &DenseHeads,
+        key: &[i64],
+        range: std::ops::Range<usize>,
+        left_null: Option<&[bool]>,
+        join_type: super::JoinType,
+        left_out: &mut super::IndexBuf,
+        right_out: &mut super::IndexBuf,
+    ) {
+        debug_assert!(matches!(
+            join_type,
+            super::JoinType::Inner | super::JoinType::Semi
+        ));
+        if dense.span == 0 {
+            return;
+        }
+        let semi = join_type == super::JoinType::Semi;
+        let mut sel = [0u32; BLOCK];
+        let mut heads = [0u32; BLOCK];
+        let mut start = range.start;
+        while start < range.end {
+            let end = (start + BLOCK).min(range.end);
+            let mut n = 0;
+            for i in start..end {
+                let slot = dense.raw(key[i]);
+                sel[n] = i as u32;
+                heads[n] = slot;
+                n += usize::from(slot != EMPTY) & usize::from(!left_null.is_some_and(|m| m[i]));
+            }
+            for (&i, &slot) in sel[..n].iter().zip(&heads[..n]) {
+                if semi {
+                    left_out.push(i);
+                    right_out.push_null();
+                    continue;
+                }
+                let mut row = slot - 1;
+                loop {
+                    left_out.push(i);
+                    right_out.push(row);
+                    if self.unique {
+                        break;
+                    }
+                    let nxt = self.next[row as usize];
+                    if nxt == u32::MAX {
+                        break;
+                    }
+                    row = nxt;
+                }
+            }
+            start = end;
         }
     }
 }
@@ -554,5 +647,103 @@ mod tests {
     fn an_all_null_build_falls_back() {
         assert!(DenseHeads::build(&[1, 2], 2, &[true, true]).is_none());
         assert!(DenseHeads::build(&[], 0, &[]).is_none());
+    }
+
+    /// The bulk dense probe ([`super::super::JoinTable::probe_range_dense`]) against a by-key
+    /// oracle. `BroadcastProbe` is the streaming executor's probe and reaches it for Inner and
+    /// Semi; probing in uneven morsels makes block boundaries fall mid-morsel. The build is
+    /// dense with duplicates and nulls; the probe's keys fall below, inside and above the
+    /// range, at both `i64` extremes, and null.
+    #[test]
+    fn the_bulk_dense_probe_matches_an_oracle() {
+        use crate::join::{BroadcastProbe, JoinType};
+        use arrow::array::{Array, ArrayRef, Int64Array};
+        use std::sync::Arc;
+
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let right: Vec<Option<i64>> = (0..2_000)
+            .map(|_| (next() % 19 != 0).then(|| (next() % 3_000) as i64 + 5_000))
+            .collect();
+        let raw: Vec<i64> = right.iter().map(|k| k.unwrap_or(0)).collect();
+        let nulls: Vec<bool> = right.iter().map(Option::is_none).collect();
+        assert!(
+            DenseHeads::build(&raw, raw.len(), &nulls).is_some(),
+            "fixture must take the dense map"
+        );
+        let left: Vec<Option<i64>> = (0..50_000)
+            .map(|i| {
+                (next() % 29 != 0).then(|| match i % 7 {
+                    0 => i64::MIN,
+                    1 => i64::MAX,
+                    2 => 5_000 - (next() % 500) as i64,
+                    3 => 8_000 + (next() % 500) as i64,
+                    _ => (next() % 3_000) as i64 + 5_000,
+                })
+            })
+            .collect();
+        let mut by_key = std::collections::HashMap::<i64, Vec<u32>>::new();
+        for (ri, rk) in right.iter().enumerate() {
+            if let Some(k) = rk {
+                by_key.entry(*k).or_default().push(ri as u32);
+            }
+        }
+        let build: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(right.clone()))];
+        let present = right
+            .iter()
+            .flatten()
+            .copied()
+            .next()
+            .expect("a non-null build key");
+        for jt in [JoinType::Inner, JoinType::Semi] {
+            let probe = BroadcastProbe::over_any_build(&build, jt, left.len(), 0.01, usize::MAX)
+                .expect("a probe-driven join over an Int64 key");
+            let mut got = Vec::new();
+            let mut start = 0;
+            for len in [1, 1_023, 1_025, 4_096, 17_000].iter().cycle() {
+                if start >= left.len() {
+                    break;
+                }
+                let end = (start + len).min(left.len());
+                // A null row carries a key the build holds underneath, so only the null mask
+                // can keep it from matching.
+                let part = &left[start..end];
+                let values: Vec<i64> = part.iter().map(|k| k.unwrap_or(present)).collect();
+                let valid: Vec<bool> = part.iter().map(Option::is_some).collect();
+                let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::new(
+                    values.into(),
+                    Some(arrow::buffer::NullBuffer::from(valid)),
+                ))];
+                let out = probe.probe(&keys).expect("same key shape");
+                let mut last = 0;
+                for i in 0..out.left.len() {
+                    let l = out.left.value(i);
+                    assert!(l >= last, "{jt:?}: probe rows must be emitted in order");
+                    last = l;
+                    let r = out.right.is_valid(i).then(|| out.right.value(i));
+                    got.push((start as u32 + l, r));
+                }
+                start = end;
+            }
+            got.sort_unstable();
+            let mut want = Vec::new();
+            for (li, lk) in left.iter().enumerate() {
+                let matched = lk
+                    .and_then(|k| by_key.get(&k))
+                    .map_or(&[][..], Vec::as_slice);
+                match jt {
+                    JoinType::Semi if !matched.is_empty() => want.push((li as u32, None)),
+                    JoinType::Inner => want.extend(matched.iter().map(|&r| (li as u32, Some(r)))),
+                    _ => {}
+                }
+            }
+            want.sort_unstable();
+            assert_eq!(got, want, "{jt:?} disagrees with the by-key oracle");
+        }
     }
 }
