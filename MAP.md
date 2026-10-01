@@ -1175,7 +1175,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
 | `learning.py` | 688 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
-| `measured_selectivity.py` | 67 | Filter selectivity derived from what Core measured, per plan signature. |
+| `measured_selectivity.py` | 78 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
 | `metadata_answer.py` | 438 | Answer terminals from metadata alone — Kyber's metadata-first decision layer. |
 | `ols.py` | 145 | Shared OLS sufficient statistics for Kyber's learned crossover models. |
@@ -1726,7 +1726,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 |---|---|---|
 | `base.py` | 87 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
 | `energy.py` | 328 | Measuring what a stage drew — Core's half of the energy loop. |
-| `executor.py` | 466 | The Core local executor. |
+| `executor.py` | 468 | The Core local executor. |
 | `gpu_transform.py` | 312 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 191 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 268 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
@@ -2391,7 +2391,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 |---|---|---|
 | `accelerator.py` | 69 | Does a plan need an accelerator? — the one predicate, for every layer that asks. |
 | `bloom_index.py` | 119 | `BloomIndex` — a data-skipping membership index over a column's values. |
-| `feedback.py` | 338 | Execution feedback contract: Core → Kyber. |
+| `feedback.py` | 345 | Execution feedback contract: Core → Kyber. |
 | `ids.py` | 10 | Stable identifiers used across plans and feedback. |
 | `ir_specs.py` | 166 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
 | `ir_tags.py` | 287 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
@@ -3409,7 +3409,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
-| `late.rs` | 369 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
+| `late.rs` | 379 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
 | `lib.rs` | 799 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `mapped.rs` | 130 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |

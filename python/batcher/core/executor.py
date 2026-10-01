@@ -205,6 +205,7 @@ def _record_one(
     """Transcribe one metrics entry into an `OperatorFeedback` and record it."""
     rows_in = _num(op, "rows_in")
     rows_out = _num(op, "rows_out")
+    runtime_filtered = bool(op.get("runtime_filtered"))
     op_id = int(_num(op, "op_id"))
     annotated = planned[op_id] if 0 <= op_id < len(planned) else None
     sink.record(
@@ -235,7 +236,8 @@ def _record_one(
             # runtime join filter reduced is not this operator's cardinality, so its q-error
             # would teach the next plan a correction that plan's own filters contradict. TPC-H
             # q7 at sf10 re-planned every few runs that way, between a 76 ms plan and a 95 ms one.
-            n_estimated=0.0 if op.get("runtime_filtered") else _raw_estimate_of(annotated),
+            n_estimated=0.0 if runtime_filtered else _raw_estimate_of(annotated),
+            runtime_filtered=runtime_filtered,
             expr_factor=annotated.properties.expr_factor if annotated else 1.0,
             # The engine flattens its hardware counters into the same document, so they
             # read as ordinary keys. `or 0` covers both an older engine that omits the key

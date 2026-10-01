@@ -20,8 +20,12 @@ from types import SimpleNamespace
 import pytest
 
 import batcher as bt
-from batcher.core import executor
+from batcher.config import active_config
+from batcher.core import default_hub, executor
 from batcher.core.executor import record_exec_metrics
+from batcher.kyber.measured_selectivity import measured_selectivities
+from batcher.metadata import MetadataHub
+from batcher.metadata.backends.in_process import InProcessBackend
 from batcher.plan.expr_ir import col
 from batcher.plan.feedback import OperatorFeedback
 
@@ -85,3 +89,57 @@ def test_the_engine_lists_the_operators_between_the_filter_and_its_join(monkeypa
     listed = {op["kind"] for op in ops if op.get("runtime_filtered")}
     assert "filter" in listed, f"the filter above the filtered scan was not listed: {ops}"
     assert "scan" not in listed and "hash_join" not in listed, f"a true count was listed: {ops}"
+
+
+def _hub_after(listed: list[int]) -> MetadataHub:
+    """A hub fed enough runs of one filter, measured 1.0 on its input, to clear every gate."""
+    hub = MetadataHub(InProcessBackend())
+    ops = [
+        {"op_id": 0, "kind": "hash_join", "rows_in": 10, "rows_out": 10},
+        {"op_id": 1, "kind": "filter", "rows_in": 10, "rows_out": 10},
+        {"op_id": 2, "kind": "scan", "rows_in": 10, "rows_out": 10},
+    ]
+    doc = json.dumps({"ops": ops, "runtime_filtered": listed})
+    for _ in range(max(3, active_config().optimizer.cardinality_correction_min_samples)):
+        record_exec_metrics(hub, doc, batch_size=16_384, planned=_planned(3))
+    return hub
+
+
+def test_a_reduced_filter_teaches_no_selectivity() -> None:
+    """JOB q27c: a sideways key range measured 1.0 behind a join filter, then sank the plan.
+
+    The control is the same history without the engine's listing: then the ratio *is* the
+    filter's own, and the reader must learn it -- so the exclusion is not a reader that has
+    simply stopped learning.
+    """
+    assert measured_selectivities(_hub_after([]))["sig"] == pytest.approx(1.0)
+    hub = _hub_after([1])
+    assert "sig" not in measured_selectivities(hub), "a reduced ratio became a selectivity"
+    filters = [row for row in hub.op_stats_with_signature() if row["kind"] == "filter"]
+    assert filters and all(row.get("runtime_filtered") for row in filters)
+
+
+def test_a_key_range_behind_a_join_filter_learns_no_selectivity(monkeypatch) -> None:
+    """End to end: the filter's ratio on the reduced input is 1.0, on its table 0.14.
+
+    `k < 7_000` is implied by the join filter built from `dim`, whose keys all lie below
+    7,000, so every row that reaches the filter passes it. The positive control asserts the
+    raw measurement was that misleading 1.0, so the hub did hold the evidence that the reader
+    must refuse; that the engine lists the filter is the test above.
+    """
+    monkeypatch.setenv("BATCHER_RUNTIME_JOIN_FILTER", "force")
+    n = 200_000
+    fact = bt.from_pydict({"k": [i % 50_000 for i in range(n)], "v": [i % 1_000 for i in range(n)]})
+    keys = list(range(0, 7_000, 7))
+    dim = bt.from_pydict({"k": keys, "w": [1] * len(keys)})
+    query = fact.filter(col("k") < 7_000).join(dim, on="k").agg(n=col("v").count())
+    want = sum(1 for i in range(n) if i % 50_000 < 7_000 and i % 50_000 % 7 == 0)
+    for _ in range(3):
+        assert query.collect().to_pydict()["n"] == [want]
+
+    hub = default_hub()
+    filters = [row for row in hub.op_stats_with_signature() if row["kind"] == "filter"]
+    assert filters, "positive control: no filter was measured"
+    assert all(row["selectivity"] == pytest.approx(1.0) for row in filters)
+    learned = measured_selectivities(hub)
+    assert not any(row["signature"] in learned for row in filters), learned
