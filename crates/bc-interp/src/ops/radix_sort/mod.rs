@@ -842,6 +842,20 @@ mod sorted_values_tests {
         check(Arc::new(Date32Array::from_iter(
             (0..n as i32).map(|i| (i % 5 != 0).then_some(18_000 + (i * 3) % 700)),
         )));
+        // A narrow float, an unsigned key past `i64::MAX`, and a zoned timestamp: each decodes
+        // through its own arm, and the timestamp must keep its time zone.
+        check(Arc::new(arrow::array::Float32Array::from_iter((0..n).map(
+            |i| (i % 9 != 0).then_some(((i * 37) % 300) as f32 / 3.0 - 40.0),
+        ))));
+        check(Arc::new(arrow::array::UInt64Array::from_iter_values(
+            (0..n as u64).map(|i| u64::MAX - (i * 7919) % 1_000),
+        )));
+        check(Arc::new(
+            arrow::array::TimestampMicrosecondArray::from_iter(
+                (0..n as i64).map(|i| (i % 4 != 0).then_some((i * 104_729) % 10_000_000)),
+            )
+            .with_timezone("+02:00"),
+        ));
         // Already ordered, all null, one row and empty.
         check(Arc::new(Int64Array::from_iter_values(0..5_000)));
         check(Arc::new(Int64Array::from(vec![None::<i64>; 4])));
