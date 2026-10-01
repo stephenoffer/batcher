@@ -547,11 +547,11 @@ fn sum_acc(values: &ArrayRef, num_groups: usize) -> Option<FusedAcc<'_>> {
         }
         // No no-null arm for decimal, unlike the two above: it was built, measured and
         // removed — see `accum::sum_acc`'s decimal arm for the numbers.
-        DataType::Decimal128(p, s) => FusedAcc::SumDecimal {
+        DataType::Decimal128(_, s) => FusedAcc::SumDecimal {
             v: values.as_primitive::<Decimal128Type>(),
             sums: vec![0; num_groups],
             valid: vec![false; num_groups],
-            precision: *p,
+            precision: super::DECIMAL_SUM_PRECISION,
             scale: *s,
         },
         _ => return None, // unsupported dtype → per-call path emits the canonical error

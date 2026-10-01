@@ -2621,7 +2621,7 @@ String free functions, in two halves: building text and reading structure out of
 | module | lines | what it is |
 |---|---|---|
 | `_setops.py` | 84 | What makes two set-operation branches compatible. |
-| `aggregate.py` | 313 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
+| `aggregate.py` | 320 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
 | `base.py` | 444 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 666 | Row-wise and set relational logical nodes. |
@@ -3085,7 +3085,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/quantile_spill/mod.rs` | 750 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
 | `ops/radix_sort/mod.rs` | 389 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/radix_sort/packed.rs` | 498 | The **composite** packed key: several sort columns narrowed into one integer. |
-| `ops/repartition.rs` | 441 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
+| `ops/repartition.rs` | 583 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 548 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/run_sort.rs` | 275 | Natural-run detection for the fixed-width sort permutations. |
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
@@ -3121,11 +3121,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg/accum.rs` | 799 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
+| `agg/accum.rs` | 800 | Per-type accumulator helpers for `sum`/`min`/`max` and the masked-array and concat utilities they share. |
 | `agg/argextreme.rs` | 128 | ARG_MIN / ARG_MAX — the value at the row with the extreme (min/max) ordering key. |
 | `agg/counted.rs` | 262 | Value-frequency state for the aggregates that only ever ask "how often?". |
 | `agg/dispatch.rs` | 239 | The per-function dispatch: the two steps where the aggregates stop being alike. |
-| `agg/distinct.rs` | 622 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
+| `agg/distinct.rs` | 667 | COUNT(DISTINCT) — exact, mergeable via a per-group value list — plus the `bucket_values_into_list` helper shared with the median path and the single-pass… |
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/fused.rs` | 710 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1788 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
@@ -3136,7 +3136,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/inputs/mod.rs` | 194 | Bringing an aggregate call's inputs to a type the accumulator kernels read. |
 | `agg/int_sum/mod.rs` | 333 | The partial state of an integer `SUM`: an exact 128-bit total, range-checked only when it is finalized. |
 | `agg/median.rs` | 612 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
-| `agg/mod.rs` | 492 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
+| `agg/mod.rs` | 506 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/ordered_list/mod.rs` | 184 | `array_agg(x ORDER BY k)`: a per-group list whose element order is a property of the rows. |
 | `agg/sketch.rs` | 196 | The sketch-backed aggregates: bounded memory in exchange for a bounded error. |
 | `agg/spill/mod.rs` | 33 | Spilling (grace) hash aggregation — bounded-memory `combine` + `finalize`. |

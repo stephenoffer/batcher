@@ -155,6 +155,20 @@ mod var;
 /// `AVG` over three 10M-row integer columns that widening was most of the query.
 pub(crate) const MEAN_INT_ACCUMULATOR: DataType = DataType::Decimal128(38, 0);
 
+/// The precision of a decimal `SUM`'s state and result: `SUM(decimal(p, s))` is
+/// `decimal(38, s)`, the DuckDB / SQL-standard rule.
+///
+/// Keeping the input's precision, which the accumulators used to do, declared a type the
+/// result does not fit: three `99999.99`s and a `1.10` in a `decimal(7, 2)` sum to
+/// `300001.07`, eight digits under a seven-digit type. Nothing rejected it, because the `i128`
+/// holds the value either way, but the column claimed a range its own rows leave, and a
+/// consumer that trusts the declared precision (a Parquet writer, the GPU tier's schema
+/// contract, another engine reading the Arrow) is entitled to. 38 is `Decimal128`'s maximum,
+/// so a sum past it is the `i128` overflow `checked_add` already reports. The control plane's
+/// type inference (`plan/logical/aggregate.py`) states the same rule, so `Dataset.schema`
+/// matches what runs.
+pub(crate) const DECIMAL_SUM_PRECISION: u8 = arrow::datatypes::DECIMAL128_MAX_PRECISION;
+
 use accum::{
     bitfold_acc, bool_acc, concat_col, kahan_acc, minmax_acc, product_acc, require, sum_acc,
 };
@@ -1015,6 +1029,69 @@ mod tests {
         let pg = partial(&[], &[AggCall::new(AggFunc::Mean, Some(v2))], 3).expect("global");
         let og = finalize(&[AggFunc::Mean], &pg).expect("finalize");
         assert!((og[0].as_primitive::<Float64Type>().value(0) - 2.5).abs() < 1e-9);
+    }
+
+    /// `SUM(decimal(7, 2))` is `decimal(38, 2)` on every path that builds its state — the
+    /// per-call kernel (one aggregate), the fused one (several), and the keyless one — and a
+    /// sum split across partials and combined is the single-node sum, value **and** type.
+    #[test]
+    fn decimal_sum_is_decimal_38_and_merges() {
+        use arrow::array::Decimal128Array;
+        use arrow::datatypes::Decimal128Type;
+        let dec = |v: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(v)
+                    .with_precision_and_scale(7, 2)
+                    .unwrap(),
+            )
+        };
+        // 3 x 99999.99 + 1.10 = 300001.07: eight digits, past the input's seven.
+        let rows = vec![
+            Some(9_999_999i128),
+            Some(9_999_999),
+            None,
+            Some(9_999_999),
+            Some(110),
+            Some(-5),
+        ];
+        let keys = vec![1i64, 1, 2, 1, 1, 2];
+        let want_type = DataType::Decimal128(38, 2);
+        let run = |ks: &[i64], vs: Vec<Option<i128>>, fused: bool| {
+            let n = ks.len();
+            let k: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ks.to_vec()))];
+            let v = dec(vs);
+            let mut calls = vec![AggCall::new(AggFunc::Sum, Some(Arc::clone(&v)))];
+            if fused {
+                calls.push(AggCall::new(AggFunc::Sum, Some(Arc::clone(&v))));
+                calls.push(AggCall::new(AggFunc::Count, Some(v)));
+            }
+            partial(&k, &calls, n).unwrap()
+        };
+        for fused in [false, true] {
+            let funcs: Vec<AggFunc> = if fused {
+                vec![AggFunc::Sum, AggFunc::Sum, AggFunc::Count]
+            } else {
+                vec![AggFunc::Sum]
+            };
+            let whole = run(&keys, rows.clone(), fused);
+            assert_eq!(whole.states[0][0].data_type(), &want_type, "fused={fused}");
+            let single = finalize(&funcs, &whole).unwrap();
+            assert_eq!(single[0].data_type(), &want_type, "fused={fused}");
+            let s = single[0].as_primitive::<Decimal128Type>();
+            assert_eq!((s.value(0), s.value(1)), (30_000_107, -5), "fused={fused}");
+
+            // The mergeable invariant: any split, combined, finalizes to the same column.
+            let parts = vec![
+                run(&keys[..2], rows[..2].to_vec(), fused),
+                run(&keys[2..], rows[2..].to_vec(), fused),
+            ];
+            let merged = finalize(&funcs, &combine(&parts, &funcs).unwrap()).unwrap();
+            assert_eq!(merged[0].as_ref(), single[0].as_ref(), "fused={fused}");
+        }
+        let global = partial(&[], &[AggCall::new(AggFunc::Sum, Some(dec(rows)))], 6).unwrap();
+        let g = finalize(&[AggFunc::Sum], &global).unwrap();
+        assert_eq!(g[0].data_type(), &want_type);
+        assert_eq!(g[0].as_primitive::<Decimal128Type>().value(0), 30_000_102);
     }
 
     #[test]
