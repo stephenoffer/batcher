@@ -22,6 +22,7 @@ from batcher.api.orchestration.sizing import (
     partitions_from_physical,
     projected_input_bytes,
     proven_empty_table,
+    resident_input_bytes,
 )
 from batcher.api.orchestration.stages import (
     execute_distributed,
@@ -562,9 +563,11 @@ def _run_relational_scoped(
     # query, because the in-memory path resolves every source to Arrow *before* the engine
     # runs — a 600M-row scan is resident in full even when the query returns four rows.
     input_bytes = projected_input_bytes(sources, opt.source_projections, opt.scanned_source_ids())
-    # `resident_total_exceeds_budget` subsumes the input-only check: the input and the
-    # plan's peak state are concurrent on this path, so what matters is their sum.
-    spill = must_spill or rm.should_spill(opt) or rm.resident_total_exceeds_budget(input_bytes, opt)
+    # `resident_total_exceeds_budget` subsumes the input-only check: the input and the plan's
+    # peak state are concurrent here, less what the process already holds (`resident_input_bytes`).
+    held = resident_input_bytes(sources, opt.source_projections, opt.scanned_source_ids())
+    over = rm.resident_total_exceeds_budget(input_bytes, opt, held_bytes=held)
+    spill = must_spill or rm.should_spill(opt) or over
     # Before either path reads the whole input, stream the largest source into the engine when
     # the plan's shape allows it (`orchestration.chunked`).
     streamed = run_chunked(plan, opt, ctx, sources, input_bytes=input_bytes, spill=spill)

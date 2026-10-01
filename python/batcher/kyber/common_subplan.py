@@ -31,12 +31,14 @@ from batcher._internal.logging import note_suppressed
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
+    Filter,
     Join,
     LogicalPlan,
     Sort,
     Window,
+    is_cartesian_key_pair,
 )
-from batcher.plan.visitor import walk
+from batcher.plan.visitor import children, walk
 
 __all__ = ["common_subplans", "structural_key"]
 
@@ -182,6 +184,8 @@ def common_subplans(
             # cost, so normalizing it per candidate would optimize the same plan once per
             # candidate for the same answer.
             run_plan = as_run(plan)
+        if _pending_cartesian(node, sized):
+            continue
         run_node = as_run(node)
         if not _fits(run_node, sized, max_bytes, row_bytes):
             continue
@@ -261,6 +265,55 @@ def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appear
     except Exception as exc:  # a cost failure must not break planning
         note_suppressed("kyber", "cost a common-subplan candidate", exc)
         return False
+
+
+def _pending_cartesian(node: LogicalPlan, estimator) -> bool:
+    """Whether `node` holds a comma join whose real condition sits *above* it, as written.
+
+    A comma join lowers to an equi-join on the constant `__cross_key`, with its `WHERE`
+    equalities in a `Filter` over the whole `FROM` list; predicate pushdown later turns them
+    into keys. A repeated subtree cut out of that `FROM` list keeps the pseudo-join and loses
+    the filter, so materialized on its own it is the cartesian product the query never
+    computes -- and since it is the *largest* repeat, it shadows the one that really repeats.
+    TPC-DS q59 references its `wss` aggregate as `FROM wss, store, date_dim` twice: the shared
+    `wss x store` cross product was chosen, came back 1.39M rows wide with every `store`
+    column (605 MB), overflowed the budget and was dropped, and `wss` ran twice -- its 27.5M
+    row aggregate is two thirds of the query.
+
+    A pseudo-join is *pending* when no `Filter` above it lies inside `node`: one that does is
+    the subtree's own `WHERE`, which goes with it (`wss` is itself a comma join of
+    `store_sales, date_dim` under its own filter). Skipping a pending subtree leaves its
+    repeated descendants eligible. A pseudo-join with a side of at most one row is not
+    pending either: that is a scalar broadcast, as cheap materialized as it is fused.
+
+    Args:
+        node: The candidate subtree.
+        estimator: The `CardinalityEstimator` for the side sizes.
+
+    Returns:
+        Whether a pending cartesian pseudo-join with two multi-row sides lies in `node`.
+    """
+    stack: list[tuple[LogicalPlan, bool]] = [(node, False)]
+    while stack:
+        current, filtered = stack.pop()
+        if isinstance(current, Join) and not filtered and _is_cartesian(current):
+            try:
+                sides = [estimator.estimate(side).rows for side in (current.left, current.right)]
+            except Exception:  # an unsizable side is not evidence of a scalar broadcast
+                return True
+            if min(sides) > 1:
+                return True
+        below = filtered or isinstance(current, Filter)
+        stack.extend((child, below) for child in children(current))
+    return False
+
+
+def _is_cartesian(join: Join) -> bool:
+    """Whether every key pair of an inner `join` is a constant pseudo-edge (or it has none)."""
+    if join.join_type != "inner":
+        return False
+    pairs = zip(join.left_keys, join.right_keys, strict=True)
+    return all(is_cartesian_key_pair(join.left, lk, join.right, rk) for lk, rk in pairs)
 
 
 def _fits(node: LogicalPlan, estimator, max_bytes: int, row_bytes: int) -> bool:

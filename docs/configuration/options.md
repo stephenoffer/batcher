@@ -215,6 +215,7 @@ nests three sub-sections: `cardinality`, `cost_coeffs`, and `cost_weights`.
 | `locality_max_bytes` | `4194304` (4 MiB) | Shuffle volume below which co-locating a small shuffle's workers beats spreading them. A network decision, kept separate from the cache-sized `broadcast_max_bytes`. |
 | `plan_cache_entries` | `256` | Optimized plans memoized in a bounded LRU, so an identical query skips re-planning. `0` disables the cache. |
 | `common_subplan_max_bytes` | `268435456` (256 MiB) | Largest result held so a subplan appearing more than once in a query runs once. `0` turns the rewrite off. |
+| `common_subplan_memory_fraction` | `0.0625` | Share of the hard memory budget the common-subplan budget rises to when that is larger than `common_subplan_max_bytes`, so the budget scales with the machine. `0` keeps it fixed. |
 | `filter_split_materialize_cost` | `1.0` | Cost, in `cost_coeffs` work units, of the extra compacted batch paid when a cheap selective predicate is split out ahead of an expensive one. |
 | `filter_split_min_gain` | `1.25` | Cost ratio a filter split must beat before it is taken, so marginal rewrites are left alone. |
 | `cardinality_correction_min_samples` | `2` | Observations an operator signature needs before its learned cardinality correction is trusted. |

@@ -42,7 +42,7 @@ from batcher.plan.logical import Filter, LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import derivation_key
 from batcher.plan.types import logical_bytes, retained_bytes
-from batcher.plan.visitor import children, transform_up, walk
+from batcher.plan.visitor import children, transform_up, walk, with_children
 
 __all__ = ["reuse_common_subplans"]
 
@@ -102,7 +102,7 @@ def _verdict_key(plan: LogicalPlan, sources: list[Source], ctx, config, cfg) -> 
         return None
     if base is None:
         return None
-    return (base, tuple(id(s) for s in sources), cfg.common_subplan_max_bytes, cfg.row_bytes)
+    return (base, tuple(id(s) for s in sources), _budget_bytes(config), cfg.row_bytes)
 
 
 def _known_verdict(key: tuple | None, sources: list[Source]):
@@ -152,6 +152,34 @@ def _record_verdict(key: tuple | None, sources: list[Source], verdict) -> None:
             _VERDICTS.popitem(last=False)
 
 
+def _budget_bytes(config) -> int:
+    """The bytes reuse may hold for one query: the fixed cap, or a share of memory if larger.
+
+    `optimizer.common_subplan_max_bytes` alone is a scale threshold: the same repeated
+    subtree fits it at one scale factor and not at the next, and past it the subtree is run
+    once per appearance. TPC-DS q67's shared ROLLUP aggregate is 57 MB at sf1 and 572 MB at
+    sf10; at sf10 it was materialized, found over 256 MiB, and dropped, and each of the nine
+    levels then recomputed it -- 27 s. Holding it costs no more than the aggregate's own
+    output already did while it was built, so the cap rises with the hard memory budget
+    (`common_subplan_memory_fraction` of it). A cap of `0` still turns reuse off.
+
+    The share is rounded down to a power of two. The hard budget follows live free RAM, and
+    the budget is part of the verdict's cache key, so an unrounded share would re-key -- and
+    re-analyze -- every plan whenever the page cache moved.
+
+    Args:
+        config: The active config.
+
+    Returns:
+        The budget in bytes, `0` when reuse is off.
+    """
+    cfg = config.optimizer
+    if cfg.common_subplan_max_bytes <= 0:
+        return 0
+    share = int(config.spill_budget_bytes() * cfg.common_subplan_memory_fraction)
+    return max(cfg.common_subplan_max_bytes, 1 << (share.bit_length() - 1) if share > 0 else 0)
+
+
 def reuse_common_subplans(
     plan: LogicalPlan, sources: list[Source], ctx, *, distributed: bool = False
 ) -> tuple[LogicalPlan, list[Source]]:
@@ -194,7 +222,8 @@ def _reuse(
 
     config = active_config()
     cfg = config.optimizer
-    if cfg.common_subplan_max_bytes <= 0:
+    budget = _budget_bytes(config)
+    if budget <= 0:
         return plan, sources
     # An unbounded source has no finite intermediate to hold, and a plan carrying one is
     # already routed to the streaming path rather than here.
@@ -207,7 +236,7 @@ def _reuse(
     key = _verdict_key(plan, sources, ctx, config, cfg)
     verdict = _known_verdict(key, sources)
     if verdict is None:
-        verdict = _analyze(plan, sources, ctx, cfg)
+        verdict = _analyze(plan, sources, ctx, cfg, budget)
         _record_verdict(key, sources, verdict)
     if not verdict:
         # Hand back the plan as written — including when the analysis built a canonical form
@@ -242,14 +271,8 @@ def _reuse(
         # the budget would then admit several such tables and hold gigabytes under a
         # 256 MiB cap — the OOM the cap exists to prevent, reached through the cap itself.
         held += retained_bytes(table)
-        if held > cfg.common_subplan_max_bytes:
-            log_kv(
-                _log,
-                logging.DEBUG,
-                "subplan reuse budget reached",
-                held=held,
-                budget=cfg.common_subplan_max_bytes,
-            )
+        if held > budget:
+            log_kv(_log, logging.DEBUG, "subplan reuse budget reached", held=held, budget=budget)
             break
         sid = len(srcs)
         # No zone maps and `ephemeral`, for the reasons `staging._stage_source` spells out:
@@ -275,7 +298,63 @@ def _reuse(
         )
     if unlearned:
         _learn_row_filters(plan, srcs, ctx, key, sources, unlearned)
-    return plan, srcs
+    if distributed:  # each binding would be shipped to the workers as a copy of its own
+        return plan, srcs
+    return _one_binding_per_scan(plan, srcs, set(range(len(sources), len(srcs))))
+
+
+def _one_binding_per_scan(
+    plan: LogicalPlan, srcs: list[Source], shared: set[int]
+) -> tuple[LogicalPlan, list[Source]]:
+    """Give every scan of a materialized subplan its own source binding over the same batches.
+
+    The rewrite reads one result back once per appearance, and binding all of them to one
+    source id is the shape the engine reads as a self-join: `bc_interp::streaming_parallelizes`
+    is "no source is scanned twice", and a plan failing it leaves the streaming parallel
+    executor for its whole length -- to the materializing one when that fits, to the
+    single-threaded pipeline when it does not. So sharing a subplan bought one execution and
+    paid for it with every other operator's parallelism. TPC-DS q67 at sf10 is that shape:
+    its nine ROLLUP levels each re-aggregate the shared 4.8M-row finest aggregate, and with
+    one binding the levels ran unsharded at ~2.5 s apiece.
+
+    Single-node only. On one machine a second binding costs nothing: it is another
+    `InMemorySource` over the same batches, with no copy. The distributed route would ship
+    each binding to the workers separately, so it keeps one. Learned row filters are
+    unaffected: they are read before this, against the one-binding plan they are keyed to.
+
+    Args:
+        plan: The rewritten plan.
+        srcs: Its bound sources, the materialized subplans last.
+        shared: The source ids of the materialized subplans.
+
+    Returns:
+        The plan with each scan of a shared source after the first rebound to a fresh source
+        id, and the source list those ids index.
+    """
+    out = list(srcs)
+    seen: set[int] = set()
+
+    def rebind(node: LogicalPlan) -> LogicalPlan:
+        if isinstance(node, Scan):
+            if node.source_id not in shared:
+                return node
+            if node.source_id not in seen:
+                seen.add(node.source_id)
+                return node
+            original = srcs[node.source_id]
+            out.append(
+                InMemorySource(
+                    original.read(),
+                    zone_maps=False,
+                    ephemeral=True,
+                    derivation=original.derivation,
+                )
+            )
+            return dataclasses.replace(node, source_id=len(out) - 1)
+        kids = children(node)
+        return with_children(node, [rebind(k) for k in kids]) if kids else node
+
+    return rebind(plan), out
 
 
 def _row_filters(key: tuple | None, sources: list[Source]) -> dict[int, Expr | None]:
@@ -387,7 +466,9 @@ def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> Lo
         return target
 
 
-def _analyze(plan: LogicalPlan, sources: list[Source], ctx, cfg) -> tuple[tuple[int, ...], ...]:
+def _analyze(
+    plan: LogicalPlan, sources: list[Source], ctx, cfg, budget: int
+) -> tuple[tuple[int, ...], ...]:
     """Which subtrees to materialize, as pre-order positions in `plan`'s own walk.
 
     The analysis runs over a **canonical** form of the plan, in which every binding of one
@@ -413,7 +494,8 @@ def _analyze(plan: LogicalPlan, sources: list[Source], ctx, cfg) -> tuple[tuple[
         plan: The plan as written.
         sources: Its bound inputs, positionally.
         ctx: The execution context, for the hub the estimator reads.
-        cfg: The optimizer config, for the size budget and the row-width fallback.
+        cfg: The optimizer config, for the row-width fallback.
+        budget: The size budget, from `_budget_bytes`.
 
     Returns:
         One position tuple per chosen subtree, outermost first; empty when nothing repeats.
@@ -425,7 +507,7 @@ def _analyze(plan: LogicalPlan, sources: list[Source], ctx, cfg) -> tuple[tuple[
     targets = common_subplans(
         canonical,
         lambda: build_estimator(sources, ctx.hub),
-        max_bytes=cfg.common_subplan_max_bytes,
+        max_bytes=budget,
         row_bytes=cfg.row_bytes,
         normalize=lambda node: _as_run(node, sources, ctx),
     )
