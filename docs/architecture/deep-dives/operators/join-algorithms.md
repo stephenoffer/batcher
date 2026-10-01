@@ -47,8 +47,12 @@ executor and the distributed executor both stand on.
 ## Hash join, and the bloom in front of it
 
 This is the default. Batcher builds a chained hash table over the right side, the build side,
-and probes it with the left. The table is a `hashbrown::HashTable` storing row ids, looked up
-by the hash of the encoded key and confirmed by an equality re-check.
+and probes it with the left. The table is an open-addressing slot table that stores a 32-bit
+hash tag and a row id per slot, looked up by the hash of the encoded key and confirmed by an
+equality re-check. A key's starting slot is a pure function of its hash, so the probe hashes a
+block of rows ahead and prefetches their slots before it looks any of them up. The lookups no
+longer wait on one cache miss at a time: a 10M-row probe of a 1M-row build on spread integer
+keys went from 133 ms to 99 ms on 16 cores.
 
 ```text
       PROBE side (left)                       BUILD side (right)
@@ -56,8 +60,8 @@ by the hash of the encoded key and confirmed by an equality re-check.
         encode key                              encode key
              │                                       │
              │                                       ▼
-             │                            hashbrown::HashTable
-             │                             row ids, chained
+             │                              slot table
+             │                          (tag, row id), chained
              ▼                                       │
       ┌──────────────┐   engaged only when the       │
       │    bloom     │   build side is ≥ 2^16 rows   │
@@ -181,6 +185,12 @@ every predicate and projection above it. On TPC-H q21, 411 of 10,000 suppliers s
 `n_name = 'SAUDI ARABIA'`, and the 6M-row `lineitem` probe is cut about 24x before its date
 predicate runs. The filter is the literal key set bounded by the build side's `[lo, hi]`, never
 a sketch, so it has no false negatives.
+
+The filter is placed per join, over a probe side of at least four morsels that scans at least four
+rows per build row, so the serial digest of the build keys stays small next to the pass it can
+save. When several joins place filters on one scan, they run most selective first and the morsel
+is cut to the survivors before the next one runs, so a later filter reads its key column only
+where an earlier one kept rows. On TPC-DS sf1 q37 that took the query from 27.0 ms to 16.0 ms.
 
 ## Radix partitioning
 
@@ -396,6 +406,7 @@ concatenated and re-gathered. The measurements are in [`benchmarks/BENCHMARK_RES
 
 - [`crates/bc-runtime/src/join/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/mod.rs): `hash_join_indices`, the bloom gate, `JoinIndices`
 - [`crates/bc-runtime/src/join/dense.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/dense.rs), `build.rs`: the direct-map build and the sharded parallel build
+- [`crates/bc-runtime/src/join/slots.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/slots.rs): the slot table the hash probe prefetches
 - [`crates/bc-runtime/src/join/key_filter.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/key_filter.rs): the build-side key set pushed to the probe scan
 - [`crates/bc-runtime/src/join/range/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/join/range): range, band and IEJoin inequality joins
 - [`crates/bc-runtime/src/join/radix.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/join/radix.rs): the parallel three-phase partition
