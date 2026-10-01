@@ -166,9 +166,10 @@ class ParquetSource(FileSource):
         result is then *exactly* the matching rows, as small as PyArrow's and decoded at
         native speed.
 
-        ``None`` (caller falls back to PyArrow) when the predicate has no native translation
-        — notably temporal literals, which `to_native_predicate` refuses because it cannot
-        verify the parquet physical unit and which PyArrow *can* prune on — or when any
+        ``None`` (caller falls back to PyArrow) when no term of the predicate has a native
+        translation — notably one made only of temporal comparisons, which `to_native_predicate`
+        refuses because it cannot verify the parquet physical unit and which PyArrow *can*
+        prune on — or when any
         file's native read or filter fails. Failing all-or-nothing keeps one read path per
         call, so a partial native result is never concatenated with a differently-derived one.
         """
