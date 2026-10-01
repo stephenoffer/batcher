@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::RecordBatch;
+use arrow::array::{BooleanArray, RecordBatch};
+use arrow::compute::filter_record_batch;
 use bc_ir::{AggFunc, AggregateItem, EngineConfig, ProjectionItem, RelOp};
 use bc_resource::{CancelToken, MemoryPool, MemoryReservation};
 use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec, SpillStore};
@@ -2739,16 +2740,7 @@ fn exec_fused(
     let n = stages.len();
     let results: Vec<(RecordBatch, Vec<u64>)> = base_morsels
         .par_iter()
-        .map(|b| {
-            opts.check_cancelled()?;
-            let mut cur = b.clone();
-            let mut stage_rows = Vec::with_capacity(n);
-            for stage in &stages {
-                cur = stage.apply(&cur)?;
-                stage_rows.push(cur.num_rows() as u64);
-            }
-            Ok((cur, stage_rows))
-        })
+        .map(|b| run_chain(&stages, b, opts))
         .collect::<Result<Vec<_>, InterpError>>()?;
 
     // Single-threaded reduce after the join (keeps the `&mut ExecMetrics` race-free):
@@ -3026,6 +3018,13 @@ fn try_fused_join_aggregate(
 
 /// Run the fused linear chain over one morsel, returning the chained batch and the row count
 /// after each stage (which is what gives the fused ops exact selectivity metrics).
+///
+/// A Filter directly under another Filter does not gather its rows: its mask is carried to
+/// the next one, which ANDs its own onto it (`ops::filter_mask_within`), and the rows are
+/// gathered once, after the last filter of the run. Each stage's row count is still its own
+/// mask's population, so the metrics are unchanged. Where the outer filter cannot be
+/// evaluated against the ungathered rows, the carried mask is applied first and the stage
+/// runs exactly as before.
 fn run_chain(
     stages: &[FusedStage],
     b: &RecordBatch,
@@ -3034,9 +3033,57 @@ fn run_chain(
     opts.check_cancelled()?;
     let mut cur = b.clone();
     let mut stage_rows = Vec::with_capacity(stages.len());
-    for stage in stages {
-        cur = stage.apply(&cur)?;
-        stage_rows.push(cur.num_rows() as u64);
+    // The keep mask of the filters run so far over `cur`, not yet applied to it.
+    let mut pending: Option<BooleanArray> = None;
+    for (i, stage) in stages.iter().enumerate() {
+        let next_is_filter = matches!(stages.get(i + 1), Some(FusedStage::Filter { .. }));
+        let FusedStage::Filter {
+            predicate,
+            jit,
+            order,
+            ..
+        } = stage
+        else {
+            if let Some(live) = pending.take() {
+                cur = filter_record_batch(&cur, &live)?;
+            }
+            cur = stage.apply(&cur)?;
+            stage_rows.push(cur.num_rows() as u64);
+            continue;
+        };
+        let mask = match pending.take() {
+            Some(live) => {
+                let within = ops::filter_mask_within(&cur, predicate, jit, order.as_ref(), &live)?;
+                if within.is_none() {
+                    cur = filter_record_batch(&cur, &live)?;
+                }
+                within
+            }
+            None if next_is_filter => Some(ops::truthy(&ops::filter_mask_jit(
+                &cur,
+                predicate,
+                jit,
+                order.as_ref(),
+            )?)),
+            None => None,
+        };
+        match mask {
+            Some(mask) if next_is_filter => {
+                stage_rows.push(mask.true_count() as u64);
+                pending = Some(mask);
+            }
+            Some(mask) => {
+                cur = filter_record_batch(&cur, &mask)?;
+                stage_rows.push(cur.num_rows() as u64);
+            }
+            None => {
+                cur = stage.apply(&cur)?;
+                stage_rows.push(cur.num_rows() as u64);
+            }
+        }
+    }
+    if let Some(live) = pending {
+        cur = filter_record_batch(&cur, &live)?;
     }
     Ok((cur, stage_rows))
 }

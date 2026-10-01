@@ -114,6 +114,26 @@ pub(crate) fn filter_batch_jit(
     jit: &Jit,
     order: Option<&bc_expr::ConjunctOrder>,
 ) -> Result<RecordBatch, InterpError> {
+    // NB: short-circuiting an all-true / all-false mask here (Arc-clone / empty slice
+    // instead of the gather) was measured and does NOT pay off: at the 16,384-row morsel
+    // granularity `filter_record_batch`'s copy is L2-resident, and mask evaluation plus
+    // rayon scheduling dominate. It only added a `true_count` pass to every morsel.
+    Ok(filter_record_batch(
+        batch,
+        &filter_mask_jit(batch, predicate, jit, order)?,
+    )?)
+}
+
+/// The keep mask [`filter_batch_jit`] gathers by — what a stacked filter needs *before* the
+/// gather, so the next filter's mask can be ANDed onto it and the rows gathered once.
+///
+/// May carry nulls; `filter_record_batch` reads a null as "drop", and so must any consumer.
+pub(crate) fn filter_mask_jit(
+    batch: &RecordBatch,
+    predicate: &bc_expr::Expr,
+    jit: &Jit,
+    order: Option<&bc_expr::ConjunctOrder>,
+) -> Result<BooleanArray, InterpError> {
     // A conjunctive predicate the JIT did not take whole gets its conjuncts
     // short-circuited: the cheap one runs at full width, the rest only over the rows
     // it kept (`bc_expr::Expr::short_circuit_filter_mask`, which owns the argument for
@@ -123,21 +143,52 @@ pub(crate) fn filter_batch_jit(
     // interchangeable with the one below, so both feed the same gather.
     if jit.is_none() {
         if let Some(mask) = predicate.short_circuit_filter_mask_with(batch, order)? {
-            return Ok(filter_record_batch(batch, &mask)?);
+            return Ok(mask);
         }
     }
     let mask = eval_jit(jit, predicate, batch)?;
-    let mask = mask
-        .as_any()
+    mask.as_any()
         .downcast_ref::<BooleanArray>()
+        .cloned()
         .ok_or_else(|| InterpError::NonBooleanPredicate {
             got: mask.data_type().to_string(),
-        })?;
-    // NB: short-circuiting an all-true / all-false mask here (Arc-clone / empty slice
-    // instead of the gather) was measured and does NOT pay off: at the 16,384-row morsel
-    // granularity `filter_record_batch`'s copy is L2-resident, and mask evaluation plus
-    // rayon scheduling dominate. It only added a `true_count` pass to every morsel.
-    Ok(filter_record_batch(batch, mask)?)
+        })
+}
+
+/// `live AND predicate` for a filter stacked on one whose mask `live` (null-free) has not
+/// been applied yet, or `None` when the outer predicate must instead see the gathered rows —
+/// see [`bc_expr::Expr::filter_mask_within`] for when that is.
+///
+/// A compiled predicate is evaluated at full width, as `filter_batch_jit` would evaluate it,
+/// so the JIT keeps the whole of its fast path.
+pub(crate) fn filter_mask_within(
+    batch: &RecordBatch,
+    predicate: &bc_expr::Expr,
+    jit: &Jit,
+    order: Option<&bc_expr::ConjunctOrder>,
+    live: &BooleanArray,
+) -> Result<Option<BooleanArray>, InterpError> {
+    if let Some(compiled) = jit {
+        if !predicate.is_infallible_predicate(&batch.schema()) || live.true_count() == 0 {
+            return Ok(None);
+        }
+        let Ok(mask) = compiled.eval(batch) else {
+            return Ok(predicate.filter_mask_within(batch, live, order)?);
+        };
+        let Some(mask) = mask.as_any().downcast_ref::<BooleanArray>() else {
+            return Ok(None);
+        };
+        return Ok(Some(arrow::compute::and(live, &truthy(mask))?));
+    }
+    Ok(predicate.filter_mask_within(batch, live, order)?)
+}
+
+/// A mask with its nulls read as `false`, which is how `filter_record_batch` reads them.
+pub(crate) fn truthy(mask: &BooleanArray) -> BooleanArray {
+    match mask.nulls() {
+        Some(nulls) => BooleanArray::new(mask.values() & nulls.inner(), None),
+        None => mask.clone(),
+    }
 }
 
 pub(crate) fn project_batch(

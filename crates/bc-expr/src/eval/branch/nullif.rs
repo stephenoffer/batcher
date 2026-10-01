@@ -15,12 +15,33 @@
 
 use arrow::array::{Array, ArrayRef};
 
-use crate::eval::binary::eval_binary;
+use arrow::record_batch::RecordBatch;
+
+use crate::eval::binary::{eval_binary, scalar_binary_on};
 use crate::eval::coerce::as_bool;
-use crate::{BinaryOp, ExprError};
+use crate::{BinaryOp, Expr, ExprError};
+
+/// `NULLIF(left, right)` from the expressions: against a literal `right` (`NULLIF(x, 0)`, the
+/// usual spelling), the comparison broadcasts the literal through the scalar path instead of
+/// materializing it as a column and canonicalizing both sides — on TPC-H's
+/// `COALESCE(NULLIF(l_discount, 0.00), 1.00)` that canonicalizing pass alone was a third of
+/// the query. The scalar path is bit-identical to `eval_binary`, so this is the same mask.
+pub(crate) fn eval_nullif_expr(
+    left: &Expr,
+    right: &Expr,
+    batch: &RecordBatch,
+) -> Result<ArrayRef, ExprError> {
+    let l = left.eval(batch)?;
+    if let Expr::Lit { value } = right {
+        if let Some(eq) = scalar_binary_on(BinaryOp::Eq, l.clone(), value, true)? {
+            return Ok(arrow::compute::nullif(&l, as_bool(&eq, "nullif")?)?);
+        }
+    }
+    eval_nullif(&l, &right.eval(batch)?)
+}
 
 /// Evaluate `NULLIF` over two already-evaluated, equal-length operands.
-pub(crate) fn eval_nullif(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
+fn eval_nullif(l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
     // Nothing can match an all-null right side, whatever its type: `NULLIF(x, NULL)` is
     // `x`. Answered first so a NULL typed differently from `left` is not a type error.
     if r.null_count() == r.len() {
@@ -118,5 +139,51 @@ mod tests {
             Some(vec![Some(0.0)]),
         ]));
         assert_eq!(nulls(&eval_nullif(&l, &r).expect("nullif")), vec![true]);
+    }
+
+    /// Against a literal, `NULLIF` broadcasts it through the scalar path; the mask must be the
+    /// one the materialized comparison gives — floats with NaN and both zeros, an integer
+    /// column against a float literal, and a date against a string.
+    #[test]
+    fn a_literal_right_side_matches_the_materialized_comparison() {
+        use arrow::array::{Date32Array, Float64Array};
+        use arrow::datatypes::Schema;
+
+        use crate::Literal;
+
+        let f: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(f64::NAN),
+            None,
+            Some(1.0),
+        ]));
+        let i: ArrayRef = Arc::new(Int64Array::from(vec![Some(0), Some(2), None]));
+        let d: ArrayRef = Arc::new(Date32Array::from(vec![Some(11_016), Some(0), None]));
+        let cases: Vec<(ArrayRef, Vec<Literal>)> = vec![
+            (
+                f,
+                vec![
+                    Literal::Float(0.0),
+                    Literal::Float(-0.0),
+                    Literal::Float(f64::NAN),
+                    Literal::Int(1),
+                ],
+            ),
+            (i, vec![Literal::Float(2.0), Literal::Int(0)]),
+            (d, vec![Literal::Str("2000-02-29".into())]),
+        ];
+        for (arr, lits) in cases {
+            let schema = Schema::new(vec![Field::new("x", arr.data_type().clone(), true)]);
+            let batch = RecordBatch::try_new(Arc::new(schema), vec![arr.clone()]).unwrap();
+            for lit in lits {
+                let right = Expr::Lit { value: lit.clone() };
+                let left = Expr::Col { name: "x".into() };
+                let got = eval_nullif_expr(&left, &right, &batch).expect("nullif");
+                let want = eval_nullif(&arr, &lit.to_array(arr.len())).expect("nullif");
+                assert_eq!(nulls(&got), nulls(&want), "{lit:?} on {}", arr.data_type());
+                assert_eq!(got.data_type(), want.data_type());
+            }
+        }
     }
 }

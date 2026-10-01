@@ -49,7 +49,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::array::{BooleanArray, RecordBatch};
+use arrow::array::{Array, BooleanArray, RecordBatch};
 use arrow::compute::kernels::boolean;
 
 use crate::eval::coerce::as_bool;
@@ -90,15 +90,68 @@ impl Expr {
         batch: &RecordBatch,
         learned: Option<&ConjunctOrder>,
     ) -> Result<Option<BooleanArray>, ExprError> {
+        self.short_circuit_from(batch, learned, None)
+    }
+
+    /// `live AND self` as a null-free keep mask over `batch`, for a filter stacked on another
+    /// whose rows have not been gathered yet — or `None` when that is not sound and the caller
+    /// should gather `live` and apply `self` as it always has.
+    ///
+    /// A filter over a filter gathers every column twice: once for the rows the inner one
+    /// keeps, once for the rows the outer one keeps. When the inner keeps most rows that first
+    /// gather is nearly a copy of the batch, and on string columns it is the dominant cost
+    /// (`memmove` and `FilterBytes` were ~49% of `l_suppkey <= 8192` under an `IN` over TPC-H).
+    /// Treating `live` as one more conjunct, already evaluated, leaves one gather: of the final
+    /// rows, by the caller.
+    ///
+    /// That is the short-circuit path with its first mask given rather than computed, so it
+    /// inherits that path's whole argument. `self` must be
+    /// [infallible](Expr::is_infallible_predicate), because it may be evaluated at rows `live`
+    /// removed; a `live` with no row set is declined, so a conjunct is never handed zero rows;
+    /// and an error evaluating `self` declines rather than surfaces, so the caller's path raises
+    /// it as written. Whether to gather the live rows before the first conjunct is decided by
+    /// that conjunct's cost, exactly as between any two conjuncts ([`should_compact`]).
+    pub fn filter_mask_within(
+        &self,
+        batch: &RecordBatch,
+        live: &BooleanArray,
+        learned: Option<&ConjunctOrder>,
+    ) -> Result<Option<BooleanArray>, ExprError> {
         let n = batch.num_rows();
-        let conjuncts = self.and_conjuncts();
-        if n == 0 || conjuncts.len() < 2 {
+        if live.len() != n || live.null_count() != 0 {
+            return Err(ExprError::Arrow(
+                arrow::error::ArrowError::InvalidArgumentError(format!(
+                    "filter_mask_within: a {n}-row null-free mask is required"
+                )),
+            ));
+        }
+        self.short_circuit_from(batch, learned, Some(live))
+    }
+
+    /// The short-circuit loop, optionally starting from a mask an earlier filter computed.
+    fn short_circuit_from(
+        &self,
+        batch: &RecordBatch,
+        learned: Option<&ConjunctOrder>,
+        initial: Option<&BooleanArray>,
+    ) -> Result<Option<BooleanArray>, ExprError> {
+        let n = batch.num_rows();
+        let raw = self.and_conjuncts();
+        // With an initial mask, a single conjunct is already the second stage.
+        let fewest = if initial.is_some() { 1 } else { 2 };
+        if n == 0 || raw.len() < fewest {
             return Ok(None);
         }
         let schema = batch.schema();
-        if !conjuncts.iter().all(|c| c.is_infallible_predicate(&schema)) {
+        if !raw.iter().all(|c| c.is_infallible_predicate(&schema)) {
             return Ok(None);
         }
+        let units = filter_units(&raw);
+        if units.len() < fewest {
+            // One fused range is the whole predicate: one pass, nothing to short-circuit.
+            return Ok(None);
+        }
+        let conjuncts: Vec<&Expr> = units.iter().map(|u| u.as_ref()).collect();
 
         // A `ConjunctOrder` built for a different predicate would index the wrong slots,
         // so a mismatched width is ignored rather than trusted.
@@ -113,7 +166,24 @@ impl Expr {
         // a null-free mask over `view`.
         let mut view = batch.clone();
         let mut view_abs: Option<Vec<u32>> = None;
-        let mut live = all_set(n);
+        let mut live = match initial {
+            Some(given) => given.clone(),
+            None => all_set(n),
+        };
+        if let Some(given) = initial {
+            if given.true_count() == 0
+                || !compact_before(
+                    &mut view,
+                    &mut view_abs,
+                    &mut live,
+                    batch,
+                    &conjuncts,
+                    &order,
+                )?
+            {
+                return Ok(None);
+            }
+        }
 
         for (pos, &ci) in order.iter().enumerate() {
             let rows_in = view.num_rows();
@@ -134,27 +204,19 @@ impl Expr {
                 );
             }
             live = boolean::and(&live, &kept)?;
-
-            let remaining = &order[pos + 1..];
-            let Some(&next) = remaining.first() else {
+            if pos + 1 == order.len() {
                 break;
-            };
-            let alive = live.values().count_set_bits();
-            // `should_compact` deliberately does not decide `alive == 0`, because its two
-            // callers want opposite answers. Here the answer is no: handing a conjunct an
-            // empty batch is the one way this rewrite could change an outcome, since a type
-            // error the whole-batch path raises might not fire on no rows.
-            if alive == 0 || !should_compact(alive, view.num_rows(), conjuncts[next].eval_cost()) {
-                continue;
             }
-            let still_to_read: Vec<&Expr> = remaining.iter().map(|&i| conjuncts[i]).collect();
-            let Some(next_view) = compact_rows(batch, &still_to_read, &live, view_abs.as_deref())?
-            else {
+            if !compact_before(
+                &mut view,
+                &mut view_abs,
+                &mut live,
+                batch,
+                &conjuncts,
+                &order[pos + 1..],
+            )? {
                 return Ok(None);
-            };
-            view = next_view.batch;
-            live = all_set(next_view.abs.len());
-            view_abs = Some(next_view.abs);
+            }
         }
 
         Ok(Some(match view_abs {
@@ -162,6 +224,75 @@ impl Expr {
             Some(abs) => scatter_mask(n, &abs, &live),
         }))
     }
+}
+
+/// Before evaluating `remaining[0]`, gather the rows `live` keeps when that pays, updating
+/// `view`, `view_abs` and `live` in place. `false` when a named column is missing, which the
+/// caller answers by declining.
+fn compact_before(
+    view: &mut RecordBatch,
+    view_abs: &mut Option<Vec<u32>>,
+    live: &mut BooleanArray,
+    batch: &RecordBatch,
+    conjuncts: &[&Expr],
+    remaining: &[usize],
+) -> Result<bool, ExprError> {
+    let Some(&next) = remaining.first() else {
+        return Ok(true);
+    };
+    let alive = live.values().count_set_bits();
+    // `should_compact` deliberately does not decide `alive == 0`, because its two
+    // callers want opposite answers. Here the answer is no: handing a conjunct an
+    // empty batch is the one way this rewrite could change an outcome, since a type
+    // error the whole-batch path raises might not fire on no rows.
+    if alive == 0 || !should_compact(alive, view.num_rows(), conjuncts[next].eval_cost()) {
+        return Ok(true);
+    }
+    let still_to_read: Vec<&Expr> = remaining.iter().map(|&i| conjuncts[i]).collect();
+    let Some(next_view) = compact_rows(batch, &still_to_read, live, view_abs.as_deref())? else {
+        return Ok(false);
+    };
+    *view = next_view.batch;
+    *live = all_set(next_view.abs.len());
+    *view_abs = Some(next_view.abs);
+    Ok(true)
+}
+
+/// The units a filter evaluates one at a time: each conjunct, except that a lower and an upper
+/// bound of one column against literals are paired into a single `AND`.
+///
+/// The pair is the shape `cmp::try_prim_range` and `cmp::try_string_range` answer in one walk
+/// of the column. Evaluated as two units it cost a full-width pass, a gather of the surviving
+/// rows, a second pass over them and a scatter of the mask back — `l_shipdate BETWEEN …` over
+/// TPC-H spent more in that bookkeeping than in either comparison. Pairing changes no answer:
+/// the conjuncts of an `AND` commute, and the paired `AND` is evaluated by the same `eval`
+/// that would have evaluated the predicate whole. Each bound joins at most one pair, the first
+/// partner found in written order, so the grouping is a pure function of the predicate and
+/// [`ConjunctOrder`] sizes itself from the same call.
+fn filter_units<'a>(conjuncts: &[&'a Expr]) -> Vec<std::borrow::Cow<'a, Expr>> {
+    use std::borrow::Cow;
+    let mut taken = vec![false; conjuncts.len()];
+    let mut units = Vec::with_capacity(conjuncts.len());
+    for i in 0..conjuncts.len() {
+        if taken[i] {
+            continue;
+        }
+        taken[i] = true;
+        let partner = (i + 1..conjuncts.len())
+            .find(|&j| !taken[j] && crate::eval::cmp::is_range_pair(conjuncts[i], conjuncts[j]));
+        units.push(match partner {
+            Some(j) => {
+                taken[j] = true;
+                Cow::Owned(Expr::Binary {
+                    op: crate::BinaryOp::And,
+                    left: Box::new(conjuncts[i].clone()),
+                    right: Box::new(conjuncts[j].clone()),
+                })
+            }
+            None => Cow::Borrowed(conjuncts[i]),
+        });
+    }
+    units
 }
 
 /// Cheapest conjunct first, the opening order DuckDB's `ExpressionHeuristics` also
@@ -220,7 +351,7 @@ impl ConjunctOrder {
     /// there is therefore no order to choose.
     #[must_use]
     pub fn new(predicate: &Expr) -> Option<Self> {
-        let width = predicate.and_conjuncts().len();
+        let width = filter_units(&predicate.and_conjuncts()).len();
         (width >= 2).then(|| Self {
             slots: (0..width).map(|_| Slot::default()).collect(),
         })
@@ -395,6 +526,87 @@ mod tests {
             );
             assert_matches_oracle(&pred, &batch);
         }
+    }
+
+    /// A lower and an upper bound of one column become one unit, wherever they sit in the
+    /// chain; a bound with no partner, a second bound of the same side, and a bound of another
+    /// column stay single. The masks still match the whole-batch oracle.
+    #[test]
+    fn range_bounds_pair_into_one_unit_and_keep_the_mask() {
+        let lo = cmp(BinaryOp::Ge, "a", 10);
+        let hi = cmp(BinaryOp::Lt, "a", 900);
+        let other = cmp(BinaryOp::Gt, "b", 3);
+        let lo2 = cmp(BinaryOp::Gt, "a", 20);
+        let pred = and(and(lo.clone(), other.clone()), and(lo2.clone(), hi.clone()));
+        let conjuncts = pred.and_conjuncts();
+        let units = filter_units(&conjuncts);
+        assert_eq!(units.len(), 3, "{units:?}");
+        let dbg = |e: &Expr| format!("{e:?}");
+        assert_eq!(dbg(&units[0]), dbg(&and(lo.clone(), hi.clone())));
+        assert_eq!(dbg(&units[1]), dbg(&other));
+        assert_eq!(dbg(&units[2]), dbg(&lo2));
+        assert_eq!(ConjunctOrder::new(&pred).map(|o| o.len()), Some(3));
+        let batch = sample(4_096);
+        assert_matches_oracle(&pred, &batch);
+        // A predicate that *is* one range has nothing to short-circuit.
+        let range = and(lo, hi);
+        assert!(range
+            .short_circuit_filter_mask(&batch)
+            .expect("eval")
+            .is_none());
+        assert!(ConjunctOrder::new(&range).is_none());
+    }
+
+    /// `filter_mask_within` is `live AND self` — held to that, computed the slow way, for a
+    /// `live` keeping almost every row (no gather), few rows (gather first), a single conjunct
+    /// and a chain; and it declines what it must: an empty `live`, a fallible predicate.
+    #[test]
+    fn a_mask_within_another_is_their_conjunction() {
+        let batch = sample(4_096);
+        let preds = [
+            cmp(BinaryOp::Gt, "b", 100),
+            and(cmp(BinaryOp::Lt, "a", 3_000), cmp(BinaryOp::Ne, "b", 17)),
+            and(
+                and(cmp(BinaryOp::Ge, "a", 5), cmp(BinaryOp::Lt, "a", 4_000)),
+                cmp(BinaryOp::Gt, "b", 2),
+            ),
+        ];
+        for keep_every in [1_usize, 2, 9, 600] {
+            let live =
+                BooleanArray::from((0..4_096).map(|i| i % keep_every == 0).collect::<Vec<_>>());
+            for pred in &preds {
+                let got = pred
+                    .filter_mask_within(&batch, &live, None)
+                    .expect("eval")
+                    .expect("served");
+                let whole = truthy(as_bool(&pred.eval(&batch).unwrap(), "t").unwrap());
+                let want = boolean::and(&live, &whole).unwrap();
+                assert_eq!(got, want, "keep 1 in {keep_every}: {pred:?}");
+            }
+        }
+        let none = BooleanArray::from(vec![false; 4_096]);
+        assert!(preds[0]
+            .filter_mask_within(&batch, &none, None)
+            .unwrap()
+            .is_none());
+        let fallible = Expr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Div,
+                left: col("a"),
+                right: col("b"),
+            }),
+            right: lit_int(1),
+        };
+        let all = BooleanArray::from(vec![true; 4_096]);
+        assert!(!fallible.is_infallible_predicate(&batch.schema()));
+        assert!(fallible
+            .filter_mask_within(&batch, &all, None)
+            .unwrap()
+            .is_none());
+        assert!(preds[0]
+            .filter_mask_within(&batch, &BooleanArray::from(vec![true; 3]), None)
+            .is_err());
     }
 
     #[test]
@@ -676,12 +888,18 @@ mod tests {
     fn a_measured_order_promotes_the_selective_conjunct() {
         let n = 8_192;
         // `keep_all` is true for every row; `keep_few` for one row in 512.
+        // Two columns holding the same values: a lower and an upper bound of *one* column would
+        // be fused into a single range unit (`filter_units`), leaving no order to learn.
         let a: Int64Array = (0..i64::from(n)).map(Some).collect();
-        let schema = Schema::new(vec![Field::new("a", DataType::Int64, true)]);
-        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).expect("batch");
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a.clone()), Arc::new(a)])
+            .expect("batch");
 
         let keep_all = cmp(BinaryOp::Ge, "a", 0);
-        let keep_few = cmp(BinaryOp::Lt, "a", 16);
+        let keep_few = cmp(BinaryOp::Lt, "b", 16);
         let pred = and(keep_all.clone(), keep_few.clone());
         assert_eq!(
             keep_all.eval_cost(),

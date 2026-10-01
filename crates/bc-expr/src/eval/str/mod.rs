@@ -8,6 +8,7 @@ use arrow::datatypes::DataType;
 
 use crate::{ExprError, StrFunc};
 
+mod ascii;
 mod case;
 mod chunk;
 mod compress;
@@ -152,20 +153,26 @@ pub(crate) fn eval_str(
         // case and is byte-parallel; `to_uppercase` walks a Unicode case-mapping table per
         // scalar value. The results are identical on ASCII input — no ASCII character has a
         // non-ASCII or multi-character case mapping — so this is a pure short-circuit.
-        StrFunc::Upper => Arc::new(map_str(s, |v| {
-            if v.is_ascii() {
-                v.to_ascii_uppercase()
-            } else {
-                v.to_uppercase()
-            }
-        })),
-        StrFunc::Lower => Arc::new(map_str(s, |v| {
-            if v.is_ascii() {
-                v.to_ascii_lowercase()
-            } else {
-                v.to_lowercase()
-            }
-        })),
+        StrFunc::Upper => match ascii::case_map(s, true) {
+            Some(mapped) => Arc::new(mapped),
+            None => Arc::new(map_str(s, |v| {
+                if v.is_ascii() {
+                    v.to_ascii_uppercase()
+                } else {
+                    v.to_uppercase()
+                }
+            })),
+        },
+        StrFunc::Lower => match ascii::case_map(s, false) {
+            Some(mapped) => Arc::new(mapped),
+            None => Arc::new(map_str(s, |v| {
+                if v.is_ascii() {
+                    v.to_ascii_lowercase()
+                } else {
+                    v.to_lowercase()
+                }
+            })),
+        },
         StrFunc::Len => Arc::new(char_len_array(s)),
         StrFunc::Contains => {
             let pat = require_pattern(pattern, func)?;
@@ -185,7 +192,10 @@ pub(crate) fn eval_str(
             // avoids the per-row `Vec<char>` + `String` allocation the generic
             // `map_str` closure would force (the array builder copies the slices once).
             let start = start.unwrap_or(1);
-            Arc::new(map_str_borrow(s, |v| substr_slice(v, start, length)))
+            match ascii::substr(s, |n| substr_window(n, start, length)) {
+                Some(sub) => Arc::new(sub),
+                None => Arc::new(map_str_borrow(s, |v| substr_slice(v, start, length))),
+            }
         }
         StrFunc::Replace => {
             let pat = require_pattern(pattern, func)?;
@@ -1493,28 +1503,7 @@ fn char_len(v: &str) -> usize {
 /// than a change of meaning: for ASCII the two agree by definition (every ASCII byte is a
 /// one-byte character), and for anything else the old code runs.
 fn char_len_array(s: &StringArray) -> Int64Array {
-    use arrow::array::Array;
-
-    let offsets = s.value_offsets();
-    // **This array's own bytes, not the buffer's.** A morsel is a *slice* of the column, and
-    // `value_data()` hands back the whole shared values buffer — so testing that would re-scan
-    // the entire column once per morsel. Measured that way the "optimization" ran 10.9 ms ->
-    // 14.5 ms on `SUM(LENGTH(l_comment))`, which is how this comment came to exist.
-    let (lo, hi) = match (offsets.first(), offsets.last()) {
-        (Some(&lo), Some(&hi)) => (lo as usize, hi as usize),
-        _ => return Int64Array::from(Vec::<Option<i64>>::new()),
-    };
-    if !s.value_data()[lo..hi].is_ascii() {
-        return s.iter().map(|o| o.map(|v| char_len(v) as i64)).collect();
-    }
-    // `from_iter` with the row's own validity: a null row must stay null rather than report
-    // the zero-width its offsets happen to span.
-    (0..s.len())
-        .map(|i| {
-            s.is_valid(i)
-                .then(|| i64::from(offsets[i + 1] - offsets[i]))
-        })
-        .collect()
+    ascii::len(s).unwrap_or_else(|| s.iter().map(|o| o.map(|v| char_len(v) as i64)).collect())
 }
 
 /// 1-based character position of the first occurrence of `finder`'s needle in `v`, or 0 if
@@ -1642,7 +1631,19 @@ fn map_bool(s: &StringArray, f: impl Fn(&str) -> bool) -> BooleanArray {
 /// so it allocates nothing per row (no `Vec<char>`, no `String`); correct for
 /// multi-byte UTF-8.
 fn substr_slice(v: &str, start: i64, length: Option<i64>) -> &str {
-    let n = v.chars().count() as i64;
+    let (from, to) = substr_window(v.chars().count() as i64, start, length);
+    if from == to {
+        return "";
+    }
+    // Byte offset of char index `k` (or the string's end when `k == n`).
+    let byte_at = |k: usize| v.char_indices().nth(k).map_or(v.len(), |(b, _)| b);
+    &v[byte_at(from)..byte_at(to)]
+}
+
+/// The half-open character window `[from, to)` that `substr` keeps of a string of `n`
+/// characters — `(0, 0)` when it keeps nothing. Shared by the per-row path and the ASCII
+/// column kernel, so the two cannot disagree on a window.
+fn substr_window(n: i64, start: i64, length: Option<i64>) -> (usize, usize) {
     // Saturating arithmetic: `start`/`length` are user i64s, so `n + start + 1`,
     // `s + len - 1`, etc. overflowed at the i64 extremes (panic in debug, wrap in
     // release — a wrapped window could even yield a wrong slice). Clamped to `[1, n]`
@@ -1659,11 +1660,9 @@ fn substr_slice(v: &str, start: i64, length: Option<i64>) -> &str {
     };
     let (lo, hi) = (lo.max(1), hi.min(n)); // clip to [1, n] inclusive
     if hi < lo {
-        return "";
+        return (0, 0);
     }
-    // Byte offset of char index `k` (or the string's end when `k == n`).
-    let byte_at = |k: i64| v.char_indices().nth(k as usize).map_or(v.len(), |(b, _)| b);
-    &v[byte_at(lo - 1)..byte_at(hi)]
+    ((lo - 1) as usize, hi as usize)
 }
 
 /// FNV-1a 64-bit hash of `bytes` — a tiny, deterministic, dependency-free hash whose

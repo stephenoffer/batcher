@@ -132,7 +132,10 @@ impl LikeMatcher {
         let values = match self {
             LikeMatcher::StartsWith(p) => {
                 let k = p.as_bytes();
-                anchored(s, |d, a, b| b - a >= k.len() && &d[a..a + k.len()] == k)
+                crate::eval::cmp::starts_with_short(s.value_offsets(), s.value_data(), k)
+                    .unwrap_or_else(|| {
+                        anchored(s, |d, a, b| b - a >= k.len() && &d[a..a + k.len()] == k)
+                    })
             }
             LikeMatcher::EndsWith(p) => {
                 let k = p.as_bytes();

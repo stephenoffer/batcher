@@ -335,22 +335,7 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
         // SIMD, so a scalar Cranelift loop has nothing to win on these predicates, and the real
         // cost on this path is in the joins and aggregates rather than the scalar expressions.
         // `par.rs` still compiles, which is where the fused-pipeline shapes make it pay.
-        RelOp::Filter { input, predicate } => {
-            let child = build_with(input, ctx)?;
-            // Per-operator conjunct order, built once and captured by the per-morsel
-            // closure. This path is the engine default and never carries a JIT (see the
-            // note above), so it is the one that most wants a measured order rather than a
-            // static-cost guess. Result-invariant: the conjuncts of an `AND` commute.
-            let order = bc_expr::ConjunctOrder::new(predicate);
-            Ok(Box::new(child.map(move |b| {
-                let b = b?;
-                let rows_in = b.num_rows() as u64;
-                let t = std::time::Instant::now();
-                let out = ops::filter_batch_jit(&b, predicate, &None, order.as_ref())?;
-                ctx.morsel(id, rows_in, &out, t);
-                Ok(out)
-            })))
-        }
+        RelOp::Filter { input, predicate } => pipeline::filter_stream(input, predicate, id, ctx),
 
         RelOp::Project { input, exprs } => {
             let child = build_with(input, ctx)?;

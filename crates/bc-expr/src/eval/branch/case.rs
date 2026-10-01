@@ -18,6 +18,9 @@ pub(crate) fn eval_case(
     otherwise: &Expr,
     batch: &RecordBatch,
 ) -> Result<ArrayRef, ExprError> {
+    if let Some((value, fallback)) = coalesce_shape(branches, otherwise) {
+        return super::coalesce::coalesce_of(&[value, fallback], batch);
+    }
     let n = batch.num_rows();
 
     // Pass one: the conditions, folded into **disjoint** selections. `unclaimed` is the
@@ -67,6 +70,33 @@ pub(crate) fn eval_case(
         acc = zip(selection, &value.as_ref(), &acc_c.as_ref())?;
     }
     Ok(acc)
+}
+
+/// `(e, o)` when this `CASE` is `CASE WHEN e IS NOT NULL THEN e ELSE o END` — which is
+/// `COALESCE(e, o)`, and is what the SQL front end lowers `COALESCE` to.
+///
+/// Evaluated as written it computes `e` twice (once for the condition, once for the body over
+/// the rows it selects), gathers and scatters for the body, and `zip`s the two arms; on
+/// `SUM(COALESCE(NULLIF(l_discount, 0.00), 1.00))` that was over half the query. `COALESCE`
+/// computes `e` once and evaluates `o` only over the rows where `e` is null — exactly the rows
+/// `CASE` hands its `ELSE` — with the same numeric coercion between the two, so the answer, its
+/// type and which rows can raise are all unchanged.
+///
+/// The two `e`s are matched on their derived `Debug` rendering, which is structural: equal
+/// renderings are the same expression, and anything it fails to match keeps the general path.
+/// The shape test runs first, so a `CASE` of any other form never formats anything.
+fn coalesce_shape<'a>(
+    branches: &'a [CaseBranch],
+    otherwise: &'a Expr,
+) -> Option<(&'a Expr, &'a Expr)> {
+    let [CaseBranch {
+        when: Expr::IsNotNull { input },
+        then,
+    }] = branches
+    else {
+        return None;
+    };
+    (format!("{input:?}") == format!("{then:?}")).then_some((input.as_ref(), otherwise))
 }
 
 #[cfg(test)]
@@ -124,6 +154,65 @@ mod tests {
         (0..a.len())
             .map(|i| (!a.is_null(i)).then(|| a.value(i)))
             .collect()
+    }
+
+    /// `CASE WHEN e IS NOT NULL THEN e ELSE o END` answers through `COALESCE(e, o)`; it must
+    /// give the general path's array and type. The general path is reached by spelling the
+    /// condition `NOT (e IS NULL)`, which means the same and is not the shape.
+    #[test]
+    fn a_coalesce_shaped_case_matches_the_general_path() {
+        let batch = sample();
+        let nullif_f = Expr::NullIf {
+            left: Box::new(col("f")),
+            right: Box::new(Expr::Lit {
+                value: Literal::Float(3.5),
+            }),
+        };
+        for (e, o) in [
+            (
+                nullif_f.clone(),
+                Expr::Lit {
+                    value: Literal::Float(-0.0),
+                },
+            ),
+            (col("f"), col("i")),
+            (
+                col("i"),
+                Expr::Lit {
+                    value: Literal::Float(0.5),
+                },
+            ),
+            (col("i"), lit_int(9)),
+        ] {
+            let shaped = [CaseBranch {
+                when: Expr::IsNotNull {
+                    input: Box::new(e.clone()),
+                },
+                then: e.clone(),
+            }];
+            assert!(coalesce_shape(&shaped, &o).is_some());
+            let general = [CaseBranch {
+                when: Expr::Not {
+                    input: Box::new(Expr::IsNull {
+                        input: Box::new(e.clone()),
+                    }),
+                },
+                then: e.clone(),
+            }];
+            assert!(coalesce_shape(&general, &o).is_none());
+            let got = eval_case(&shaped, &o, &batch).expect("coalesce shape");
+            let want = eval_case(&general, &o, &batch).expect("general");
+            assert_eq!(got.data_type(), want.data_type(), "{e:?} / {o:?}");
+            assert_eq!(&got, &want, "{e:?} / {o:?}");
+        }
+        // A body that is not the condition's operand is not the shape.
+        let other = [CaseBranch {
+            when: Expr::IsNotNull {
+                input: Box::new(col("f")),
+            },
+            then: col("i"),
+        }];
+        assert!(coalesce_shape(&other, &lit_int(0)).is_none());
     }
 
     /// A branch no row selects is not evaluated, so a body that would fail on the rows it

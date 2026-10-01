@@ -53,7 +53,7 @@ mod nullif;
 
 pub(crate) use case::eval_case;
 pub(crate) use coalesce::eval_coalesce;
-pub(crate) use nullif::eval_nullif;
+pub(crate) use nullif::eval_nullif_expr;
 
 /// Evaluate `expr` over the rows `selection` marks, returning a full-length array that is
 /// null everywhere else.

@@ -10,7 +10,7 @@ use arrow::compute::kernels::boolean;
 use arrow::compute::{is_not_null, is_null};
 
 use crate::eval::binary::{eval_binary, try_dict_compare, try_scalar_binary};
-use crate::eval::branch::{eval_case, eval_coalesce, eval_nullif};
+use crate::eval::branch::{eval_case, eval_coalesce, eval_nullif_expr};
 use crate::eval::cast::cast_expr;
 use crate::eval::coerce::as_bool;
 use crate::eval::generate::eval_sequence;
@@ -87,6 +87,10 @@ impl Expr {
                 // `LIKE 'a%'` becomes) walks the column once for both bounds.
                 if matches!(op, BinaryOp::And) {
                     if let Some(out) = crate::eval::cmp::try_string_range(left, right, batch)? {
+                        return Ok(out);
+                    }
+                    // And a numeric or temporal one (`d >= DATE 'a' AND d <= DATE 'b'`).
+                    if let Some(out) = crate::eval::cmp::try_prim_range(left, right, batch)? {
                         return Ok(out);
                     }
                 }
@@ -367,11 +371,7 @@ impl Expr {
                 let arr = input.eval(batch)?;
                 eval_list(*func, &arr)
             }
-            Expr::NullIf { left, right } => {
-                let l = left.eval(batch)?;
-                let r = right.eval(batch)?;
-                eval_nullif(&l, &r)
-            }
+            Expr::NullIf { left, right } => eval_nullif_expr(left, right, batch),
             Expr::Greatest { inputs } => eval_extreme(inputs, batch, true),
             Expr::Least { inputs } => eval_extreme(inputs, batch, false),
             Expr::Math2 { func, left, right } => {
