@@ -355,6 +355,8 @@ def _bucketed(fit: object, state_key: tuple = ()) -> str:
     """
     if fit is None:
         return "-"
+    if state_key and (hit := _BUCKETED.get(fit, state_key)) is not MISSING:
+        return hit
     values: list[tuple[str, float]]
     if isinstance(fit, dict):
         values = sorted((str(k), float(v)) for k, v in fit.items())
@@ -367,7 +369,21 @@ def _bucketed(fit: object, state_key: tuple = ()) -> str:
             if isinstance(getattr(fit, f.name), (int, float))
             and not isinstance(getattr(fit, f.name), bool)
         )
-    return ";".join(f"{n}:{_sticky_bucket(state_key, n, v)}" for n, v in values)
+    out = ";".join(f"{n}:{_sticky_bucket(state_key, n, v)}" for n, v in values)
+    return _BUCKETED.put(fit, out, state_key) if state_key else out
+
+
+#: `_bucketed`'s rendering per `(fit, state key)`.
+#:
+#: The fits are the refit memos' own objects (`calibration.live_coefficients`,
+#: `cpu_shares.live_shares`), replaced -- never mutated -- when a refit lands, so the same
+#: object means the same values. Re-rendering the same values against the sticky state is
+#: idempotent: the first render leaves each coefficient's bucket in `_BUCKET_STATE` at the value
+#: it returned, and a second render of the same value finds it inside the deadband and returns
+#: it again. So between refits the answer cannot change, and `cache_key` -- asked two or three
+#: times per query -- skips the per-field sort, log and format it was repeating. Profiled at
+#: ~0.4 ms of a warm TPC-H sf1 query. Cleared with `_BUCKET_STATE` (`memo.clear`).
+_BUCKETED: IdentityMemo[str] = IdentityMemo(64)
 
 
 # Digest memo for `_source_stats_key`, keyed by the statistics object's identity.

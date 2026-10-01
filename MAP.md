@@ -186,7 +186,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 
 | module | lines | what it is |
 |---|---|---|
-| `gating.py` | 490 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
+| `gating.py` | 517 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 88 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
 | `staging.py` | 608 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
@@ -1263,8 +1263,8 @@ Memoize the optimizer — the same query, planned once.
 
 | module | lines | what it is |
 |---|---|---|
-| `keys.py` | 558 | The plan-cache key: an exact half that decides meaning and a learned half that decides quality. |
-| `memo.py` | 124 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
+| `keys.py` | 574 | The plan-cache key: an exact half that decides meaning and a learned half that decides quality. |
+| `memo.py` | 125 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
 | `writes.py` | 128 | Advance the learning generation only when a write could change a plan. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem

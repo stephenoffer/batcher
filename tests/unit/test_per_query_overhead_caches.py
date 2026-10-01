@@ -112,6 +112,72 @@ def test_the_reduced_budget_is_what_measuring_everything_gives(monkeypatch, pres
     assert cpu_budget.reduced_core_budget() == expected
 
 
+# --- plan_cache.keys._bucketed: rendered once per fit object ---------------------------
+
+
+def test_the_bucketed_fingerprint_is_rendered_once_per_fit_and_follows_a_refit():
+    from batcher.kyber import plan_cache
+
+    keys = plan_cache.keys
+    plan_cache.clear()
+    key = (12345, "coeffs")
+    fit = {"scan": 1.0, "filter": 4.0}
+    first = keys._bucketed(fit, key)
+    assert keys._BUCKETED.get(fit, key) == first
+    assert keys._bucketed(fit, key) == first
+    refit = {"scan": 1.0, "filter": 64.0}  # a genuine move: a new object, a new bucket
+    moved = keys._bucketed(refit, key)
+    assert moved != first
+    assert moved == keys._bucketed(dict(refit), ())  # same as an unmemoized render
+    plan_cache.clear()
+    from batcher._internal.registry import MISSING
+
+    assert keys._BUCKETED.get(refit, key) is MISSING
+    assert keys._BUCKET_STATE == {}
+
+
+def test_a_memoized_render_equals_a_fresh_render_through_the_deadband():
+    """The memo may not freeze a value the sticky bucket would have let move."""
+    from batcher.kyber import plan_cache
+
+    keys = plan_cache.keys
+    plan_cache.clear()
+    key = (999, "shares")
+    for value in (1.0, 1.3, 1.45, 1.6, 2.2, 2.9, 3.1):
+        fit = {"x": value}
+        memoized = keys._bucketed(fit, key)
+        assert keys._bucketed(fit, key) == memoized
+        keys._BUCKETED.clear()  # force a render against the same sticky state
+        assert keys._bucketed(fit, key) == memoized
+    plan_cache.clear()
+
+
+# --- api.adaptive.gating._scan_sizes: the stream-whole measurement, not the verdict -----
+
+
+def test_the_scan_sizes_are_measured_once_per_key_and_follow_the_generation(monkeypatch):
+    from batcher import core
+    from batcher.api.adaptive import gating
+    from batcher.plan.logical import Scan
+    from batcher.plan.visitor import walk
+
+    a = bt.from_pydict({"k": [1, 2, 3], "v": [1.0, 2.0, 3.0]})
+    b = bt.from_pydict({"t": [1, 2], "x": [5, 6]})
+    ds = a.join(b, left_on="k", right_on="t")
+    plan, sources, hub = ds._plan, ds._sources, core.default_hub()
+    scans = [n for n in walk(plan) if isinstance(n, Scan)]
+    built = []
+    real = gating.build_estimator
+    monkeypatch.setattr(gating, "build_estimator", lambda *a: built.append(1) or real(*a))
+    first = gating._scan_sizes(plan, scans, sources, hub)
+    assert gating._scan_sizes(plan, scans, sources, hub) is first
+    assert len(built) == 1
+    learning.bump_generation()  # a learned write a plan could turn on: measure again
+    again = gating._scan_sizes(plan, scans, sources, hub)
+    assert len(built) == 2 and again == first
+    assert set(first) == {s.source_id for s in scans}
+
+
 # --- learning.load_column_tables: the column slice of the bundle -----------------------
 
 

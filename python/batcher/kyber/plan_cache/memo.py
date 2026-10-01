@@ -10,7 +10,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
-from batcher.kyber.plan_cache.keys import _BUCKET_STATE, _split
+from batcher.kyber.plan_cache.keys import _BUCKET_STATE, _BUCKETED, _split
 
 __all__ = ["clear", "lookup", "misses", "store"]
 
@@ -62,6 +62,7 @@ def clear() -> None:
     with _LOCK:
         _CACHE.clear()
         _BUCKET_STATE.clear()
+        _BUCKETED.clear()
         _ROUNDS.clear()
 
 
