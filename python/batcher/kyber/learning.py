@@ -21,7 +21,6 @@ from batcher.config import active_config
 from batcher.kyber.column_tables import (
     AVG_BYTES_KEY,
     CARDINALITY_CORRECTION_KEY,
-    JOIN_EDGE_KEY,
     MCV_KEY,
     NDV_KEY,
     QUANTILES_KEY,
@@ -207,14 +206,6 @@ def load_learned_stats(hub: MetadataHub | None) -> dict[str, Any]:
     udf_costs = load_udf_row_seconds_table(hub)
     if udf_costs:
         stats[UDF_ROW_SECONDS_KEY] = udf_costs
-    # Measured join-edge selectivities, keyed by the edge rather than a tree's signature, so
-    # they reach the join orders a search considers and nobody ran (`join_edges`). Imported
-    # here because `kyber.stats` imports this module.
-    from batcher.kyber.stats.selectivity.join_edges import measured_edge_selectivities
-
-    edges = measured_edge_selectivities(hub)
-    if edges:
-        stats[JOIN_EDGE_KEY] = edges
     _BUNDLE_CACHE[hub] = (*fingerprint, stats)
     return stats
 

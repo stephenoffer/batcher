@@ -30,7 +30,6 @@ from batcher.kyber.rules.source_limits import (
     required_orderings_per_source,
 )
 from batcher.kyber.spill_rates import learned_spill_factor
-from batcher.kyber.stats.selectivity.join_edges import register_join_edges
 from batcher.metadata import MetadataHub
 from batcher.metadata.io_stats import relative_read_cost
 from batcher.plan.logical import LogicalPlan
@@ -283,9 +282,6 @@ class Optimizer:
             prefer_materializing_aggregate=_prefers_materializing_aggregate(plan, ctx),
             prefer_sideways=_prefers_sideways(plan, ctx),
         )
-        # The join structure Core's measurements will be filed under, so a later run can learn
-        # each edge's selectivity from this one (`join_edges`). Written once per join shape.
-        register_join_edges(self._hub, plan, ctx.estimator)
         return phys, plan, ctx.notes.get("build_side_decisions", [])
 
     def logical_rewrite(self, logical: LogicalPlan) -> LogicalPlan:

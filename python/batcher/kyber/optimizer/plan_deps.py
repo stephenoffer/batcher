@@ -60,25 +60,12 @@ def _bucket(value: float | None) -> int | None:
 
 
 def _measured(hub: Any) -> tuple[dict, dict, dict]:
-    """The three feedback-folded quantities, each an incremental fold (cheap when idle).
-
-    A measured join-edge selectivity rides in the selectivity slot under its prefixed edge key
-    (`join_edges.EDGE_PREFIX`), the name the estimator records it as consulted under: it is the
-    same kind of quantity, appears the same way, and gets the same learning rounds.
-    """
+    """The three feedback-folded quantities, each an incremental fold (cheap when idle)."""
     from batcher.kyber.learning import measured_corrections
     from batcher.kyber.measured_selectivity import measured_selectivities
     from batcher.kyber.measured_width import measured_widths
-    from batcher.kyber.stats.selectivity.join_edges import (
-        EDGE_PREFIX,
-        measured_edge_selectivities,
-    )
 
-    selectivities = measured_selectivities(hub)
-    edges = measured_edge_selectivities(hub)
-    if edges:
-        selectivities = {**selectivities, **{EDGE_PREFIX + k: v for k, v in edges.items()}}
-    return selectivities, measured_corrections(hub), measured_widths(hub)
+    return measured_selectivities(hub), measured_corrections(hub), measured_widths(hub)
 
 
 def dependency_snapshot(hub: Any, signatures: set[str]) -> Snapshot:

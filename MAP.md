@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1556 Python modules across 220 packages and 317 Rust files across 14 crates.
+Covering 1555 Python modules across 220 packages and 317 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -1169,11 +1169,11 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `annotate.py` | 574 | Physical-plan annotation — the `ResourceBounds` Kyber hands Carbonite. |
 | `calibration.py` | 704 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
-| `column_tables.py` | 237 | The learned per-column statistics tables — their schema, their keys, and their bound. |
+| `column_tables.py` | 232 | The learned per-column statistics tables — their schema, their keys, and their bound. |
 | `common_subplan.py` | 322 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 673 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 664 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
 | `measured_selectivity.py` | 67 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
@@ -1254,8 +1254,8 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 508 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 239 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 641 | The `Optimizer` façade and the module-level entry points. |
-| `plan_deps.py` | 131 | Re-validate a memoized plan against the measurements its own planning read. |
+| `facade.py` | 637 | The `Optimizer` façade and the module-level entry points. |
+| `plan_deps.py` | 118 | Re-validate a memoized plan against the measurements its own planning read. |
 
 ### `batcher/kyber/plan_cache/` — 3 · subsystem
 
@@ -1568,7 +1568,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 270 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 488 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 2499 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 2422 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `group_bound.py` | 87 | An upper bound on a group-by's output from where its keys come from, not what they hold. |
 | `join_columns.py` | 202 | Join column-statistics propagation. |
 | `predicate_bounds.py` | 178 | Tighten a filtered column's bounds to the values its own predicate admits. |
@@ -1583,7 +1583,6 @@ Predicate selectivity — the fraction of rows a `Filter` keeps.
 | `arithmetic.py` | 242 | Reading a predicate through the arithmetic wrapped around its column. |
 | `combine.py` | 609 | Composing leaf selectivities into a whole-predicate estimate. |
 | `contradiction.py` | 149 | Recognizing a conjunction that no row can satisfy, from its shape alone. |
-| `join_edges.py` | 268 | Join selectivity measured by past runs, keyed by the *edge* a join applies, not by its tree. |
 | `leaves.py` | 739 | Leaf predicate selectivity — one estimate per non-composite predicate. |
 | `patterns.py` | 345 | What a text pattern says about how many rows it matches. |
 | `scalars.py` | 502 | Scalar and column-statistic primitives shared by every selectivity estimator. |

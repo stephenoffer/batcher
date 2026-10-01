@@ -27,7 +27,6 @@ from batcher.config import CardinalityConfig, active_config
 from batcher.kyber.column_tables import (
     AVG_BYTES_KEY,
     CARDINALITY_CORRECTION_KEY,
-    JOIN_EDGE_KEY,
     MCV_KEY,
     NDV_KEY,
     QUANTILES_KEY,
@@ -47,7 +46,6 @@ from batcher.kyber.stats.distribution import (
 from batcher.kyber.stats.group_bound import key_origin_rows
 from batcher.kyber.stats.predicate_bounds import bounded_by_predicate
 from batcher.kyber.stats.selectivity import predicate_selectivity
-from batcher.kyber.stats.selectivity.join_edges import EDGE_PREFIX, Edge, OriginMemo, edge_key
 from batcher.kyber.stats.selectivity.scalars import _fraction_below_on_axis, _ordinal
 from batcher.metadata.udf_stats import udf_cost_key
 from batcher.plan.expr_ir import (
@@ -306,11 +304,6 @@ class StatsEstimator:
         # `scan_columns` — a `dataclasses.replace` per column of a 30-column dimension — was
         # 12% of the query's warm wall time, all of it computing nine answers 48 times.
         self._scan_cache: dict[tuple[int, int], RelStats] = {}
-        # Column origins and measured edge selectivities for `_edge_selectivity`, by node
-        # identity like the memos above: join ordering asks for both on thousands of candidate
-        # joins whose subtrees it shares.
-        self._origin_memo: OriginMemo = {}
-        self._edge_cache: dict[int, tuple[LogicalPlan, tuple[float, Edge] | None]] = {}
 
     def estimate(self, node: LogicalPlan) -> RelStats:
         """Cardinality + column stats for `node`, memoized by node identity for the
@@ -350,8 +343,8 @@ class StatsEstimator:
         """
         if not isinstance(node, _CORRECTABLE):
             return 1.0
-        if self._learned_rows_win(node) or self._learned_edge(node) is not None:
-            return 1.0  # a measured absolute size (or edge selectivity) supersedes any correction
+        if self._learned_rows_win(node):
+            return 1.0  # a measured absolute size supersedes any correction
         sig = self._sig(node)
         self.consulted.add(sig)
         factor = self._corrections.get(sig)
@@ -384,68 +377,10 @@ class StatsEstimator:
         """
         if not isinstance(node, _CORRECTABLE) or self._learned_rows_win(node):
             return 0.0
-        if self._learned_edge(node) is not None:
-            return 0.0  # priced from a measurement, so its q-error teaches nothing
         est = self.estimate(node)
         if est.provenance is Provenance.EXACT or est.rows >= self._cfg.unknown_rows:
             return 0.0
         return self._raw(node) if self._corrections else est.rows
-
-    def scan_identity(self, node: Scan) -> str | None:
-        """The name of the relation `node` reads, for keying what was measured about it.
-
-        The scan's data-stable key where it has one; otherwise the bound source's own
-        statistics key, the one its learned column statistics are filed under. That second
-        key is per source *object* rather than data-stable (see `stable_source_key`), which is
-        enough for a later run in the same session to recognise the relation.
-
-        Args:
-            node: The scan.
-
-        Returns:
-            The relation's key, or None when the scan has neither.
-        """
-        return node.source_key or self._source_key(node.source_id)
-
-    def key_is_unique(self, node: Scan, column: str) -> bool:
-        """Whether `column` is a key of the relation `node` reads, by its distinct count.
-
-        Args:
-            node: The scan.
-            column: One of its columns.
-
-        Returns:
-            True when the column's distinct count reaches `_UNIQUE_KEY_NDV_RATIO` of the rows.
-        """
-        stats = self.estimate(node)
-        stat = stats.columns.get(column)
-        ndv = stat.ndv if stat is not None else None
-        return bool(ndv) and stats.rows > 0 and ndv >= _UNIQUE_KEY_NDV_RATIO * stats.rows
-
-    def _learned_edge(self, node: LogicalPlan) -> tuple[float, Edge] | None:
-        """The measured selectivity of an inner join's edge, and the edge, or None.
-
-        Keyed by the base columns the join's keys trace to rather than by the join's subtree,
-        which is what lets it reach a candidate join order nobody has executed
-        (`join_edges`). Recorded in `consulted` (prefixed) so a memoized plan re-plans when
-        the measurement appears.
-        """
-        if not isinstance(node, Join) or node.join_type != "inner":
-            return None
-        table = self._learned.get(JOIN_EDGE_KEY)
-        if not table:
-            return None
-        cached = self._edge_cache.get(id(node))
-        if cached is not None and cached[0] is node:
-            return cached[1]
-        edge = edge_key(node, self, self._origin_memo)
-        found = None
-        if edge is not None:
-            self.consulted.add(EDGE_PREFIX + edge.key)
-            sel = table.get(edge.key)
-            found = (sel, edge) if sel is not None else None
-        self._edge_cache[id(node)] = (node, found)
-        return found
 
     def _learned_rows_win(self, node: LogicalPlan) -> bool:
         """Whether `_estimate_uncached` short-circuits to a measured absolute row count."""
@@ -1326,18 +1261,6 @@ class StatsEstimator:
                 return float(learned_rows), Provenance.LEARNED
         if self._is_cartesian(node):
             return self._cartesian_rows(node, left, right)
-        # A selectivity measured on this edge by some other join order: the containment
-        # estimate below is the guess it replaces (`join_edges`).
-        learned = self._learned_edge(node)
-        if learned is not None:
-            sel, edge = learned
-            rows = min(sel * left.rows * right.rows, left.rows * right.rows)
-            # A key on one side: each row of the other meets at most one of its rows.
-            if edge.left_unique:
-                rows = min(rows, right.rows)
-            if edge.right_unique:
-                rows = min(rows, left.rows)
-            return rows, Provenance.LEARNED
 
         left_ndv = self._side_ndv(node.left_keys, left)
         right_ndv = self._side_ndv(node.right_keys, right)

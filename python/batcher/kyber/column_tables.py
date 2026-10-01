@@ -61,11 +61,6 @@ CARDINALITY_CORRECTION_KEY = "__cardinality_correction__"
 # Keyed by UDF identity, not by plan signature — the cost of a callable is a property of the
 # callable, and the same `fn` under two different plans costs the same per row.
 UDF_ROW_SECONDS_KEY = "__udf_row_seconds__"
-# Derived, not stored: `load_learned_stats` folds the measured operator history over the
-# registered join structures into `{edge key: selectivity}` under this key
-# (`stats.selectivity.join_edges`), so a join order nobody has run can still be priced from an
-# edge some other order measured.
-JOIN_EDGE_KEY = "__join_edge_selectivity__"
 
 # Column statistics are keyed by **source, then column** — never by column name alone.
 #
