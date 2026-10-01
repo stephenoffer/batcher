@@ -16,14 +16,17 @@ pytest.importorskip("libcst")
 
 from _corpus import CORPUS, EXECUTED, equivalent, run
 
+from _ray_cluster import local_ray_resources
+
 
 @pytest.fixture(scope="module", autouse=True)
 def _local_ray():
     import ray
 
-    ray.init(address="local", num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
-    yield
-    ray.shutdown()
+    with local_ray_resources():
+        ray.init(address="local", num_cpus=2, include_dashboard=False, ignore_reinit_error=True)
+        yield
+        ray.shutdown()
 
 
 @pytest.mark.parametrize("case", sorted(EXECUTED["ray_data"]))

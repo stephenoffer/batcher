@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
+from _ray_cluster import local_ray_resources
 from batcher import col
 
 pytestmark = pytest.mark.integration
@@ -65,6 +66,8 @@ def cluster(tmp_path_factory):
     # detaches this driver (and stops a local instance it started), never a shared cluster.
     if ray.is_initialized():
         ray.shutdown()
+    resources = local_ray_resources()
+    resources.__enter__()
     ray.init(
         address="local",
         num_cpus=4,
@@ -95,6 +98,7 @@ def cluster(tmp_path_factory):
     finally:
         cloudpickle.unregister_pickle_by_value(sys.modules[__name__])
         ray.shutdown()
+        resources.__exit__(None, None, None)
         if prior_address is not None:
             os.environ["RAY_ADDRESS"] = prior_address
 

@@ -18,13 +18,43 @@ module, and the import fails. A uniquely-named module is unambiguous from anywhe
 
 from __future__ import annotations
 
+import contextlib
+import os
 from collections.abc import Callable, Iterator
 
 import pytest
 
 from batcher.dist.executors.ray_runtime.lifecycle import _platform_env_hook_disabled
 
-__all__ = ["init_test_ray", "ray_session_fixture", "shutdown_test_ray"]
+__all__ = ["init_test_ray", "local_ray_resources", "ray_session_fixture", "shutdown_test_ray"]
+
+
+#: The managed-workspace variable that pins the resources of every Ray node started in this
+#: process. The Anyscale head exports it with `"CPU": 0` so no work lands on the head.
+_RESOURCE_OVERRIDE = "RAY_OVERRIDE_RESOURCES"
+
+
+@contextlib.contextmanager
+def local_ray_resources() -> Iterator[None]:
+    """Let a test's own `ray.init(address="local", num_cpus=N)` really get its `N` CPUs.
+
+    A managed head exports `RAY_OVERRIDE_RESOURCES={"CPU": 0, ...}`, and Ray applies it to
+    *every* node started in the process, a local one included — so the local instance a test
+    asked for came back advertising no CPU, and anything submitted to it pended forever. That
+    is why `tests/migrate/test_executed_ray_data.py` hung for 600 s per case on a groupby of
+    three rows, and why the local fan-out in `test_gpu_fanout.py` skipped. With the variable
+    unset the same groupby finishes in about 6 s.
+
+    The variable is restored on exit: a later module attaching to the session's cluster does
+    not start a node, so it never read the override, but leaving the process environment as it
+    was found keeps modules order-independent.
+    """
+    prior = os.environ.pop(_RESOURCE_OVERRIDE, None)
+    try:
+        yield
+    finally:
+        if prior is not None:
+            os.environ[_RESOURCE_OVERRIDE] = prior
 
 
 def init_test_ray(num_cpus: int) -> bool:
@@ -69,13 +99,11 @@ def _require_schedulable_cpu(ray, num_cpus: int) -> None:
     `memory`, `object_store_memory` and node labels and **no `CPU` key at all**, while the
     real 1,024-core cluster ran on a different port.
 
-    Deliberately an error rather than a repair, because the repair does not exist here.
-    Starting a *local* Ray is the obvious fallback and it is the one thing that cannot work
-    on this platform: `ray.init(address="local", num_cpus=4)` came back with `CPU: None` and a
-    one-CPU task pending on `No available node types can fulfill resource request {'CPU': 1.0}`
-    — the workspace's head runs no work, and only the autoscaled fleet schedules. A helper
-    that silently substitutes some other cluster would also be worse than one that says what
-    it got.
+    Deliberately an error rather than a repair: a helper that silently substitutes some other
+    cluster would be worse than one that says what it got. A local Ray on such a head came back
+    with `CPU: None` only because the platform's `RAY_OVERRIDE_RESOURCES` pins every node
+    started there to zero CPUs; a test that wants a local instance starts it under
+    [`local_ray_resources`].
 
     The fix is an address, and it is verified rather than suggested: with `RAY_ADDRESS` set to
     the scheduling cluster, `test_distributed_unordered_limit` goes from hanging indefinitely
