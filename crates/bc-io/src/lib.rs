@@ -24,6 +24,7 @@ use parquet::file::metadata::ParquetMetaData;
 mod avro;
 mod bloom;
 mod footer_stats;
+mod late;
 mod mapped;
 mod page_index;
 mod predicate;
@@ -55,7 +56,11 @@ pub use avro::read_avro_bytes;
 pub use footer_stats::{
     parquet_file_manifest, parquet_footer_stats, ColumnFooterStats, FooterStats,
 };
-pub use row_groups::{parquet_row_groups, read_parquet_row_group};
+pub use late::{LateFilter, MaskFn, RowPredicate};
+pub use row_groups::{
+    parquet_row_groups, parquet_row_groups_surviving, read_parquet_row_group,
+    read_parquet_row_group_late,
+};
 pub use split_read::block_cache::{stats as object_cache_stats, CacheStats};
 
 /// How many row-groups to fetch+decode concurrently. The single-stream reader processes
@@ -185,9 +190,10 @@ pub fn read_parquet(
 /// *during* the decode.
 ///
 /// The first three are superset-safe: they only skip provably-empty blocks. The row filter is
-/// not — it removes individual rows — which is sound because `to_native_predicate` is
-/// all-or-nothing, so a predicate that arrives here is a *complete* translation of the
-/// `Filter` above the scan rather than a weakening of it. The result is therefore anywhere
+/// not — it removes individual rows — which is sound because `to_native_predicate` only ever
+/// *widens*: it drops a conjunct it cannot express and declines a disjunction it cannot, so a
+/// predicate that arrives here keeps every row the `Filter` above the scan keeps. The result is
+/// therefore anywhere
 /// between the exact matching rows and every requested row-group, and the engine keeps its
 /// `Filter` either way (`core/scan_only.py` refuses its shortcut whenever a predicate was
 /// pushed). An unparseable or non-pushable predicate simply reads every requested row-group.
@@ -486,7 +492,7 @@ async fn read_parquet_async(
     batch_size: usize,
     predicate: Option<&str>,
 ) -> Result<Vec<RecordBatch>, IoError> {
-    read_parquet_inner(uri, row_groups, columns, batch_size, predicate, false).await
+    read_parquet_inner(uri, row_groups, columns, batch_size, predicate, false, None).await
 }
 
 /// [`read_parquet_async`], optionally decoding each row group on the polling thread (`inline`)
@@ -503,6 +509,7 @@ pub(crate) async fn read_parquet_inner(
     batch_size: usize,
     predicate: Option<&str>,
     inline: bool,
+    late: Option<&Arc<late::LateFilter>>,
 ) -> Result<Vec<RecordBatch>, IoError> {
     let resolved = store::resolve(uri)?;
     let (size, arrow_meta) = load_metadata_cached(uri, &resolved).await?;
@@ -610,7 +617,17 @@ pub(crate) async fn read_parquet_inner(
         let bloom_pred = parsed.clone();
         let bloom_meta = arrow_meta.clone();
         let rf_cols = row_filter_cols.clone();
+        // The caller's own filter, decoded first (`late`), whenever the scan's measurement says
+        // it pays — and every read, either way, reports what it cost to that measurement. It
+        // replaces the native row filter rather than stacking on it: the caller's predicate is
+        // the whole `Filter`, of which the native one is at most a translation.
+        let group = arrow_meta.metadata().row_groups().get(rg);
+        let late = late
+            .filter(|l| group.is_some_and(|g| l.worth_deferring(g, columns)))
+            .map(|l| (l.clone(), l.install()));
+        let rg_rows = group.map_or(0, |g| u64::try_from(g.num_rows()).unwrap_or(0));
         let decode = async move {
+            let started = std::time::Instant::now();
             let mut b = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, amd)
                 .with_batch_size(batch_size)
                 .with_row_groups(vec![rg]);
@@ -638,11 +655,22 @@ pub(crate) async fn read_parquet_inner(
             // when the probe above measured it worth doing, and only for a predicate proved to
             // carry the engine's own comparison semantics — unlike the pruning above, this
             // step *removes rows* rather than skipping provably-empty work.
-            if let (Some(pred), Some(cols)) = (bloom_pred.as_ref(), rf_cols.as_ref()) {
+            if let Some((late, true)) = late.as_ref() {
+                b = b.with_row_filter(late.row_filter(bloom_meta.parquet_schema()));
+            } else if late.is_some() {
+                // Measuring the unfiltered side: the native row filter would make it a third
+                // configuration, timed as if it were this one.
+            } else if let (Some(pred), Some(cols)) = (bloom_pred.as_ref(), rf_cols.as_ref()) {
                 b = b.with_row_filter(row_filter::build(pred, cols, bloom_meta.parquet_schema()));
             }
             let stream = b.build()?;
-            stream.try_collect::<Vec<RecordBatch>>().await
+            let out = stream.try_collect::<Vec<RecordBatch>>().await?;
+            if let Some((late, installed)) = late.as_ref() {
+                let kept: usize = out.iter().map(RecordBatch::num_rows).sum();
+                let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                late.record(*installed, rg_rows, kept as u64, nanos);
+            }
+            Ok::<_, parquet::errors::ParquetError>(out)
         };
         if inline {
             futures::future::Either::Left(async move { Ok(decode.await) })

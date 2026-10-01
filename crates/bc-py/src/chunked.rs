@@ -8,7 +8,10 @@
 //! producer that decodes on a background thread (the control plane's prefetching Parquet reader)
 //! keeps decoding while the engine computes.
 
-use arrow::array::RecordBatch;
+use std::sync::Arc;
+
+use arrow::array::{Array, BooleanArray, RecordBatch};
+use arrow::datatypes::Schema;
 use arrow_pyarrow::PyArrowType;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
@@ -122,6 +125,8 @@ struct ParquetUnits<'a> {
     units: Vec<(usize, usize)>,
     /// Rows across every unit, from the footers `parquet_row_groups` already read.
     rows: usize,
+    /// The plan's own `Filter` over this scan, decoded first and shared by every unit read.
+    late: Option<Arc<bc_io::LateFilter>>,
 }
 
 impl bc_interp::UnitSource for ParquetUnits<'_> {
@@ -136,12 +141,13 @@ impl bc_interp::UnitSource for ParquetUnits<'_> {
     fn read(&self, unit: usize) -> Result<Vec<RecordBatch>, bc_interp::InterpError> {
         let source = |e: String| bc_interp::InterpError::ChunkSource(e);
         let (file, rg) = self.units[unit];
-        bc_io::read_parquet_row_group(
+        bc_io::read_parquet_row_group_late(
             &self.uris[file],
             rg,
             self.columns,
             self.batch_size,
             self.predicate,
+            self.late.as_ref(),
         )
         .map_err(|e| source(e.to_string()))?
         .iter()
@@ -204,7 +210,9 @@ pub(crate) fn execute_plan_parquet(
         bc_arrow::usable_cores().max(1)
     };
     let out = py.detach(|| {
-        let groups = bc_io::parquet_row_groups(&uris)
+        // Pruned before the units are ranged across the workers, so a clustered predicate's
+        // survivors are spread over them rather than left in the few ranges they fall in.
+        let groups = bc_io::parquet_row_groups_surviving(&uris, predicate.as_deref())
             .map_err(|e| bc_interp::InterpError::ChunkSource(e.to_string()))?;
         let rows = groups.iter().map(|&(_, _, n)| n).sum();
         let src = ParquetUnits {
@@ -214,6 +222,7 @@ pub(crate) fn execute_plan_parquet(
             batch_size: batch_size.max(1),
             units: groups.into_iter().map(|(file, rg, _)| (file, rg)).collect(),
             rows,
+            late: late_filter(&plan, driving, &sources[driving], columns.as_deref()),
         };
         bc_interp::execute_units_metered(&plan, &sources, driving, &src, workers, budget, &opts)
     });
@@ -288,6 +297,17 @@ pub(crate) fn partial_aggregate_parquet(
                 .into_iter()
                 .map(|(file, rg, n)| ((file, rg), n))
                 .collect();
+        // The units the footers prove empty, dropped before the fold ranges them across its
+        // workers (see `execute_plan_parquet`). Only those: a unit the footers do not list at
+        // all stays, so a bad index still fails its read rather than vanishing.
+        let surviving: std::collections::HashSet<(usize, usize)> =
+            bc_io::parquet_row_groups_surviving(&uris, predicate.as_deref())
+                .map_err(|e| bc_interp::InterpError::ChunkSource(e.to_string()))?
+                .into_iter()
+                .map(|(file, rg, _)| (file, rg))
+                .collect();
+        let mut pairs = pairs;
+        pairs.retain(|u| surviving.contains(u) || !counts.contains_key(u));
         let rows = pairs.iter().filter_map(|u| counts.get(u)).sum();
         let src = ParquetUnits {
             uris: &uris,
@@ -296,6 +316,7 @@ pub(crate) fn partial_aggregate_parquet(
             batch_size: batch_size.max(1),
             units: pairs,
             rows,
+            late: late_filter(&plan, 0, &sources[0], columns.as_deref()),
         };
         bc_interp::partial_aggregate_units(
             &plan,
@@ -313,6 +334,123 @@ pub(crate) fn partial_aggregate_parquet(
         PyArrowType(crate::normalize::rebase_batch(batch)),
         metrics.to_json(),
     ))
+}
+
+/// The predicate of the plan's `Filter` directly over `Scan(driving)`, if it has one.
+fn scan_filter(plan: &bc_ir::RelOp, driving: usize) -> Option<&bc_expr::Expr> {
+    if let bc_ir::RelOp::Filter { input, predicate } = plan {
+        if matches!(**input, bc_ir::RelOp::Scan { source_id } if source_id == driving) {
+            return Some(predicate);
+        }
+    }
+    plan.children()
+        .into_iter()
+        .find_map(|child| scan_filter(child, driving))
+}
+
+/// The plan's `Filter` over the driving scan, as a late-materialization filter for its reads.
+///
+/// The decode evaluates exactly what the `Filter` evaluates — the same expression, by the same
+/// evaluator, over the same columns normalized the same way ([`filter_mask`]) — so the rows it
+/// keeps are the rows that `Filter` keeps, and the `Filter` still runs over them.
+///
+/// A conjunction is split into stages, cheapest first, so a wide column is decoded only for the
+/// rows the narrow ones kept. That evaluates a later conjunct over fewer rows, which is what the
+/// engine's own `Filter` already does (`Expr::short_circuit_filter_mask`), and is sound on the
+/// same condition: every conjunct is [infallible](bc_expr::Expr::is_infallible_predicate), so a
+/// row skipped can never have been the one that raised. Its one remaining hazard is a
+/// schema-driven error that only fires on a non-empty input, which a stage after one that kept
+/// nothing would never see; so each conjunct is first evaluated over one all-null row of the
+/// scan's schema, and a conjunction any of whose conjuncts fails that is pushed whole.
+///
+/// `None` when the first stage would decode every column the scan reads: there is then nothing
+/// left to defer, and the filter could only add its own evaluation to the read.
+fn late_filter(
+    plan: &bc_ir::RelOp,
+    driving: usize,
+    carrier: &[RecordBatch],
+    columns: Option<&[String]>,
+) -> Option<Arc<bc_io::LateFilter>> {
+    let predicate = scan_filter(plan, driving)?;
+    let schema = carrier.first()?.schema();
+    let conjuncts = predicate.and_conjuncts();
+    let split = conjuncts.len() > 1
+        && conjuncts
+            .iter()
+            .all(|c| c.is_infallible_predicate(&schema) && evaluates_on_a_null_row(c, &schema));
+    let stages = if split {
+        let mut ordered = conjuncts;
+        ordered.sort_by_key(|c| c.eval_cost());
+        ordered.into_iter().map(stage).collect()
+    } else {
+        vec![stage(predicate)]
+    };
+    let first = &stages.first()?.columns;
+    let defers = match columns {
+        Some(cols) => cols.iter().any(|c| !first.contains(c)),
+        None => schema.fields().iter().any(|f| !first.contains(f.name())),
+    };
+    if !defers {
+        return None;
+    }
+    bc_io::LateFilter::new(stages).map(Arc::new)
+}
+
+/// One late-materialization stage evaluating `expr`.
+fn stage(expr: &bc_expr::Expr) -> bc_io::RowPredicate {
+    let mut names: Vec<&str> = Vec::new();
+    expr.collect_columns(&mut names);
+    names.sort_unstable();
+    names.dedup();
+    let owned = expr.clone();
+    bc_io::RowPredicate {
+        columns: names.into_iter().map(str::to_string).collect(),
+        mask: Arc::new(move |batch: &RecordBatch| filter_mask(&owned, batch)),
+    }
+}
+
+/// Whether `expr` evaluates to a boolean over one all-null row of `schema`'s columns.
+fn evaluates_on_a_null_row(expr: &bc_expr::Expr, schema: &Schema) -> bool {
+    let fields: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone().with_nullable(true))
+        .collect();
+    let columns = fields
+        .iter()
+        .map(|f| arrow::array::new_null_array(f.data_type(), 1))
+        .collect();
+    let Ok(row) = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns) else {
+        return false;
+    };
+    expr.eval(&row)
+        .is_ok_and(|a| a.as_any().downcast_ref::<BooleanArray>().is_some())
+}
+
+/// The keep mask the engine's `Filter` computes for `predicate` over `batch`: null-free, and
+/// every row kept when it cannot be computed, so the `Filter` above raises whatever it raises.
+fn filter_mask(predicate: &bc_expr::Expr, batch: &RecordBatch) -> BooleanArray {
+    let keep_all = || BooleanArray::from(vec![true; batch.num_rows()]);
+    // The columns as the engine sees them: decoded straight from Parquet they may still be
+    // narrow or dictionary-encoded, which `normalize_batch` undoes on the way to the `Filter`.
+    let Ok(batch) = normalize_batch(batch) else {
+        return keep_all();
+    };
+    let mask = match predicate.short_circuit_filter_mask(&batch) {
+        Ok(Some(mask)) => mask,
+        _ => match predicate.eval(&batch) {
+            Ok(array) => match array.as_any().downcast_ref::<BooleanArray>() {
+                Some(mask) => mask.clone(),
+                None => return keep_all(),
+            },
+            Err(_) => return keep_all(),
+        },
+    };
+    if mask.null_count() > 0 {
+        arrow::compute::prep_null_mask_filter(&mask)
+    } else {
+        mask
+    }
 }
 
 /// Register this module's entry points on the extension module.

@@ -13,6 +13,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bc-arrow.workspace = true
+# Direct, to evaluate a scan's `Filter` inside the Parquet decode (`chunked::late_filter`).
+bc-expr.workspace = true
 bc-ir.workspace = true
 bc-interp.workspace = true
 # Direct, for the temporal-key helpers the sort sample shares with the range partition.
