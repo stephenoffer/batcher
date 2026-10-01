@@ -221,13 +221,13 @@ pub fn distinct_dense(parts: &[RecordBatch]) -> Result<Option<RecordBatch>, Runt
             }
             w
         })
-        .reduce(
-            || vec![0u64; words],
-            |mut a, b| {
-                a.par_iter_mut().zip(b).for_each(|(x, y)| *x |= y);
-                a
-            },
-        );
+        // `reduce_with`, not `reduce`: an identity bitmap per split would zero `span / 8` bytes
+        // for nothing, as many times as rayon splits.
+        .reduce_with(|mut a, b| {
+            a.par_iter_mut().zip(b).for_each(|(x, y)| *x |= y);
+            a
+        })
+        .unwrap_or_else(|| vec![0u64; words]);
 
     // Pass 3: the set bits, ascending, extracted across cores into one exactly-sized buffer —
     // a popcount per stripe fixes where each stripe's values land.

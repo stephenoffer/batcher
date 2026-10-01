@@ -3085,7 +3085,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/quantile_spill/mod.rs` | 750 | Bounded out-of-core exact value-list aggregates for a single grouped aggregate. |
 | `ops/radix_sort/mod.rs` | 389 | LSD radix sort for fixed-width integer / temporal / float sort keys. |
 | `ops/radix_sort/packed.rs` | 498 | The **composite** packed key: several sort columns narrowed into one integer. |
-| `ops/repartition.rs` | 583 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
+| `ops/repartition.rs` | 600 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
 | `ops/reshape.rs` | 548 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/run_sort.rs` | 275 | Natural-run detection for the fixed-width sort permutations. |
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
@@ -3101,7 +3101,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/units.rs` | 34 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
-| `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |
+| `stream/folds.rs` | 646 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 376 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 795 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
@@ -3136,7 +3136,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/group/short_key.rs` | 199 | Short byte-string keys (≤ 7 bytes) as one `u64` each, and the small table that groups them. |
 | `agg/inputs/mod.rs` | 194 | Bringing an aggregate call's inputs to a type the accumulator kernels read. |
 | `agg/int_sum/mod.rs` | 333 | The partial state of an integer `SUM`: an exact 128-bit total, range-checked only when it is finalized. |
-| `agg/median.rs` | 687 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
+| `agg/median.rs` | 688 | Aggregates backed by a per-group **value list** — exact and mergeable, with no dedup (unlike COUNT(DISTINCT)). |
 | `agg/mod.rs` | 503 | Hash aggregation — built mergeable so the SAME code runs single-node and distributed. |
 | `agg/ordered_list/mod.rs` | 184 | `array_agg(x ORDER BY k)`: a per-group list whose element order is a property of the rows. |
 | `agg/sketch.rs` | 196 | The sketch-backed aggregates: bounded memory in exchange for a bounded error. |

@@ -366,8 +366,9 @@ fn copy_value(dst: &mut [u8], at: usize, src: &[u8], s: usize, e: usize) {
 /// Two passes per chunk over the same (cache-resident) morsels: the first sums each
 /// (chunk, bucket)'s value bytes, which fixes every slot of every bucket's value buffer; the
 /// second writes the offsets and the bytes together. The output is the array `interleave`
-/// produces — same rows, same order — and is re-validated by the safe constructor rather than
-/// asserted, so an offset that outgrew `T::Offset` is an error, not a wrapped value.
+/// produces — same rows, same order. An offset that would outgrow `T::Offset` is an error, not
+/// a wrapped value; the bytes are not re-validated as UTF-8, since each is a copy of a value
+/// that already was (checked in debug builds).
 fn scatter_bytes<T: ByteArrayType>(
     cols: &[&GenericByteArray<T>],
     per_morsel: &[(Vec<u32>, Vec<u32>)],
@@ -440,8 +441,24 @@ fn scatter_bytes<T: ByteArrayType>(
     data.into_iter()
         .zip(offsets)
         .map(|(data, offsets)| {
+            // `OffsetBuffer::new` still checks the offsets are monotone; what is skipped is the
+            // UTF-8 re-validation of every gathered byte, which measured ~22% of ClickBench
+            // q14/q30/q31 (string group keys through this partition).
             let offsets = OffsetBuffer::new(offsets.into());
-            Ok(Arc::new(GenericByteArray::<T>::try_new(offsets, data.into(), None)?) as ArrayRef)
+            let data: arrow::buffer::Buffer = data.into();
+            debug_assert!(
+                GenericByteArray::<T>::try_new(offsets.clone(), data.clone(), None).is_ok(),
+                "a scattered byte column must be what its sources were"
+            );
+            // SAFETY: every value in `data` is a byte-exact copy of one value of a source array
+            // of this same type `T` (`copy_value` moves exactly `src[s..e]` for a source row),
+            // and the offsets are the running sums of those value lengths, so each offset falls
+            // on a value boundary. The sources are valid arrays (UTF-8 for a string type), so
+            // the result is too; the offset width was checked against `T::Offset` above.
+            Ok(
+                Arc::new(unsafe { GenericByteArray::<T>::new_unchecked(offsets, data, None) })
+                    as ArrayRef,
+            )
         })
         .collect()
 }

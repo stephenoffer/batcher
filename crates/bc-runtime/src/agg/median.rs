@@ -147,6 +147,7 @@ pub(crate) fn merge_median(
         list.len(),
         "one merged group id per partial row"
     );
+    let group_ids = &group_ids[..list.len()];
     // Each merged group's row count and element count, then the rows sorted by group, stably.
     let mut row_start = vec![0usize; num_groups + 1];
     let mut out_offsets = vec![0i32; num_groups + 1];

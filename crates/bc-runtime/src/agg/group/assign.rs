@@ -529,9 +529,9 @@ where
                 .zip(&a.values()[..num_rows])
                 .enumerate()
             {
-                // `to_isize` succeeded for min and max above, so it succeeds for every
-                // value between them.
-                let slot = &mut map[(v.to_isize().unwrap_or(lo) - lo) as usize];
+                // Wrapping arithmetic on the bit pattern: every value lies in `[min, max]`, so
+                // `v - min` is in `[0, span)` modulo 2^64, for signed and unsigned keys alike.
+                let slot = &mut map[v.as_usize().wrapping_sub(lo as usize)];
                 if *slot == u32::MAX {
                     *slot = reps.len() as u32;
                     reps.push(i as u32);
