@@ -106,7 +106,11 @@ EXPECTED_DISTRIBUTED: dict[str, object] = {
     # `distinct` takes `transport` as an argument instead of being routed by it, so it has
     # exactly one entry point on either fleet.
     "distinct": "distinct",
-    "join": {"join", "join_flight"},
+    # A splittable side joined to a small one is the aligned executor's by-file shape
+    # (`dist.executors.aligned`), tried before the shuffle join: it splits the Parquet side
+    # by file and broadcasts the other. It declines before running anything when the plan or
+    # the footers do not support it, and the shuffle join takes the shape then.
+    "join": {"join", "join_flight", "aligned"},
     "asof_join_by": "asof_by",
     "asof_join_keyless": "asof_keyless",
 }

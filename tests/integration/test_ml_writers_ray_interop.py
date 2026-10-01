@@ -59,6 +59,10 @@ def test_ray_parses_tfrecord_examples_into_typed_columns(tmp_path):
         import google_crc32c  # noqa: F401
     except ImportError:
         pytest.importorskip("crc32c")
+    # Ray Data parses each record as a `tf.train.Example`, which it imports from TensorFlow
+    # inside the read task (`TFRecordDatasource._read_stream`); without it the read fails on
+    # the worker rather than at import, so the guard has to be explicit.
+    pytest.importorskip("tensorflow", reason="ray.data.read_tfrecords parses with TensorFlow")
     out = str(tmp_path / "t.tfrecord")
     ds = bt.from_pydict({"label": [1, None], "text": ["x", "y"], "score": [0.5, 1.5]})
     ds.write.tfrecord(out)
