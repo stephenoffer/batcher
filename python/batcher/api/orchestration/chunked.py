@@ -48,8 +48,19 @@ CHUNKED_MIN_INPUT_BYTES = 8 << 30
 
 #: Projected input bytes above which the engine reads a Parquet driving source itself, row group
 #: by row group (`io.formats.structured.parquet.units`), rather than having it decoded whole
-#: first. Below it the whole read is short and the resident path's single pass is as fast.
-UNITS_MIN_INPUT_BYTES = 64 << 20
+#: first. Below it the read is small enough that how it is scheduled does not show.
+#:
+#: This was 64 MiB, on the reading that a short read gains nothing from overlapping with the
+#: compute. The overlap was never the point at that size; the resident read's *fixed* costs
+#: are -- a Python thread per file, each batch conformed by a Python loop (`_normalize`), the
+#: whole relation crossing the FFI before the engine starts. ClickBench's
+#: ``COUNT(*) WHERE AdvEngineID <> 0`` over 10M rows projects one `Int16` column, sat under
+#: the old bar, and spent 17 ms reading resident plus 30 ms executing for 54 ms in all; read
+#: by the engine's workers it took 16 ms, against DuckDB's 25. One-file reads of 1,000 to
+#: 1,000,000 rows measured the same or faster on the unit path (2.7 vs 2.7 ms, 3.6 vs 4.1 ms,
+#: 8.5 vs 12.4 ms grouped). The floor stays at 1 MiB only so that a query over in-memory
+#: sources -- which never take this path -- does not pay the eligibility checks to find out.
+UNITS_MIN_INPUT_BYTES = 1 << 20
 
 
 def units_worthy(input_bytes: int) -> bool:
