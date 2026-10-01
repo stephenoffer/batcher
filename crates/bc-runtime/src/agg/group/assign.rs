@@ -19,6 +19,7 @@ use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 use std::sync::Arc;
 
+use super::short_key::pack_short_bytes;
 use crate::error::RuntimeError;
 use crate::keys::canon_f64;
 
@@ -528,9 +529,9 @@ where
                 .zip(&a.values()[..num_rows])
                 .enumerate()
             {
-                // `to_isize` succeeded for min and max above, so it succeeds for every
-                // value between them.
-                let slot = &mut map[(v.to_isize().unwrap_or(lo) - lo) as usize];
+                // Wrapping arithmetic on the bit pattern: every value lies in `[min, max]`, so
+                // `v - min` is in `[0, span)` modulo 2^64, for signed and unsigned keys alike.
+                let slot = &mut map[v.as_usize().wrapping_sub(lo as usize)];
                 if *slot == u32::MAX {
                     *slot = reps.len() as u32;
                     reps.push(i as u32);
@@ -700,8 +701,7 @@ where
         // routing a low-cardinality key to `int_group_ids`' dense direct-map instead of hashing
         // byte slices. Distinct `(len, bytes)` → distinct `u64`, so the groups are identical.
         if let Some(packed) = pack_short_bytes::<T>(a, num_rows) {
-            let keys = arrow::array::UInt64Array::from(packed);
-            let (group_ids, reps) = int_group_ids::<UInt64Type>(&keys, num_rows);
+            let (group_ids, reps) = super::short_key::short_group_ids(&packed);
             let num_groups = reps.len();
             let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
             return Ok((group_ids, num_groups, group_columns));
@@ -801,14 +801,17 @@ where
     let bytes = &a.value_data()[base..base + num_rows];
     let mut slot = [u32::MAX; 256];
     let mut reps: Vec<u32> = Vec::new();
-    let mut group_ids = Vec::with_capacity(num_rows);
-    for (i, &b) in bytes.iter().enumerate() {
+    // Written into a pre-sized buffer rather than `push`ed: a `push` re-checks capacity and
+    // bumps a length on every row of the loop the engine's flag-keyed aggregates spend a third
+    // of their time in, and zipping two equal-length slices proves every index for free.
+    let mut group_ids = vec![0u32; num_rows];
+    for (i, (out, &b)) in group_ids.iter_mut().zip(bytes).enumerate() {
         let s = &mut slot[b as usize];
         if *s == u32::MAX {
             *s = reps.len() as u32;
             reps.push(i as u32);
         }
-        group_ids.push(*s);
+        *out = *s;
     }
     Some((group_ids, reps))
 }
@@ -845,15 +848,15 @@ fn bytes1_multi_group_ids(cols: &[ArrayRef], num_rows: usize) -> Option<(Vec<u32
     if let [c0, c1] = byte_cols[..] {
         let mut slot = vec![u32::MAX; 1 << 16];
         let mut reps: Vec<u32> = Vec::new();
-        let mut group_ids = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let idx = (c0[i] as usize) | ((c1[i] as usize) << 8);
-            let s = &mut slot[idx];
+        // Pre-sized and zipped for the reason `byte1_group_ids` gives.
+        let mut group_ids = vec![0u32; num_rows];
+        for (i, ((out, &b0), &b1)) in group_ids.iter_mut().zip(c0).zip(c1).enumerate() {
+            let s = &mut slot[(b0 as usize) | ((b1 as usize) << 8)];
             if *s == u32::MAX {
                 *s = reps.len() as u32;
                 reps.push(i as u32);
             }
-            group_ids.push(*s);
+            *out = *s;
         }
         return Some((group_ids, reps));
     }
@@ -888,65 +891,6 @@ where
         return None;
     }
     Some((&a.value_data()[base..base + num_rows], true))
-}
-
-/// Pack each null-free byte-string ≤ 7 bytes into a `u64` group key, or `None` if any value
-/// exceeds 7 bytes (in which case the caller keeps the byte-slice hash path).
-///
-/// The key is `(len << 56) | little_endian(bytes)`: the length occupies the high byte and the
-/// ≤ 7 payload bytes the low 56 bits, so two values collide iff they have the same length and
-/// the same bytes — i.e. iff the strings are equal. That injectivity is what lets the integer
-/// grouping produce the exact same groups as hashing the slices directly. One linear pass over
-/// the offsets bails out the moment a value is too long, so a long-string column pays only a
-/// cheap scan before falling back.
-///
-/// ## Seven bytes, and why widening it to fifteen does not pay
-///
-/// Seven is a low ceiling for a categorical key — an ISO code, a SKU, a `YYYY-MM-DD`, most real
-/// identifiers are wider — and the byte-slice hash path beyond it is the engine's worst measured
-/// group-by shape. On the H2O db-benchmark's group-by table at its 1e7-row tier, over 100,000
-/// groups and the identical `sum(v1)`:
-///
-/// | key | bytes | Batcher | DuckDB |
-/// |---|---|---:|---:|
-/// | `id6` (`int32`) | — | 26.0 ms | 31.6 ms |
-/// | `id3` (`'id0000039083'`) | 12 | 54.5 ms | 32.0 ms |
-///
-/// Same cardinality, same aggregate: the string key costs **2.1x** what the integer one does,
-/// while DuckDB pays the same either way. So the obvious move is to pack 8-15 bytes into an
-/// `i128` and route it through [`int_group_ids`] exactly as this does for `u64`.
-///
-/// **Measured, it is 1.13x *slower*** (`id3` 49.7/53.0 ms -> 57.6/59.2 ms
-/// over two interleaved rounds, same tree, two `.so`s differing only in this). Two costs swamp
-/// the saving, and both are properties of the wide key rather than of the implementation: the
-/// packing is a second full pass that materializes a 160 MB `Vec<i128>` the hash path never
-/// allocates, and `int_group_ids`' inline-key table becomes 20 bytes a slot against the byte
-/// path's 4, so it loses far more to cache misses on a 100,000-group probe than it gains by
-/// comparing registers instead of slices. The byte path is not naive: it already keeps each
-/// group's representative *slice* beside its id, so its comparison costs no indirection either.
-///
-/// The gap is real and still open; a wider pack of the same shape is not the way to close it.
-/// What the measurement points at is the representation, not the key width — a `StringView`
-/// leaf with an inline prefix, so the comparison never leaves the array that was scanned
-/// (`competitor_technique_review.md` item 2).
-fn pack_short_bytes<T>(a: &GenericByteArray<T>, num_rows: usize) -> Option<Vec<u64>>
-where
-    T: arrow::array::types::ByteArrayType,
-{
-    let mut out = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
-        let v: &[u8] = a.value(i).as_ref();
-        let len = v.len();
-        if len > 7 {
-            return None;
-        }
-        let mut key = (len as u64) << 56;
-        for (j, &b) in v.iter().enumerate() {
-            key |= u64::from(b) << (8 * j);
-        }
-        out.push(key);
-    }
-    Some(out)
 }
 
 /// `(len, bytes)` packed into a `u128` per row, or `None` when some value exceeds 15 bytes.
@@ -1296,6 +1240,11 @@ where
     let a = arr.as_bytes::<T>();
     if a.null_count() != 0 {
         return None;
+    }
+    // Short values rank as packed registers: no slice hash, no `memcmp` per row.
+    if let Some(packed) = pack_short_bytes::<T>(a, num_rows) {
+        let codes = super::short_key::rank_short(&packed, RANK_MAX_DISTINCT)?;
+        return Some(Arc::new(Int64Array::from(codes)) as ArrayRef);
     }
     let mut ids: ahash::AHashMap<&[u8], i64> = ahash::AHashMap::new();
     let mut codes: Vec<i64> = Vec::with_capacity(num_rows);
@@ -2262,6 +2211,27 @@ mod tests {
     #[test]
     fn short_strings_mixed_lengths_stay_distinct() {
         check_str(vec!["", "a", "aa", "a", "aaa", "", "aa", "b", "ab", "ba"]);
+    }
+
+    /// The packing loads 8 bytes per value and masks to its length, so the bytes *after* a
+    /// value — the next value's — must never reach its key. Values that are prefixes of their
+    /// successors (`"ab"` then `"abc"`), every length 0..=7, and the last values of the buffer
+    /// (where the load would overrun and the byte loop takes over), over a fresh array and a
+    /// slice of one whose offsets do not start at zero.
+    #[test]
+    fn short_strings_load_past_their_end_and_mask_it() {
+        let alphabet = [
+            "", "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "b", "ba",
+        ];
+        let vals: Vec<&str> = (0..300)
+            .map(|i| alphabet[(i * 7) % alphabet.len()])
+            .collect();
+        check_str(vals.clone());
+        let arr: ArrayRef = Arc::new(StringArray::from(vals.clone()));
+        let sliced = arr.slice(37, 200);
+        let (ids, n, _) = assign_groups(&[sliced], 200).unwrap();
+        let (want_ids, want_n, _) = reference_str(&vals[37..237]);
+        assert_eq!((ids, n), (want_ids, want_n));
     }
 
     /// A key longer than 7 bytes forces the fallback hash path — which must still be correct.

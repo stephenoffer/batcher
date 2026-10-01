@@ -198,43 +198,88 @@ pub fn distinct_dense(parts: &[RecordBatch]) -> Result<Option<RecordBatch>, Runt
     let Ok(span) = usize::try_from(span_i) else {
         return Ok(None);
     };
-    if span > dense_budget(rows) {
+    let threads = rayon::current_num_threads().max(1);
+    if span > dense_bitmap_budget(rows, threads) {
         return Ok(None);
     }
 
-    // Pass 2: presence bitmap, OR-reduced across cores.
+    // Pass 2: one presence bitmap per **worker**, OR-reduced across cores. A bitmap per morsel
+    // (what this used to build) zeroes `span / 8` bytes for every 16,384 rows, which is what
+    // forced the budget down to a `u32` map's; per worker, the zeroing is `threads x span / 8`
+    // for the whole relation.
     let words = span.div_ceil(64);
+    let per = cols.len().div_ceil(threads).max(1);
     let bits = cols
-        .par_iter()
-        .map(|c| {
+        .par_chunks(per)
+        .map(|chunk| {
             let mut w = vec![0u64; words];
-            for &v in c.values() {
-                let i = (v.wrapping_sub(lo)) as usize;
-                w[i >> 6] |= 1u64 << (i & 63);
+            for c in chunk {
+                for &v in c.values() {
+                    let i = (v.wrapping_sub(lo)) as usize;
+                    w[i >> 6] |= 1u64 << (i & 63);
+                }
             }
             w
         })
-        .reduce(
-            || vec![0u64; words],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(b) {
-                    *x |= y;
-                }
-                a
-            },
-        );
+        // `reduce_with`, not `reduce`: an identity bitmap per split would zero `span / 8` bytes
+        // for nothing, as many times as rayon splits.
+        .reduce_with(|mut a, b| {
+            a.par_iter_mut().zip(b).for_each(|(x, y)| *x |= y);
+            a
+        })
+        .unwrap_or_else(|| vec![0u64; words]);
 
-    let mut vals: Vec<i64> = Vec::new();
-    for (wi, &w) in bits.iter().enumerate() {
-        let mut w = w;
-        while w != 0 {
-            let b = w.trailing_zeros() as usize;
-            vals.push(lo.wrapping_add(((wi << 6) + b) as i64));
-            w &= w - 1;
-        }
+    // Pass 3: the set bits, ascending, extracted across cores into one exactly-sized buffer —
+    // a popcount per stripe fixes where each stripe's values land.
+    let stripe = words.div_ceil(threads.saturating_mul(4)).max(1024);
+    let counts: Vec<usize> = bits
+        .par_chunks(stripe)
+        .map(|ws| ws.iter().map(|w| w.count_ones() as usize).sum())
+        .collect();
+    let mut vals: Vec<i64> = vec![0; counts.iter().sum()];
+    let mut slots: Vec<&mut [i64]> = Vec::with_capacity(counts.len());
+    let mut rest: &mut [i64] = &mut vals;
+    for &n in &counts {
+        let (slot, tail) = std::mem::take(&mut rest).split_at_mut(n);
+        slots.push(slot);
+        rest = tail;
     }
+    bits.par_chunks(stripe)
+        .zip(slots)
+        .enumerate()
+        .for_each(|(si, (ws, slot))| {
+            let mut k = 0;
+            for (wj, &w) in ws.iter().enumerate() {
+                let base = ((si * stripe + wj) << 6) as i64;
+                let mut w = w;
+                while w != 0 {
+                    let b = w.trailing_zeros() as i64;
+                    slot[k] = lo.wrapping_add(base + b);
+                    k += 1;
+                    w &= w - 1;
+                }
+            }
+        });
     let out: ArrayRef = Arc::new(Int64Array::from(vals));
     Ok(Some(RecordBatch::try_new(first.schema(), vec![out])?))
+}
+
+/// The widest value range [`distinct_dense`] takes a bitmap for, over `rows` rows on `threads`
+/// workers.
+///
+/// A presence bitmap costs **one bit** per value in the range, not the `u32` slot per value the
+/// group-id map pays, so the map's budget ([`dense_budget`], ~1 M values) is far too tight for
+/// it. That budget declined `DISTINCT l_orderkey` over TPC-H — keys `1..6M`, 1.5 M of them
+/// present — and sent it through a per-morsel hash and a 3.4 M-row combine instead of a 750 KB
+/// bitmap. The bound here is the bitmaps' total zeroing: `threads` of them at `span / 8` bytes
+/// each may cost no more than the column itself (8 bytes a row), so the bitmap pass never
+/// writes more than it reads. A fixed ceiling keeps one bitmap at 128 MiB whatever the row
+/// count says.
+fn dense_bitmap_budget(rows: usize, threads: usize) -> usize {
+    const MAX_BITMAP_BITS: usize = 1 << 30;
+    (rows.saturating_mul(64) / threads.max(1))
+        .max(dense_budget(rows))
+        .min(MAX_BITMAP_BITS)
 }
 
 /// Single-pass whole-row DISTINCT over a relation held as morsels: hash-partition every
@@ -844,6 +889,44 @@ mod dense_tests {
         ];
         // Must return None (decline), never panic.
         assert!(distinct_dense(&parts).unwrap().is_none());
+    }
+
+    /// A range wider than the group-id map's budget — but one bit per value is cheap — takes
+    /// the bitmap, with per-worker bitmaps and the striped extraction both reached: many
+    /// morsels, a negative minimum, a span that is not a multiple of 64, and more words than
+    /// one stripe holds. Held to a sorted-set oracle, in ascending order.
+    #[test]
+    fn dense_distinct_wide_range_across_workers() {
+        let rows = 2_000_000usize;
+        let span = 1_500_001i64;
+        let all: Vec<i64> = (0..rows as i64)
+            .map(|i| (i * 7919) % span - 700_000)
+            .collect();
+        let parts: Vec<RecordBatch> = all
+            .chunks(16_384)
+            .map(|c| batches(vec![c.iter().copied().map(Some).collect()]).remove(0))
+            .collect();
+        assert!(
+            span as usize > dense_budget(rows),
+            "must exceed the map's budget"
+        );
+        let want: Vec<i64> = all
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let out = pool
+                .install(|| distinct_dense(&parts))
+                .unwrap()
+                .expect("a bitmap over 1.5 M values must engage");
+            assert_eq!(values(&out), want, "threads={threads}");
+        }
     }
 
     /// A sparse range exceeds the budget and declines rather than allocating a huge map.
