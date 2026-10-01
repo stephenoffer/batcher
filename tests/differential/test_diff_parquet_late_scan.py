@@ -55,6 +55,13 @@ def _part(part: int) -> pa.Table:
                     for i in ids
                 ]
             ),
+            # A low-cardinality plain string: read as a `Dictionary` by a stage over it alone.
+            "mode": pa.array(
+                [
+                    None if i % 11 == 0 else ("AIR", "MAIL", "RAIL", "SHIP", "AIR REG")[i % 5]
+                    for i in ids
+                ]
+            ),
             "d": pa.array([dt.date(2020, 1, 1) + dt.timedelta(days=i // 100) for i in ids]),
             "ts": pa.array(
                 [None if i % 23 == 0 else i * 1_000_003 for i in ids],
@@ -124,6 +131,14 @@ _QUERIES = [
     "SELECT id, cat, txt FROM t WHERE cat = 'c' AND id % 10 = 1 ORDER BY id",
     "SELECT cat, count(*) AS n, sum(f) AS s FROM t WHERE txt LIKE '%needle%' OR k IS NULL "
     "GROUP BY cat",
+    # A stage over one low-cardinality string, its mask computed once per dictionary value:
+    # membership, a pattern, a null test, a value no row holds, and the column in the output.
+    "SELECT id, mode, txt FROM t WHERE mode IN ('MAIL', 'SHIP') ORDER BY id",
+    "SELECT mode, count(*) AS n, sum(dec) AS s FROM t WHERE mode = 'AIR' OR mode IS NULL "
+    "GROUP BY mode",
+    "SELECT id, txt FROM t WHERE mode LIKE 'AIR%' AND k = 3 ORDER BY id",
+    "SELECT count(*) AS n, sum(dec) AS s FROM t WHERE mode <> 'RAIL' AND txt LIKE '%needle%'",
+    "SELECT count(*) AS n FROM t WHERE mode IN ('NOPE')",
     # A date the native translation cannot express beside a key it can: the key still prunes.
     "SELECT count(*) AS n, sum(dec) AS s, max(d) AS hi FROM t "
     "WHERE id >= 17000 AND d >= DATE '2020-07-01'",

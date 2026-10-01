@@ -655,6 +655,18 @@ pub(crate) async fn read_parquet_inner(
             .filter(|l| group.is_some_and(|g| l.worth_deferring(g, columns)))
             .map(|l| (l.clone(), l.install()));
         let rg_rows = group.map_or(0, |g| u64::try_from(g.num_rows()).unwrap_or(0));
+        // An installed filter whose stages accept dictionaries reads their low-cardinality
+        // string columns as `Dictionary`, cast back before returning (`late::DictionaryRead`).
+        // A locating read keeps the plain decode: its metadata carries the row-number column,
+        // which a supplied schema would have to restate.
+        let dictionary = match (late.as_ref(), group) {
+            (Some((l, true)), Some(g)) if !locate => l.dictionary_read(arrow_meta.schema(), g),
+            _ => None,
+        };
+        let (amd, dictionary) = match dictionary.and_then(|d| d.reader_metadata(&amd)) {
+            Some((m, d)) => (m, Some(d)),
+            None => (amd, None),
+        };
         let decode = async move {
             let started = std::time::Instant::now();
             let mut b = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, amd)
@@ -693,7 +705,13 @@ pub(crate) async fn read_parquet_inner(
                 b = b.with_row_filter(row_filter::build(pred, cols, bloom_meta.parquet_schema()));
             }
             let stream = b.build()?;
-            let out = stream.try_collect::<Vec<RecordBatch>>().await?;
+            let mut out = stream.try_collect::<Vec<RecordBatch>>().await?;
+            if let Some(d) = dictionary.as_ref() {
+                out = out
+                    .into_iter()
+                    .map(|b| d.restore(b))
+                    .collect::<Result<_, _>>()?;
+            }
             if let Some((late, installed)) = late.as_ref() {
                 let kept: usize = out.iter().map(RecordBatch::num_rows).sum();
                 let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);

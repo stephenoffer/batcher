@@ -396,6 +396,7 @@ mod tests {
             crate::LateFilter::new(vec![crate::RowPredicate {
                 columns: cols.clone(),
                 mask: Arc::new(keep),
+                dictionary: false,
             }])
             .unwrap(),
         );

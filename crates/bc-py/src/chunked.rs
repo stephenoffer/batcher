@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, RecordBatch};
-use arrow::datatypes::Schema;
+use arrow::array::{Array, BooleanArray, DictionaryArray, RecordBatch};
+use arrow::datatypes::{DataType, Int32Type, Schema};
 use arrow_pyarrow::PyArrowType;
 use pyo3::exceptions::PyStopIteration;
 use pyo3::prelude::*;
@@ -567,9 +567,9 @@ fn late_filter(
     let stages = if split {
         let mut ordered = conjuncts;
         ordered.sort_by_key(|c| c.eval_cost());
-        ordered.into_iter().map(stage).collect()
+        ordered.into_iter().map(|c| stage(c, &schema)).collect()
     } else {
-        vec![stage(predicate)]
+        vec![stage(predicate, &schema)]
     };
     let staged = |name: &String| stages.iter().any(|s| s.columns.contains(name));
     let defers = match columns {
@@ -583,16 +583,78 @@ fn late_filter(
 }
 
 /// One late-materialization stage evaluating `expr`.
-fn stage(expr: &bc_expr::Expr) -> bc_io::RowPredicate {
+///
+/// A stage over one string column that cannot raise accepts that column dictionary-encoded
+/// (`dictionary`): its mask is then a pure function of each row's value, so it is computed once
+/// per distinct value and looked up by key ([`dictionary_mask`]).
+fn stage(expr: &bc_expr::Expr, schema: &Schema) -> bc_io::RowPredicate {
     let mut names: Vec<&str> = Vec::new();
     expr.collect_columns(&mut names);
     names.sort_unstable();
     names.dedup();
+    let dictionary = matches!(names.as_slice(), [only] if schema
+        .field_with_name(only)
+        .is_ok_and(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8)))
+        && expr.is_infallible_predicate(schema);
     let owned = expr.clone();
     bc_io::RowPredicate {
         columns: names.into_iter().map(str::to_string).collect(),
-        mask: Arc::new(move |batch: &RecordBatch| filter_mask(&owned, batch)),
+        mask: Arc::new(move |batch: &RecordBatch| {
+            dictionary_mask(&owned, batch).unwrap_or_else(|| filter_mask(&owned, batch))
+        }),
+        dictionary,
     }
+}
+
+/// [`filter_mask`] over a batch whose one column is a `Dictionary`, computed per distinct value.
+///
+/// The predicate is evaluated over the dictionary's values, plus one null standing for the rows
+/// whose key is null, and each row takes its key's answer. That is the mask the per-row
+/// evaluation computes because the stage's predicate reads only this column and cannot raise
+/// (see [`stage`]), so its answer for a row is a function of the row's value alone. `None` for
+/// any other batch, and for a dictionary larger than the batch, where evaluating every value
+/// would cost more than evaluating every row.
+fn dictionary_mask(predicate: &bc_expr::Expr, batch: &RecordBatch) -> Option<BooleanArray> {
+    let [column] = batch.columns() else {
+        return None;
+    };
+    let dict = column
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int32Type>>()?;
+    let values = dict.values();
+    if values.len() > batch.num_rows() {
+        return None;
+    }
+    let keys = dict.keys();
+    let null_slot = values.len();
+    let candidates = if keys.null_count() > 0 {
+        let null = arrow::array::new_null_array(values.data_type(), 1);
+        arrow::compute::concat(&[values.as_ref(), null.as_ref()]).ok()?
+    } else {
+        values.clone()
+    };
+    let field = batch
+        .schema()
+        .field(0)
+        .clone()
+        .with_data_type(values.data_type().clone())
+        .with_nullable(true);
+    let candidates =
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![candidates]).ok()?;
+    let answers = filter_mask(predicate, &candidates);
+    if answers.len() != candidates.num_rows() {
+        return None;
+    }
+    let (codes, nulls) = (keys.values(), keys.nulls());
+    let mask = arrow::buffer::BooleanBuffer::collect_bool(codes.len(), |i| {
+        let slot = if nulls.is_some_and(|n| n.is_null(i)) {
+            null_slot
+        } else {
+            usize::try_from(codes[i]).unwrap_or(null_slot)
+        };
+        answers.value(slot)
+    });
+    Some(BooleanArray::new(mask, None))
 }
 
 /// Whether `expr` evaluates to a boolean over one all-null row of `schema`'s columns.
@@ -646,4 +708,71 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_plan_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate_parquet, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::Field;
+
+    fn expr(json: &str) -> bc_expr::Expr {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// A one-column batch `m` holding `values` indexed by `keys` (a `None` key is a null row).
+    fn dict_batch(values: &[Option<&str>], keys: &[Option<i32>]) -> RecordBatch {
+        let dict = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(keys.to_vec()),
+            Arc::new(StringArray::from(values.to_vec())),
+        )
+        .unwrap();
+        let field = Field::new("m", dict.data_type().clone(), true);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![Arc::new(dict)]).unwrap()
+    }
+
+    /// Per distinct value, the mask is the one the per-row evaluation of the decoded column
+    /// computes — for membership, equality, a pattern and a null test, with null keys and a
+    /// null dictionary value both present.
+    #[test]
+    fn a_dictionary_mask_equals_the_decoded_mask() {
+        let values = [
+            Some("MAIL"),
+            Some("SHIP"),
+            Some("AIR"),
+            None,
+            Some("AIR REG"),
+        ];
+        let keys: Vec<Option<i32>> = (0..64).map(|i| (i % 9 != 0).then_some(i * 7 % 5)).collect();
+        let batch = dict_batch(&values, &keys);
+        let decoded = normalize_batch(&batch).unwrap();
+        assert_eq!(decoded.schema().field(0).data_type(), &DataType::Utf8);
+        let col = r#"{"e":"col","name":"m"}"#;
+        let air = r#"{"e":"lit","value":{"str":"AIR"}}"#;
+        for predicate in [
+            format!(r#"{{"e":"in_list","input":{col},"set":[{{"str":"MAIL"}},{{"str":"SHIP"}}]}}"#),
+            format!(r#"{{"e":"binary","op":"eq","left":{col},"right":{air}}}"#),
+            format!(r#"{{"e":"str","fn":"like","input":{col},"pattern":"AIR%"}}"#),
+            format!(r#"{{"e":"is_null","input":{col}}}"#),
+        ] {
+            let e = expr(&predicate);
+            let got = dictionary_mask(&e, &batch).expect("a dictionary batch takes this path");
+            assert_eq!(got, filter_mask(&e, &decoded), "{predicate}");
+        }
+    }
+
+    /// A dictionary with more values than the batch has rows, and a plain column, take the
+    /// per-row path.
+    #[test]
+    fn a_large_dictionary_or_a_plain_column_is_declined() {
+        let e = expr(r#"{"e":"is_null","input":{"e":"col","name":"m"}}"#);
+        let values = [Some("a"), Some("b"), Some("c")];
+        assert!(dictionary_mask(&e, &dict_batch(&values, &[Some(0), Some(1)])).is_none());
+        let plain = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![Some("a"), None]))],
+        )
+        .unwrap();
+        assert!(dictionary_mask(&e, &plain).is_none());
+    }
 }

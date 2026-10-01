@@ -45,7 +45,12 @@ use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, RecordBatch};
-use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowFilter};
+use arrow::datatypes::{DataType, FieldRef, Schema};
+use arrow::error::ArrowError;
+use parquet::arrow::arrow_reader::{
+    ArrowPredicate, ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter,
+};
+use parquet::basic::Encoding;
 use parquet::schema::types::SchemaDescriptor;
 
 /// A keep mask over a batch of a predicate's columns. Must return exactly one non-null value
@@ -63,6 +68,71 @@ pub struct RowPredicate {
     pub columns: Vec<String>,
     /// The mask itself.
     pub mask: Arc<MaskFn>,
+    /// Whether the mask also accepts its string columns as `Dictionary` arrays, and computes
+    /// the same mask from them. See [`DictionaryRead`].
+    pub dictionary: bool,
+}
+
+/// Uncompressed bytes per row above which a dictionary-encoded string chunk is decoded as plain
+/// strings rather than as a `Dictionary`. A chunk under it holds at most a few thousand distinct
+/// values, so a mask computed once per dictionary value is far cheaper than one per row.
+const DICTIONARY_MAX_BYTES_PER_ROW: i64 = 2;
+
+/// A row group whose dictionary-capable stages read their string columns as `Dictionary`.
+///
+/// Decoding a dictionary-encoded string column to plain strings copies every row's bytes out of
+/// the dictionary (`OffsetBuffer::extend_from_dictionary`), which is most of what a filter on a
+/// low-cardinality string costs: TPC-H's `l_shipinstruct = 'DELIVER IN PERSON' AND l_shipmode
+/// IN ('AIR', 'AIR REG')` over sf100 `lineitem` spent a quarter of its CPU there. Read as a
+/// `Dictionary`, the stage decodes only the keys and its mask is computed once per distinct
+/// value, so the strings are copied only for the rows that survive -- and the columns are cast
+/// back to the file's own types before the read returns, so a caller never sees the difference.
+pub(crate) struct DictionaryRead {
+    /// The file's Arrow schema with the chosen columns retyped as `Dictionary<Int32, _>`.
+    pub(crate) schema: arrow::datatypes::SchemaRef,
+    /// The retyped columns, by name, with the type each is cast back to.
+    restore: Vec<(String, DataType)>,
+}
+
+impl DictionaryRead {
+    /// Reader metadata decoding this read's columns as dictionaries, paired with `self` to cast
+    /// them back; `None` when the file's metadata does not accept the retyped schema, in which
+    /// case the caller keeps the plain decode.
+    pub(crate) fn reader_metadata(
+        self,
+        amd: &ArrowReaderMetadata,
+    ) -> Option<(ArrowReaderMetadata, Self)> {
+        let options = ArrowReaderOptions::new().with_schema(self.schema.clone());
+        ArrowReaderMetadata::try_new(amd.metadata().clone(), options)
+            .ok()
+            .map(|m| (m, self))
+    }
+
+    /// `batch` with every retyped column cast back to the file's type.
+    pub(crate) fn restore(&self, batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+        let schema = batch.schema();
+        let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+        let mut columns = batch.columns().to_vec();
+        let mut changed = false;
+        for (i, field) in schema.fields().iter().enumerate() {
+            let Some((_, to)) = self.restore.iter().find(|(name, _)| name == field.name()) else {
+                continue;
+            };
+            if field.data_type() == to {
+                continue;
+            }
+            columns[i] = arrow::compute::cast(&columns[i], to)?;
+            fields[i] = Arc::new(field.as_ref().clone().with_data_type(to.clone()));
+            changed = true;
+        }
+        if !changed {
+            return Ok(batch);
+        }
+        RecordBatch::try_new(
+            Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+            columns,
+        )
+    }
 }
 
 /// Row groups each way the scan times before keeping the faster.
@@ -209,6 +279,56 @@ impl LateFilter {
         deferred > 0 && deferred >= decoded
     }
 
+    /// How row group `rg` reads its dictionary-capable stages' string columns, if any qualifies.
+    ///
+    /// A column qualifies when every stage reading it accepts a `Dictionary`, it is a top-level
+    /// `Utf8`/`LargeUtf8` column of `schema` (the file's Arrow schema), and its chunk is
+    /// dictionary-encoded throughout and small per row (see [`DICTIONARY_MAX_BYTES_PER_ROW`]).
+    pub(crate) fn dictionary_read(
+        &self,
+        schema: &Schema,
+        rg: &parquet::file::metadata::RowGroupMetaData,
+    ) -> Option<DictionaryRead> {
+        let rows = rg.num_rows().max(1);
+        let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+        let mut restore = Vec::new();
+        for (i, field) in schema.fields().iter().enumerate() {
+            let name = field.name();
+            let mut readers = self.predicates.iter().filter(|p| p.columns.contains(name));
+            let first = readers.next();
+            let accepts = first.is_some_and(|p| p.dictionary) && readers.all(|p| p.dictionary);
+            if !accepts || !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+                continue;
+            }
+            let Some(chunk) = rg
+                .columns()
+                .iter()
+                .find(|c| c.column_path().parts() == std::slice::from_ref(name))
+            else {
+                continue;
+            };
+            let all_dictionary = chunk.page_encoding_stats_mask().is_none_or(|m| {
+                m.is_only(Encoding::RLE_DICTIONARY) || m.is_only(Encoding::PLAIN_DICTIONARY)
+            });
+            if chunk.dictionary_page_offset().is_none()
+                || !all_dictionary
+                || chunk.uncompressed_size() > DICTIONARY_MAX_BYTES_PER_ROW * rows
+            {
+                continue;
+            }
+            let dict = DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(field.data_type().clone()),
+            );
+            fields[i] = Arc::new(field.as_ref().clone().with_data_type(dict));
+            restore.push((name.clone(), field.data_type().clone()));
+        }
+        (!restore.is_empty()).then(|| DictionaryRead {
+            schema: Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+            restore,
+        })
+    }
+
     /// The parquet `RowFilter` running every stage, against the file's schema.
     pub(crate) fn row_filter(&self, descr: &SchemaDescriptor) -> RowFilter {
         let stages: Vec<Box<dyn ArrowPredicate>> = self
@@ -314,6 +434,7 @@ mod tests {
         LateFilter::new(vec![RowPredicate {
             columns: columns.iter().map(|c| (*c).to_string()).collect(),
             mask: Arc::new(mask),
+            dictionary: false,
         }])
         .unwrap()
     }
@@ -368,6 +489,127 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A file whose `m` is a low-cardinality string (five values, every 7th null), `u` a unique
+    /// string per row, and `b` an integer payload.
+    fn write_categorical(path: &std::path::Path, rows: usize, per_group: usize) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("m", DataType::Utf8, true),
+            Field::new("u", DataType::Utf8, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let modes = ["AIR", "MAIL", "RAIL", "SHIP", "TRUCK"];
+        let m = StringArray::from(
+            (0..rows)
+                .map(|i| (i % 7 != 0).then_some(modes[(i * 31 + i / 3) % 5]))
+                .collect::<Vec<_>>(),
+        );
+        let u = StringArray::from((0..rows).map(|i| format!("u{i}")).collect::<Vec<_>>());
+        let b = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(m) as ArrayRef, Arc::new(u), Arc::new(b)],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(per_group))
+            .set_data_page_row_count_limit(1_000)
+            .set_write_batch_size(1_000)
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// `m IN ('MAIL', 'SHIP')` as a mask over either a plain or a dictionary-encoded `m`,
+    /// recording in `saw` whether it was handed a dictionary.
+    fn mode_mask(saw: Arc<std::sync::atomic::AtomicBool>) -> Arc<MaskFn> {
+        Arc::new(move |batch: &RecordBatch| {
+            let col = batch.column_by_name("m").unwrap();
+            let decoded = match col.data_type() {
+                DataType::Dictionary(_, _) => {
+                    saw.store(true, Ordering::Relaxed);
+                    arrow::compute::cast(col, &DataType::Utf8).unwrap()
+                }
+                _ => col.clone(),
+            };
+            let s = decoded.as_any().downcast_ref::<StringArray>().unwrap();
+            s.iter()
+                .map(|v| Some(matches!(v, Some("MAIL" | "SHIP"))))
+                .collect()
+        })
+    }
+
+    /// A dictionary-capable stage reads a low-cardinality string as a `Dictionary` and returns
+    /// exactly the rows the plain read keeps, with every column in the file's own type; a stage
+    /// that does not accept dictionaries, or a high-cardinality column, keeps the plain decode.
+    #[test]
+    fn a_dictionary_stage_returns_the_plain_reads_rows_and_types() {
+        let dir = std::env::temp_dir().join(format!("bcio_late_dict_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.parquet");
+        write_categorical(&path, 40_000, 10_000);
+        let uri = path.to_str().unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+        let file_schema = builder.schema().clone();
+        let meta = builder.metadata().clone();
+        let all: Vec<RecordBatch> = builder.build().unwrap().map(Result::unwrap).collect();
+        let all = concat(&all);
+        let plain_saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let want_mask = mode_mask(plain_saw)(&all);
+        let want = filter_record_batch(&all, &want_mask).unwrap();
+        assert!(want.num_rows() > 0 && want.num_rows() < all.num_rows());
+
+        for dictionary in [true, false] {
+            let saw = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let late = Arc::new(
+                LateFilter::new(vec![RowPredicate {
+                    columns: vec!["m".to_string()],
+                    mask: mode_mask(saw.clone()),
+                    dictionary,
+                }])
+                .unwrap(),
+            );
+            late.state.store(ON, Ordering::Relaxed);
+            assert_eq!(
+                late.dictionary_read(&file_schema, meta.row_group(0))
+                    .is_some(),
+                dictionary
+            );
+            let got: Vec<RecordBatch> = (0..4)
+                .flat_map(|rg| {
+                    crate::read_parquet_row_group_late(
+                        uri,
+                        rg,
+                        None,
+                        4096,
+                        None,
+                        Some(&late),
+                        false,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let got = concat(&got);
+            assert_eq!(got.schema(), want.schema(), "dictionary {dictionary}");
+            assert_eq!(got, want, "dictionary {dictionary}");
+            assert_eq!(saw.load(Ordering::Relaxed), dictionary);
+        }
+
+        // The unique column is far past the per-row budget, so a stage over it reads plain.
+        let unique = LateFilter::new(vec![RowPredicate {
+            columns: vec!["u".to_string()],
+            mask: Arc::new(|b: &RecordBatch| BooleanArray::from(vec![true; b.num_rows()])),
+            dictionary: true,
+        }])
+        .unwrap();
+        assert!(unique
+            .dictionary_read(&file_schema, meta.row_group(0))
+            .is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Off, a row group comes back whole — a superset the caller's `Filter` reduces to the
     /// same rows.
     #[test]
@@ -412,10 +654,12 @@ mod tests {
             RowPredicate {
                 columns: cols(&["a"]),
                 mask: Arc::new(mask),
+                dictionary: false,
             },
             RowPredicate {
                 columns: cols(&["s"]),
                 mask: Arc::new(mask),
+                dictionary: false,
             },
         ])
         .unwrap();
@@ -467,6 +711,7 @@ mod tests {
             LateFilter::new(vec![RowPredicate {
                 columns: vec!["a".to_string()],
                 mask: Arc::new(|_: &RecordBatch| BooleanArray::from(vec![false; 3])),
+                dictionary: false,
             }])
             .unwrap(),
         );
