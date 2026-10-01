@@ -159,3 +159,29 @@ def test_no_fire_without_a_string_key():
         .agg(tot=col("f_v").sum())
     )
     assert pre_aggregate_beneath_dimension(ds._plan, _ctx(ds, _NDV)) is None
+
+
+def _coarse(ndv_cust: float):
+    """Facts joined to customers and grouped by a two-valued customer string."""
+    cust = bt.from_pydict(
+        {"c_sk": list(range(10)), "c_region": ["east", "west"] * 5, "c_n": [1] * 10}
+    )
+    ds = (
+        _facts()
+        .join(cust, left_on="f_cust", right_on="c_sk")
+        .group_by("c_region")
+        .agg(tot=col("f_v").sum())
+    )
+    return ds, _ctx(ds, {**_NDV, "f_cust": ndv_cust, "c_region": 2.0})
+
+
+def test_a_coarse_grouping_takes_a_strong_reduction():
+    """TPC-DS q70's per-state level: a few outer groups, but the partial is tiny."""
+    ds, ctx = _coarse(10.0)  # 400 rows into 10 partial groups: 40x
+    assert pre_aggregate_beneath_dimension(ds._plan, ctx) is not None
+
+
+def test_a_coarse_grouping_refuses_a_marginal_reduction():
+    """`lineitem JOIN orders GROUP BY o_orderpriority`: 4-8x into far more groups than kept."""
+    ds, ctx = _coarse(60.0)  # 400 rows into 60 partial groups: 6.7x, against 2 outer groups
+    assert pre_aggregate_beneath_dimension(ds._plan, ctx) is None

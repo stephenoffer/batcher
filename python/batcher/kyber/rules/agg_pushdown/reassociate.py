@@ -29,7 +29,8 @@ import pyarrow as pa
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
-from batcher.kyber.rules.agg_pushdown.rules import _PREAGG_MERGE
+from batcher.kyber.rules.agg_pushdown.gates import _OUTER_GROUP_SHARE
+from batcher.kyber.rules.agg_pushdown.rules import _MIN_PREAGG_REDUCTION, _PREAGG_MERGE
 from batcher.plan.expr_ir import AggExpr, Col, referenced_columns, remap_columns
 from batcher.plan.logical import (
     Aggregate,
@@ -160,17 +161,31 @@ def pre_aggregate_beneath_dimension(node: Aggregate, ctx: OptimizerContext) -> L
     if not isinstance(upper, Join) or upper.join_type != "inner" or not node.aggregates:
         return None
     for rewritten in (_push_under(node, upper), _reassociated(node, upper, facts_only=True)):
-        if rewritten is not None and _partial_reduces(rewritten, ctx):
+        if rewritten is not None and _partial_reduces(rewritten, node, ctx):
             return rewritten
     return None
 
 
-def _partial_reduces(rewritten: Aggregate, ctx: OptimizerContext) -> bool:
-    """Whether the partial's group keys can form at most a `_MIN_KEY_REDUCTION`th of its input.
+def _partial_reduces(rewritten: Aggregate, node: Aggregate, ctx: OptimizerContext) -> bool:
+    """Whether the partial pays: it shrinks its input, and the aggregate above keeps the grain.
 
-    The *product* of the keys' distinct counts, the bound independent keys can reach, rather
-    than the estimator's group count, which damps that product on an assumption of
+    The partial's keys must be able to form at most a `_MIN_KEY_REDUCTION`th of its input,
+    by the *product* of their distinct counts -- the bound independent keys can reach --
+    rather than the estimator's group count, which damps that product on an assumption of
     correlation and so can invent a reduction (`gates._moves_string_keys` has the case).
+
+    And a partial that only just clears that bar must also keep the outer aggregate's grain,
+    by the `_OUTER_GROUP_SHARE` `_moves_string_keys` applies: its saving is the string work
+    the outer aggregate stops doing per fact row, which is small when the outer aggregate
+    groups far more coarsely. `lineitem JOIN orders GROUP BY o_orderpriority`, five groups,
+    would otherwise take a 1.5M-group partial -- a 4x reduction -- it does not need
+    (26 -> 95 ms). A partial the estimator expects to reduce by `_MIN_PREAGG_REDUCTION` or
+    more pays at any grain, because its hash table is small: TPC-DS q70's per-state ROLLUP
+    level groups 5.8M fact rows into 51 stores, and q3's `(ss_item_sk, d_year)` over one
+    manufacturer's items and one month is a few hundred groups, which the key product --
+    every item, every year -- overstates by four orders of magnitude. The product stays the
+    test for the first bar, where an overstatement can only refuse. A side the plan has
+    already grouped (another rule's partial) is never grouped again.
     """
     from batcher.plan.visitor import walk
 
@@ -179,6 +194,8 @@ def _partial_reduces(rewritten: Aggregate, ctx: OptimizerContext) -> bool:
         for n in walk(rewritten.input)
         if isinstance(n, Aggregate) and any(a.alias.startswith(_PARTIAL) for a in n.aggregates)
     )
+    if any(isinstance(n, Aggregate) for n in walk(partial.input)):
+        return False
     try:
         side = ctx.estimator.estimate(partial.input)
         groups = 1.0
@@ -187,9 +204,33 @@ def _partial_reduces(rewritten: Aggregate, ctx: OptimizerContext) -> bool:
             if col is None or col.ndv is None:
                 return False
             groups *= max(1.0, col.ndv)
+        if groups * _MIN_KEY_REDUCTION > side.rows:
+            return False
+        if _group_bound(node, ctx) * _OUTER_GROUP_SHARE >= groups:
+            return True
+        expected = ctx.estimator.estimate(partial).rows
     except Exception:  # an unsizable side is no evidence of a reduction
         return False
-    return groups * _MIN_KEY_REDUCTION <= side.rows
+    return expected > 0 and expected * _MIN_PREAGG_REDUCTION <= side.rows
+
+
+def _group_bound(node: Aggregate, ctx: OptimizerContext) -> float:
+    """The most groups `node` can form: the product of its keys' distinct counts.
+
+    Measured the way the partial is, so the two sides of the comparison are the same kind of
+    number. The estimator's own group count damps that product on an assumption that the keys
+    are correlated, and seven customer strings are correlated -- with the customer -- so it
+    read TPC-DS q4's `year_total` as coarser than its own partial and refused a push worth
+    3.8 s -> 1.1 s at sf10. Falls back to that estimate when a key's count is unknown.
+    """
+    stats = ctx.estimator.estimate(node.input)
+    bound = 1.0
+    for key in node.group_keys:
+        col = stats.columns.get(key.expr.name) if isinstance(key.expr, Col) else None
+        if col is None or col.ndv is None:
+            return ctx.estimator.estimate(node).rows
+        bound *= max(1.0, col.ndv)
+    return min(bound, stats.rows)
 
 
 def _rewrite_aggregate(node: Aggregate) -> LogicalPlan | None:

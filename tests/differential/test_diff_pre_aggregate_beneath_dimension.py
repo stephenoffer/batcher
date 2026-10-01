@@ -137,7 +137,7 @@ def test_the_answer_does_not_depend_on_the_rule(tables, monkeypatch, no_plan_cac
     s = _session(tables)
     s.sql(_QUERIES[0]).collect()
     with_rule = s.sql(_QUERIES[0]).collect()
-    monkeypatch.setattr(reassociate, "_partial_reduces", lambda rewritten, ctx: False)
+    monkeypatch.setattr(reassociate, "_partial_reduces", lambda *_args: False)
     without = s.sql(_QUERIES[0]).collect()
 
     def rows(t):

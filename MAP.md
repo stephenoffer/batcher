@@ -1291,7 +1291,7 @@ Aggregate-through-join pushdown: pre-aggregate a join side to shrink its input.
 | module | lines | what it is |
 |---|---|---|
 | `gates.py` | 240 | The cost gates the aggregate-through-join pushdown rules consult. |
-| `reassociate.py` | 503 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
+| `reassociate.py` | 544 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
 | `rules.py` | 533 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
