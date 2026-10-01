@@ -52,6 +52,36 @@ def test_a_measured_filter_is_used_once_it_is_measured():
     assert actual / 2 <= est <= actual * 2, (est, actual)
 
 
+def test_a_measured_filter_survives_a_busy_machine(monkeypatch):
+    """The run after each re-plan is made to look slow, as a CPU-saturated box makes it.
+
+    The re-plans this query takes change only the filter's estimate, never what the engine
+    runs, so the memo's regret guard must not read their timing as a plan regression. It did:
+    it restored the unmeasured plan and pinned it, and this file's tests failed only under
+    load. Deterministic: the slow-down is injected at the guard, not generated.
+    """
+    from batcher.kyber.plan_cache import memo
+
+    plan_cache.clear()
+    real = memo.record_outcome
+    spiked: list[float] = []
+
+    def busy(result, elapsed_ms):
+        hit = memo._SERVED.get(id(result))
+        if hit is not None and hit[1] in memo._DISPLACED:  # the first run of a re-plan
+            spiked.append(elapsed_ms)
+            elapsed_ms = elapsed_ms * 5 + 10.0
+        real(result, elapsed_ms)
+
+    monkeypatch.setattr(plan_cache, "record_outcome", busy)
+    ds = _having(_orders())
+    for _ in range(4):
+        ds.collect()
+    assert spiked, "no re-plan was timed, so the guard was never exercised"
+    warm = _filter_estimate(ds)
+    assert "(learned)" in warm, warm
+
+
 def test_another_query_learning_does_not_invalidate_this_plans_dependencies():
     """B learning its own filter leaves every dependency A's cached plans recorded intact.
 

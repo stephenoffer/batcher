@@ -25,6 +25,7 @@ from collections.abc import Callable
 from typing import Any
 
 from batcher.kyber.plan_cache.keys import _BUCKET_STATE, _BUCKETED, _split
+from batcher.plan.physical import PhysicalPlan
 
 __all__ = ["clear", "lookup", "misses", "record_outcome", "served", "store"]
 
@@ -224,9 +225,51 @@ def record_outcome(result: Any, elapsed_ms: float) -> None:
         if displaced is None:
             return
         entry, prior_ms = displaced
+        if _runs_identically(entry[0], result):
+            # The re-plan moved only the annotations (estimates, provenance, bounds), not what
+            # the engine runs, so any difference in time is the machine, never the plan.
+            _BEST_MS[exact] = min(_BEST_MS[exact], prior_ms)
+            return
         slower = elapsed_ms > prior_ms * _REGRESSION_RATIO
         if slower and elapsed_ms - prior_ms > _REGRESSION_MIN_MS:
             _CACHE[exact] = entry
             _CACHE.move_to_end(exact)
             _BEST_MS[exact] = prior_ms
             _PINNED.add(exact)
+
+
+def _runs_identically(displaced: Any, replacement: Any) -> bool:
+    """Whether a displaced cache entry and the plan that replaced it execute the same way.
+
+    The regret guard compares one wall-clock sample of the replacement against the best of the
+    displaced plan's, which is only evidence about the *plans* when they differ. A re-plan very
+    often does not change what runs: a filter's selectivity being measured re-plans its key
+    (`optimizer.plan_deps`) and moves only the estimate annotated on it. Judging such a pair by
+    time reverted the measured plan to the unmeasured one whenever the box was busy for that
+    one run, and pinned it there, so a learned selectivity flickered back to the Selinger
+    default under load. The comparison is over what the engine and the source pushdowns read --
+    never the estimates, provenance or resource bounds -- and anything that is not a
+    `PhysicalPlan` is never identical, which keeps the guard's behaviour for every other value.
+    """
+    old = displaced[0] if isinstance(displaced, tuple) and displaced else displaced
+    if not isinstance(old, PhysicalPlan) or not isinstance(replacement, PhysicalPlan):
+        return False
+    if old is replacement:
+        return True
+
+    def executed(p: PhysicalPlan) -> tuple:
+        return (
+            p.to_json(),
+            p.source_projections,
+            p.source_predicates,
+            p.source_limits,
+            p.source_orderings,
+            p.prefer_materializing_aggregate,
+            p.prefer_sideways,
+            [(op.kind, op.backend, op.algorithm, op.params) for op in p.ops],
+        )
+
+    try:
+        return executed(old) == executed(replacement)
+    except Exception:  # an incomparable param is a difference, not a crash in the guard
+        return False

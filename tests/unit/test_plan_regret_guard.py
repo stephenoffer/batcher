@@ -10,6 +10,9 @@ from __future__ import annotations
 import pytest
 
 from batcher.kyber import plan_cache
+from batcher.plan.ids import OpId
+from batcher.plan.physical import PhysicalOp, PhysicalPlan, PlanProperties
+from batcher.plan.resource import ResourceBounds
 
 _KEY = "L1:x|full|plan|cfg|hub|stats|hw|[]"
 
@@ -85,3 +88,41 @@ def test_a_key_stops_replanning_after_its_budget():
             _replan()
     # The budget is spent: a dependency moving again no longer drops the plan.
     assert plan_cache.lookup(_KEY, lambda deps, rounds: False) is plans[-1]
+
+
+def _physical(est_rows: float, algorithm: str = "hash") -> PhysicalPlan:
+    """A one-operator plan; `est_rows` is an annotation, `algorithm` is what the engine runs."""
+    op = PhysicalOp(
+        op_id=OpId(0),
+        kind="Filter",
+        backend="engine",
+        algorithm=algorithm,
+        bounds=ResourceBounds(m_max_bytes=int(est_rows) * 8, c_max_credits=1, n_max_parallelism=1),
+        inputs=(),
+        properties=PlanProperties(est_rows=est_rows),
+    )
+    return PhysicalPlan(ir={"op": "filter"}, output_schema=None, ops=(op,))
+
+
+def test_a_replan_that_moved_only_estimates_is_never_reverted_for_time():
+    """A busy machine slowing the one run after a re-plan is not a regression of the plan.
+
+    A measured filter selectivity re-plans its key and changes only the annotated estimate;
+    reverting on time put the unmeasured estimate back, and pinned it, whenever that run was
+    slow (`tests/unit/test_plan_deps.py` failed only on a CPU-saturated box).
+    """
+    unmeasured, measured = _physical(1_667.0), _physical(0.0)
+    _store_and_run(unmeasured, 1.3)
+    _replan()
+    _store_and_run(measured, 9.0)  # 7x and 7.7 ms: past both thresholds, purely load
+    assert plan_cache.lookup(_KEY) is measured
+    _replan()  # not pinned: the key still re-plans when its dependencies move
+
+
+def test_a_replan_that_changed_what_runs_is_still_reverted():
+    """Positive control for the test above: the same timings revert a genuinely different plan."""
+    first, second = _physical(1_667.0, "hash"), _physical(0.0, "sort")
+    _store_and_run(first, 1.3)
+    _replan()
+    _store_and_run(second, 9.0)
+    assert plan_cache.lookup(_KEY, lambda deps, rounds: False) is first
