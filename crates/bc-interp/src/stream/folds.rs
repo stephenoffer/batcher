@@ -98,6 +98,7 @@ pub(super) fn fold_partial_parallel(
     let funcs = ops::agg_funcs(aggregates);
     let per_round = workers.saturating_mul(PAR_FOLD_MORSELS_PER_WORKER).max(2);
     let mut buf: Vec<RecordBatch> = Vec::with_capacity(per_round);
+    let mut pending: Vec<agg::Partial> = Vec::new();
     let mut folded: Option<agg::Partial> = None;
     let mut rows_in: u64 = 0;
 
@@ -110,18 +111,51 @@ pub(super) fn fold_partial_parallel(
         for piece in slice_to_morsels(morsel) {
             buf.push(piece);
             if buf.len() >= per_round {
-                folded = Some(fold_round(
-                    &mut buf, group_keys, aggregates, jit, &funcs, folded,
-                )?);
+                pending.push(fold_round(&mut buf, group_keys, aggregates, jit, &funcs)?);
+                if fold_pays(&pending, folded.as_ref()) {
+                    folded = Some(fold_pending(&mut pending, folded, &funcs)?);
+                }
             }
         }
     }
     if !buf.is_empty() {
-        folded = Some(fold_round(
-            &mut buf, group_keys, aggregates, jit, &funcs, folded,
-        )?);
+        pending.push(fold_round(&mut buf, group_keys, aggregates, jit, &funcs)?);
+    }
+    if !pending.is_empty() {
+        folded = Some(fold_pending(&mut pending, folded, &funcs)?);
     }
     Ok((folded, rows_in))
+}
+
+/// Whether to fold the `pending` partials into the carried state now, or let them pile up.
+///
+/// Folding re-hashes the carried state, so it pays only while the pending rows are at least as
+/// many as the carried ones. On a key that **reduces**, the carried state is the group count and
+/// a round of partials always outweighs it, so this folds exactly when it always did and state
+/// stays at `O(groups)`. On a key that does **not** reduce — a near-unique `GROUP BY`, whose
+/// state *is* its input — folding on a fixed count re-hashed the whole growing state every few
+/// morsels, which is quadratic in the relation: H2O q10 at 1e8 rows, routed here, ran **53 s**
+/// against 8 s on the materializing executor. Waiting for the pending rows to catch up doubles
+/// the carried state on each fold, so a row is re-hashed `O(log n)` times rather than `O(n)`,
+/// and the memory held is at most twice the state the fold would hold anyway.
+fn fold_pays(pending: &[agg::Partial], folded: Option<&agg::Partial>) -> bool {
+    let carried = folded.map_or(0, kept_rows);
+    pending.iter().map(kept_rows).sum::<usize>() >= carried
+}
+
+/// Combine `pending` (in arrival order) with the carried partial, which folds in last — the
+/// order the per-round fold always used.
+fn fold_pending(
+    pending: &mut Vec<agg::Partial>,
+    carried: Option<agg::Partial>,
+    funcs: &[agg::AggFunc],
+) -> Result<agg::Partial, InterpError> {
+    if let Some(prev) = carried {
+        pending.push(prev);
+    }
+    let merged = agg::combine(pending, funcs)?;
+    pending.clear();
+    Ok(merged)
 }
 
 /// One batch as morsel-sized, in-order, **zero-copy** slices — itself when it already fits.
@@ -140,27 +174,24 @@ fn slice_to_morsels(batch: RecordBatch) -> Vec<RecordBatch> {
 }
 
 /// One round of [`fold_partial_parallel`]: `partial` every buffered morsel in parallel, then
-/// combine them (and the partial carried in from earlier rounds) into one.
+/// combine them into one. The round's partial folds into the carried state when
+/// [`fold_pays`] says so.
 fn fold_round(
     buf: &mut Vec<RecordBatch>,
     group_keys: &[bc_ir::ProjectionItem],
     aggregates: &[bc_ir::AggregateItem],
     jit: &std::sync::OnceLock<ops::AggJit>,
     funcs: &[agg::AggFunc],
-    carried: Option<agg::Partial>,
 ) -> Result<agg::Partial, InterpError> {
     // Compiled once per query, before the fan-out, and shared by every worker — the same
     // `OnceLock` contract `fold_partial` documents. Compiling inside the `par_iter` would pay
     // Cranelift's per-expression cost once per core.
     let compiled = jit.get_or_init(|| ops::compile_agg(group_keys, aggregates, &buf[0]));
-    let mut partials: Vec<agg::Partial> = buf
+    let partials: Vec<agg::Partial> = buf
         .par_iter()
         .map(|m| ops::eval_partial_jit(m, group_keys, aggregates, compiled))
         .collect::<Result<Vec<_>, _>>()?;
     buf.clear();
-    if let Some(prev) = carried {
-        partials.push(prev);
-    }
     agg::combine(&partials, funcs).map_err(Into::into)
 }
 
@@ -483,7 +514,7 @@ pub(crate) fn fold_partial(
         // Bounded: without this the "streaming" aggregate quietly re-materializes its input as a
         // heap of per-morsel partials. Combining on *every* morsel would instead re-hash the
         // whole running state once per morsel; batching the fold keeps state at O(groups).
-        if partials.len() >= AGG_FOLD_EVERY {
+        if partials.len() >= AGG_FOLD_EVERY && fold_pays(&partials, folded.as_ref()) {
             if let Some(prev) = folded.take() {
                 partials.push(prev);
             }
@@ -700,6 +731,60 @@ mod fold_unit_tests {
             );
             assert_eq!(sums(&streamed).len(), groups.min(rows));
         }
+    }
+
+    /// Past [`AGG_FOLD_EVERY`] morsels the fold starts folding, and a near-unique key is where
+    /// [`fold_pays`] holds the pending partials back: both regimes still give the oracle's
+    /// answer, with more morsels than one fold's worth so the carried state is re-folded.
+    #[test]
+    fn the_fold_schedule_agrees_with_the_sequential_oracle() {
+        let rows = (AGG_FOLD_EVERY * 3 + 5) * bc_arrow::DEFAULT_MORSEL_ROWS;
+        for groups in [100usize, rows] {
+            let sources = vec![keyed(rows, groups)];
+            let plan = group_by_k_sum_v();
+            let mut streamed: Vec<(i64, i64)> = Vec::new();
+            let mut oracle: Vec<(i64, i64)> = Vec::new();
+            for (out, bs) in [
+                (
+                    &mut streamed,
+                    crate::execute_streaming(&plan, &sources, 0).unwrap(),
+                ),
+                (&mut oracle, crate::execute(&plan, &sources).unwrap()),
+            ] {
+                for b in &bs {
+                    let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                    let s = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                    out.extend((0..b.num_rows()).map(|i| (k.value(i), s.value(i))));
+                }
+                out.sort_unstable();
+            }
+            assert_eq!(streamed.len(), groups);
+            assert_eq!(streamed, oracle, "groups={groups}");
+        }
+    }
+
+    /// The fold is deferred exactly while the pending partials are outweighed by the carried
+    /// state — never for a reducing key, whose carried state is its (small) group count.
+    #[test]
+    fn a_fold_waits_until_the_pending_rows_catch_up() {
+        let partial = |n: i64| agg::Partial {
+            group_columns: vec![Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())) as ArrayRef],
+            states: Vec::new(),
+        };
+        let pending: Vec<agg::Partial> = (0..4).map(|_| partial(100)).collect();
+        assert!(fold_pays(&pending, None), "nothing carried: fold");
+        assert!(
+            fold_pays(&pending, Some(&partial(400))),
+            "pending == carried: fold"
+        );
+        assert!(
+            !fold_pays(&pending, Some(&partial(401))),
+            "carried outweighs pending: wait"
+        );
+        assert!(
+            fold_pays(&pending, Some(&partial(8))),
+            "a reducing key always folds"
+        );
     }
 
     /// A near-unique key does not stay on the chunked path.
