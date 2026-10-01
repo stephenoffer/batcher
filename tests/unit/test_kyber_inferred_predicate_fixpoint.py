@@ -114,7 +114,10 @@ def test_the_previous_behaviour_did_cycle(caplog, monkeypatch, shape):
     """
     import batcher.kyber.rules.pushdown as pushdown
 
+    # Both guards, since either one closes the cycle on its own: the bounds oracle, and the
+    # check that the target already proves the constraint further down.
     monkeypatch.setattr(pushdown, "implied_by_bounds", lambda *a, **k: False)
+    monkeypatch.setattr(pushdown, "_proven_below", lambda *a, **k: set())
     with caplog.at_level(logging.WARNING, logger="batcher.kyber"):
         SHAPES[shape]().explain()
     assert _fixpoint_warnings(caplog), f"{shape} was expected to cycle without the guard"

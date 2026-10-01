@@ -26,7 +26,11 @@ import itertools
 
 import pyarrow as pa
 
-from batcher.kyber.rules.agg_pushdown.rules import _PREAGG_MERGE
+from batcher.kyber.pass_base import OptimizerContext
+from batcher.kyber.registry import rule
+from batcher.kyber.rule import Phase
+from batcher.kyber.rules.agg_pushdown.gates import _OUTER_GROUP_SHARE
+from batcher.kyber.rules.agg_pushdown.rules import _MIN_PREAGG_REDUCTION, _PREAGG_MERGE
 from batcher.plan.expr_ir import AggExpr, Col, referenced_columns, remap_columns
 from batcher.plan.logical import (
     Aggregate,
@@ -37,7 +41,7 @@ from batcher.plan.logical import (
     Projection,
 )
 
-__all__ = ["pre_aggregate_facts"]
+__all__ = ["pre_aggregate_beneath_dimension", "pre_aggregate_facts"]
 
 _FRESH = itertools.count()
 #: Prefix of the partial-aggregate columns this rule creates, which is also how it recognizes
@@ -114,6 +118,121 @@ def pre_aggregate_facts(plan: LogicalPlan) -> LogicalPlan:
     )
 
 
+#: The row reduction the partial aggregate must promise, from its keys' distinct counts.
+_MIN_KEY_REDUCTION = 4.0
+
+
+@rule(name="pre_aggregate_beneath_dimension", phase=Phase.FUSION, matches=(Aggregate,))
+def pre_aggregate_beneath_dimension(node: Aggregate, ctx: OptimizerContext) -> LogicalPlan | None:
+    """Pre-aggregate the facts with the dimension that only groups them, beneath the one that
+    supplies string keys.
+
+    TPC-DS q4/q11/q74's `year_total` is `(store_sales JOIN customer) JOIN date_dim`, grouped by
+    seven `customer` strings and `d_year`, summing a `store_sales` measure. No join in that
+    tree has the facts on one side and every grouping dimension on the other, so neither
+    `pre_aggregation_through_join` nor `_push_under` can move the strings off the facts: every
+    one of 27M rows at sf10 is joined to `customer` and row-encoded by seven strings into the
+    group hash, and that aggregate is 3 of q11's 3.5 s.
+
+    Re-associated, `customer JOIN Agg(store_sales JOIN date_dim by ss_customer_sk, d_year)`,
+    the strings meet 1.5M partial groups instead. When join order already put the facts and
+    the plain dimension together, `(store_sales JOIN date_dim) JOIN customer`, the partial
+    goes beneath the top join as it is (`_push_under`). Both are correct for any fan-out
+    (see `_rewrite`), so neither needs the uniqueness proof `pre_aggregation_through_join`
+    waits for -- which on preloaded tables is a measured exact ndv that is rarely there.
+
+    This is the one shape `pre_aggregate_facts` takes that is a rule rather than an
+    alternative the aligned planner may keep, so it is narrowed to where that function's
+    measured single-node losses (TPC-H q10, q12, q18 at sf100) do not reach. Re-associated,
+    the measures must read the facts (`B`) alone, which excludes q10, whose measures are on
+    the far side of the upper join. Either way the string keys must come from the dimension
+    the partial leaves out, and the keys the partial groups by must promise a
+    `_MIN_KEY_REDUCTION` from the product of their distinct counts -- which q18's
+    `o_orderkey`, one group per order, cannot.
+
+    Args:
+        node: The aggregate.
+        ctx: The optimizer context, for the estimator.
+
+    Returns:
+        The re-associated aggregate, or None.
+    """
+    upper = node.input
+    if not isinstance(upper, Join) or upper.join_type != "inner" or not node.aggregates:
+        return None
+    for rewritten in (_push_under(node, upper), _reassociated(node, upper, facts_only=True)):
+        if rewritten is not None and _partial_reduces(rewritten, node, ctx):
+            return rewritten
+    return None
+
+
+def _partial_reduces(rewritten: Aggregate, node: Aggregate, ctx: OptimizerContext) -> bool:
+    """Whether the partial pays: it shrinks its input, and the aggregate above keeps the grain.
+
+    The partial's keys must be able to form at most a `_MIN_KEY_REDUCTION`th of its input,
+    by the *product* of their distinct counts -- the bound independent keys can reach --
+    rather than the estimator's group count, which damps that product on an assumption of
+    correlation and so can invent a reduction (`gates._moves_string_keys` has the case).
+
+    And a partial that only just clears that bar must also keep the outer aggregate's grain,
+    by the `_OUTER_GROUP_SHARE` `_moves_string_keys` applies: its saving is the string work
+    the outer aggregate stops doing per fact row, which is small when the outer aggregate
+    groups far more coarsely. `lineitem JOIN orders GROUP BY o_orderpriority`, five groups,
+    would otherwise take a 1.5M-group partial -- a 4x reduction -- it does not need
+    (26 -> 95 ms). A partial the estimator expects to reduce by `_MIN_PREAGG_REDUCTION` or
+    more pays at any grain, because its hash table is small: TPC-DS q70's per-state ROLLUP
+    level groups 5.8M fact rows into 51 stores, and q3's `(ss_item_sk, d_year)` over one
+    manufacturer's items and one month is a few hundred groups, which the key product --
+    every item, every year -- overstates by four orders of magnitude. The product stays the
+    test for the first bar, where an overstatement can only refuse. A side the plan has
+    already grouped (another rule's partial) is never grouped again.
+    """
+    from batcher.plan.visitor import walk
+
+    partial = next(
+        n
+        for n in walk(rewritten.input)
+        if isinstance(n, Aggregate) and any(a.alias.startswith(_PARTIAL) for a in n.aggregates)
+    )
+    if any(isinstance(n, Aggregate) for n in walk(partial.input)):
+        return False
+    try:
+        side = ctx.estimator.estimate(partial.input)
+        groups = 1.0
+        for key in partial.group_keys:
+            col = side.columns.get(key.alias)
+            if col is None or col.ndv is None:
+                return False
+            groups *= max(1.0, col.ndv)
+        if groups * _MIN_KEY_REDUCTION > side.rows:
+            return False
+        if _group_bound(node, ctx) * _OUTER_GROUP_SHARE >= groups:
+            return True
+        expected = ctx.estimator.estimate(partial).rows
+    except Exception:  # an unsizable side is no evidence of a reduction
+        return False
+    return expected > 0 and expected * _MIN_PREAGG_REDUCTION <= side.rows
+
+
+def _group_bound(node: Aggregate, ctx: OptimizerContext) -> float:
+    """The most groups `node` can form: the product of its keys' distinct counts.
+
+    Measured the way the partial is, so the two sides of the comparison are the same kind of
+    number. The estimator's own group count damps that product on an assumption that the keys
+    are correlated, and seven customer strings are correlated -- with the customer -- so it
+    read TPC-DS q4's `year_total` as coarser than its own partial and refused a push worth
+    3.8 s -> 1.1 s at sf10. Falls back to that estimate when a key's count is unknown.
+    """
+    stats = ctx.estimator.estimate(node.input)
+    bound = 1.0
+    for key in node.group_keys:
+        col = stats.columns.get(key.expr.name) if isinstance(key.expr, Col) else None
+        if col is None or col.ndv is None:
+            return ctx.estimator.estimate(node).rows
+        bound *= max(1.0, col.ndv)
+    return min(bound, stats.rows)
+
+
 def _rewrite_aggregate(node: Aggregate) -> LogicalPlan | None:
     """`Agg((A JOIN B) JOIN C)` -> `Agg'(A JOIN Agg_partial(B JOIN C))` when the measures
     read only `B` and `C` and the upper join reaches the lower one through `B` alone."""
@@ -131,6 +250,15 @@ def _rewrite_aggregate(node: Aggregate) -> LogicalPlan | None:
     options = [o for o in options if o is not None]
     if options:
         return max(options, key=_facts_pushed)
+    return _reassociated(node, upper)
+
+
+def _reassociated(node: Aggregate, upper: Join, *, facts_only: bool = False) -> Aggregate | None:
+    """`Agg((A JOIN B) JOIN C)` -> `Agg'(A JOIN Agg_partial(B JOIN C))`, or None.
+
+    The measures must read only `B` and `C` (`B` alone when `facts_only`), and the upper join
+    must reach the lower one through `B`.
+    """
     split = _split(upper)
     if split is None:
         return None
@@ -162,7 +290,8 @@ def _rewrite_aggregate(node: Aggregate) -> LogicalPlan | None:
             if agg.func not in _PREAGG_MERGE or agg.input2 is not None:
                 break
             cols = referenced_columns(agg.input) if agg.input is not None else set()
-            if any(col not in origin or origin[col][0] == a_letter for col in cols):
+            barred = {a_letter, "c"} if facts_only else {a_letter}
+            if any(col not in origin or origin[col][0] in barred for col in cols):
                 break
             specs.append(spec)
         else:

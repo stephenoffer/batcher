@@ -197,6 +197,11 @@ def _check_optimizer(o: OptimizerConfig) -> None:
     )
     _check(o.row_bytes >= 1, f"optimizer.row_bytes must be >= 1, got {o.row_bytes}")
     _check(
+        0.0 <= o.common_subplan_memory_fraction <= 1.0,
+        "optimizer.common_subplan_memory_fraction must be in [0, 1], "
+        f"got {o.common_subplan_memory_fraction}",
+    )
+    _check(
         0.0 <= o.learning_smoothing_alpha <= 1.0,
         f"optimizer.learning_smoothing_alpha must be in [0, 1], got {o.learning_smoothing_alpha}",
     )

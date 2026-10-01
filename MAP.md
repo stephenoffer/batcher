@@ -178,7 +178,7 @@ The public, fluent, lazy, expression-first API surface.
 | `multi_group.py` | 408 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 737 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
-| `subplan_reuse.py` | 584 | Compute a repeated subplan once and read it back (control plane, `api`). |
+| `subplan_reuse.py` | 620 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
 ### `batcher/api/adaptive/` — 5 · conductor
 
@@ -352,8 +352,8 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
 | `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 273 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
-| `run.py` | 676 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
-| `sizing.py` | 302 | What the conductor needs to know about a plan's size before it runs it. |
+| `run.py` | 679 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `sizing.py` | 342 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 592 | The three ways the conductor can execute an admitted plan, plus the source read. |
 | `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
 
@@ -1170,7 +1170,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `calibration.py` | 704 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 232 | The learned per-column statistics tables — their schema, their keys, and their bound. |
-| `common_subplan.py` | 322 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
+| `common_subplan.py` | 418 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
 | `learning.py` | 688 | Cross-execution learning — the metadata feedback loop. |
@@ -1279,7 +1279,7 @@ Kyber rule modules.
 | `literals.py` | 56 | Literal-value predicates shared by the expression rules: the i64 range and boolean literals. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 909 | Projection rewrites — collapse stacked projections and prune unread columns. |
-| `pushdown.py` | 637 | Predicate pushdown — evaluate filters as early as possible. |
+| `pushdown.py` | 692 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 574 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
 | `zonemap_pruning.py` | 580 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
@@ -1291,7 +1291,7 @@ Aggregate-through-join pushdown: pre-aggregate a join side to shrink its input.
 | module | lines | what it is |
 |---|---|---|
 | `gates.py` | 240 | The cost gates the aggregate-through-join pushdown rules consult. |
-| `reassociate.py` | 415 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
+| `reassociate.py` | 544 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
 | `rules.py` | 533 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
@@ -1595,7 +1595,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 | `base.py` | 117 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 681 | The result cache — a memory-bounded, cost-aware store of materialized query results. |
 | `cache_disk.py` | 382 | The result cache's disk tier — where an evicted result goes instead of nowhere. |
-| `manager.py` | 720 | The Carbonite resource manager entry point. |
+| `manager.py` | 722 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/accel/` — 3 · subsystem
 
@@ -1665,7 +1665,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `morsel.py` | 390 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
 | `scheduling.py` | 288 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
-| `spill_advice.py` | 469 | Whether a query goes out of core, and what shape its spilled state takes. |
+| `spill_advice.py` | 479 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 176 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
@@ -2746,7 +2746,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 3343 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3349 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `env.py` | 281 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
@@ -2765,7 +2765,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `distributed.py` | 269 | Range and combination checks for the `distributed` section and its shuffle TLS block. |
 | `gate.py` | 58 | The validation gate: run every section check once per distinct `Config` object. |
 | `gpu.py` | 58 | Range checks for the GPU packing and merge tunables. |
-| `sections.py` | 392 | The range and consistency checks themselves, one function per `Config` section. |
+| `sections.py` | 397 | The range and consistency checks themselves, one function per `Config` section. |
 
 ### `batcher/_internal/` — 0 · utility
 

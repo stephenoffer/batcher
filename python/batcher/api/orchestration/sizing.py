@@ -34,6 +34,7 @@ __all__ = [
     "partitions_from_physical",
     "projected_input_bytes",
     "proven_empty_table",
+    "resident_input_bytes",
 ]
 
 # When the user leaves a knob unset, fill it from the same analyses Kyber and Carbonite
@@ -148,6 +149,45 @@ def projected_input_bytes(
             return 0
         total += rows * width
     return int(total)
+
+
+def resident_input_bytes(
+    sources: list[Source],
+    projections: dict[int, list[str]],
+    scanned: Collection[int] | None = None,
+) -> int:
+    """The share of `projected_input_bytes` this process already held, under a sensed envelope.
+
+    A `resident` source (an in-memory table) is resolved by handing its batches over without
+    a copy, so reading it allocates nothing: its bytes were spent when it was built, and they
+    stay held whichever path the query takes -- the out-of-core path spills partitioned
+    *copies* while the original stays referenced by its owner. An envelope **sensed** from
+    live free RAM (`memory.max_memory_bytes_sensed`) was measured with those bytes already
+    held, so charging them against it again counts them twice, for memory spilling cannot
+    release. TPC-DS sf10 with its tables preloaded is that shape: under a 2 GiB envelope q47
+    counted its resident `store_sales` as new input, went out of core, wrote 3.7 GiB of spill
+    and ran 7.1 s against 0.9 s in memory.
+
+    An envelope the caller *set* is different: it caps the process, held tables included, so
+    nothing is subtracted from it and this returns `0`.
+
+    Args:
+        sources: The plan's bound sources.
+        projections: Pushed column projections, keyed by source index.
+        scanned: The source indices the plan reads, or `None` to count them all.
+
+    Returns:
+        The projected bytes of the scanned resident sources under a sensed envelope; `0`
+        under a configured one, when there are none, or when they cannot be sized.
+    """
+    from batcher.config import active_config
+
+    if not active_config().memory.max_memory_bytes_sensed:
+        return 0
+    held = [i for i, src in enumerate(sources) if getattr(src, "resident", False)]
+    if scanned is not None:
+        held = [i for i in held if i in scanned]
+    return projected_input_bytes(sources, projections, held) if held else 0
 
 
 def _estimated_row_count(src: Source) -> int | None:

@@ -899,6 +899,12 @@ class OptimizerConfig:
     # result until the query ends, so the budget is the whole gate. Sized like
     # `memory.result_cache_max_bytes` and for the same reason; `0` turns the rewrite off.
     common_subplan_max_bytes: int = 256 * 1024 * 1024  # 256 MiB
+    # ...raised to this share of the hard memory budget when that is larger, so the budget
+    # scales with the machine instead of capping every box at the laptop figure. A fixed cap
+    # is a scale threshold in disguise: TPC-DS q67's shared ROLLUP aggregate is 57 MB at sf1
+    # and 572 MB at sf10, so at sf10 it was materialized, refused, and then recomputed by every
+    # one of its nine levels. `0` keeps the cap fixed at `common_subplan_max_bytes`.
+    common_subplan_memory_fraction: float = 1 / 16
     # Build-side byte threshold below which a join is broadcast (the right side is
     # replicated to every worker) rather than shuffled — Spark's
     # autoBroadcastJoinThreshold. Both the planner's *estimate*-based decision and the

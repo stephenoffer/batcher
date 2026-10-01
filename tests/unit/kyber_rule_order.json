@@ -14,6 +14,7 @@
   "pre_aggregation_through_join@2",
   "pre_aggregation_through_reordered_join@5",
   "pre_aggregate_join_measures@2",
+  "pre_aggregate_beneath_dimension@5",
   "de_morgan_not_of_conjunction@1",
   "de_morgan_not_of_disjunction@1",
   "drop_double_negation@1",

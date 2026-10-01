@@ -208,7 +208,9 @@ class SpillAdvisor:
         """
         return input_bytes > 0 and input_bytes > self.hard_budget()
 
-    def resident_total_exceeds_budget(self, input_bytes: int, plan: PhysicalPlan) -> bool:
+    def resident_total_exceeds_budget(
+        self, input_bytes: int, plan: PhysicalPlan, *, held_bytes: int = 0
+    ) -> bool:
         """Whether the resident input **plus** the plan's peak operator state overflows the
         envelope.
 
@@ -232,9 +234,16 @@ class SpillAdvisor:
         `input_exceeds_budget`: an unsizable source must not be read as a small one. The other
         signals (`should_spill`, live pressure) still apply in that case.
 
+        `held_bytes` is the part of the input this process held before the query started (an
+        in-memory table). It still sizes the intermediates, since bytes-per-row is a property
+        of what is read, but it is not charged as input: resolving it copies nothing, the
+        live envelope was sensed with it already held, and going out of core cannot release
+        it -- the spill writes copies while the owner keeps the original.
+
         Args:
             input_bytes: Metadata-only estimate of the resident input, or `0` for unknown.
             plan: The physical plan about to run.
+            held_bytes: The share of `input_bytes` already held before the query began.
 
         Returns:
             True when the two together do not fit, so the query should go out of core.
@@ -264,7 +273,8 @@ class SpillAdvisor:
         # The cost is real and worth stating: this is the trade the module already names --
         # over-estimating costs latency, under-estimating costs the process -- taken
         # deliberately rather than by accident.
-        return input_bytes + 2 * max(0, self.peak_bytes(plan), widest) > self.hard_budget()
+        added = max(0, input_bytes - held_bytes)
+        return added + 2 * max(0, self.peak_bytes(plan), widest) > self.hard_budget()
 
     def _widest_intermediate(self, input_bytes: int, plan: PhysicalPlan) -> int:
         """Bytes of the largest operator *output* the materializing path holds resident.

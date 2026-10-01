@@ -522,13 +522,15 @@ class ResourceManager:
         """
         return self._spill.input_exceeds_budget(input_bytes)
 
-    def resident_total_exceeds_budget(self, input_bytes: int, plan: PhysicalPlan) -> bool:
+    def resident_total_exceeds_budget(
+        self, input_bytes: int, plan: PhysicalPlan, *, held_bytes: int = 0
+    ) -> bool:
         """Whether the resident input plus the plan's peak state overflows the envelope.
 
         The two terms coexist on the in-memory path and were only ever compared to the budget
         separately. See `policies.spill_advice.SpillAdvisor.resident_total_exceeds_budget`.
         """
-        return self._spill.resident_total_exceeds_budget(input_bytes, plan)
+        return self._spill.resident_total_exceeds_budget(input_bytes, plan, held_bytes=held_bytes)
 
     def recommend_spill_partitions(self, plan: PhysicalPlan) -> int | None:
         """Out-of-core buckets to shard `plan`'s spilled state into, or `None` to keep the

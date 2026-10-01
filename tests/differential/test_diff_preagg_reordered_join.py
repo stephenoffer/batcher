@@ -84,9 +84,32 @@ def test_unique_dimension_pushes_and_matches_duckdb(duck):
 
 
 def test_duplicated_dimension_key_stands_down_and_matches_duckdb(duck):
-    result, explained = _run(duck, _tables(duplicate_key=True))
-    assert not _pushed(explained), explained
+    tables = _tables(duplicate_key=True)
+    result, _explained = _run(duck, tables)
+    # The uniqueness-licensed rewrite must stand down. A partial beneath the join may still
+    # appear, from `pre_aggregate_beneath_dimension`, whose merge is correct for any fan-out;
+    # the answer below is what proves the duplicated key was not counted once.
+    assert not _uniqueness_push(tables), "the push that needs a unique dimension fired"
     assert_same(result, duck.sql(_QUERY))
+
+
+def _uniqueness_push(tables: dict[str, pa.Table]) -> bool:
+    """Whether `pre_aggregation_through_join`'s own partials (`__pre_*`) are in the plan."""
+    from batcher import kyber
+    from batcher.core import default_hub
+    from batcher.plan.logical import Aggregate
+    from batcher.plan.visitor import walk
+
+    session = bt.Session()
+    for name, table in tables.items():
+        session.register(name, table)
+    ds = session.sql(_QUERY)
+    ds.collect()
+    plan = kyber.optimize_logical(ds._plan, sources=ds._sources, hub=default_hub())
+    return any(
+        isinstance(n, Aggregate) and any(a.alias.startswith("__pre_") for a in n.aggregates)
+        for n in walk(plan)
+    )
 
 
 def test_empty_fact_table_matches_duckdb(duck):
