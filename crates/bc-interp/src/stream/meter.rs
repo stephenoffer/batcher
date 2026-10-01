@@ -154,12 +154,39 @@ impl Meter {
     /// Record one morsel through a pipeline operator: rows in, rows out, and the nanoseconds
     /// its own transform took.
     pub(crate) fn morsel(&self, op: u32, rows_in: u64, out: &RecordBatch, elapsed_ns: u64) {
+        let bytes = crate::batch_bytes(std::slice::from_ref(out));
+        self.morsel_counted(op, rows_in, out.num_rows() as u64, bytes, elapsed_ns);
+    }
+
+    /// [`Self::morsel`] for a filter whose kept rows were never gathered, because the filter
+    /// stacked on it consumed its mask instead (`pipeline::filter_stream`).
+    ///
+    /// Rows in and out are exact. The bytes are the input's in proportion to the rows kept —
+    /// what the gathered morsel would have weighed, to within the variance of row width — so the
+    /// per-family bytes-per-row the memory model learns from filters is the one an unfused run
+    /// reports, rather than a zero for a relation that was simply never built.
+    pub(crate) fn morsel_ungathered(
+        &self,
+        op: u32,
+        rows_in: u64,
+        rows_out: u64,
+        input: &RecordBatch,
+        elapsed_ns: u64,
+    ) {
+        let in_bytes = crate::batch_bytes(std::slice::from_ref(input));
+        let bytes = if rows_in == 0 {
+            0
+        } else {
+            (u128::from(in_bytes) * u128::from(rows_out) / u128::from(rows_in)) as u64
+        };
+        self.morsel_counted(op, rows_in, rows_out, bytes, elapsed_ns);
+    }
+
+    fn morsel_counted(&self, op: u32, rows_in: u64, rows_out: u64, bytes: u64, elapsed_ns: u64) {
         let c = &self.counters[op as usize];
         c.rows_in.fetch_add(rows_in, Ordering::Relaxed);
-        c.rows_out
-            .fetch_add(out.num_rows() as u64, Ordering::Relaxed);
+        c.rows_out.fetch_add(rows_out, Ordering::Relaxed);
         c.elapsed_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-        let bytes = crate::batch_bytes(std::slice::from_ref(out));
         c.result_bytes.fetch_add(bytes, Ordering::Relaxed);
         // A pipeline operator holds one morsel at a time, so its peak *is* the largest morsel it
         // ever produced — not the sum of them, which is the whole point of streaming.
