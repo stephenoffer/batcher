@@ -616,15 +616,9 @@ def _run_relational_scoped(
             spilled = measured_spill_collect(logical_opt, sources, parts, ctx, watch)
             phases.record("core.execute.spilled", time.perf_counter() - mark)
             if spilled is not None:
+                rows = spilled.num_rows
                 _close_resident_free_loops(
-                    plan,
-                    logical_opt,
-                    ctx,
-                    rm,
-                    sources,
-                    spilled.num_rows,
-                    decisions,
-                    started=started,
+                    plan, logical_opt, ctx, rm, sources, rows, decisions, started=started
                 )
                 return spilled, decisions
         # The phase a reader came for. Everything recorded above it is *planning*, so the
@@ -633,7 +627,8 @@ def _run_relational_scoped(
         phases.begin("core.execute")
         mark = time.perf_counter()
         table = _execute_in_memory(logical_opt, plan, opt, ctx, resolved)
-        phases.record("core.execute", time.perf_counter() - mark)
+        phases.record("core.execute", elapsed := time.perf_counter() - mark)
+        kyber.plan_cache.record_outcome(opt, elapsed * 1e3)  # the memo's regret guard
 
     _close_learning_loops(
         plan, logical_opt, ctx, rm, sources, resolved, table, decisions, started=started

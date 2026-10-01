@@ -1448,13 +1448,16 @@ class StatsEstimator:
         rstat = right.columns.get(node.right_keys[0])
         if lstat is None or rstat is None:
             return None
+        left_d, right_d = left_ndv or lstat.ndv, right_ndv or rstat.ndv
+        if _stale_mcv(lstat.mcv, left_d) or _stale_mcv(rstat.mcv, right_d):
+            return None
         return mcv_join_rows(
             left.rows,
             right.rows,
             lstat.mcv,
             rstat.mcv,
-            left_ndv or lstat.ndv,
-            right_ndv or rstat.ndv,
+            left_d,
+            right_d,
             _key_non_null(node.left_keys, left),
             _key_non_null(node.right_keys, right),
         )
@@ -2029,6 +2032,22 @@ def _ordinal_range(stat: ColumnStat) -> tuple[float, float] | None:
     if lo is None or hi is None or hi < lo:
         return None
     return lo, hi
+
+
+def _stale_mcv(mcv: dict[str, float] | None, ndv: float | None) -> bool:
+    """Whether a key's frequency table lists more values than the relation can still hold.
+
+    A filter on *another* column keeps the key's measured frequency table (it was measured on
+    the source) while capping the key's distinct count at the surviving rows. Past that point
+    the two disagree, and the skew+residual decomposition reads the disagreement as "every
+    surviving row holds one of the listed values" -- with no residual left for anything else.
+    JOB q4c's `info_type` filtered to its one `'rating'` row kept a table listing eight other
+    ids, none of which `movie_info_idx` held, and its join to 806,365 rows was priced at zero
+    against 448,969 actual. The plan built on that zero ran every other join over the "empty"
+    side first. A table that cannot describe the relation is not consulted; the containment
+    estimate answers instead.
+    """
+    return bool(mcv) and ndv is not None and ndv < len(mcv)
 
 
 def _key_non_null(keys: tuple, stats: RelStats) -> float:

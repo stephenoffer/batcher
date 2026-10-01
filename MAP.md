@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1554 Python modules across 220 packages and 325 Rust files across 14 crates.
+Covering 1555 Python modules across 220 packages and 325 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -352,7 +352,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
 | `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 273 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
-| `run.py` | 679 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 674 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 342 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 592 | The three ways the conductor can execute an admitted plan, plus the source read. |
 | `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
@@ -430,7 +430,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 735 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1494 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1517 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 800 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
@@ -1254,7 +1254,7 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 508 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 239 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 635 | The `Optimizer` façade and the module-level entry points. |
+| `facade.py` | 637 | The `Optimizer` façade and the module-level entry points. |
 | `plan_deps.py` | 118 | Re-validate a memoized plan against the measurements its own planning read. |
 
 ### `batcher/kyber/plan_cache/` — 3 · subsystem
@@ -1264,7 +1264,7 @@ Memoize the optimizer — the same query, planned once.
 | module | lines | what it is |
 |---|---|---|
 | `keys.py` | 574 | The plan-cache key: an exact half that decides meaning and a learned half that decides quality. |
-| `memo.py` | 125 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
+| `memo.py` | 232 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
 | `writes.py` | 128 | Advance the learning generation only when a write could change a plan. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -1446,11 +1446,12 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | `order_budget.py` | 191 | How much join-order search a query is worth — the budget the DP search spends against. |
 | `order_goo.py` | 133 | Greedy operator ordering: the bushy fallback when the join-order DP cannot afford a graph. |
 | `order_residual.py` | 178 | Non-equi predicates inside a join region: hoist them, then re-attach where they fit. |
-| `order_search.py` | 499 | Join-order search: pick a tree over an extracted join graph, and build it. |
+| `order_search.py` | 538 | Join-order search: pick a tree over an extracted join graph, and build it. |
 | `outer_float.py` | 211 | Float a left/semi/anti join above the inner joins that only read its preserved side. |
 | `projection.py` | 191 | Push a derived projection through a join onto the side it reads, so the join |
 | `range_join.py` | 365 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
-| `rewrites.py` | 648 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
+| `rewrites.py` | 520 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
+| `runtime_range.py` | 227 | Runtime join filters — the key range one side of a join implies about the other. |
 
 ### `batcher/kyber/rules/math_algebra/` — 3 · subsystem
 
@@ -1567,7 +1568,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 270 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 488 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 2403 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 2422 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `group_bound.py` | 87 | An upper bound on a group-by's output from where its keys come from, not what they hold. |
 | `join_columns.py` | 202 | Join column-statistics propagation. |
 | `predicate_bounds.py` | 178 | Tighten a filtered column's bounds to the values its own predicate admits. |

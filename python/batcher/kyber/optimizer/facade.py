@@ -586,6 +586,7 @@ def optimize_full(
     cached = plan_cache.lookup(key, lambda deps, rounds: dependencies_hold(hub, deps, rounds))
     if cached is not None:
         phys, plan, decisions = cached
+        plan_cache.served(phys, key)
         return phys, plan, list(decisions)  # decisions are telemetry; hand out a copy
 
     optimizer = Optimizer(cfg, sources, hub, source_stats=source_stats, hardware=hardware)
@@ -593,6 +594,7 @@ def optimize_full(
     deps = dependency_snapshot(hub, getattr(optimizer, "consulted", set()))
     plan_cache.store(key, result, sources, max_entries, deps)
     phys, plan, decisions = result
+    plan_cache.served(phys, key)
     return phys, plan, list(decisions)
 
 
