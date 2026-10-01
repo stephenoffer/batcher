@@ -42,7 +42,7 @@ from batcher.plan.logical import Filter, LogicalPlan, Scan
 from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import derivation_key
 from batcher.plan.types import logical_bytes, retained_bytes
-from batcher.plan.visitor import children, transform_up, walk, with_children
+from batcher.plan.visitor import children, transform_up, walk
 
 __all__ = ["reuse_common_subplans"]
 
@@ -298,63 +298,7 @@ def _reuse(
         )
     if unlearned:
         _learn_row_filters(plan, srcs, ctx, key, sources, unlearned)
-    if distributed:  # each binding would be shipped to the workers as a copy of its own
-        return plan, srcs
-    return _one_binding_per_scan(plan, srcs, set(range(len(sources), len(srcs))))
-
-
-def _one_binding_per_scan(
-    plan: LogicalPlan, srcs: list[Source], shared: set[int]
-) -> tuple[LogicalPlan, list[Source]]:
-    """Give every scan of a materialized subplan its own source binding over the same batches.
-
-    The rewrite reads one result back once per appearance, and binding all of them to one
-    source id is the shape the engine reads as a self-join: `bc_interp::streaming_parallelizes`
-    is "no source is scanned twice", and a plan failing it leaves the streaming parallel
-    executor for its whole length -- to the materializing one when that fits, to the
-    single-threaded pipeline when it does not. So sharing a subplan bought one execution and
-    paid for it with every other operator's parallelism. TPC-DS q67 at sf10 is that shape:
-    its nine ROLLUP levels each re-aggregate the shared 4.8M-row finest aggregate, and with
-    one binding the levels ran unsharded at ~2.5 s apiece.
-
-    Single-node only. On one machine a second binding costs nothing: it is another
-    `InMemorySource` over the same batches, with no copy. The distributed route would ship
-    each binding to the workers separately, so it keeps one. Learned row filters are
-    unaffected: they are read before this, against the one-binding plan they are keyed to.
-
-    Args:
-        plan: The rewritten plan.
-        srcs: Its bound sources, the materialized subplans last.
-        shared: The source ids of the materialized subplans.
-
-    Returns:
-        The plan with each scan of a shared source after the first rebound to a fresh source
-        id, and the source list those ids index.
-    """
-    out = list(srcs)
-    seen: set[int] = set()
-
-    def rebind(node: LogicalPlan) -> LogicalPlan:
-        if isinstance(node, Scan):
-            if node.source_id not in shared:
-                return node
-            if node.source_id not in seen:
-                seen.add(node.source_id)
-                return node
-            original = srcs[node.source_id]
-            out.append(
-                InMemorySource(
-                    original.read(),
-                    zone_maps=False,
-                    ephemeral=True,
-                    derivation=original.derivation,
-                )
-            )
-            return dataclasses.replace(node, source_id=len(out) - 1)
-        kids = children(node)
-        return with_children(node, [rebind(k) for k in kids]) if kids else node
-
-    return rebind(plan), out
+    return plan, srcs
 
 
 def _row_filters(key: tuple | None, sources: list[Source]) -> dict[int, Expr | None]:
@@ -467,7 +411,7 @@ def _narrowed(plan: LogicalPlan, appearances: list[LogicalPlan], sid: int) -> Lo
 
 
 def _analyze(
-    plan: LogicalPlan, sources: list[Source], ctx, cfg, budget: int
+    plan: LogicalPlan, sources: list[Source], ctx, cfg, budget: int | None = None
 ) -> tuple[tuple[int, ...], ...]:
     """Which subtrees to materialize, as pre-order positions in `plan`'s own walk.
 
@@ -495,7 +439,7 @@ def _analyze(
         sources: Its bound inputs, positionally.
         ctx: The execution context, for the hub the estimator reads.
         cfg: The optimizer config, for the row-width fallback.
-        budget: The size budget, from `_budget_bytes`.
+        budget: The size budget; `_budget_bytes` of the active config when omitted.
 
     Returns:
         One position tuple per chosen subtree, outermost first; empty when nothing repeats.
@@ -503,6 +447,10 @@ def _analyze(
     from batcher.api.source_stats import build_estimator
     from batcher.kyber.common_subplan import common_subplans, structural_key
 
+    if budget is None:
+        from batcher.config import active_config
+
+        budget = _budget_bytes(active_config())
     canonical = _one_id_per_source(plan, sources)
     targets = common_subplans(
         canonical,

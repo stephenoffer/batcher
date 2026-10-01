@@ -6,8 +6,7 @@ really fired -- every assertion about the answer would also pass on a rewrite th
 
 * a CTE referenced twice at the head of a comma join (TPC-DS q59), where the shared subtree
   must be the CTE and not the cross product as written;
-* a windowed CTE read three times (TPC-DS q47), where each read of the materialized result
-  gets its own source binding so the plan stays on the parallel executor;
+* a windowed CTE read three times (TPC-DS q47);
 * a ROLLUP whose shared finest aggregate is over the fixed cap (TPC-DS q67), held because the
   budget now rises with the memory budget.
 
@@ -28,7 +27,7 @@ from _harness import assert_same, assert_same_for_query
 from batcher import core
 from batcher.api.subplan_reuse import reuse_common_subplans
 from batcher.config import Config, config_context
-from batcher.plan.logical import Aggregate, Scan
+from batcher.plan.logical import Aggregate
 from batcher.plan.visitor import walk
 
 pytestmark = pytest.mark.differential
@@ -124,18 +123,6 @@ def test_a_windowed_cte_read_three_times_matches_duckdb(duck, tables):
     assert_same_for_query(got, duck.sql(_WINDOWED_CTE), _WINDOWED_CTE)
 
 
-def test_each_read_of_a_shared_result_has_its_own_binding(tables):
-    """The control: one binding read three times is what pushes the plan off the parallel
-    executor (`bc_interp::streaming_parallelizes`), and the rebinding is what prevents it."""
-    ds = _session(tables).sql(_WINDOWED_CTE)
-    plan, sources = _rewritten(ds)
-    materialized = range(len(ds._sources), len(sources))
-    scans = [n.source_id for n in walk(plan) if isinstance(n, Scan) and n.source_id in materialized]
-    assert len(scans) == 3, "the CTE is read three times"
-    assert len(set(scans)) == 3, f"reads of the shared result share a binding: {scans}"
-    assert len({id(sources[i]._batches[0]) for i in scans}) == 1, "the bindings must not copy"
-
-
 # TPC-DS q67: a ROLLUP over a join, every level rolled up from one shared finest aggregate.
 _ROLLUP = """
 SELECT st.name, d.dw, d.dm, f.s, sum(f.v) sv, count(f.v) nv, min(f.v) lo
@@ -186,3 +173,21 @@ def test_the_rollup_answer_does_not_depend_on_sharing(tables):
         return sorted(t.to_pylist(), key=repr)
 
     assert rows(shared) == rows(recomputed)
+
+
+# TPC-DS q77: a genuine cross product (`FROM cs, cr`) inside the shared ROLLUP input.
+_ROLLUP_OVER_PRODUCT = """
+WITH cs AS (SELECT s, sum(v) t, count(*) n FROM fact GROUP BY s),
+     cr AS (SELECT dm, sum(v) r FROM fact, dim WHERE k = dk GROUP BY dm)
+SELECT channel, s, sum(t) tt, sum(r) rr, sum(n) nn FROM (
+  SELECT 'catalog' channel, s, t, r, n FROM cs, cr
+  UNION ALL SELECT 'store' channel, s, t, 0.0 r, n FROM cs
+) u GROUP BY ROLLUP(channel, s)
+"""
+
+
+def test_a_rollup_over_a_real_cross_product_matches_duckdb(duck, tables):
+    _register(duck, tables)
+    got = _session(tables).sql(_ROLLUP_OVER_PRODUCT).collect()
+    assert got.num_rows > 20
+    assert_same(got, duck.sql(_ROLLUP_OVER_PRODUCT))

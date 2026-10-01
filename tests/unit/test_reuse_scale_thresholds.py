@@ -141,6 +141,61 @@ def test_a_cross_join_of_two_multi_row_sides_is_pending():
     assert cs._pending_cartesian(joins[0], _Estimator())
 
 
+def test_a_cross_product_the_query_really_computes_is_still_shared():
+    """TPC-DS q77's `FROM cs, cr` is a cartesian product with no `WHERE` to lose.
+
+    It sits inside the shared ROLLUP input, under the union of the channels, and nothing above
+    it filters it -- so it is not a comma join cut from its condition, and declining it is
+    what made q77 recompute that input once per level (65 ms -> 146 ms at sf10).
+    """
+    found = _candidates(
+        "WITH cs AS (SELECT s, sum(v) t FROM fact GROUP BY s), "
+        "cr AS (SELECT k % 3 g, sum(v) r FROM fact GROUP BY k % 3) "
+        "SELECT channel, s, sum(t) tt, sum(r) rr FROM ("
+        "  SELECT 'a' channel, s, t, r FROM cs, cr "
+        "  UNION ALL SELECT 'b' channel, s, t, 0.0 r FROM cs"
+        ") u GROUP BY ROLLUP(channel, s)"
+    )
+    assert found, "the levels' shared input must still be offered for reuse"
+    assert any(_has_cartesian_join(n) for n in found), "the shared input holds the product"
+
+
+class _HugeInput(_Estimator):
+    """A shared aggregate over an enormous scan, under a join priced larger still.
+
+    The aggregate's own share of the plan is tiny -- the share bar refuses it -- but what one
+    recomputation of it costs is billions of work units, which no fixed round trip outweighs.
+    That is TPC-DS q23's `frequent_ss_items` at sf10.
+    """
+
+    def estimate(self, node):
+        rows = {"Scan": 5e9, "Join": 1e13}.get(type(node).__name__, 10.0)
+        return type("Stats", (), {"rows": rows})()
+
+
+def _shared_aggregate():
+    ds = bt.from_pydict({"k": [1, 2, 3], "v": [10, 20, 30]})
+    agg = ds.group_by("k").agg(total=bt.col("v").sum())
+    q = agg.join(agg.select(bt.col("k").alias("hk")), left_on="k", right_on="hk")
+    return _one_id_per_source(q._plan, q._sources)
+
+
+def test_a_large_absolute_saving_is_worth_a_small_share():
+    found = cs.common_subplans(
+        _shared_aggregate(), lambda: _HugeInput(), max_bytes=256 << 20, row_bytes=64
+    )
+    assert [type(n).__name__ for n in found] == ["Aggregate"]
+
+
+def test_the_share_bar_alone_refuses_it(monkeypatch):
+    """The control: without the absolute floor the same candidate is declined."""
+    monkeypatch.setattr(cs, "_MIN_SAVED_COST", float("inf"))
+    found = cs.common_subplans(
+        _shared_aggregate(), lambda: _HugeInput(), max_bytes=256 << 20, row_bytes=64
+    )
+    assert found == []
+
+
 # --- the reuse budget ------------------------------------------------------------------
 
 

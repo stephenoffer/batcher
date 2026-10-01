@@ -34,6 +34,7 @@ from batcher.plan.logical import (
     Filter,
     Join,
     LogicalPlan,
+    Project,
     Sort,
     Window,
     is_cartesian_key_pair,
@@ -170,6 +171,7 @@ def common_subplans(
 
     accepted: list[LogicalPlan] = []
     covered: set[str] = set()
+    under_where = _under_a_where(plan)
     sized = None
     as_run = normalize or (lambda node: node)
     run_plan = None
@@ -184,7 +186,7 @@ def common_subplans(
             # cost, so normalizing it per candidate would optimize the same plan once per
             # candidate for the same answer.
             run_plan = as_run(plan)
-        if _pending_cartesian(node, sized):
+        if id(node) in under_where and _pending_cartesian(node, sized):
             continue
         run_node = as_run(node)
         if not _fits(run_node, sized, max_bytes, row_bytes):
@@ -224,6 +226,17 @@ def common_subplans(
 #: fixed cost, so the same fixed cost is worth clearing a lower bar for.
 _MIN_SAVED_SHARE = 1.0 / 6.0
 
+#: A saving this large, in `CostModel` work units, pays for the materialization at any share.
+#:
+#: The share bar prices the fixed cost of materializing -- one extra engine round trip, ~18 ms
+#: on TPC-H q20 -- against the plan it sits in, which is right for a small query and wrong for a
+#: large one: the fixed cost does not grow with the data and the saving does. TPC-DS q23's
+#: `frequent_ss_items` aggregate is 28% of the plan's cost and appears twice, a saving of 14%
+#: of it, so the share bar refused it at every scale -- while at sf10 that is 5.6e9 units, two
+#: of the query's 4.3 s, against the same ~18 ms. Set well above the largest saving the share
+#: bar was measured to be right to refuse (q20's semi-join, 1.6e8 at sf1 and 1.6e9 at sf10).
+_MIN_SAVED_COST = 4.0e9
+
 
 def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appearances: int) -> bool:
     """Whether materializing `node` saves enough of `plan`'s cost to pay for itself.
@@ -243,7 +256,8 @@ def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appear
             one of them, so this is what turns a share of the cost into a saving.
 
     Returns:
-        Whether the saved share clears `_MIN_SAVED_SHARE`.
+        Whether the saved share clears `_MIN_SAVED_SHARE`, or the saved cost
+        `_MIN_SAVED_COST`.
     """
     from batcher.kyber.cost.model import CostModel
 
@@ -260,15 +274,21 @@ def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appear
         # the less worth sharing it looked. Measured on a subtree that is the whole plan's
         # cost, repeated: at 2 appearances it scored 0.247 and passed, at 9 it scored
         # 0.094 and was refused -- where the true savings are half the plan and 8/9 of it.
-        share = model.cost(node).total() * appearances / total
-        return share * (appearances - 1) / appearances >= _MIN_SAVED_SHARE
+        one = model.cost(node).total()
+        share = one * appearances / total
+        saved = share * (appearances - 1) / appearances
+        return saved >= _MIN_SAVED_SHARE or one * (appearances - 1) >= _MIN_SAVED_COST
     except Exception as exc:  # a cost failure must not break planning
         note_suppressed("kyber", "cost a common-subplan candidate", exc)
         return False
 
 
+#: Nodes a query block's `FROM` list is built from: a `WHERE` above them applies to them.
+_SAME_BLOCK = (Project, Join, Filter)
+
+
 def _pending_cartesian(node: LogicalPlan, estimator) -> bool:
-    """Whether `node` holds a comma join whose real condition sits *above* it, as written.
+    """Whether `node` is a comma join cut away from the `WHERE` that makes it a real join.
 
     A comma join lowers to an equi-join on the constant `__cross_key`, with its `WHERE`
     equalities in a `Filter` over the whole `FROM` list; predicate pushdown later turns them
@@ -280,32 +300,55 @@ def _pending_cartesian(node: LogicalPlan, estimator) -> bool:
     column (605 MB), overflowed the budget and was dropped, and `wss` ran twice -- its 27.5M
     row aggregate is two thirds of the query.
 
-    A pseudo-join is *pending* when no `Filter` above it lies inside `node`: one that does is
-    the subtree's own `WHERE`, which goes with it (`wss` is itself a comma join of
-    `store_sales, date_dim` under its own filter). Skipping a pending subtree leaves its
-    repeated descendants eligible. A pseudo-join with a side of at most one row is not
-    pending either: that is a scalar broadcast, as cheap materialized as it is fused.
+    Asked only of a candidate some appearance of which sits under a `WHERE` of its own query
+    block (`_under_a_where`); this checks the other half, that the pseudo-join is in the
+    candidate's top block -- reachable through projections and joins alone, with no `Filter`
+    on the way, since one that is there is the subtree's own `WHERE` and goes with it (`wss`
+    is itself `store_sales, date_dim` under its own filter). A cross product below an
+    aggregate or a union belongs to another block, and one with nothing above it at all --
+    TPC-DS q77's `FROM cs, cr` -- is a product the query really computes, so neither is
+    pending. Nor is one with a side of at most one row: that is a scalar broadcast, as cheap
+    materialized as it is fused. Skipping a pending subtree leaves its repeated descendants
+    eligible.
 
     Args:
         node: The candidate subtree.
         estimator: The `CardinalityEstimator` for the side sizes.
 
     Returns:
-        Whether a pending cartesian pseudo-join with two multi-row sides lies in `node`.
+        Whether a pending cartesian pseudo-join with two multi-row sides tops `node`.
     """
-    stack: list[tuple[LogicalPlan, bool]] = [(node, False)]
+    stack = [node]
     while stack:
-        current, filtered = stack.pop()
-        if isinstance(current, Join) and not filtered and _is_cartesian(current):
+        current = stack.pop()
+        if isinstance(current, Join) and _is_cartesian(current):
             try:
                 sides = [estimator.estimate(side).rows for side in (current.left, current.right)]
             except Exception:  # an unsizable side is not evidence of a scalar broadcast
                 return True
             if min(sides) > 1:
                 return True
-        below = filtered or isinstance(current, Filter)
-        stack.extend((child, below) for child in children(current))
+        if isinstance(current, Project | Join):
+            stack.extend(children(current))
     return False
+
+
+def _under_a_where(plan: LogicalPlan) -> set[int]:
+    """The ids of nodes with an appearance under a `Filter` of their own query block.
+
+    "Their own block" is the run of projections, joins and filters a `SELECT` builds its
+    `FROM` list and `WHERE` from; an aggregate, a union, a sort or a window above a node
+    starts a new block, so a filter above *that* is about something else.
+    """
+    found: set[int] = set()
+    stack: list[tuple[LogicalPlan, bool]] = [(plan, False)]
+    while stack:
+        node, filtered = stack.pop()
+        if filtered:
+            found.add(id(node))
+        below = isinstance(node, Filter) or (filtered and isinstance(node, _SAME_BLOCK))
+        stack.extend((child, below) for child in children(node))
+    return found
 
 
 def _is_cartesian(join: Join) -> bool:

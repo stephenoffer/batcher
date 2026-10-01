@@ -178,7 +178,7 @@ The public, fluent, lazy, expression-first API surface.
 | `multi_group.py` | 408 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 737 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
-| `subplan_reuse.py` | 666 | Compute a repeated subplan once and read it back (control plane, `api`). |
+| `subplan_reuse.py` | 614 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
 ### `batcher/api/adaptive/` — 5 · conductor
 
@@ -1170,7 +1170,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `calibration.py` | 704 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 232 | The learned per-column statistics tables — their schema, their keys, and their bound. |
-| `common_subplan.py` | 375 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
+| `common_subplan.py` | 418 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
 | `learning.py` | 664 | Cross-execution learning — the metadata feedback loop. |
