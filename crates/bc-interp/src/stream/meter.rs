@@ -265,20 +265,46 @@ impl Meter {
             return;
         };
         for op in &sub.ops {
-            let id = (base + op.op_id) as usize;
-            let (Some(c), Some(kind)) = (self.counters.get(id), self.kinds.get(id)) else {
-                continue;
-            };
-            if *kind != op.kind {
-                continue;
-            }
-            c.rows_in.fetch_add(op.rows_in, Ordering::Relaxed);
-            c.rows_build.fetch_add(op.rows_build, Ordering::Relaxed);
-            c.rows_out.fetch_add(op.rows_out, Ordering::Relaxed);
-            c.elapsed_ns.fetch_add(op.elapsed_ns, Ordering::Relaxed);
-            c.peak_bytes.fetch_max(op.peak_bytes, Ordering::Relaxed);
-            c.result_bytes.fetch_max(op.result_bytes, Ordering::Relaxed);
+            self.add(base + op.op_id, op);
         }
+    }
+
+    /// [`Self::absorb`] for a sub-plan whose numbering is *not* a contiguous offset of this
+    /// meter's: `map[i]` is the id, relative to `root`, of the operator the sub-plan numbers
+    /// `i`, or `None` for one with no counterpart here.
+    ///
+    /// The chunked executor needs it for the operators above its streamed core. It runs them as
+    /// a post plan in which the core's whole subtree is one `Scan` over the collected result, so
+    /// every operator after that subtree in pre-order sits at a different id than in the plan
+    /// this meter numbered. Those post operators — a `Sort` over a Parquet-driven aggregate, the
+    /// `LIMIT` of a top-N tail — used to run unmetered and vanished from `stats()`.
+    pub(crate) fn absorb_mapped(&self, root: &RelOp, map: &[Option<u32>], sub: &ExecMetrics) {
+        let Some(&base) = self.ids.get(&(root as *const RelOp as usize)) else {
+            return;
+        };
+        for op in &sub.ops {
+            if let Some(Some(id)) = map.get(op.op_id as usize) {
+                self.add(base + id, op);
+            }
+        }
+    }
+
+    /// Fold one sub-plan metric into the counter at `id`. A metric whose kind disagrees with the
+    /// node at that id is dropped rather than filed under the wrong operator.
+    fn add(&self, id: u32, op: &OpMetric) {
+        let id = id as usize;
+        let (Some(c), Some(kind)) = (self.counters.get(id), self.kinds.get(id)) else {
+            return;
+        };
+        if *kind != op.kind {
+            return;
+        }
+        c.rows_in.fetch_add(op.rows_in, Ordering::Relaxed);
+        c.rows_build.fetch_add(op.rows_build, Ordering::Relaxed);
+        c.rows_out.fetch_add(op.rows_out, Ordering::Relaxed);
+        c.elapsed_ns.fetch_add(op.elapsed_ns, Ordering::Relaxed);
+        c.peak_bytes.fetch_max(op.peak_bytes, Ordering::Relaxed);
+        c.result_bytes.fetch_max(op.result_bytes, Ordering::Relaxed);
     }
 
     /// [`Self::finish`], with each metric's `op_id` translated through `original` (indexed by

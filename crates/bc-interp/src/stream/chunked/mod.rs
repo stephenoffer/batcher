@@ -320,7 +320,7 @@ fn units_with(
             };
             srcs[driving] = Vec::new();
             srcs.push(result);
-            crate::par::execute_parallel_with(&rest, &srcs, opts)
+            run_post(plan, &rest, &path, &srcs, opts, meter)
         }
         Core::Spine { depth, node } => {
             if let Some(out) = run.top_n_late(plan, depth, node, &srcs, src, &ranges, meter)? {
@@ -339,9 +339,60 @@ fn units_with(
             // The parallel executor, not the sequential oracle: a top-N over a spine that kept
             // a million rows (`SELECT s ... ORDER BY s LIMIT 10`) is the whole query's work, and
             // sorting it on one core made it 3.9x slower than the resident read it replaced.
-            crate::par::execute_parallel_with(&post, &srcs, opts)
+            run_post(plan, &post, &vec![0; depth], &srcs, opts, meter)
         }
     }
+}
+
+/// Run the operators above the streamed core — `post` is `plan` with the subtree at `path`
+/// replaced by a `Scan` of the collected result — on the parallel executor, filing each of
+/// their measurements under the operator of `plan` it belongs to.
+///
+/// They were run unmetered, so a `Sort` over a Parquet-driven aggregate executed and was never
+/// reported: `stats()` listed the scan, the join and the aggregate of
+/// `lineitem JOIN orders GROUP BY o_orderpriority ORDER BY o_orderpriority` and no sort.
+fn run_post(
+    plan: &RelOp,
+    post: &RelOp,
+    path: &[usize],
+    srcs: &[Vec<RecordBatch>],
+    opts: &ExecOptions,
+    meter: Option<&super::Meter>,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    let (out, metrics) = crate::par::execute_parallel_with_metrics(post, srcs, opts)?;
+    if let Some(m) = meter {
+        m.absorb_mapped(plan, &post_ids(plan, path), &metrics);
+    }
+    Ok(out)
+}
+
+/// For each operator of the post plan (pre-order), the pre-order id in `plan` of the operator it
+/// is — `None` for the `Scan` standing in for the subtree at `path`, which is that subtree's
+/// result rather than any one of its operators. Every operator after the subtree sits at an id
+/// shifted by the subtree's size, which is why the post plan cannot be absorbed by offset.
+fn post_ids(plan: &RelOp, path: &[usize]) -> Vec<Option<u32>> {
+    fn size(node: &RelOp) -> u32 {
+        1 + node.children().into_iter().map(size).sum::<u32>()
+    }
+    fn walk(node: &RelOp, path: Option<&[usize]>, next: &mut u32, out: &mut Vec<Option<u32>>) {
+        if path == Some(&[]) {
+            out.push(None);
+            *next += size(node);
+            return;
+        }
+        out.push(Some(*next));
+        *next += 1;
+        for (i, child) in node.children().into_iter().enumerate() {
+            let sub = match path {
+                Some([head, rest @ ..]) if *head == i => Some(rest),
+                _ => None,
+            };
+            walk(child, sub, next, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(plan, Some(path), &mut 0, &mut out);
+    out
 }
 
 /// `units` split into contiguous, in-order ranges for `workers` workers.
@@ -746,7 +797,7 @@ mod tests {
     use bc_ir::{AggFunc, AggregateItem, JoinOutputCol, JoinSide, JoinType, ProjectionItem, RelOp};
 
     use super::orient::{orient_counted, original_ids};
-    use super::{chunkable, execute_chunked, execute_units};
+    use super::{chunkable, execute_chunked, execute_units, post_ids};
     use crate::error::InterpError;
     use crate::par::ExecOptions;
 
@@ -1308,6 +1359,25 @@ mod tests {
             &ExecOptions::default(),
         );
         assert!(matches!(r, Err(InterpError::NotChunkable)));
+    }
+
+    /// The post plan's operators map to their ids in the full plan, across the subtree the
+    /// collected result replaced: `Limit > Sort > Aggregate > Join(Filter > Scan0, Scan1)` is
+    /// 0..=6 in pre-order.
+    #[test]
+    fn post_plan_operators_map_to_the_full_plans_ids() {
+        let full = plan(JoinType::Inner, true);
+        // The aggregate core: only the `Limit` and `Sort` above it remain, then its result.
+        assert_eq!(post_ids(&full, &[0, 0]), vec![Some(0), Some(1), None]);
+        // A core inside the join's left side: `Scan1` follows the two-node `Filter > Scan0`
+        // subtree, so it is 6 in the full plan though it is 5th in the post plan. Absorbing by
+        // offset would have filed it under 5, the scan the subtree swallowed.
+        assert_eq!(
+            post_ids(&full, &[0, 0, 0, 0]),
+            vec![Some(0), Some(1), Some(2), Some(3), None, Some(6)]
+        );
+        // No core replaced at the root's own position: every operator is itself.
+        assert_eq!(post_ids(&full, &[]), vec![None]);
     }
 
     /// A swapped join reorders its children in the numbering the meter uses, and every metric
