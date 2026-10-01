@@ -1413,7 +1413,7 @@ Join elimination — removing a join outright, and the proofs that make it legal
 
 | module | lines | what it is |
 |---|---|---|
-| `evidence.py` | 143 | The proofs a join elimination must clear before it may delete or degenerate a join. |
+| `evidence.py` | 147 | The proofs a join elimination must clear before it may delete or degenerate a join. |
 | `rules.py` | 367 | The join-elimination rewrites — outer, self, cartesian, inner-reduction, disjoint-key. |
 
 ### `batcher/kyber/rules/extra/runtime_filters/` — 3 · subsystem
