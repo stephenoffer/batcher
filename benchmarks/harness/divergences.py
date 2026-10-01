@@ -177,6 +177,30 @@ KNOWN_DIVERGENCES: tuple[Divergence, ...] = _validate(
             ),
         ),
         Divergence(
+            case="tpcds-q67",
+            engine="batcher",
+            versus="duckdb",
+            signature="column '",
+            verdict="batcher",
+            reason=(
+                "The same float-rank instability as the entry above, surfacing in a *grouping* "
+                "column rather than in `rk`: the query keeps `rk <= 100`, so a rank that float "
+                "noise moves across 100 changes which rows survive, and the first mismatch then "
+                "lands on whatever column misaligns first (`d_year` row 32: None vs 2000 at SF10). "
+                "Here the evidence favours Batcher: recomputed in exact DECIMAL arithmetic from "
+                "the parquet (`ss_sales_price` is DECIMAL(7,2)), the four `shirts` rollup rows "
+                "tie at rank 30 and the three `amalgscholar #2` rows at rank 44 -- the ranks "
+                "Batcher returns -- while DuckDB, summing the harness's float64 cast, splits them "
+                "to 32 and 46."
+            ),
+            citation=(
+                "TPC-DS SF10, 2026-09-30: DuckDB rank() over the exact DECIMAL sums read from "
+                "the parquet (ties at 30 and 44); the benchmark's own tables through both "
+                "engines, rows 24/74/75 (Batcher 44/30/30, DuckDB 46/32/32); "
+                "sources/tables.py::_normalize_types"
+            ),
+        ),
+        Divergence(
             case="tpch-q6",
             engine="polars",
             versus=None,
