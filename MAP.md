@@ -241,7 +241,7 @@ The shared machinery behind the batch-UDF verbs on `Dataset`.
 
 | module | lines | what it is |
 |---|---|---|
-| `build.py` | 399 | Build the `MapBatches` stage behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
+| `build.py` | 411 | Build the `MapBatches` stage behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
 | `checks.py` | 322 | Edge validation and advisory warnings for the batch-UDF verbs. |
 | `cluster.py` | 163 | Checks a UDF stage must pass against the live Ray cluster before it is submitted. |
 | `ray_options.py` | 275 | Resolve the Ray Data resource parameters of the UDF verbs onto what the scheduler honours. |
@@ -2626,7 +2626,7 @@ String free functions, in two halves: building text and reading structure out of
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
 | `relational.py` | 666 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
-| `transforms.py` | 712 | Plan transforms and predicates over `LogicalPlan` trees. |
+| `transforms.py` | 738 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 522 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract

@@ -192,3 +192,43 @@ def test_two_alternating_configs_both_stay_resolved():
         assert _resolved(adapted) is resolved_adapted
     reset_resolution_memo()
     assert _resolved(auto) is not resolved_auto  # reset still forces a fresh resolution
+
+
+# --- plan building: memos a fresh query plan inherits from the scans it is built on ------
+
+
+def test_a_moved_scan_inherits_only_the_schema_memos():
+    """A join renumbers its right side's scans; the copy keeps what depends on schema alone."""
+    from batcher.plan.logical import Scan
+    from batcher.plan.logical.transforms import remap_sources
+
+    right = bt.from_pydict({"t": [1, 2], "x": [3.0, 4.0]})._plan
+    assert isinstance(right, Scan)
+    moved = remap_sources(right, 5)
+    assert moved.source_id == right.source_id + 5
+    assert moved.available_schema() is right.available_schema()  # carried, not re-derived
+    # The IR carries the source id, so it is never carried.
+    assert moved.to_ir() != right.to_ir()
+    assert moved.to_ir()["source_id"] == right.source_id + 5
+    # And the moved scan's answers are the ones a fresh derivation gives.
+    fresh = Scan(moved.source_id, moved.schema, moved.source_key)
+    assert moved.available_schema().arrow.equals(fresh.available_schema().arrow)
+    assert moved.content_key() == fresh.content_key()
+
+
+def test_filter_still_refuses_udf_options_without_a_callable():
+    from batcher._internal.errors import PlanError
+    from batcher.api.dataset._udf import build
+
+    ds = bt.from_pydict({"x": [1, 2, 3]})
+    assert ds.filter(bt.col("x") > 1).to_pydict() == {"x": [2, 3]}
+    with pytest.raises(PlanError, match="num_gpus"):
+        ds.filter(bt.col("x") > 1, num_gpus=1)
+
+    def method(a, b=1, c="x"):
+        return a
+
+    assert build._defaults(method) == {"a": build._defaults(method)["a"], "b": 1, "c": "x"}
+    build.refuse_callable_options(method, {"b": 1, "c": "x"})
+    with pytest.raises(PlanError, match=r"\['c'\]"):
+        build.refuse_callable_options(method, {"b": 1, "c": "y"})

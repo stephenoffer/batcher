@@ -9,6 +9,7 @@ binds its extra arguments the same way (`bind_fn`), and validates the rest here.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -85,15 +86,26 @@ def refuse_callable_options(method: Callable, given: dict[str, Any]) -> None:
     Raises:
         PlanError: If any option differs from its default.
     """
-    import inspect
-
-    params = inspect.signature(method).parameters
-    set_names = sorted(name for name, value in given.items() if value != params[name].default)
+    defaults = _defaults(method)
+    set_names = sorted(name for name, value in given.items() if value != defaults[name])
     if set_names:
         raise PlanError(
             f"{method.__name__}() got {set_names}, which apply only to a callable predicate; "
             "drop them, or pass the condition as a function of the batch"
         )
+
+
+@functools.lru_cache(maxsize=32)
+def _defaults(method: Callable) -> dict[str, Any]:
+    """`method`'s parameter defaults by name, read from its signature once.
+
+    `filter` asks on every call, and `inspect.signature` rebuilds a `Parameter` per argument
+    each time -- ~50 us of building a one-predicate filter, for a signature that is fixed when
+    the class is defined. Keyed on the function object, so a rebound method is read afresh.
+    """
+    import inspect
+
+    return {name: p.default for name, p in inspect.signature(method).parameters.items()}
 
 
 def _check_format(verb: str, batch_format: str, allowed: tuple[str, ...]) -> None:
