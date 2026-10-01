@@ -433,6 +433,7 @@ the test says in a comment that it is a change-detector and not an oracle.
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -1308,6 +1309,10 @@ def _uncontrolled_runtime_comparisons(tree: ast.Module, rel: str) -> Iterator[Fi
 #: Clock reads that mark a module as *timing* something.
 _BENCH_TIMERS = frozenset({"perf_counter", "monotonic", "process_time", "perf_counter_ns"})
 
+#: What a module that can run Batcher's engine names: the package, its usual alias, or the
+#: harness and engine runners that drive it on a script's behalf.
+_ENGINE_TOKENS = re.compile(r"\bbatcher\b|\bbt\.|\bharness\b|\bengines\b|_native")
+
 
 def check_benchmark_guards(path: Path, tree: ast.Module, source: str) -> Iterator[Finding]:
     """A benchmark that publishes a timing without checking what it is timing.
@@ -1333,6 +1338,13 @@ def check_benchmark_guards(path: Path, tree: ast.Module, source: str) -> Iterato
         for call in ast.walk(tree)
     )
     if not times or "require_release_build" in source:
+        return
+    # A script that never reaches the engine cannot time a debug build of it. The one that
+    # tripped this is `cluster/tpch_reference.py`: it writes DuckDB's TPC-H answers and prints
+    # DuckDB's per-query seconds, and guarding it would refuse a DuckDB run over Batcher's build
+    # profile. It imports a suite module for the query strings, so a transitive check would flag
+    # it; reaching the engine means naming it, or importing the harness or engine runners that do.
+    if not _ENGINE_TOKENS.search(source):
         return
     yield Finding(
         "benchmark-unguarded-build",
