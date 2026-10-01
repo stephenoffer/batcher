@@ -206,7 +206,7 @@ def collect_source_metadata(hub, sources: list[Source], plan: LogicalPlan | None
     from batcher import kyber
 
     try:
-        learned = kyber.load_learned_stats(hub)
+        learned = kyber.load_column_tables(hub)
         # The columns any later plan could consult a *distribution* statistic for. An empty
         # set means none, and then the whole pass is a read with no consumer -- so it is not
         # performed at all. `None` (no plan handed down) keeps the old unrestricted behaviour.
@@ -366,7 +366,7 @@ def seed_column_ndv(hub, sources: list[Source], plan: LogicalPlan | None = None)
         if _NOTHING_TO_SEED.get(plan) == verdict:
             return
         wanted = ndv_columns(plan) if plan is not None else None
-        learned = kyber.load_learned_stats(hub)
+        learned = kyber.load_column_tables(hub)
         max_cells = active_config().optimizer.ndv_sketch_max_cells
         measured: list[kyber.MeasuredColumns] = []
         fully_known = True
@@ -477,7 +477,7 @@ def _learn_row_bytes(hub, resolved, sources) -> None:
     # a whole-table read-modify-write, and this runs on *every* execution rather than being
     # gated by the sketch pass's "already measured" marker — so without this check a served
     # workload would pay that write per query forever to re-record the same numbers.
-    known = kyber.load_learned_stats(hub)
+    known = kyber.load_column_tables(hub)
     # Collected, then written once: each write re-serializes the whole width table, so
     # writing per source made the cost quadratic in the source count. See
     # `record_column_row_bytes_batch`.
@@ -657,7 +657,7 @@ def learn_column_stats(
     from batcher import core, kyber
 
     try:
-        learned = kyber.load_learned_stats(hub)
+        learned = kyber.load_column_tables(hub)
         min_frac = active_config().optimizer.cardinality.mcv_min_fraction
         max_cells = active_config().optimizer.ndv_sketch_max_cells
         wanted = learnable_columns(plan) if plan is not None else None

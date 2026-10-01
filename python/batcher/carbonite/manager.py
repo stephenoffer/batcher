@@ -348,8 +348,7 @@ class ResourceManager:
         if parallelism is not None:
             changes["parallelism"] = parallelism
             _report_reduced_parallelism()
-        execution = dataclasses.replace(self._config.execution, **changes)
-        return dataclasses.replace(self._config, execution=execution)
+        return _adapted(self._config, tuple(sorted(changes.items())))
 
     def estimated_bytes(self, plan: PhysicalPlan) -> int:
         """Estimated peak in-memory bytes for `plan` — its learned-blended dominant breaker.
@@ -660,6 +659,28 @@ class ResourceManager:
             yield granted
 
 
+#: The last adaptation `recommended_config` built: `(base, changes, adapted)`.
+#:
+#: Under sustained pressure or contention every query asks for the same adaptation of the
+#: same base config, and handing back the *same* adapted object is what lets
+#: `config_context` find it already resolved (its memo is by identity) instead of
+#: re-validating an identical config on every query. Exact: the base is matched by identity
+#: and is frozen, and the changes by value.
+_ADAPTED: tuple[Config, tuple, Config] | None = None
+
+
+def _adapted(base: Config, changes: tuple) -> Config:
+    """`base` with `changes` applied to its execution section, reusing the last such object."""
+    global _ADAPTED
+    memo = _ADAPTED
+    if memo is not None and memo[0] is base and memo[1] == changes:
+        return memo[2]
+    execution = dataclasses.replace(base.execution, **dict(changes))
+    adapted = dataclasses.replace(base, execution=execution)
+    _ADAPTED = (base, changes, adapted)
+    return adapted
+
+
 def _report_reduced_parallelism() -> None:
     """Say on the bus that contention, not the plan, narrowed the fan-out.
 
@@ -678,6 +699,10 @@ def _report_reduced_parallelism() -> None:
         from batcher._internal import events
         from batcher.plan.profile import Decision
 
+        # `publish` drops the event with nobody listening, so building the note -- a second
+        # full CPU probe -- for it was the cost of a contended query with no consumer.
+        if not events.listening():
+            return
         note = oversubscription_note()
         if not note:
             return

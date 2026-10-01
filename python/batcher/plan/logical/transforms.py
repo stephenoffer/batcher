@@ -266,6 +266,35 @@ def share_sources(
     return plans, merged
 
 
+#: A `Scan`'s per-node memos that are functions of its `schema` alone (see
+#: `LogicalPlan.__init_subclass__`). `to_ir` is not one: it carries the `source_id` a move changes.
+_SCHEMA_MEMOS = (
+    "_c_available_schema",
+    "_c_available_columns",
+    "_c_available_column_set",
+    "_c_identity_suffix",
+)
+
+
+def _carry_schema_memos(old: Scan, new: Scan) -> None:
+    """Hand `old`'s schema-only memos to `new`, a copy differing only in `source_id`.
+
+    Every join renumbers its right side's scans, and the fresh `Scan` then re-derived its
+    widened `available_schema` -- an Arrow schema rebuilt field by field -- for the same
+    schema object the original had already derived it from. The values are read-only and
+    shared exactly as the memo on the original already shares them.
+    """
+    if old.schema is not new.schema:
+        return
+    # Derived on the original first, so it is paid once per scan rather than once per join
+    # built over it: the original `Dataset` keeps its scan, and every join renumbers a copy.
+    old.available_schema()
+    src, dst = old.__dict__, new.__dict__
+    for slot in _SCHEMA_MEMOS:
+        if slot in src and slot not in dst:
+            dst[slot] = src[slot]
+
+
 def _rewrite_source_ids(plan: LogicalPlan, renumber: Callable[[int], int]) -> LogicalPlan:
     """Return a copy of `plan` with every `Scan.source_id` passed through `renumber`.
 
@@ -279,7 +308,9 @@ def _rewrite_source_ids(plan: LogicalPlan, renumber: Callable[[int], int]) -> Lo
         if isinstance(node, Scan):
             # `replace`, not a fresh `Scan`: the source key is this scan's identity and
             # rebuilding without it would silently return the plan to the collided key.
-            return dataclasses.replace(node, source_id=renumber(node.source_id))
+            moved = dataclasses.replace(node, source_id=renumber(node.source_id))
+            _carry_schema_memos(node, moved)
+            return moved
         return node
 
     return transform_up(plan, move)

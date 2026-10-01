@@ -33,6 +33,7 @@ disabled event log adds nothing.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -45,7 +46,7 @@ from typing import Any
 
 from batcher._internal.concurrency.serial import SerialWorker
 from batcher._internal.logging import note_suppressed
-from batcher._internal.paths import private_dir
+from batcher._internal.paths import private_dir, write_private
 from batcher.plan.profile import ProfileCollector
 from batcher.plan.types import logical_bytes
 
@@ -250,7 +251,6 @@ def _emit(
 ) -> None:
     """Assemble one query's profile and send it to every enabled sink (`write_event_log`)."""
     from batcher._internal.logging import get_logger
-    from batcher._internal.paths import open_private
     from batcher.api.terminal.lineage import emit_run_complete
     from batcher.api.terminal.otel import emit_query_spans
     from batcher.config import active_config
@@ -276,8 +276,7 @@ def _emit(
         try:
             log_dir = _resolve_dir(cfg.event_log_dir)
             name = f"{query_id}.json"
-            with open_private(log_dir / name) as fh:
-                fh.write(_encode(document, collector).encode("utf-8"))
+            write_private(os.path.join(log_dir, name), _encode(document, collector).encode("utf-8"))
             # Retention runs on every write because it is now O(1) there — see `_prune`.
             _prune(log_dir, cfg.event_log_max_files, wrote=name, seq=seq)
         except Exception:  # pragma: no cover - event logging must never break a query
@@ -790,7 +789,10 @@ def _prune(log_dir: Path, max_files: int, *, wrote: str, seq: int) -> None:
     else:
         window.append(wrote)
     while len(window) > max_files:
-        (log_dir / window.popleft()).unlink(missing_ok=True)
+        # `os.unlink` on a joined string rather than `Path.unlink`: this runs on every query,
+        # and building and rendering a fresh `Path` per deletion was a third of its cost.
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(os.path.join(log_dir, window.popleft()))
 
 
 def _is_document(entry: os.DirEntry[str]) -> bool:

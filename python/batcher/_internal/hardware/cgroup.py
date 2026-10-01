@@ -15,6 +15,7 @@ import functools
 import os
 import time
 
+from batcher._internal.hardware.sysfs import read_live_text
 from batcher._internal.mathx import ceil_div
 
 __all__ = [
@@ -205,14 +206,18 @@ def read_cgroup_stat(base: str, name: str) -> dict[str, int]:
     Returns:
         The parsed counters, empty when the file is absent or unreadable.
     """
+    # Through a held descriptor (`read_live_text`): the kernel's own `memory.stat` and
+    # `memory.events` behind the pressure snapshot, re-read on every sampling window.
+    text = read_live_text(os.path.join(base, name))
+    if text is None:
+        return {}
     try:
-        with open(os.path.join(base, name)) as f:
-            return {
-                parts[0]: int(parts[1])
-                for line in f
-                if len(parts := line.split()) == 2 and parts[1].isdigit()
-            }
-    except (OSError, ValueError):
+        return {
+            parts[0]: int(parts[1])
+            for line in text.splitlines()
+            if len(parts := line.split()) == 2 and parts[1].isdigit()
+        }
+    except ValueError:
         return {}
 
 
@@ -324,11 +329,10 @@ def read_psi(path: str) -> dict[str, float]:
         pressure" for a kernel that measured nothing.
     """
     out: dict[str, float] = {}
-    try:
-        with open(path) as f:
-            lines = f.read().splitlines()
-    except OSError:
+    text = read_live_text(path)
+    if text is None:
         return out
+    lines = text.splitlines()
     for line in lines:
         fields = line.split()
         if not fields or fields[0] not in ("some", "full"):
@@ -357,11 +361,12 @@ def read_cgroup_bytes(path: str) -> int | None:
     Returns:
         The byte value, or `None` when the file is absent, unlimited, or unparseable.
     """
-    try:
-        with open(path) as f:
-            raw = f.read().strip()
-    except OSError:
+    # A held-descriptor read: this is the cgroup charge the pressure ladder re-reads several
+    # times per query, and the `open` was 90% of its cost. Still a live reading every call.
+    text = read_live_text(path)
+    if text is None:
         return None
+    raw = text.strip()
     if raw in ("", "max"):
         return None
     try:

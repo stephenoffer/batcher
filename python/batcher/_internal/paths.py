@@ -21,7 +21,7 @@ import pathlib
 import sys
 from typing import BinaryIO
 
-__all__ = ["batcher_home", "open_private", "package_dir", "private_dir"]
+__all__ = ["batcher_home", "open_private", "package_dir", "private_dir", "write_private"]
 
 #: Directory mode: owner-only. Applied to anything Batcher creates to hold its artifacts.
 _DIR_MODE = 0o700
@@ -105,3 +105,26 @@ def open_private(path: str | os.PathLike[str], mode: str = "wb") -> BinaryIO:
         raise ValueError(f"open_private is for binary writes, got mode={mode!r}")
     flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "ab" else os.O_TRUNC)
     return os.fdopen(os.open(path, flags, _FILE_MODE), mode)
+
+
+def write_private(path: str | os.PathLike[str], data: bytes) -> None:
+    """Create or truncate `path` owner-only and write `data` to it, in one call.
+
+    The same guarantee as `open_private` -- the mode is set in the `open` itself, so the file
+    is never world-readable -- for a caller that already holds the whole payload. It goes
+    straight to the descriptor rather than through a buffered file object, because the
+    caller it exists for writes one small document per *query*: the event log, on by
+    default. There the `fdopen` wrapper and its buffer were a measurable share of the
+    write, on a path whose filesystem work (create, write, close) is the irreducible part.
+
+    Args:
+        path: The file to create or truncate.
+        data: The complete contents.
+    """
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _FILE_MODE)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+    finally:
+        os.close(fd)

@@ -15,6 +15,18 @@ from batcher._internal.humanize import byte_size
 from batcher._internal.mathx import safe_div
 from batcher.plan.feedback import CONTENDED_PREEMPTIONS_PER_CORE_SECOND, preemption_rate
 
+#: `QueryProfile.machine`'s rendering, with the profile object it rendered. The hardware
+#: profile is assembled once per process and replaced (never mutated) by a probe reset, so the
+#: same object always renders the same name -- and every profiled query renders it once, for
+#: the event-log document, hashing the fingerprint and formatting the label each time.
+_MACHINE_NAME: tuple[object, str] | None = None
+
+
+def _remember_machine_name(profile: object, name: str) -> None:
+    global _MACHINE_NAME
+    _MACHINE_NAME = (profile, name)
+
+
 __all__ = ["Decision", "OpProfile", "QueryProfile", "QueryUsage"]
 
 
@@ -371,7 +383,12 @@ class QueryProfile:
         read as facts about this box.
         """
         profile = hardware_profile()
-        return f"{profile.label()} [{profile.fingerprint()}]"
+        memo = _MACHINE_NAME
+        if memo is not None and memo[0] is profile:
+            return memo[1]
+        name = f"{profile.label()} [{profile.fingerprint()}]"
+        _remember_machine_name(profile, name)
+        return name
 
     @property
     def spilled(self) -> bool:

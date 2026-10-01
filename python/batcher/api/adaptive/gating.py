@@ -224,18 +224,13 @@ def _streams_whole(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     from collections import Counter
 
     from batcher.api.orchestration.chunked import chunk_worthy
-    from batcher.config import active_config
     from batcher.plan.logical import Join
 
-    estimator = build_estimator(sources, hub)
-    row_bytes = active_config().optimizer.row_bytes
     scans = [n for n in walk(plan) if isinstance(n, Scan)]
     if not scans:
         return False
     counts = Counter(n.source_id for n in scans)
-    sized = {
-        n.source_id: estimator.estimate(n).rows * estimator.row_width(n, row_bytes) for n in scans
-    }
+    sized = _scan_sizes(plan, scans, sources, hub)
     driving = max(sized, key=sized.__getitem__)
     if (
         counts[driving] != 1
@@ -245,6 +240,38 @@ def _streams_whole(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     ):
         return False
     return not any(isinstance(n, Join) and n.join_type in ("right", "full") for n in walk(plan))
+
+
+def _scan_sizes(
+    plan: LogicalPlan, scans: list[Scan], sources: list[Source], hub
+) -> dict[int, float]:
+    """Each scanned source's estimated bytes (rows x width), memoized like `_input_size`.
+
+    The same measurement-not-verdict memo, under the same key, for the same reason: building
+    an estimator and sizing every scan was ~2 ms of a warm TPC-H sf1 join on every execution,
+    to reach the numbers it reached last time. `chunk_worthy` and the shape checks that turn
+    the sizes into a verdict still run on every call.
+    """
+    from batcher.config import active_config
+
+    key = _size_key(plan, sources, hub)
+    hit = _SCAN_SIZES.get(key) if key is not None else None
+    if hit is not None:
+        return hit
+    estimator = build_estimator(sources, hub)
+    row_bytes = active_config().optimizer.row_bytes
+    sized = {
+        n.source_id: estimator.estimate(n).rows * estimator.row_width(n, row_bytes) for n in scans
+    }
+    if key is not None:
+        _SCAN_SIZES[key] = sized
+        while len(_SCAN_SIZES) > _INPUT_SIZES_MAX:
+            _SCAN_SIZES.pop(next(iter(_SCAN_SIZES)))
+    return sized
+
+
+#: `_scan_sizes` results, keyed and bounded exactly as `_INPUT_SIZES` is. Read-only values.
+_SCAN_SIZES: dict[tuple, dict[int, float]] = {}
 
 
 def _stage_count(plan: LogicalPlan) -> int:

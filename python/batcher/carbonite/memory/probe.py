@@ -22,6 +22,7 @@ import os
 import time
 
 from batcher._internal.hardware import cgroup_v2_dirs, machine_memory_bytes, read_cgroup_bytes
+from batcher._internal.hardware.sysfs import read_live_text
 from batcher.config import active_config
 
 __all__ = [
@@ -147,15 +148,13 @@ def _read_cgroup_file_cache_bytes() -> int:
         ("/sys/fs/cgroup/memory.stat", "file"),
         ("/sys/fs/cgroup/memory/memory.stat", "total_cache"),
     ):
-        try:
-            with open(path) as f:
-                lines = f.read().splitlines()
-        except OSError:
+        text = read_live_text(path)
+        if text is None:
             # Not this cgroup version, or not in a cgroup at all. Both paths being absent
             # is the normal case off Linux, so trying the next one is the answer rather
             # than a reportable failure.
             continue
-        for line in lines:
+        for line in text.splitlines():
             field, _, raw = line.partition(" ")
             if field == key:
                 try:
@@ -261,39 +260,54 @@ def effective_limit_bytes() -> int | None:
 
 
 def process_rss_bytes() -> int | None:
-    """This process's resident set size (RSS) via `psutil`, or `None` without it.
+    """This process's resident set size (RSS), or `None` when no reader is available.
 
     RSS captures the engine's true footprint — the Flight `PartitionStore`, pyarrow
-    buffers, everything — not just the buffer pool's accounted reservations. Falls back
-    to `/proc/self/statm` on Linux, so a container without the optional dependency still
-    gets a real footprint reading rather than losing the safety-critical half of
-    `_engine_used_fraction` (which then cannot see anything the pool does not account).
+    buffers, everything — not just the buffer pool's accounted reservations. It is the
+    safety-critical half of `_engine_used_fraction` wherever there is no cgroup charge to
+    read (bare metal, a laptop), so it is read on every pressure check there.
+
+    `/proc/self/statm` first, `psutil` only where that file does not exist (macOS,
+    Windows). On Linux the two are the same number — `psutil.Process().memory_info().rss`
+    *is* statm's resident field times the page size — but psutil builds a `Process` and
+    re-opens the file on every call, which measured **135 us** against a held-descriptor
+    read of the file itself (`sysfs.read_live_text`), a live reading either way.
 
     Returns:
         Resident bytes, or `None` when no reader is available.
     """
+    rss = _proc_statm_rss_bytes()
+    if rss is not None:
+        return rss
     try:
         import psutil
     except ImportError:
-        return _proc_statm_rss_bytes()
+        return None
     try:
         return int(psutil.Process().memory_info().rss)
     except (OSError, ValueError, AttributeError):
-        return _proc_statm_rss_bytes()
+        return None
 
 
 def _proc_statm_rss_bytes() -> int | None:
     """RSS from `/proc/self/statm` (Linux), in bytes, or `None` if unreadable.
 
     Field two of `statm` is the resident set in pages. It costs one small read and needs
-    no dependency, which is exactly the situation the psutil-less container is in.
+    no dependency.
     """
-    try:
-        with open("/proc/self/statm") as f:
-            pages = int(f.read().split()[1])
-        return pages * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError, AttributeError):
+    raw = read_live_text("/proc/self/statm")
+    if raw is None:
         return None
+    try:
+        return int(raw.split()[1]) * _page_size()
+    except (ValueError, IndexError):
+        return None
+
+
+@functools.lru_cache(maxsize=1)
+def _page_size() -> int:
+    """The VM page size, which cannot change while the process runs."""
+    return os.sysconf("SC_PAGE_SIZE")
 
 
 def total_memory_bytes() -> int:
