@@ -176,13 +176,8 @@ def _collect(
             from batcher import core
             from batcher.api.orchestration import collect_source_stats
 
-            # Only MIN/MAX read a source's column bounds (and only for the aggregated
-            # column); COUNT answers from the row count, and SUM/MEAN/COUNT DISTINCT from
-            # the source's lazy per-column methods — none of which need the O(rows)
-            # zone-map scan. So a keyless SUM/COUNT over a fresh in-memory source no longer
-            # pays to build bounds it never reads, and a MIN(x) scans only column x.
             source_stats = collect_source_stats(
-                sources, core.default_hub(), need_columns=_global_agg_bound_columns(plan)
+                sources, core.default_hub(), need_columns=_keyless_aggregate_bound_columns(plan)
             )
     metadata = metadata_aggregate_table(plan, sources, source_stats)
     if metadata is not None:
@@ -454,6 +449,34 @@ def _explain(
     from batcher.api.terminal.profile import explain
 
     return explain(plan, sources, columns, analyze=analyze, fmt=fmt)
+
+
+def _keyless_aggregate_bound_columns(plan: LogicalPlan) -> set[str] | None:
+    """The columns whose bounds a keyless aggregate's statistics must carry, or None for all.
+
+    Only MIN/MAX read a source's column bounds for the metadata answer (and only for the
+    aggregated column); COUNT answers from the row count, and SUM/MEAN/COUNT DISTINCT from the
+    source's lazy per-column methods — none of which need the O(rows) zone-map scan. So a
+    keyless SUM/COUNT over a fresh in-memory source does not pay to build bounds it never
+    reads (`_global_agg_bound_columns`).
+
+    But these statistics are also the ones the *execution* plans with when the metadata answer
+    misses, so they must carry every bound the optimizer reads as well: the filter, join and
+    sort columns `column_bounds_needed` names, which a plan that is not a keyless aggregate is
+    given anyway. Narrowed to the aggregate's own columns, every Join Order Benchmark query
+    (each a `SELECT MIN(...)` over a join) planned with no `[min, max]` on any filter or join
+    key: range selectivity fell back to defaults, and `runtime_join_filter` never fired.
+
+    Args:
+        plan: The keyless aggregate's plan.
+
+    Returns:
+        The column names to compute bounds for, or None to compute them all.
+    """
+    from batcher.api.source_stats import column_bounds_needed
+
+    need = _global_agg_bound_columns(plan)
+    return None if need is None else need | column_bounds_needed(plan)
 
 
 def _global_agg_bound_columns(plan: LogicalPlan) -> set[str] | None:

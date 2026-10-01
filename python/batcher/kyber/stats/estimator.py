@@ -1387,7 +1387,13 @@ class StatsEstimator:
         if len(node.left_keys) >= 2 and _composite_pk_fk(
             left.rows, right.rows, left_ndv, right_ndv
         ):
-            return max(left.rows, right.rows, skew)
+            # Each row of the foreign-key side meets at most one row of the unique side, so the
+            # FK side's rows bound the join -- `_unique_key_row_cap`. `max(|L|, |R|)` alone is
+            # that bound only while the unique side is the smaller one; once a filter has cut
+            # the *key* side below the FK side (a selective dimension), the larger input is the
+            # key side and the max priced the join above anything it can emit.
+            cap = _unique_key_row_cap(left, right, left_ndv, right_ndv)
+            return max(min(max(left.rows, right.rows), cap), skew)
         # With both sides' key frequencies measured, the join decomposes exactly into the
         # matched-hot-value term plus a uniform estimate over the *residual* mass. That sum is
         # sharper than either part alone: the uniform estimate alone prices a 47%-frequent key
@@ -2312,7 +2318,7 @@ def _composite_pk_fk(
 
     True when either side's (capped) combination ndv saturates its row count — that
     side's composite key is then ~unique, so each row of the other side matches at most
-    one, and the result is the FK side's rows (the caller uses `max(left, right)`).
+    one, and the result is bounded by the FK side's rows (`_unique_key_row_cap`).
 
     A heuristic, not a key proof. At `_UNIQUE_KEY_NDV_RATIO` a side may still hold one value
     repeated on `(1 - ratio)` of its rows, and a join of two sides hot on the same value emits
