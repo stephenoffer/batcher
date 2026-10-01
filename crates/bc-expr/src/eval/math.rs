@@ -374,7 +374,21 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             // Measured, `sqrt` over 20M Float64: **15.6 ms -> 13.3 ms with 30 % nulls**, and
             // 13.7 ms -> 13.0 ms with none — so the nullable path gains and the dense path does
             // not lose, which is what retires the branch.
-            let out: Float64Array = unary(a, |v| apply_unary(func, v));
+            //
+            // The cheap rounding family gets its own monomorphized loop. Through `apply_unary`
+            // every element dispatched on `func` -- a jump table the compiler does not hoist --
+            // so `floor`, a single packed instruction, ran one element at a time: 17% of
+            // `SUM(CAST(FLOOR(l_extendedprice) AS BIGINT))`. Each arm is the very method
+            // `apply_unary` calls, so the values are identical.
+            let out: Float64Array = match func {
+                MathFunc::Floor => unary(a, f64::floor),
+                MathFunc::Ceil => unary(a, f64::ceil),
+                MathFunc::Trunc => unary(a, f64::trunc),
+                MathFunc::Abs => unary(a, f64::abs),
+                MathFunc::Round => unary(a, f64::round),
+                MathFunc::Sqrt => unary(a, f64::sqrt),
+                _ => unary(a, |v| apply_unary(func, v)),
+            };
             Ok(Arc::new(out))
         }
         // An all-null column types as `Null`, which is a real type rather than an error: it
@@ -589,6 +603,42 @@ mod int_math_tests {
         (0..a.len())
             .map(|i| (!a.is_null(i)).then(|| a.value(i)))
             .collect()
+    }
+
+    /// The rounding family's own loops answer exactly what `apply_unary` does, bit for bit,
+    /// across the values each one treats specially: ties, both zeros, NaN, the infinities.
+    #[test]
+    fn the_monomorphized_float_arms_equal_apply_unary() {
+        let vals = vec![
+            Some(0.5),
+            Some(-0.5),
+            Some(1.5),
+            Some(-2.5),
+            Some(-0.0),
+            Some(0.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(1e300),
+            Some(-7.25),
+            None,
+        ];
+        let arr: ArrayRef = Arc::new(Float64Array::from(vals.clone()));
+        use MathFunc::{Abs, Ceil, Floor, Round, Sqrt, Trunc};
+        for func in [Floor, Ceil, Trunc, Abs, Round, Sqrt] {
+            let got = eval_math(func, &arr).unwrap();
+            let got = got.as_primitive::<Float64Type>();
+            for (i, v) in vals.iter().enumerate() {
+                match v {
+                    None => assert!(got.is_null(i)),
+                    Some(v) => assert_eq!(
+                        got.value(i).to_bits(),
+                        apply_unary(func, *v).to_bits(),
+                        "{func:?}({v})"
+                    ),
+                }
+            }
+        }
     }
 
     /// `gcd`/`bit_count` stay Int64 and are exact above 2^53 — the old f64 route both
