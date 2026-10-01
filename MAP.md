@@ -432,7 +432,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 1494 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
-| `event_log.py` | 798 | Per-query event log — one JSON document per query (Spark's event-log analog). |
+| `event_log.py` | 800 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
 | `map_stream.py` | 190 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 215 | Emit a query's execution profile as OpenTelemetry spans. |
@@ -1173,7 +1173,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `common_subplan.py` | 322 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 664 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 688 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
 | `measured_selectivity.py` | 67 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
@@ -1647,7 +1647,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | `ledger.py` | 72 | The memory ledger: reserved, resident, and unaccounted bytes as separate figures. |
 | `pool.py` | 422 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 466 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
-| `probe.py` | 373 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
+| `probe.py` | 389 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
 | `reclaim.py` | 273 | Handing the allocator's arena back when a query is about to go out of core. |
 
 ### `batcher/carbonite/policies/` — 3 · subsystem
@@ -1660,7 +1660,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `bdp.py` | 110 | Sizing a credit window from the path it runs over, instead of probing for it. |
 | `concurrency.py` | 361 | Bounding how many queries run at once, and how wide each one gets. |
 | `congestion.py` | 255 | What one round of a data channel actually observed, as a three-state congestion verdict. |
-| `cpu_budget.py` | 101 | How many cores the engine should ask for, given how many it is really getting. |
+| `cpu_budget.py` | 108 | How many cores the engine should ask for, given how many it is really getting. |
 | `flow_control.py` | 682 | Credit-window flow control: how many in-flight batch slots a shuffle channel may hold. |
 | `morsel.py` | 372 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
@@ -2396,7 +2396,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `schema.py` | 174 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 442 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 650 | `plan.stats` — the neutral statistics algebra shared across every layer. |
-| `visitor.py` | 338 | Shared traversal for `LogicalPlan` trees. |
+| `visitor.py` | 356 | Shared traversal for `LogicalPlan` trees. |
 
 ### `batcher/plan/distribution/` — 1 · contract
 
@@ -2638,7 +2638,7 @@ Query profiles — the planned plan joined to the measured run, for `EXPLAIN`.
 | `collect.py` | 402 | Profile assembly — join Kyber's estimates to Core's measurements by `op_id`. |
 | `spill.py` | 88 | What the Python out-of-core executors wrote to disk, measured where they write it. |
 | `stages.py` | 193 | Measuring the Python-UDF stages of a pipeline the engine cannot see into. |
-| `types.py` | 565 | Profile value types and rendering — `Decision`, `OpProfile`, `QueryProfile`. |
+| `types.py` | 582 | Profile value types and rendering — `Decision`, `OpProfile`, `QueryProfile`. |
 | `usage.py` | 126 | The operating system's own account of what this process consumed. |
 
 ### `batcher/plan/profile/render/` — 1 · contract
@@ -2780,7 +2780,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `mathx.py` | 131 | Small, exact numeric helpers shared across every subsystem — the one home for the idioms. |
 | `native.py` | 92 | The single accessor for the compiled Rust data plane (``batcher._native``). |
 | `optional.py` | 82 | The one optional-dependency import guard. |
-| `paths.py` | 107 | Filesystem locations of the installed package, and how to create things there safely. |
+| `paths.py` | 130 | Filesystem locations of the installed package, and how to create things there safely. |
 | `prefetch.py` | 116 | Overlap a producer generator with its consumer on a background thread. |
 | `registry.py` | 257 | Keyed lookup tables: the generic extension-point registry and the identity memo. |
 | `sql_errors.py` | 95 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
@@ -2821,7 +2821,7 @@ Effective hardware detection — what this process's machine really is and reall
 | module | lines | what it is |
 |---|---|---|
 | `cache.py` | 151 | The CPU cache hierarchy this process runs on — the sizes every blocking decision needs. |
-| `cgroup.py` | 374 | cgroup file-format mechanics — the container limits that override what the host reports. |
+| `cgroup.py` | 376 | cgroup file-format mechanics — the container limits that override what the host reports. |
 | `cpu.py` | 369 | The CPU budget this process really has, and how much of it something else is taking. |
 | `isa.py` | 215 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 212 | The memory ceiling and page geometry this process runs under. |
@@ -2830,7 +2830,7 @@ Effective hardware detection — what this process's machine really is and reall
 | `probes.py` | 110 | The one hook that clears every memoized hardware reading. |
 | `profile.py` | 386 | The machine's identity — one record of what this hardware is, and a key that names it. |
 | `storage.py` | 284 | The block device behind a directory — what spilling to it will actually cost. |
-| `sysfs.py` | 123 | Reading a kernel pseudo-file, where "absent" means "unknown" rather than "error". |
+| `sysfs.py` | 230 | Reading a kernel pseudo-file, where "absent" means "unknown" rather than "error". |
 | `topology.py` | 188 | NUMA and SMT topology — which cores are really independent, and where memory is cheap. |
 
 ### `batcher/_internal/hardware/amd/` — 0 · utility

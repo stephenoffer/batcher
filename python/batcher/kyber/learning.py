@@ -46,6 +46,7 @@ __all__ = [
     "bump_generation",
     "generation",
     "is_material_change",
+    "load_column_tables",
     "load_learned_stats",
     "measured_corrections",
     "q_error_window",
@@ -228,6 +229,29 @@ def measured_corrections(hub: MetadataHub) -> dict[str, float]:
         `{signature: factor}` for every shape with a confident correction.
     """
     return _cardinality_corrections(hub)
+
+
+def load_column_tables(hub: MetadataHub | None) -> dict[str, Any]:
+    """The learned per-column tables (`NDV_KEY`, `AVG_BYTES_KEY`, ...), read-only.
+
+    The slice of `load_learned_stats` a *column* consumer reads -- `columns_for` over one of
+    the `column_tables` keys -- without assembling the rest of the bundle. Those tables are
+    stored in the same namespace the bundle starts from, under reserved `__column_*__` keys
+    no plan signature can take, and the bundle's derived entries (corrections, measured
+    selectivities and widths, UDF costs) never touch them. So `columns_for` returns the same
+    slice from either, and only the bundle costs a reassembly whenever the hub has moved,
+    which it does on every query: the column learners read it after execution, once the
+    query's own operator feedback has advanced the hub's version.
+
+    Args:
+        hub: The metadata hub, or `None`.
+
+    Returns:
+        The namespace's parsed view; `{}` without a hub.
+    """
+    if hub is None:
+        return {}
+    return hub.load_keyed_params(_NAMESPACE)
 
 
 def _cardinality_corrections(hub: MetadataHub) -> dict[str, float]:

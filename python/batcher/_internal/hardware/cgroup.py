@@ -15,6 +15,7 @@ import functools
 import os
 import time
 
+from batcher._internal.hardware.sysfs import read_live_text
 from batcher._internal.mathx import ceil_div
 
 __all__ = [
@@ -357,11 +358,12 @@ def read_cgroup_bytes(path: str) -> int | None:
     Returns:
         The byte value, or `None` when the file is absent, unlimited, or unparseable.
     """
-    try:
-        with open(path) as f:
-            raw = f.read().strip()
-    except OSError:
+    # A held-descriptor read: this is the cgroup charge the pressure ladder re-reads several
+    # times per query, and the `open` was 90% of its cost. Still a live reading every call.
+    text = read_live_text(path)
+    if text is None:
         return None
+    raw = text.strip()
     if raw in ("", "max"):
         return None
     try:

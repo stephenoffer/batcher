@@ -27,6 +27,7 @@ from batcher.kyber.correction import estimate_is_reliable
 from batcher.kyber.learning import (
     MeasuredColumns,
     is_material_change,
+    load_column_tables,
     load_learned_stats,
     record_column_row_bytes,
     record_column_row_bytes_batch,
@@ -74,6 +75,7 @@ __all__ = [
     "hot_join_value_shares",
     "hot_join_values",
     "is_material_change",
+    "load_column_tables",
     "load_learned_stats",
     "optimize",
     "optimize_full",

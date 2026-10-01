@@ -78,6 +78,13 @@ def reduced_core_budget() -> int | None:
     Returns:
         The reduced core count, or `None` when the permitted count stands.
     """
+    # Inside the deadband `_measure` returns `budget == permitted`, so the answer is `None`
+    # whatever the permitted count is. Asking the (TTL-sampled) contention reading first
+    # skips the `available_cpu_count` probe -- affinity mask, CFS quota and a dozen
+    # scheduler environment variables, ~25-50 us -- on the quiet machine, which is the
+    # common case and the one this runs on once per terminal op.
+    if cpu_oversubscription() <= CONTENTION_DEADBAND:
+        return None
     permitted, budget, _ = _measure()
     return budget if budget < permitted else None
 
