@@ -3145,7 +3145,7 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
     return replace(obj, **updates) if updates else obj
 
 
-#: The last `(input, output)` pair `_resolved` produced, matched by *identity*. One slot,
+#: The recent `(input, output)` pairs `_resolved` produced, matched by *identity*. Memoized
 #: because the access pattern it exists for is one config object resolved over and over:
 #: `api.orchestration.with_auto_config` wraps every terminal op in a `config_context` over
 #: the object `resolve_auto_config` memoizes, so a `collect()` loop resolves the *same*
@@ -3159,13 +3159,21 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
 #: single config object is being reused — a node does not become preemptible mid-process,
 #: and a test that exports a spot variable builds a fresh `Config` (or calls
 #: `reset_resolution_memo`) and so re-detects.
-_RESOLUTION_MEMO: tuple[Config, Config] | None = None
+#:
+#: **Several slots, not one**, because a terminal op resolves more than one object: the
+#: auto-config object above, then -- whenever Carbonite adapts the execution knobs to live
+#: pressure or contention -- the adapted config `run_relational` scopes the run under. With
+#: one slot the two evicted each other on every query, so a busy machine paid a full
+#: re-validation (~100 us) per query for a config identical to the last query's
+#: (`ResourceManager.recommended_config` hands back the same object for the same
+#: adaptation). Entries hold their input, so an `id` is never recycled under one.
+_RESOLUTION_MEMO: dict[int, tuple[Config, Config]] = {}
+_RESOLUTION_MEMO_MAX = 8
 
 
 def reset_resolution_memo() -> None:
     """Forget the memoized resolution, so the next `_resolved` re-reads the environment."""
-    global _RESOLUTION_MEMO
-    _RESOLUTION_MEMO = None
+    _RESOLUTION_MEMO.clear()
 
 
 def _resolved(cfg: Config) -> Config:
@@ -3178,14 +3186,13 @@ def _resolved(cfg: Config) -> Config:
     Memoized on the input's identity; see `_RESOLUTION_MEMO` for why that is sound and for
     the one assumption it makes.
     """
-    global _RESOLUTION_MEMO
     from batcher.config.profiles import (
         apply_resilience_profile,
         detect_spot_environment,
         resolve_autoscale_wait,
     )
 
-    memo = _RESOLUTION_MEMO
+    memo = _RESOLUTION_MEMO.get(id(cfg))
     if memo is not None and memo[0] is cfg:
         return memo[1]
     original = cfg
@@ -3193,7 +3200,9 @@ def _resolved(cfg: Config) -> Config:
         cfg = cfg.replace(distributed=replace(cfg.distributed, resilience="spot"))
     cfg = resolve_autoscale_wait(apply_resilience_profile(cfg))
     out = cfg.validate()
-    _RESOLUTION_MEMO = (original, out)
+    if len(_RESOLUTION_MEMO) >= _RESOLUTION_MEMO_MAX:
+        _RESOLUTION_MEMO.clear()
+    _RESOLUTION_MEMO[id(original)] = (original, out)
     return out
 
 

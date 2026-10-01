@@ -1595,7 +1595,7 @@ Carbonite — the resource manager. **Resources, memory, and flow control only.*
 | `base.py` | 117 | Policy seams for the Carbonite resource manager. |
 | `cache.py` | 681 | The result cache — a memory-bounded, cost-aware store of materialized query results. |
 | `cache_disk.py` | 382 | The result cache's disk tier — where an evicted result goes instead of nowhere. |
-| `manager.py` | 695 | The Carbonite resource manager entry point. |
+| `manager.py` | 720 | The Carbonite resource manager entry point. |
 
 ### `batcher/carbonite/accel/` — 3 · subsystem
 
@@ -2746,7 +2746,7 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 3334 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3343 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `env.py` | 281 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |

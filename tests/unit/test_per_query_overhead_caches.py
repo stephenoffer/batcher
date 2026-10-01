@@ -159,3 +159,36 @@ def test_a_trivial_query_still_returns_its_rows_with_every_memo_warm():
         again = ds.filter(bt.col("k") > 5).group_by("g").agg(n=bt.count()).sort("g").to_pydict()
         assert again == first
     assert first["n"] == [sum(1 for k in range(6, 100) if k % 7 == g) for g in range(7)]
+
+
+# --- config adaptation: the same adaptation is the same object, and stays resolved ------
+
+
+def test_the_same_adaptation_of_the_same_config_is_the_same_object():
+    from batcher.carbonite import manager
+    from batcher.config import Config
+
+    base = Config()
+    first = manager._adapted(base, (("morsel_rows", 4096),))
+    assert first.execution.morsel_rows == 4096
+    assert manager._adapted(base, (("morsel_rows", 4096),)) is first
+    other = manager._adapted(base, (("morsel_rows", 2048),))
+    assert other is not first and other.execution.morsel_rows == 2048
+    rebuilt = manager._adapted(Config(), (("morsel_rows", 2048),))  # a new base object
+    assert rebuilt is not other and rebuilt == other
+    assert base.execution.morsel_rows != 4096  # the base is never touched
+
+
+def test_two_alternating_configs_both_stay_resolved():
+    """The auto-config and the adapted config alternate every query; neither evicts the other."""
+    from batcher.config import Config
+    from batcher.config.config import _resolved, reset_resolution_memo
+
+    reset_resolution_memo()
+    auto, adapted = Config(), Config()
+    resolved_auto, resolved_adapted = _resolved(auto), _resolved(adapted)
+    for _ in range(3):
+        assert _resolved(auto) is resolved_auto
+        assert _resolved(adapted) is resolved_adapted
+    reset_resolution_memo()
+    assert _resolved(auto) is not resolved_auto  # reset still forces a fresh resolution
