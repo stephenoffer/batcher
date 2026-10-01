@@ -22,11 +22,10 @@
 //! rows in the same sequence. The `seq == par` oracle sees no difference; only the clock does.
 
 use bc_sketches::BloomFilter;
-use hashbrown::hash_table::Entry;
-use hashbrown::HashTable;
 use rayon::prelude::*;
 
 use super::radix;
+use super::slots::SlotTable;
 use super::JoinKeys;
 
 /// Below this many build rows the serial loop wins: the table is small (a few hundred µs) and
@@ -40,9 +39,9 @@ pub(super) const PARALLEL_BUILD_MIN_ROWS: usize = 1 << 14; // 16,384 — one mor
 /// probe's shard indirection starts to cost more than the build saves.
 const MAX_SHARDS: usize = 64;
 
-/// The shard holding `hash`. Reads the **high** bits: hashbrown indexes its buckets with the
-/// low bits, so sharding on those would hand every shard a table whose keys all collide into
-/// the same region. `shards` is always a power of two, so this is a mask.
+/// The shard holding `hash`. Reads the **high** bits: a [`SlotTable`] places a key by its low
+/// bits, so sharding on those would hand every shard a table whose keys all collide into the
+/// same region. `shards` is always a power of two, so this is a mask.
 #[inline]
 pub(super) fn shard_of(hash: u64, shards: usize) -> usize {
     ((hash >> 32) as usize) & (shards - 1)
@@ -64,7 +63,7 @@ pub(super) fn shard_count(rows: usize) -> usize {
 
 /// One shard's build output: its head table, the `(row, next)` chain links it stitched, and its
 /// share of the probe bloom. Merged into the whole table by [`build_sharded`].
-type ShardBuild = (HashTable<u32>, Vec<(u32, u32)>, Option<BloomFilter>);
+type ShardBuild = (SlotTable, Vec<(u32, u32)>, Option<BloomFilter>);
 
 /// The chained hash table, built across every core.
 ///
@@ -78,7 +77,7 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
     right_null: &[bool],
     shards: usize,
     bloom: Option<BloomFilter>,
-) -> (Vec<HashTable<u32>>, Vec<u32>, Vec<BloomFilter>, bool) {
+) -> (Vec<SlotTable>, Vec<u32>, Vec<BloomFilter>, bool) {
     // `partition_side` carries the hash itself as the partition's key, so it is computed once
     // here and reused by both the insert below and the bloom — the serial build hashed each
     // row exactly once too.
@@ -96,7 +95,7 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
     let built: Vec<ShardBuild> = parts
         .par_iter()
         .map(|rows| {
-            let mut heads: HashTable<u32> = HashTable::with_capacity(rows.len());
+            let mut heads = SlotTable::with_rows(rows.len());
             let mut chain: Vec<(u32, u32)> = Vec::new();
             // Same dimensions as the caller's, so the union below is a plain bit-OR.
             let mut shard_bloom = bloom
@@ -109,20 +108,12 @@ pub(super) fn build_sharded<K: JoinKeys + Sync>(
                 if let Some(b) = shard_bloom.as_mut() {
                     b.add_hash(hash);
                 }
-                match heads.entry(
-                    hash,
-                    |&h| keys.right_eq_right(h as usize, abs as usize),
-                    |&h| keys.hash_right(state, h as usize),
-                ) {
-                    // Prepend, exactly as the serial loop did — see the module docs on why the
-                    // resulting chain order is what keeps this bit-identical.
-                    Entry::Occupied(mut e) => {
-                        chain.push((abs, *e.get()));
-                        *e.get_mut() = abs;
-                    }
-                    Entry::Vacant(e) => {
-                        e.insert(abs);
-                    }
+                // Prepend, exactly as the serial loop did — see the module docs on why the
+                // resulting chain order is what keeps this bit-identical.
+                if let Some(prev) =
+                    heads.upsert(hash, abs, |h| keys.right_eq_right(h as usize, abs as usize))
+                {
+                    chain.push((abs, prev));
                 }
             }
             (heads, chain, shard_bloom)

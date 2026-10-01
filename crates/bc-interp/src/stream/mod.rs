@@ -737,17 +737,11 @@ fn materialized_join_from<'a>(
     //
     // The exception is a join whose output order nothing above it can see (`order`): a
     // `COUNT(*)` over it, or a grouped aggregate sorted on every group key. The order this arm
-    // protects is then unobservable, and the partitioned join runs the same rows on every core.
+    // protects is then unobservable, and the partitioned join runs the same rows on every core
+    // — built on whichever side is smaller (`join_par::order_free_swap_pays`).
     let out = if ctx.order_free && ctx.workers > 1 {
-        let (parts, _) = crate::par::join_partitioned(
-            std::slice::from_ref(&probe_side),
-            std::slice::from_ref(&build_side),
-            left_keys,
-            right_keys,
-            join_type,
-            output,
-            strategy,
-            &crate::ExecOptions::default(),
+        let parts = crate::join_par::join_partitioned_order_free(
+            probe_side, build_side, left_keys, right_keys, join_type, output, strategy,
         )?;
         // One batch, as the serial arm emits, for the reason given below.
         match ops::materialize_opt(&parts)? {

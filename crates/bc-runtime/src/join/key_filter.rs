@@ -698,4 +698,38 @@ mod tests {
             vec![false, true, true, false, true, false, false, false, false, false, false]
         );
     }
+
+    /// The packed mask agrees with the per-key test at every position, over probes long enough
+    /// to fill whole 64-key words and a partial last one, with members, gaps, keys either side
+    /// of the range and nulls interleaved irregularly — for both representations. A packer that
+    /// misplaced a bit within a word would still pass every test whose answers are all `true`
+    /// or all `false`.
+    #[test]
+    fn the_mask_matches_the_per_key_test_bit_for_bit() {
+        let members: Vec<i64> = (0..3_000).map(|i| i * 5 + (i % 3)).collect();
+        let spread: Vec<i64> = members.iter().map(|k| k * 1_000_003).collect();
+        for build in [&members, &spread] {
+            let f = filter_of(build.iter().map(|&k| Some(k)).collect()).expect("digestible");
+            let (lo, hi) = f.bounds();
+            let scale = if build[1] - build[0] > 100 {
+                1_000_003
+            } else {
+                1
+            };
+            let probe: Vec<Option<i64>> = (0..1_000i64)
+                .map(|i| match i % 11 {
+                    0 => None,
+                    1 => Some(lo - 1 - i),
+                    2 => Some(hi + 1 + i),
+                    _ => Some((i * 7 % 15_000) * scale),
+                })
+                .collect();
+            let want: Vec<bool> = probe
+                .iter()
+                .map(|k| k.is_some_and(|k| build.contains(&k)))
+                .collect();
+            assert!(want.iter().any(|&b| b) && !want.iter().all(|&b| b));
+            assert_eq!(mask_of(&f, probe), want);
+        }
+    }
 }
