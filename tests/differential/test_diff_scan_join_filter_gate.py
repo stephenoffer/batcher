@@ -21,6 +21,8 @@ comparison above could be passing on a path that never filters.
 
 from __future__ import annotations
 
+import collections
+
 import numpy as np
 import pyarrow as pa
 import pytest
@@ -153,8 +155,9 @@ def _star(build_keys: list[int]) -> tuple[bt.Dataset, bt.Dataset, int]:
         {"k": [i % _KEYS for i in range(_N)], "v": [i % 1_000 for i in range(_N)]}
     )
     dim = bt.from_pydict({"k": build_keys, "w": [1] * len(build_keys)})
-    keys = set(build_keys)
-    want = sum(1 for i in range(_N) if i % 1_000 < 900 and i % _KEYS in keys)
+    # Matches per probe key, so a build side that repeats a key counts each pairing.
+    times = collections.Counter(build_keys)
+    want = sum(times[i % _KEYS] for i in range(_N) if i % 1_000 < 900)
     return fact, dim, want
 
 
@@ -168,11 +171,18 @@ def test_the_default_gate_places_a_filter_on_a_lopsided_join(monkeypatch) -> Non
 
 
 def test_the_gate_declines_a_build_side_as_large_as_a_quarter_of_the_probe(monkeypatch) -> None:
+    """A 2.25:1 join (270,000 probe rows past `v < 900`, 120,000 build rows) gets no filter.
+
+    Every build key lies inside the probe's key range and repeats twice, so the planner's
+    range derivation from the probe's bounds cannot shrink the build below the gate: a
+    build of distinct keys reaching past the probe's range (`range(0, _N // 3)`) is cut to
+    its 60,000 in-range keys, a 4.5:1 join the gate rightly filters.
+    """
     monkeypatch.delenv("BATCHER_RUNTIME_JOIN_FILTER", raising=False)
-    fact, dim, want = _star(list(range(0, _N // 3)))
+    fact, dim, want = _star(list(range(_KEYS)) * 2)
     n, listed = _listed(monkeypatch, fact, dim)
     assert n == want
-    assert not listed, f"a 3:1 join was filtered: {listed}"
+    assert not listed, f"a 2.25:1 join was filtered: {listed}"
 
 
 def test_the_kill_switch_places_no_filter(monkeypatch) -> None:
