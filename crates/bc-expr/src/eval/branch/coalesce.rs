@@ -3,8 +3,13 @@
 //! See the [module docs](super) for why the arguments are evaluated selectively and what
 //! that changes about errors.
 
-use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use std::sync::Arc;
+
+use arrow::array::{
+    Array, ArrayRef, ArrowPrimitiveType, AsArray, BooleanArray, PrimitiveArray, RecordBatch,
+};
 use arrow::buffer::BooleanBuffer;
+use arrow::buffer::NullBuffer;
 use arrow::compute::is_not_null;
 use arrow::compute::kernels::boolean;
 use arrow::compute::kernels::zip::zip;
@@ -16,6 +21,12 @@ use crate::{Expr, ExprError};
 /// Evaluate `COALESCE`, computing each argument only over the rows that still need a
 /// value — which may be none of them, and often is.
 pub(crate) fn eval_coalesce(inputs: &[Expr], batch: &RecordBatch) -> Result<ArrayRef, ExprError> {
+    coalesce_of(&inputs.iter().collect::<Vec<_>>(), batch)
+}
+
+/// [`eval_coalesce`] over borrowed arguments, so a caller holding them elsewhere — the
+/// coalesce-shaped `CASE` in `case.rs` — need not clone an expression tree per morsel.
+pub(super) fn coalesce_of(inputs: &[&Expr], batch: &RecordBatch) -> Result<ArrayRef, ExprError> {
     let Some((first, rest)) = inputs.split_first() else {
         return Err(ExprError::MissingArgument {
             func: "coalesce".to_string(),
@@ -37,6 +48,11 @@ pub(crate) fn eval_coalesce(inputs: &[Expr], batch: &RecordBatch) -> Result<Arra
         // DuckDB and was DOUBLE here, and a version of this that broke out of the loop
         // returned BIGINT — the right values under a wrong column type, which
         // `assert_same` is int/float tolerant by design and could never have caught.
+        let expr: &Expr = expr;
+        if let Some(filled) = fill_with_literal(&acc, expr) {
+            acc = filled;
+            continue;
+        }
         let needed = still_null(&acc)
             .unwrap_or_else(|| BooleanArray::new(BooleanBuffer::new_unset(n), None));
         let value = eval_over(expr, batch, &needed, n)?;
@@ -52,6 +68,47 @@ pub(crate) fn eval_coalesce(inputs: &[Expr], batch: &RecordBatch) -> Result<Arra
         acc = zip(&present, &value.as_ref(), &acc_c.as_ref())?;
     }
     Ok(acc)
+}
+
+/// `acc` with every null replaced by the literal `expr`, when `expr` is a literal (never null) of
+/// exactly `acc`'s primitive type — the `COALESCE(x, 0)` shape — or `None` for anything else.
+///
+/// The general step gathers the rows still needing a value, evaluates the argument over them,
+/// and `zip`s the two arrays through `MutableArrayData`; for a literal that is three passes and
+/// an allocation per morsel to write one constant (`zip`, `try_extend` and `set_bits` were a
+/// quarter of `SUM(COALESCE(NULLIF(l_discount, 0.00), 1.00))`). Writing the constant into a copy
+/// of the values at the null positions is the same array: `zip` takes the literal exactly where
+/// `acc` is null, and a non-null literal leaves no row null. The exact-type condition is what
+/// keeps the result type the promotion the general step computes; any mismatch declines.
+fn fill_with_literal(acc: &ArrayRef, expr: &Expr) -> Option<ArrayRef> {
+    let Expr::Lit { value } = expr else {
+        return None;
+    };
+    let lit = value.to_array(1);
+    if lit.data_type() != acc.data_type() || !acc.data_type().is_primitive() {
+        return None;
+    }
+    let Some(nulls) = acc.logical_nulls() else {
+        return Some(acc.clone());
+    };
+    Some(arrow::array::downcast_primitive_array!(
+        acc => Arc::new(fill(acc, &lit, &nulls)) as ArrayRef,
+        _ => return None
+    ))
+}
+
+/// `acc`'s values with `lit` written at each position `nulls` marks null, and no nulls left.
+fn fill<T: ArrowPrimitiveType>(
+    acc: &PrimitiveArray<T>,
+    lit: &ArrayRef,
+    nulls: &NullBuffer,
+) -> PrimitiveArray<T> {
+    let v = lit.as_primitive::<T>().value(0);
+    let mut values = acc.values().to_vec();
+    for i in (!nulls.inner()).set_indices() {
+        values[i] = v;
+    }
+    PrimitiveArray::<T>::new(values.into(), None).with_data_type(acc.data_type().clone())
 }
 
 /// The rows of `arr` that are still null, or `None` when none are.
@@ -99,6 +156,60 @@ mod tests {
             vec![std::sync::Arc::new(i), std::sync::Arc::new(f)],
         )
         .expect("sample batch")
+    }
+
+    /// `COALESCE(x, literal)` of x's own type writes the literal at x's nulls — held to the
+    /// general step (`zip` through the gathered argument) over floats with NaN and `-0.0`, a
+    /// sliced column, and a column with no nulls; and a literal of another type still promotes.
+    #[test]
+    fn a_literal_fallback_fills_exactly_like_the_general_step() {
+        let f = Float64Array::from(vec![
+            Some(1.5),
+            None,
+            Some(f64::NAN),
+            Some(-0.0),
+            None,
+            Some(6.5),
+        ]);
+        let schema = Schema::new(vec![Field::new("f", DataType::Float64, true)]);
+        let full = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(f)]).unwrap();
+        let lit = Expr::Lit {
+            value: Literal::Float(-0.0),
+        };
+        for batch in [full.clone(), full.slice(1, 4), full.slice(2, 2)] {
+            let got = eval_coalesce(&[col("f"), lit.clone()], &batch).unwrap();
+            let x = batch.column(0).clone();
+            let fallback = Literal::Float(-0.0).to_array(batch.num_rows());
+            let want = zip(&arrow::compute::is_null(&x).unwrap(), &fallback, &x).unwrap();
+            let bits = |a: &ArrayRef| -> Vec<Option<u64>> {
+                a.as_primitive::<arrow::datatypes::Float64Type>()
+                    .iter()
+                    .map(|v| v.map(f64::to_bits))
+                    .collect()
+            };
+            assert_eq!(bits(&got), bits(&want));
+            assert_eq!(got.null_count(), 0);
+        }
+        // An integer literal against a float column is not this type, so it keeps the general
+        // step, and an int column under a float literal still promotes to DOUBLE.
+        let batch = sample();
+        let int_under_float = eval_coalesce(
+            &[
+                col("i"),
+                Expr::Lit {
+                    value: Literal::Float(0.5),
+                },
+            ],
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(int_under_float.data_type(), &DataType::Float64);
+        assert_eq!(
+            int_under_float
+                .as_primitive::<arrow::datatypes::Float64Type>()
+                .value(5),
+            0.5
+        );
     }
 
     /// The result type is the promotion of *every* argument's type, even when no row

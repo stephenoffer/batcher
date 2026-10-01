@@ -6,12 +6,12 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Datum, Int64Array, RecordBatch, Scalar,
 };
-use arrow::buffer::BooleanBuffer;
 use arrow::compute::cast;
 use arrow::compute::kernels::{boolean, cmp, numeric};
-use arrow::datatypes::{DataType, Float32Type, Float64Type};
+use arrow::datatypes::DataType;
 use bc_arrow::canon_float_array;
 
+use crate::eval::cmp::{float_scalar_cmp, mirror_cmp};
 use crate::eval::coerce::{
     align_date_timestamp_for_cmp, align_decimals_for_cmp, as_bool, coerce_numeric,
 };
@@ -102,7 +102,6 @@ pub(crate) fn try_scalar_binary(
     batch: &RecordBatch,
 ) -> Result<Option<ArrayRef>, ExprError> {
     use BinaryOp::{Add, Eq, Ge, Gt, Le, Lt, Mul, Ne, Sub};
-    use DataType::{Float64, Int64};
 
     // Only arithmetic and comparison broadcast cleanly and share the array path's
     // kernels. And/Or/Concat/bitwise/Div/Mod/AddMonths keep the array path.
@@ -119,18 +118,109 @@ pub(crate) fn try_scalar_binary(
     let Expr::Lit { value: lit } = lit_expr else {
         return Ok(None);
     };
-    // A non-numeric literal has no arithmetic arm here (`Utf8 || Utf8` is `Concat`, which
-    // keeps the array path), so reject that combination before evaluating the column
-    // rather than after.
-    let numeric_lit = matches!(lit, Literal::Int(_) | Literal::Float(_));
-    let is_cmp = matches!(op, Eq | Ne | Lt | Le | Gt | Ge);
-    if !numeric_lit && !is_cmp {
+    // Reject a combination the scalar path cannot serve before evaluating the column.
+    if !serves(op, lit) {
         return Ok(None);
     }
+    scalar_binary_on(op, arr_expr.eval(batch)?, lit, lit_on_right)
+}
 
-    let arr = arr_expr.eval(batch)?;
+/// Whether [`scalar_binary_on`] can serve `op` against `lit` at all: a non-numeric literal has
+/// no arithmetic arm (`Utf8 || Utf8` is `Concat`, which keeps the array path).
+fn serves(op: BinaryOp, lit: &Literal) -> bool {
+    use BinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
+    matches!(lit, Literal::Int(_) | Literal::Float(_)) || matches!(op, Eq | Ne | Lt | Le | Gt | Ge)
+}
+
+/// [`try_scalar_binary`] for an operand already evaluated: `arr OP lit` (or `lit OP arr` when
+/// `lit_on_right` is false), or `None` where the array path must decide. `NULLIF(x, 0.0)` uses
+/// it to compare against its literal without materializing it.
+pub(crate) fn scalar_binary_on(
+    op: BinaryOp,
+    arr: ArrayRef,
+    lit: &Literal,
+    lit_on_right: bool,
+) -> Result<Option<ArrayRef>, ExprError> {
+    use BinaryOp::{Add, Eq, Ge, Gt, Le, Lt, Mul, Ne, Sub};
+    if !matches!(op, Add | Sub | Mul | Eq | Ne | Lt | Le | Gt | Ge) || !serves(op, lit) {
+        return Ok(None);
+    }
+    let Some((arr, lit_arr)) = scalar_operands(arr, lit)? else {
+        return Ok(None);
+    };
+
+    // A float column against a float scalar answers in **one IEEE pass**, with no
+    // canonicalizing rewrite of the column at all — see `float_scalar_cmp`. Declines (and
+    // falls through to the canonicalize-then-compare path below) for anything it cannot
+    // answer exactly, so the two are interchangeable.
+    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+        if let Some(out) = float_scalar_cmp(op, &arr, &lit_arr, lit_on_right) {
+            return Ok(Some(out));
+        }
+        // Strings likewise, from an eight-byte prefix instead of a `memcmp` per row.
+        if let Some(out) = crate::eval::cmp::string_scalar_cmp(op, &arr, &lit_arr, lit_on_right) {
+            return Ok(Some(out));
+        }
+        // Integers and temporals a word of mask bits at a time (`cmp::prim`).
+        let row_op = if lit_on_right { op } else { mirror_cmp(op) };
+        if let Some(out) = crate::eval::cmp::int_scalar_cmp(row_op, &arr, &lit_arr) {
+            return Ok(Some(out));
+        }
+        if let Some(out) = crate::eval::cmp::bool_scalar_cmp(row_op, &arr, &lit_arr) {
+            return Ok(Some(out));
+        }
+    }
+    // Canonicalize both float operands for the comparison arms, exactly as the array path
+    // does — this path must be bit-identical to it (see `canon_floats_for_cmp`). Arithmetic
+    // is untouched: `-0.0 + x` and NaN propagation stay IEEE.
+    let (arr, lit_arr) =
+        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) && is_float_dtype(arr.data_type()) {
+            (canon_float_array(&arr), canon_float_array(&lit_arr))
+        } else {
+            (arr, lit_arr)
+        };
+
+    let scalar = Scalar::new(lit_arr);
+    let arr_dyn: &dyn Array = arr.as_ref();
+    let arr_datum: &dyn Datum = &arr_dyn;
+    let scalar_datum: &dyn Datum = &scalar;
+    let (lhs, rhs) = if lit_on_right {
+        (arr_datum, scalar_datum)
+    } else {
+        (scalar_datum, arr_datum)
+    };
+
+    let out: ArrayRef = match op {
+        // Wrapping integer arithmetic (no-op for floats, which stay IEEE), bit-identical
+        // to `eval_binary` and to the Cranelift JIT's `iadd/isub/imul`. See the parity
+        // note there — a *checked* kernel would error on overflow and diverge from the
+        // compiled tier, breaking the hard interpreter == JIT invariant.
+        Add => numeric::add_wrapping(lhs, rhs)?,
+        Sub => numeric::sub_wrapping(lhs, rhs)?,
+        Mul => numeric::mul_wrapping(lhs, rhs)?,
+        Eq => Arc::new(cmp::eq(lhs, rhs)?),
+        Ne => Arc::new(cmp::neq(lhs, rhs)?),
+        Lt => Arc::new(cmp::lt(lhs, rhs)?),
+        Le => Arc::new(cmp::lt_eq(lhs, rhs)?),
+        Gt => Arc::new(cmp::gt(lhs, rhs)?),
+        Ge => Arc::new(cmp::gt_eq(lhs, rhs)?),
+        _ => unreachable!("filtered to arith/cmp above"),
+    };
+    Ok(Some(out))
+}
+
+/// The column and the literal of a `column <op> literal` comparison or arithmetic, coerced to
+/// the pair the scalar path compares — or `None` where that path declines and the array path's
+/// wider coercion must decide. Shared with `cmp::prim::try_prim_range`, so a fused range
+/// compares exactly the operands the two separate comparisons would.
+pub(crate) fn scalar_operands(
+    arr: ArrayRef,
+    lit: &Literal,
+) -> Result<Option<(ArrayRef, ArrayRef)>, ExprError> {
+    use DataType::{Float64, Int64};
+    let numeric_lit = matches!(lit, Literal::Int(_) | Literal::Float(_));
     let lit_arr = lit.to_array(1);
-    let (arr, lit_arr) = if numeric_lit {
+    Ok(Some(if numeric_lit {
         // Only Int64/Float64 columns broadcast here; defer decimals to the array path's
         // coercion, which handles their wider promotion rules.
         if !matches!(arr.data_type(), Int64 | Float64) {
@@ -184,162 +274,7 @@ pub(crate) fn try_scalar_binary(
         } else {
             (arr, lit_arr)
         }
-    };
-
-    // A float column against a float scalar answers in **one IEEE pass**, with no
-    // canonicalizing rewrite of the column at all — see `float_scalar_cmp`. Declines (and
-    // falls through to the canonicalize-then-compare path below) for anything it cannot
-    // answer exactly, so the two are interchangeable.
-    if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
-        if let Some(out) = float_scalar_cmp(op, &arr, &lit_arr, lit_on_right) {
-            return Ok(Some(out));
-        }
-        // Strings likewise, from an eight-byte prefix instead of a `memcmp` per row.
-        if let Some(out) = crate::eval::cmp::string_scalar_cmp(op, &arr, &lit_arr, lit_on_right) {
-            return Ok(Some(out));
-        }
-    }
-    // Canonicalize both float operands for the comparison arms, exactly as the array path
-    // does — this path must be bit-identical to it (see `canon_floats_for_cmp`). Arithmetic
-    // is untouched: `-0.0 + x` and NaN propagation stay IEEE.
-    let (arr, lit_arr) =
-        if matches!(op, Eq | Ne | Lt | Le | Gt | Ge) && is_float_dtype(arr.data_type()) {
-            (canon_float_array(&arr), canon_float_array(&lit_arr))
-        } else {
-            (arr, lit_arr)
-        };
-
-    let scalar = Scalar::new(lit_arr);
-    let arr_dyn: &dyn Array = arr.as_ref();
-    let arr_datum: &dyn Datum = &arr_dyn;
-    let scalar_datum: &dyn Datum = &scalar;
-    let (lhs, rhs) = if lit_on_right {
-        (arr_datum, scalar_datum)
-    } else {
-        (scalar_datum, arr_datum)
-    };
-
-    let out: ArrayRef = match op {
-        // Wrapping integer arithmetic (no-op for floats, which stay IEEE), bit-identical
-        // to `eval_binary` and to the Cranelift JIT's `iadd/isub/imul`. See the parity
-        // note there — a *checked* kernel would error on overflow and diverge from the
-        // compiled tier, breaking the hard interpreter == JIT invariant.
-        Add => numeric::add_wrapping(lhs, rhs)?,
-        Sub => numeric::sub_wrapping(lhs, rhs)?,
-        Mul => numeric::mul_wrapping(lhs, rhs)?,
-        Eq => Arc::new(cmp::eq(lhs, rhs)?),
-        Ne => Arc::new(cmp::neq(lhs, rhs)?),
-        Lt => Arc::new(cmp::lt(lhs, rhs)?),
-        Le => Arc::new(cmp::lt_eq(lhs, rhs)?),
-        Gt => Arc::new(cmp::gt(lhs, rhs)?),
-        Ge => Arc::new(cmp::gt_eq(lhs, rhs)?),
-        _ => unreachable!("filtered to arith/cmp above"),
-    };
-    Ok(Some(out))
-}
-
-/// `<float column> <cmp> <float scalar>` in one IEEE pass — no canonicalized copy of the
-/// column, and no `total_cmp`.
-///
-/// The engine's float identity folds `-0.0` into `0.0` and all NaNs into one value
-/// (`bc_arrow::float_ident`), and every other float comparison here obtains it by rewriting
-/// **both operands** and handing them to arrow's `cmp`, which ranks floats by `total_cmp`.
-/// That is two full passes over the column — one to look for a `-0.0` or a NaN, plus a
-/// second, scalar one to compare — and on a 60 M-row predicate the first alone profiled at
-/// 10.9 % of the query while the comparison kernel took another 39 %.
-///
-/// Neither pass is necessary against a scalar, because the identity is already *implied* by
-/// the right IEEE predicate. Two observations do it:
-///
-/// * **IEEE already folds the zeros.** `-0.0 == 0.0` is true and `-0.0 < x` iff `0.0 < x`
-///   for every `x`, so a canonicalizing pass changes no comparison's answer. Only
-///   `total_cmp` — which orders the two zeros apart, and which nothing here needs — made it
-///   look necessary.
-/// * **NaN is the only real difference, and it is a predicate choice.** Canonicalizing sends
-///   every NaN to `+qNaN`, which `total_cmp` ranks above `+inf`, so against a non-NaN literal
-///   a NaN row answers *false* to `<` and `<=` and *true* to `>` and `>=`. IEEE agrees on the
-///   first pair (a NaN comparison is false) and disagrees on the second — which is exactly
-///   what the **negated** form fixes: `!(v <= lit)` is true for a NaN and equals `v > lit`
-///   for everything else. That is one unordered-or-greater compare, which is a single
-///   instruction on every SIMD target, rather than a branch.
-///
-/// `Eq`/`Ne` need no adjustment: with a non-NaN literal, `canon(v) == canon(lit)` under
-/// `total_cmp` holds exactly when `v == lit` under IEEE, NaN answering false to both.
-///
-/// # Declines
-///
-/// * A **NaN literal**. It is the one value whose canonical form changes the answer —
-///   `canon(NaN) == canon(NaN)` is *true*, where IEEE `NaN == NaN` is false — so it keeps
-///   the canonicalizing path rather than being special-cased here.
-/// * A null literal, a non-float column, or a column and literal of different float widths.
-///   All are the array path's to coerce; this fires only where the two already agree.
-///
-/// Nulls are carried through unchanged: the output is null exactly where the input is,
-/// which is what `arrow_ord::cmp` produces for a null-free scalar operand.
-fn float_scalar_cmp(
-    op: BinaryOp,
-    arr: &ArrayRef,
-    lit_arr: &ArrayRef,
-    lit_on_right: bool,
-) -> Option<ArrayRef> {
-    if arr.data_type() != lit_arr.data_type() || lit_arr.is_null(0) {
-        return None;
-    }
-    // A literal on the *left* is the mirrored predicate on the right: `24 > x` is `x < 24`.
-    // Mirroring the operator is exact for every arm, including the NaN ones, because it is
-    // the same total order read in the other direction.
-    let op = if lit_on_right { op } else { mirror_cmp(op) };
-    let values = match arr.data_type() {
-        DataType::Float64 => {
-            let lit = lit_arr.as_primitive::<Float64Type>().value(0);
-            if lit.is_nan() {
-                return None;
-            }
-            float_cmp_bits(arr.as_primitive::<Float64Type>().values(), lit, op)
-        }
-        DataType::Float32 => {
-            let lit = lit_arr.as_primitive::<Float32Type>().value(0);
-            if lit.is_nan() {
-                return None;
-            }
-            float_cmp_bits(arr.as_primitive::<Float32Type>().values(), lit, op)
-        }
-        _ => return None,
-    };
-    Some(Arc::new(BooleanArray::new(values, arr.nulls().cloned())))
-}
-
-/// The comparison read from the other side — `a < b` is `b > a`, and so on.
-fn mirror_cmp(op: BinaryOp) -> BinaryOp {
-    use BinaryOp::{Ge, Gt, Le, Lt};
-    match op {
-        Lt => Gt,
-        Le => Ge,
-        Gt => Lt,
-        Ge => Le,
-        other => other, // Eq / Ne are symmetric
-    }
-}
-
-/// One IEEE comparison per value, packed 64 bits at a time. See [`float_scalar_cmp`] for why
-/// `Gt`/`Ge` are written as negations — that is the whole of the NaN handling.
-// `!(a <= b)` on a partially ordered type is exactly what this needs, and it is what the
-// lint exists to question: the negation is the NaN handling, not a lazy spelling of `>`.
-// `partial_cmp` — the lint's suggestion — would reintroduce the branch on `None` that the
-// unordered-or-greater compare replaces with one instruction.
-#[allow(clippy::neg_cmp_op_on_partial_ord)]
-fn float_cmp_bits<T: PartialOrd + Copy>(values: &[T], lit: T, op: BinaryOp) -> BooleanBuffer {
-    use BinaryOp::{Eq, Ge, Gt, Le, Lt, Ne};
-    let n = values.len();
-    match op {
-        Lt => BooleanBuffer::collect_bool(n, |i| values[i] < lit),
-        Le => BooleanBuffer::collect_bool(n, |i| values[i] <= lit),
-        Gt => BooleanBuffer::collect_bool(n, |i| !(values[i] <= lit)),
-        Ge => BooleanBuffer::collect_bool(n, |i| !(values[i] < lit)),
-        Eq => BooleanBuffer::collect_bool(n, |i| values[i] == lit),
-        Ne => BooleanBuffer::collect_bool(n, |i| !(values[i] == lit)),
-        _ => unreachable!("float_scalar_cmp filters to the comparison arms"),
-    }
+    }))
 }
 
 pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {

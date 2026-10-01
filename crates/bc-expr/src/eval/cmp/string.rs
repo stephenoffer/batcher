@@ -191,6 +191,19 @@ fn compare<O: OffsetSizeTrait>(
     lit: &str,
     op: BinaryOp,
 ) -> BooleanBuffer {
+    if lit.is_empty() {
+        // The empty string orders below every other string, so a comparison with it is a
+        // question about each row's *length* alone — answered from the offsets, without
+        // reading a byte of text. `SearchPhrase <> ''` over a column that is 160 MB of mostly
+        // short strings stops touching the value buffer at all.
+        let n = strings.len();
+        return match op {
+            BinaryOp::Eq | BinaryOp::Le => fill_len(strings, |len| len == 0),
+            BinaryOp::Ne | BinaryOp::Gt => fill_len(strings, |len| len != 0),
+            BinaryOp::Lt => BooleanBuffer::new_unset(n),
+            _ => BooleanBuffer::new_set(n),
+        };
+    }
     let needle = Needle::new(lit);
     if let Some(key) = needle.short_key() {
         // Short literal: every row orders by one integer compare, with no branch on the data.
@@ -280,6 +293,26 @@ fn fill_short<O: OffsetSizeTrait>(
         for (bit, pair) in offsets[base..=(base + 64).min(n)].windows(2).enumerate() {
             let (start, end) = (pair[0].as_usize(), pair[1].as_usize());
             bits |= u64::from(test(short_key(values, start, end - start))) << bit;
+        }
+        *word = bits;
+    }
+    BooleanBuffer::new(words.into(), 0, n)
+}
+
+/// One bit per row, `test` applied to each row's byte length, filled a word at a time.
+#[inline(always)]
+fn fill_len<O: OffsetSizeTrait>(
+    strings: &GenericStringArray<O>,
+    test: impl Fn(usize) -> bool,
+) -> BooleanBuffer {
+    let offsets = strings.value_offsets();
+    let n = strings.len();
+    let mut words = vec![0u64; n.div_ceil(64)];
+    for (w, word) in words.iter_mut().enumerate() {
+        let base = w * 64;
+        let mut bits = 0u64;
+        for (bit, pair) in offsets[base..=(base + 64).min(n)].windows(2).enumerate() {
+            bits |= u64::from(test((pair[1] - pair[0]).as_usize())) << bit;
         }
         *word = bits;
     }

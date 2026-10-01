@@ -10,7 +10,12 @@
 //! *is* the path for lists, structs and maps, which the generic kernels refuse.
 
 mod nested;
+mod prim;
 mod string;
 
 pub(crate) use nested::{eval_nested_cmp, is_nested};
+pub(crate) use prim::{
+    bool_scalar_cmp, fill, float_scalar_cmp, int_scalar_cmp, is_range_pair, mirror_cmp,
+    try_prim_range,
+};
 pub(crate) use string::{string_scalar_cmp, try_string_range};

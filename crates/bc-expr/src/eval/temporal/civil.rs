@@ -17,6 +17,13 @@
 //! every supported day in the non-negative range, so no division has to handle a sign either.
 //! Day-of-week needs no decomposition at all and costs 2.8 ns against the kernel's 12.4.
 //!
+//! **Inside 1900..2100 the decomposition is a table lookup.** Even at 7.3 ns the arithmetic was
+//! two thirds of `GROUP BY EXTRACT(YEAR FROM l_shipdate)`'s CPU (perf: `eval_date` 65%, the
+//! grouping 23%). A table of every day's packed fields across those two centuries is 292 KB,
+//! built once per process *from `civil_from_days` itself*, so the two cannot disagree; a lookup
+//! is one load from a range real data keeps cache-resident, because a column of dates clusters.
+//! A day outside the window takes the arithmetic, per row, behind a branch real data predicts.
+//!
 //! **Arrow's kernel is the oracle, and this path declines rather than extends it.** Only a
 //! `Date32` or a timezone-naive `Timestamp` takes this route — a zoned timestamp extracts in
 //! local time, which is `date_part`'s business — and a column holding any value outside
@@ -24,7 +31,7 @@
 //! the kernel gives it instead of a second one invented here. The tests below hold the two
 //! paths equal across that whole range.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{Array, ArrayRef, AsArray, Int64Array};
 use arrow::buffer::NullBuffer;
@@ -80,6 +87,37 @@ fn ordinal(c: Civil) -> i64 {
     i64::from(CUMULATIVE[(c.month - 1) as usize] + c.day + u32::from(leap && c.month > 2))
 }
 
+/// First day the lookup table covers: 1900-01-01.
+const TABLE_FIRST: i32 = -25_567;
+/// Days the table covers: 1900-01-01 up to, not including, 2100-01-01.
+const TABLE_LEN: usize = 73_049;
+
+/// `civil_from_days` for every day in the table window, packed `year << 16 | month << 8 | day`.
+fn table() -> &'static [u32] {
+    static TABLE: OnceLock<Box<[u32]>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        (0..TABLE_LEN as i32)
+            .map(|i| {
+                let c = civil_from_days(TABLE_FIRST + i);
+                ((c.year as u32) << 16) | (c.month << 8) | c.day
+            })
+            .collect()
+    })
+}
+
+/// [`civil_from_days`], answered from `table` when `days` falls inside its window.
+#[inline(always)]
+fn civil(days: i32, table: &[u32]) -> Civil {
+    match table.get(days.wrapping_sub(TABLE_FIRST) as u32 as usize) {
+        Some(&p) => Civil {
+            year: (p >> 16) as i32,
+            month: (p >> 8) & 0xff,
+            day: p & 0xff,
+        },
+        None => civil_from_days(days),
+    }
+}
+
 /// Whether every non-null value in `vals` lies in `[lo, hi]`.
 ///
 /// A min/max fold first, because it vectorizes and is the whole answer for real data; the
@@ -133,14 +171,15 @@ fn map_fields<T: Copy + Into<i64>>(
     let b = (lo, hi);
     let t = ticks_per_sec;
     let timed = ticks_per_sec.is_some();
+    let tb = table();
     Some(match func {
-        DateFunc::Year => apply(vals, t, b, |d, _| i64::from(civil_from_days(d).year)),
-        DateFunc::Month => apply(vals, t, b, |d, _| i64::from(civil_from_days(d).month)),
-        DateFunc::Day => apply(vals, t, b, |d, _| i64::from(civil_from_days(d).day)),
+        DateFunc::Year => apply(vals, t, b, |d, _| i64::from(civil(d, tb).year)),
+        DateFunc::Month => apply(vals, t, b, |d, _| i64::from(civil(d, tb).month)),
+        DateFunc::Day => apply(vals, t, b, |d, _| i64::from(civil(d, tb).day)),
         DateFunc::Quarter => apply(vals, t, b, |d, _| {
-            i64::from((civil_from_days(d).month - 1) / 3 + 1)
+            i64::from((civil(d, tb).month - 1) / 3 + 1)
         }),
-        DateFunc::DayOfYear => apply(vals, t, b, |d, _| ordinal(civil_from_days(d))),
+        DateFunc::DayOfYear => apply(vals, t, b, |d, _| ordinal(civil(d, tb))),
         // 1970-01-01 was a Thursday; Sunday is 0.
         DateFunc::DayOfWeek => apply(vals, t, b, |d, _| i64::from((d + 4).rem_euclid(7))),
         DateFunc::Hour if timed => apply(vals, t, b, |_, s| i64::from(s / 3600)),
@@ -264,6 +303,30 @@ mod tests {
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         assert_eq!((NaiveDate::MIN - epoch).num_days(), MIN_DAY);
         assert_eq!((NaiveDate::MAX - epoch).num_days(), MAX_DAY);
+    }
+
+    /// Every day of the lookup window, and a day either side of it, against the kernel — so
+    /// both the table and the boundary where a lookup hands back to the arithmetic are checked.
+    #[test]
+    fn every_day_the_table_covers_matches_the_arrow_kernel() {
+        let first = TABLE_FIRST - 3;
+        let last = TABLE_FIRST + TABLE_LEN as i32 + 3;
+        let arr: ArrayRef = Arc::new(Date32Array::from((first..last).collect::<Vec<_>>()));
+        assert_agrees(&arr);
+        let edges: ArrayRef = Arc::new(TimestampMicrosecondArray::from(
+            [
+                TABLE_FIRST - 1,
+                TABLE_FIRST,
+                TABLE_FIRST + TABLE_LEN as i32 - 1,
+            ]
+            .iter()
+            .flat_map(|&d| {
+                let at = i64::from(d) * 86_400_000_000;
+                [at, at + 86_400_000_000 - 1]
+            })
+            .collect::<Vec<_>>(),
+        ));
+        assert_agrees(&edges);
     }
 
     #[test]
