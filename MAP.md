@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1554 Python modules across 220 packages and 317 Rust files across 14 crates.
+Covering 1554 Python modules across 220 packages and 319 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -3067,7 +3067,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 146 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par/asof_stream.rs` | 454 | A keyless ASOF join that does not fit: a merge over two out-of-core sorted streams. |
-| `join_par/mod.rs` | 794 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `join_par/mod.rs` | 710 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `join_par/orient.rs` | 163 | Which side of a join to build on, once both sides' true sizes are known. |
 | `join_par/probe_stream.rs` | 223 | Streaming a join's probe side past a build side that is already resident. |
 | `join_par/range_blocked.rs` | 169 | A range join whose right side does not fit: block-nested over chunks of both sides. |
 | `join_par/sideways.rs` | 243 | Restrict a join's build-side aggregate to the keys its (already materialized) probe side holds. |
@@ -3103,7 +3104,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 615 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 376 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 795 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/mod.rs` | 789 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
 | `stream/parallel.rs` | 1604 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 181 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
@@ -3148,11 +3149,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 753 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `join/asof.rs` | 248 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
-| `join/build.rs` | 246 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
+| `join/build.rs` | 237 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 444 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
 | `join/key_filter.rs` | 419 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 2148 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 2238 | Hash join — produces match index-pairs, built to distribute. |
 | `join/probe_par.rs` | 113 | The flat hash join's probe, across cores, emitting exactly what the serial probe emits. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
@@ -3160,6 +3161,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `join/range/marks.rs` | 85 | The mark bitmap the IEJoin sweep reads, and the levels that make reading it cheap. |
 | `join/range/mod.rs` | 665 | Range (inequality) join: `L.x op R.y`, optionally with a second inequality. |
 | `join/range/small.rs` | 174 | A range join whose right side is a handful of rows: scan, don't sort. |
+| `join/slots.rs` | 144 | The hash join's chain-head table: open addressing over packed 64-bit slots, laid out so a probe can prefetch where a key lives before it looks. |
 | `join/sort_merge.rs` | 206 | Sort-merge equi-join: the no-hash-table join for two large (or already-sorted) inputs. |
 | `join/stream.rs` | 360 | Streaming broadcast probe — build the hash table once, probe one morsel at a time. |
 | `keys.rs` | 391 | The one canonical form for grouping/partitioning keys. |
