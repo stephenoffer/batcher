@@ -698,9 +698,9 @@ pub(crate) async fn read_parquet_inner(
             // step *removes rows* rather than skipping provably-empty work.
             if let Some((late, true)) = late.as_ref() {
                 b = b.with_row_filter(late.row_filter(bloom_meta.parquet_schema()));
-            } else if late.is_some() {
-                // Measuring the unfiltered side: the native row filter would make it a third
-                // configuration, timed as if it were this one.
+            } else if late.as_ref().is_some_and(|(l, _)| l.deciding()) {
+                // Measuring the unfiltered side, which the native filter would turn into a third
+                // configuration. After `OFF` the read takes the native filter (`deciding`).
             } else if let (Some(pred), Some(cols)) = (bloom_pred.as_ref(), rf_cols.as_ref()) {
                 b = b.with_row_filter(row_filter::build(pred, cols, bloom_meta.parquet_schema()));
             }

@@ -212,6 +212,16 @@ impl LateFilter {
         }
     }
 
+    /// Whether the scan is still timing both configurations, before any verdict.
+    ///
+    /// Only then must an uninstalled read skip the native row filter: it is the measured
+    /// unfiltered side, and the native filter would make it a third configuration timed as if
+    /// it were this one. Once the verdict is `OFF` the uninstalled read is simply the ordinary
+    /// read, native row filter included.
+    pub(crate) fn deciding(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == UNDECIDED
+    }
+
     /// Record a row group of `rows` rows read in `nanos`, `installed` or not, keeping `kept`.
     pub(crate) fn record(&self, installed: bool, rows: u64, kept: u64, nanos: u64) {
         if self.state.load(Ordering::Relaxed) != UNDECIDED {
