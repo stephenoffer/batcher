@@ -106,70 +106,344 @@ fn partition_morsels_with(
         .map(|c| batches.iter().map(|b| b.column(c).as_ref()).collect())
         .collect();
     let plans: Vec<ColGather> = sources.iter().map(|s| plan_column(s)).collect();
-    // Each byte column's per-bucket byte total, measured once, **in row order**.
-    //
-    // `gather_bytes` needs the exact size of a bucket's value buffer before it can copy into
-    // one that never reallocates, and it used to get it by walking the bucket's bin and
-    // reading `offsets[r]`/`offsets[r+1]` for every row — a second *random* pass over the
-    // offsets, on top of the one the copy itself makes. A bucket owns about one row in
-    // `parts`, so that walk touches nearly every cache line of a 40 MB offsets array to use
-    // eight bytes from each.
-    //
-    // The same totals fall out of a sequential scan of the whole column, which the hardware
-    // prefetcher serves at streaming speed, and one such scan covers every bucket at once.
-    // Row order also has to be re-derived here (`bucket_csr` keeps only the binned ids), and
-    // that is deliberately cheap: it is a scan of a `u32` per row, not of the values.
-    let byte_totals: Vec<Option<Vec<usize>>> = plans
+    let layout = Layout::new(&per_morsel, parts, rayon::current_num_threads());
+
+    // Column-major: each column is scattered into every bucket at once (see `Layout`), so a
+    // column's result is one array per bucket. Transposed into one batch per bucket below.
+    let by_column: Vec<Vec<ArrayRef>> = plans
         .par_iter()
-        .map(|plan| match plan {
-            ColGather::Bytes(cols) => Some(cols.bucket_byte_totals(&per_morsel, parts)),
-            _ => None,
-        })
-        .collect();
-    let buckets: Vec<RecordBatch> = (0..parts)
-        .into_par_iter()
-        .map(|bucket| {
-            // `(morsel, row)` pairs for this bucket, morsels in order, rows in order — the
-            // relation's own order, restricted to the rows that hashed here. Sized exactly,
-            // so the gather never reallocates.
-            let total: usize = per_morsel
-                .iter()
-                .map(|(_, off)| (off[bucket + 1] - off[bucket]) as usize)
-                .sum();
-            // Built lazily: only a column that declined the flat gather needs index pairs.
-            let mut pairs: Option<Vec<(usize, usize)>> = None;
-            let columns: Vec<ArrayRef> = plans
-                .iter()
-                .zip(&sources)
-                .zip(&byte_totals)
-                .map(|((plan, src), totals)| match plan {
-                    ColGather::Fast(cols) => Ok(cols.gather(&per_morsel, bucket, total)),
-                    ColGather::Bytes(cols) => cols.gather(
-                        &per_morsel,
-                        bucket,
-                        total,
-                        totals.as_ref().expect("a byte column has byte totals")[bucket],
-                    ),
-                    ColGather::Interleave => {
-                        let pairs = pairs.get_or_insert_with(|| {
-                            let mut p = Vec::with_capacity(total);
-                            for (morsel, (rows, off)) in per_morsel.iter().enumerate() {
-                                p.extend(
-                                    rows[off[bucket] as usize..off[bucket + 1] as usize]
-                                        .iter()
-                                        .map(|&row| (morsel, row as usize)),
-                                );
-                            }
-                            p
-                        });
-                        interleave(src, pairs).map_err(InterpError::from)
+        .zip(&sources)
+        .map(|(plan, src)| match plan {
+            ColGather::Fast(cols) => Ok(cols.scatter(&per_morsel, &layout)),
+            ColGather::Bytes(cols) => cols.scatter(&per_morsel, &layout),
+            ColGather::Interleave => (0..parts)
+                .into_par_iter()
+                .map(|bucket| {
+                    let mut pairs = Vec::with_capacity(layout.totals[bucket]);
+                    for (morsel, (rows, off)) in per_morsel.iter().enumerate() {
+                        pairs.extend(
+                            rows[off[bucket] as usize..off[bucket + 1] as usize]
+                                .iter()
+                                .map(|&row| (morsel, row as usize)),
+                        );
                     }
+                    interleave(src, &pairs).map_err(InterpError::from)
                 })
-                .collect::<Result<_, InterpError>>()?;
-            RecordBatch::try_new(schema.clone(), columns).map_err(InterpError::from)
+                .collect(),
         })
         .collect::<Result<_, InterpError>>()?;
-    Ok(buckets)
+
+    let mut columns: Vec<std::vec::IntoIter<ArrayRef>> =
+        by_column.into_iter().map(Vec::into_iter).collect();
+    (0..parts)
+        .map(|_| {
+            let cols: Vec<ArrayRef> = columns
+                .iter_mut()
+                .map(|c| c.next().expect("one array per bucket"))
+                .collect();
+            RecordBatch::try_new(schema.clone(), cols).map_err(InterpError::from)
+        })
+        .collect()
+}
+
+/// Where every scatter task writes: the morsels cut into contiguous **chunks**, and each
+/// chunk's row count per bucket.
+///
+/// The gather used to be *bucket-major* — one task per bucket, pulling that bucket's rows out
+/// of every morsel. A bucket owns about one row in `parts`, so each task read every source
+/// morsel at a `parts`-row stride: a cache line fetched per 8-byte value, from a relation far
+/// larger than any cache. And it copied each string with its own `memmove` call, for values a
+/// few bytes long. Measured on H2O `groupby` q10 (10 M rows, six keys, three of them strings,
+/// 315 buckets on 15 cores), that gather was **68 % of the query's CPU** — `memmove` alone
+/// 33 %, ahead of hashing and the aggregation itself.
+///
+/// Scattering *chunk-major* turns the reads sequential: a task walks its own morsels in order,
+/// each morsel's column resident in cache while its rows are dealt to the buckets, and writes
+/// each bucket's rows into a slot reserved for it. The slots are disjoint slices of each
+/// bucket's single output buffer, laid out chunk by chunk, so the output is **byte-for-byte
+/// what the bucket-major gather produced**: every bucket holds its rows morsels-in-order,
+/// rows-in-order within a morsel, contiguous in one batch. The slots are carved with
+/// `split_at_mut`, so the parallel writes need no `unsafe` and no synchronisation.
+///
+/// Chunks rather than morsels, because a slot is one `&mut [T]` per (chunk, bucket): at
+/// sf10's 3,663 morsels and 576 buckets per-morsel slots would be two million slice
+/// descriptors per column, where a few chunks per worker keep it to tens of thousands. And
+/// chunks cut by **rows**, not whole morsels, because the input is not always morsel-sized: a
+/// filtered or materialized relation can arrive as a handful of large batches, and a chunk of
+/// whole morsels would then leave one task scattering the entire relation while the pool
+/// waited. That shape is exactly the shuffle join's (15 buckets over two large batches), and
+/// it read 25 % slower than the bucket-major gather until the cut moved inside the batch.
+struct Layout {
+    /// Contiguous row ranges of the relation, in order — one scatter task each.
+    chunks: Vec<Vec<Seg>>,
+    /// `rows[c][b]`: rows chunk `c` sends to bucket `b`.
+    rows: Vec<Vec<usize>>,
+    /// Rows per bucket, over the whole relation.
+    totals: Vec<usize>,
+}
+
+/// Chunks per worker: enough that an uneven chunk does not leave the pool idle, few enough
+/// that the per-(chunk, bucket) slot table stays small.
+const CHUNKS_PER_THREAD: usize = 4;
+
+/// Rows below which a chunk is not worth its own task and its own row of slots.
+const MIN_CHUNK_ROWS: usize = 4_096;
+
+/// The rows `[lo, hi)` of one morsel: a piece of a chunk.
+#[derive(Clone, Copy)]
+struct Seg {
+    morsel: usize,
+    lo: u32,
+    hi: u32,
+    /// The whole morsel, so a bin needs no trimming to the range.
+    whole: bool,
+}
+
+impl Layout {
+    fn new(per_morsel: &[(Vec<u32>, Vec<u32>)], parts: usize, threads: usize) -> Self {
+        // `bucket_csr` keeps one row id per row, so its length is the morsel's row count.
+        let total: usize = per_morsel.iter().map(|(rows, _)| rows.len()).sum();
+        let want = threads.max(1).saturating_mul(CHUNKS_PER_THREAD);
+        let target = total.div_ceil(want).max(MIN_CHUNK_ROWS);
+        let mut chunks: Vec<Vec<Seg>> = Vec::new();
+        let (mut cur, mut cur_rows) = (Vec::new(), 0usize);
+        for (morsel, (rows, _)) in per_morsel.iter().enumerate() {
+            let len = rows.len();
+            let mut lo = 0usize;
+            while lo < len {
+                let take = (target - cur_rows).min(len - lo);
+                cur.push(Seg {
+                    morsel,
+                    lo: lo as u32,
+                    hi: (lo + take) as u32,
+                    whole: take == len,
+                });
+                (lo, cur_rows) = (lo + take, cur_rows + take);
+                if cur_rows >= target {
+                    chunks.push(std::mem::take(&mut cur));
+                    cur_rows = 0;
+                }
+            }
+        }
+        if !cur.is_empty() {
+            chunks.push(cur);
+        }
+        let rows: Vec<Vec<usize>> = chunks
+            .par_iter()
+            .map(|chunk| {
+                let mut counts = vec![0usize; parts];
+                for seg in chunk {
+                    for (b, count) in counts.iter_mut().enumerate() {
+                        *count += bin(per_morsel, seg, b).len();
+                    }
+                }
+                counts
+            })
+            .collect();
+        let totals = column_sums(&rows, parts);
+        Layout {
+            chunks,
+            rows,
+            totals,
+        }
+    }
+}
+
+/// Bucket `b`'s rows within `seg`, ascending: the morsel's CSR bin, trimmed to the segment's
+/// range when it covers only part of the morsel. A bin is sorted (`bucket_csr` visits rows in
+/// order), so the trim is two binary searches, not a scan.
+fn bin<'p>(per_morsel: &'p [(Vec<u32>, Vec<u32>)], seg: &Seg, b: usize) -> &'p [u32] {
+    let (rows, off) = &per_morsel[seg.morsel];
+    let bin = &rows[off[b] as usize..off[b + 1] as usize];
+    if seg.whole {
+        return bin;
+    }
+    let start = bin.partition_point(|&r| r < seg.lo);
+    let end = bin.partition_point(|&r| r < seg.hi);
+    &bin[start..end]
+}
+
+/// One buffer of `len + extra` copies of `fill` per bucket, allocated **across the pool**.
+///
+/// Allocated serially, this was the scatter's one regression: a 15-way shuffle join over 3 M
+/// rows asks for fifteen 1.6 MB buffers, and zeroing them (and taking their first-touch page
+/// faults) on the calling thread put ~18 ms of serial work in front of a parallel copy that
+/// takes less. The bucket-major gather never paid it, because each bucket's task allocated
+/// its own output. The fill is overwritten in full by the scatter; it exists only so the
+/// slots can be carved as initialized memory, with no `unsafe`.
+fn zeroed_buffers<T: Copy + Send + Sync>(lens: &[usize], extra: usize, fill: T) -> Vec<Vec<T>> {
+    lens.par_iter().map(|&n| vec![fill; n + extra]).collect()
+}
+
+/// `sums[b] = Σ_c table[c][b]`.
+fn column_sums(table: &[Vec<usize>], parts: usize) -> Vec<usize> {
+    let mut sums = vec![0usize; parts];
+    for row in table {
+        for (s, &x) in sums.iter_mut().zip(row) {
+            *s += x;
+        }
+    }
+    sums
+}
+
+/// Carve each bucket's buffer (past its first `skip` elements) into one disjoint slot per
+/// chunk, sized `sizes[c][b]` and laid out in chunk order. Returned chunk-major — `[c][b]` —
+/// so each scatter task owns exactly its own row of slots.
+fn carve<'a, T>(
+    bufs: &'a mut [Vec<T>],
+    sizes: &[Vec<usize>],
+    skip: usize,
+) -> Vec<Vec<&'a mut [T]>> {
+    let mut out: Vec<Vec<&'a mut [T]>> = (0..sizes.len())
+        .map(|_| Vec::with_capacity(bufs.len()))
+        .collect();
+    for (b, buf) in bufs.iter_mut().enumerate() {
+        let mut rest: &'a mut [T] = &mut buf.as_mut_slice()[skip..];
+        for (c, slots) in out.iter_mut().enumerate() {
+            let (slot, tail) = std::mem::take(&mut rest).split_at_mut(sizes[c][b]);
+            slots.push(slot);
+            rest = tail;
+        }
+        debug_assert!(rest.is_empty(), "slots must tile the bucket exactly");
+    }
+    out
+}
+
+/// Scatter one primitive column into every bucket — see [`Layout`].
+///
+/// `interleave` needs a materialized `&[(usize, usize)]` — **sixteen bytes of index per
+/// output row** — where the row ids already exist as `u32` in the CSR bins, so this reads them
+/// in place and writes the output directly.
+fn scatter_prim<T: ArrowPrimitiveType>(
+    cols: &[&PrimitiveArray<T>],
+    per_morsel: &[(Vec<u32>, Vec<u32>)],
+    layout: &Layout,
+) -> Vec<ArrayRef> {
+    let parts = layout.totals.len();
+    let mut bufs: Vec<Vec<T::Native>> = zeroed_buffers(&layout.totals, 0, T::Native::default());
+    carve(&mut bufs, &layout.rows, 0)
+        .into_par_iter()
+        .zip(layout.chunks.par_iter())
+        .for_each(|(mut slots, chunk)| {
+            let mut cursor = vec![0usize; parts];
+            for seg in chunk {
+                let values = cols[seg.morsel].values();
+                for (b, (slot, at)) in slots.iter_mut().zip(cursor.iter_mut()).enumerate() {
+                    let bin = bin(per_morsel, seg, b);
+                    for (dst, &r) in slot[*at..*at + bin.len()].iter_mut().zip(bin) {
+                        *dst = values[r as usize];
+                    }
+                    *at += bin.len();
+                }
+            }
+        });
+    bufs.into_iter()
+        .map(|v| Arc::new(PrimitiveArray::<T>::new(v.into(), None)) as ArrayRef)
+        .collect()
+}
+
+/// Values at most this long are copied as one fixed-width move rather than a `memmove`
+/// call. Most group and join keys are short, and a call per few-byte string was the single
+/// largest cost of the old gather — see [`Layout`].
+const SHORT_COPY: usize = 16;
+
+/// Copy `src[s..e]` to `dst[at..]`, over-writing up to [`SHORT_COPY`] bytes past the value
+/// when both sides have room. The over-written tail lies inside the caller's own slot and is
+/// overwritten by the values that follow it, so only the exact `e - s` bytes survive.
+#[inline(always)]
+fn copy_value(dst: &mut [u8], at: usize, src: &[u8], s: usize, e: usize) {
+    let len = e - s;
+    if len <= SHORT_COPY && at + SHORT_COPY <= dst.len() && s + SHORT_COPY <= src.len() {
+        dst[at..at + SHORT_COPY].copy_from_slice(&src[s..s + SHORT_COPY]);
+    } else {
+        dst[at..at + len].copy_from_slice(&src[s..e]);
+    }
+}
+
+/// Scatter one null-free byte column into every bucket — the [`scatter_prim`] argument at the
+/// type where it is worth the most.
+///
+/// Two passes per chunk over the same (cache-resident) morsels: the first sums each
+/// (chunk, bucket)'s value bytes, which fixes every slot of every bucket's value buffer; the
+/// second writes the offsets and the bytes together. The output is the array `interleave`
+/// produces — same rows, same order — and is re-validated by the safe constructor rather than
+/// asserted, so an offset that outgrew `T::Offset` is an error, not a wrapped value.
+fn scatter_bytes<T: ByteArrayType>(
+    cols: &[&GenericByteArray<T>],
+    per_morsel: &[(Vec<u32>, Vec<u32>)],
+    layout: &Layout,
+) -> Result<Vec<ArrayRef>, InterpError> {
+    let parts = layout.totals.len();
+    let bytes: Vec<Vec<usize>> = layout
+        .chunks
+        .par_iter()
+        .map(|chunk| {
+            let mut counts = vec![0usize; parts];
+            for seg in chunk {
+                let src = cols[seg.morsel].value_offsets();
+                for (b, count) in counts.iter_mut().enumerate() {
+                    for &r in bin(per_morsel, seg, b) {
+                        *count += src[r as usize + 1].as_usize() - src[r as usize].as_usize();
+                    }
+                }
+            }
+            counts
+        })
+        .collect();
+    let byte_totals = column_sums(&bytes, parts);
+    // Each slot's first absolute byte position within its bucket's value buffer.
+    let mut base: Vec<Vec<usize>> = Vec::with_capacity(bytes.len());
+    let mut running = vec![0usize; parts];
+    for counts in &bytes {
+        base.push(running.clone());
+        for (r, &x) in running.iter_mut().zip(counts) {
+            *r += x;
+        }
+    }
+    if let Some(&too_big) = byte_totals
+        .iter()
+        .find(|&&n| T::Offset::from_usize(n).is_none())
+    {
+        return Err(InterpError::Arrow(
+            arrow::error::ArrowError::OffsetOverflowError(too_big),
+        ));
+    }
+
+    let mut data: Vec<Vec<u8>> = zeroed_buffers(&byte_totals, 0, 0u8);
+    let mut offsets: Vec<Vec<T::Offset>> =
+        zeroed_buffers(&layout.totals, 1, T::Offset::usize_as(0));
+    carve(&mut data, &bytes, 0)
+        .into_par_iter()
+        .zip(carve(&mut offsets, &layout.rows, 1))
+        .zip(layout.chunks.par_iter().zip(&base))
+        .for_each(|((mut dslots, mut oslots), (chunk, base))| {
+            let mut row_at = vec![0usize; parts];
+            let mut byte_at = vec![0usize; parts];
+            for seg in chunk {
+                let src = cols[seg.morsel].value_offsets();
+                let values = cols[seg.morsel].value_data();
+                for b in 0..parts {
+                    let (dslot, oslot) = (&mut *dslots[b], &mut *oslots[b]);
+                    let (mut k, mut at) = (row_at[b], byte_at[b]);
+                    for &r in bin(per_morsel, seg, b) {
+                        let (s, e) = (src[r as usize].as_usize(), src[r as usize + 1].as_usize());
+                        copy_value(dslot, at, values, s, e);
+                        at += e - s;
+                        oslot[k] = T::Offset::usize_as(base[b] + at);
+                        k += 1;
+                    }
+                    (row_at[b], byte_at[b]) = (k, at);
+                }
+            }
+        });
+
+    data.into_iter()
+        .zip(offsets)
+        .map(|(data, offsets)| {
+            let offsets = OffsetBuffer::new(offsets.into());
+            Ok(Arc::new(GenericByteArray::<T>::try_new(offsets, data.into(), None)?) as ArrayRef)
+        })
+        .collect()
 }
 
 /// One column's source arrays, downcast once for the whole partition.
@@ -180,156 +454,25 @@ fn partition_morsels_with(
 /// Q9 at 576. It depends only on the column, so it is hoisted to exactly that.
 enum ColGather<'a> {
     Fast(FastCols<'a>),
-    /// A null-free string/binary column: gathered from the CSR bins, like [`ColGather::Fast`].
+    /// A null-free string/binary column: scattered from the CSR bins, like [`ColGather::Fast`].
     Bytes(ByteCols<'a>),
     /// A nested type, or any source carrying a null: `interleave` owns it.
     Interleave,
 }
 
-/// Gather `cols`' rows for `bucket` into a flat value array.
-///
-/// `interleave` needs a materialized `&[(usize, usize)]` — **sixteen bytes of index per
-/// output row**. Partitioning a 60 M-row probe side that way writes and re-reads a 960 MB
-/// scratch array to move 480 MB of payload: ~2.9 GB of traffic, and the ~120 ms it measured.
-/// The row ids already exist as `u32` in the CSR bins, so a column whose copy is a plain
-/// value move reads them in place and writes the output directly. Traffic drops to ~1.2 GB.
-fn gather_from<T: ArrowPrimitiveType>(
-    cols: &[&PrimitiveArray<T>],
-    per_morsel: &[(Vec<u32>, Vec<u32>)],
-    bucket: usize,
-    total: usize,
-) -> ArrayRef {
-    let mut out: Vec<T::Native> = Vec::with_capacity(total);
-    for (array, (rows, off)) in cols.iter().zip(per_morsel) {
-        let values = array.values();
-        out.extend(
-            rows[off[bucket] as usize..off[bucket + 1] as usize]
-                .iter()
-                .map(|&r| values[r as usize]),
-        );
-    }
-    Arc::new(PrimitiveArray::<T>::new(out.into(), None))
-}
-
-/// Gather one null-free byte column's rows for `bucket` out of the CSR bins.
-///
-/// The same argument [`gather_from`] makes for a primitive column, at the type where it is
-/// worth the most. `interleave` needs a materialized `&[(usize, usize)]` — sixteen bytes of
-/// scratch per output row — and the string columns were the reason that array got built at
-/// all: partitioning a relation whose key is three strings wrote and re-read 160 MB of index
-/// pairs at 10 M rows before copying a single character. The row ids already exist as `u32`
-/// in the bins, so this reads them in place.
-///
-/// Two passes rather than one growing `Vec`: the first accumulates each value's length into
-/// the offset buffer, whose last entry *is* the exact byte count, so the second copies into a
-/// buffer that never reallocates. Both passes walk the same bin in the same order.
-///
-/// Measured on the H2O `groupby` key columns (three `Utf8`, 10 M rows, 64 buckets):
-/// **711 ms -> 300 ms**, and the win holds at 512 buckets. The output is the same array
-/// `interleave` produces — same rows, same order, and re-validated as UTF-8 by the safe
-/// constructor rather than asserted.
-fn gather_bytes<T: ByteArrayType>(
-    cols: &[&GenericByteArray<T>],
-    per_morsel: &[(Vec<u32>, Vec<u32>)],
-    bucket: usize,
-    total: usize,
-    byte_total: usize,
-) -> Result<ArrayRef, InterpError> {
-    // One pass, not two. `byte_total` is this bucket's exact value-byte count, measured for
-    // every bucket at once by `bucket_byte_totals` in a sequential scan — so the offsets and
-    // the bytes are now built together over a buffer that cannot reallocate, and the bin's
-    // random walk over the offsets array happens once instead of twice.
-    let mut offsets: Vec<T::Offset> = Vec::with_capacity(total + 1);
-    let mut data: Vec<u8> = Vec::with_capacity(byte_total);
-    let mut acc = 0usize;
-    offsets.push(T::Offset::usize_as(0));
-    for (array, (rows, off)) in cols.iter().zip(per_morsel) {
-        let src = array.value_offsets();
-        let bytes = array.value_data();
-        for &r in &rows[off[bucket] as usize..off[bucket + 1] as usize] {
-            let (s, e) = (src[r as usize].as_usize(), src[r as usize + 1].as_usize());
-            data.extend_from_slice(&bytes[s..e]);
-            acc += e - s;
-            offsets.push(T::Offset::usize_as(acc));
-        }
-    }
-    debug_assert_eq!(acc, byte_total, "bucket byte total disagreed with the copy");
-
-    let offsets = OffsetBuffer::new(offsets.into());
-    Ok(Arc::new(GenericByteArray::<T>::try_new(
-        offsets,
-        data.into(),
-        None,
-    )?))
-}
-
-/// Every bucket's value-byte total for one byte column, from a single sequential scan.
-///
-/// The bins hold row ids grouped by bucket; walking them to size a bucket's buffer reads the
-/// offsets array at a `parts`-row stride and pulls in a cache line per row. Reconstructing the
-/// row's bucket from the bins instead — a `u32` write per row into a scratch vector, then one
-/// in-order walk — reads both arrays straight through. See the call site for why the size has
-/// to be known before the copy at all.
-fn bucket_byte_totals_of<T: ByteArrayType>(
-    cols: &[&GenericByteArray<T>],
-    per_morsel: &[(Vec<u32>, Vec<u32>)],
-    parts: usize,
-) -> Vec<usize> {
-    cols.par_iter()
-        .zip(per_morsel.par_iter())
-        .map(|(array, (rows, off))| {
-            let src = array.value_offsets();
-            let mut bucket_of = vec![0u32; array.len()];
-            for b in 0..parts {
-                for &r in &rows[off[b] as usize..off[b + 1] as usize] {
-                    bucket_of[r as usize] = b as u32;
-                }
-            }
-            let mut totals = vec![0usize; parts];
-            for (row, &b) in bucket_of.iter().enumerate() {
-                totals[b as usize] += src[row + 1].as_usize() - src[row].as_usize();
-            }
-            totals
-        })
-        .reduce(
-            || vec![0usize; parts],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(b) {
-                    *x += y;
-                }
-                a
-            },
-        )
-}
-
 macro_rules! byte_cols {
     ($($variant:ident => $ty:ty),* $(,)?) => {
-        /// The concrete byte types the CSR gather handles, downcast once per column.
+        /// The concrete byte types the CSR scatter handles, downcast once per column.
         enum ByteCols<'a> { $($variant(Vec<&'a GenericByteArray<$ty>>)),* }
 
         impl ByteCols<'_> {
-            fn gather(
+            fn scatter(
                 &self,
                 per_morsel: &[(Vec<u32>, Vec<u32>)],
-                bucket: usize,
-                total: usize,
-                byte_total: usize,
-            ) -> Result<ArrayRef, InterpError> {
+                layout: &Layout,
+            ) -> Result<Vec<ArrayRef>, InterpError> {
                 match self {
-                    $(ByteCols::$variant(cols) =>
-                        gather_bytes(cols, per_morsel, bucket, total, byte_total)),*
-                }
-            }
-
-            /// Every bucket's value-byte total — see [`bucket_byte_totals_of`].
-            fn bucket_byte_totals(
-                &self,
-                per_morsel: &[(Vec<u32>, Vec<u32>)],
-                parts: usize,
-            ) -> Vec<usize> {
-                match self {
-                    $(ByteCols::$variant(cols) =>
-                        bucket_byte_totals_of(cols, per_morsel, parts)),*
+                    $(ByteCols::$variant(cols) => scatter_bytes(cols, per_morsel, layout)),*
                 }
             }
         }
@@ -353,18 +496,17 @@ byte_cols! {
 
 macro_rules! fast_cols {
     ($($variant:ident => $ty:ty),* $(,)?) => {
-        /// The concrete primitive types the flat gather handles, downcast once per column.
+        /// The concrete primitive types the flat scatter handles, downcast once per column.
         enum FastCols<'a> { $($variant(Vec<&'a PrimitiveArray<$ty>>)),* }
 
         impl FastCols<'_> {
-            fn gather(
+            fn scatter(
                 &self,
                 per_morsel: &[(Vec<u32>, Vec<u32>)],
-                bucket: usize,
-                total: usize,
-            ) -> ArrayRef {
+                layout: &Layout,
+            ) -> Vec<ArrayRef> {
                 match self {
-                    $(FastCols::$variant(cols) => gather_from(cols, per_morsel, bucket, total)),*
+                    $(FastCols::$variant(cols) => scatter_prim(cols, per_morsel, layout)),*
                 }
             }
         }
@@ -686,6 +828,153 @@ mod tests {
                     &want,
                     "bucket {bucket} of {parts} differs from interleave"
                 );
+            }
+        }
+    }
+
+    /// The chunked scatter against `interleave` on a relation with **more morsels than
+    /// chunks** (so a chunk spans several morsels and a slot holds several bins), values on
+    /// both sides of the fixed-width short copy (0, 15, 16, 17 and 40 bytes), and every
+    /// morsel a slice ending at its source buffer's last byte — where an over-read of the
+    /// short copy would run off the end.
+    #[test]
+    fn the_chunked_scatter_matches_interleave_across_many_morsels() {
+        use arrow::array::Float64Array;
+        let lens = [0usize, 1, 15, 16, 17, 3, 40, 2, 16, 5];
+        let morsels: Vec<RecordBatch> = (0..97)
+            .map(|m| {
+                let n = 1 + (m * 7) % 23;
+                let keys: Vec<i64> = (0..n).map(|i| ((m * 31 + i * 17) % 50) as i64).collect();
+                let strs: Vec<String> = (0..n)
+                    .map(|i| {
+                        let len = lens[(m + i) % lens.len()];
+                        (0..len)
+                            .map(|j| (b'a' + ((m + i + j) % 26) as u8) as char)
+                            .collect()
+                    })
+                    .collect();
+                let f: Vec<f64> = (0..n).map(|i| (m * 100 + i) as f64).collect();
+                RecordBatch::try_from_iter(vec![
+                    ("k", Arc::new(Int64Array::from(keys)) as ArrayRef),
+                    ("s", Arc::new(StringArray::from(strs)) as ArrayRef),
+                    ("f", Arc::new(Float64Array::from(f)) as ArrayRef),
+                ])
+                .unwrap()
+            })
+            .collect();
+        for parts in [2usize, 7, 64] {
+            let got = partition_morsels(&morsels, &["k".into()], parts).unwrap();
+            assert_eq!(got.len(), parts);
+            let bins: Vec<(Vec<u32>, Vec<u32>)> = morsels
+                .iter()
+                .map(|b| {
+                    let k = vec![b.column(0).clone()];
+                    let p = shuffle::bucket_of_rows(&k, b.num_rows(), parts).unwrap();
+                    shuffle::bucket_csr(&p, parts)
+                })
+                .collect();
+            for (bucket, batch) in got.iter().enumerate() {
+                let mut pairs: Vec<(usize, usize)> = Vec::new();
+                for (mi, (rows, off)) in bins.iter().enumerate() {
+                    pairs.extend(
+                        rows[off[bucket] as usize..off[bucket + 1] as usize]
+                            .iter()
+                            .map(|&r| (mi, r as usize)),
+                    );
+                }
+                for c in 0..3 {
+                    let src: Vec<&dyn Array> =
+                        morsels.iter().map(|b| b.column(c).as_ref()).collect();
+                    let want = interleave(&src, &pairs).unwrap();
+                    assert_eq!(
+                        batch.column(c),
+                        &want,
+                        "column {c}, bucket {bucket} of {parts} differs from interleave"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A relation of a few **large** batches — what a filter or a materialized input hands a
+    /// shuffle join — is cut into chunks *inside* each batch, so the scatter fills the pool
+    /// instead of running on one task per batch. The cut must not move a row: every bucket
+    /// still equals `interleave` over the same bins, with chunks ending mid-batch at points
+    /// that need the bin trimming (`bin`) on both sides.
+    #[test]
+    fn chunks_cut_inside_large_batches_and_still_match_interleave() {
+        let mk = |from: usize, n: usize| {
+            let keys: Vec<i64> = (from..from + n)
+                .map(|i| (i * 7919 % 1_000) as i64)
+                .collect();
+            let strs: Vec<String> = (from..from + n).map(|i| "x".repeat(i % 23)).collect();
+            RecordBatch::try_from_iter(vec![
+                ("k", Arc::new(Int64Array::from(keys)) as ArrayRef),
+                ("s", Arc::new(StringArray::from(strs)) as ArrayRef),
+            ])
+            .unwrap()
+        };
+        let big = mk(0, 60_000);
+        // A slice of a larger batch, so the trimmed bins index a rebased `value_offsets`.
+        let morsels = [
+            big.slice(0, 41_000),
+            mk(41_000, 9),
+            big.slice(41_000, 19_000),
+        ];
+        let total: usize = morsels.iter().map(|b| b.num_rows()).sum();
+        let layout_chunks = {
+            let bins: Vec<(Vec<u32>, Vec<u32>)> = morsels
+                .iter()
+                .map(|b| {
+                    let p =
+                        shuffle::bucket_of_rows(&[b.column(0).clone()], b.num_rows(), 5).unwrap();
+                    shuffle::bucket_csr(&p, 5)
+                })
+                .collect();
+            Layout::new(&bins, 5, 4).chunks
+        };
+        assert!(
+            layout_chunks.iter().flatten().any(|s| !s.whole),
+            "the fixture must make a chunk end inside a batch"
+        );
+        assert_eq!(
+            layout_chunks
+                .iter()
+                .flatten()
+                .map(|s| (s.hi - s.lo) as usize)
+                .sum::<usize>(),
+            total,
+            "the chunks must tile the relation"
+        );
+        for parts in [3usize, 16] {
+            let got = partition_morsels(&morsels, &["k".into()], parts).unwrap();
+            let bins: Vec<(Vec<u32>, Vec<u32>)> = morsels
+                .iter()
+                .map(|b| {
+                    let p = shuffle::bucket_of_rows(&[b.column(0).clone()], b.num_rows(), parts)
+                        .unwrap();
+                    shuffle::bucket_csr(&p, parts)
+                })
+                .collect();
+            for (bucket, batch) in got.iter().enumerate() {
+                let mut pairs: Vec<(usize, usize)> = Vec::new();
+                for (mi, (rows, off)) in bins.iter().enumerate() {
+                    pairs.extend(
+                        rows[off[bucket] as usize..off[bucket + 1] as usize]
+                            .iter()
+                            .map(|&r| (mi, r as usize)),
+                    );
+                }
+                for c in 0..2 {
+                    let src: Vec<&dyn Array> =
+                        morsels.iter().map(|b| b.column(c).as_ref()).collect();
+                    let want = interleave(&src, &pairs).unwrap();
+                    assert_eq!(
+                        batch.column(c),
+                        &want,
+                        "column {c}, bucket {bucket}/{parts}"
+                    );
+                }
             }
         }
     }
