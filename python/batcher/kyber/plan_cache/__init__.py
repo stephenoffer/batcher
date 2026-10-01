@@ -45,7 +45,16 @@ and the data its pruning decisions read. Both are keyed exactly.
 from __future__ import annotations
 
 from batcher.kyber.plan_cache.keys import cache_key
-from batcher.kyber.plan_cache.memo import clear, lookup, misses, store
+from batcher.kyber.plan_cache.memo import clear, lookup, misses, record_outcome, served, store
 from batcher.kyber.plan_cache.writes import record_write
 
-__all__ = ["cache_key", "clear", "lookup", "misses", "record_write", "store"]
+__all__ = [
+    "cache_key",
+    "clear",
+    "lookup",
+    "misses",
+    "record_outcome",
+    "record_write",
+    "served",
+    "store",
+]

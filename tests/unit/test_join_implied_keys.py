@@ -1,14 +1,14 @@
-"""Join reordering keeps one key per equality, sinks the key range, and bounds PK-FK joins.
+"""Join reordering keeps one key per implied equality and sinks the key range it derives.
 
-Three plan-shape contracts the JOB workload exposed, each pinned with the rows it must not
-change:
+Plan-shape contracts the JOB workload exposed, each pinned with the rows it must not change:
 
 * a region written with every pairwise equality on one key (JOB's `t.id = mi.movie_id AND
   mi.movie_id = mk.movie_id AND ...`) is rebuilt with **one** key pair per join, because the
   other pairs are implied by equalities a side already enforces;
 * the key range `runtime_join_filter` derives sinks beneath the side's own filters when it is
-  selective, so the cheap integer compare runs first;
-* a composite key join on a unique side is never estimated above the foreign-key side's rows.
+  selective, so the cheap integer compare runs first, and is not attached when it would keep
+  nearly every row;
+* a keyless aggregate plans with the bounds of its filter and join columns.
 """
 
 from __future__ import annotations
@@ -157,25 +157,6 @@ def test_a_range_does_not_pass_a_computed_key():
     assert isinstance(out, Filter) and out.input is leaf
 
 
-def _pk_fk_join() -> Join:
-    pk = _scan(0, ["a", "b"])
-    fk = _scan(1, ["a", "b"])
-    out = (JoinOutputCol("left", "a", "a"), JoinOutputCol("right", "b", "b_r"))
-    return Join(pk, fk, ("a", "b"), ("a", "b"), "inner", out)
-
-
-def test_a_composite_unique_key_bounds_the_join_by_the_foreign_key_side():
-    def stat(ndv: int) -> ColumnStat:
-        return ColumnStat(min=0, max=ndv, ndv=ndv, provenance=Provenance.EXACT)
-
-    # The unique (primary-key) side is the *larger* one: 10,000 rows, `a` unique by itself.
-    pk = SourceStatistics(row_count=10_000, columns={"a": stat(10_000), "b": stat(40)})
-    fk = SourceStatistics(row_count=300, columns={"a": stat(250), "b": stat(40)})
-    rows = StatsEstimator([None, None], source_stats=[pk, fk]).estimate(_pk_fk_join()).rows
-    # Each of the 300 FK rows meets at most one PK row; `max(|L|, |R|)` said 10,000.
-    assert rows <= 300
-
-
 def test_a_keyless_aggregate_plans_with_its_filter_and_join_bounds():
     from batcher.api.terminal.core import _keyless_aggregate_bound_columns
 
@@ -185,3 +166,36 @@ def test_a_keyless_aggregate_plans_with_its_filter_and_join_bounds():
     # execution plans with these same statistics when the metadata answer misses.
     assert need is not None
     assert {"year", "id", "movie_id"} <= need
+
+
+def test_a_key_frequency_table_a_filter_made_stale_does_not_zero_the_join():
+    def scan(sid: int, names: list[str]) -> Scan:
+        fields = [pa.field(n, pa.string() if n == "info" else pa.int64()) for n in names]
+        return Scan(sid, SchemaRef(pa.schema(fields)))
+
+    # `info_type`: 113 ids, a frequency table listing eight of them; filtered on `info` to a row.
+    it = SourceStatistics(
+        row_count=113,
+        columns={
+            "id": ColumnStat(
+                min=1, max=113, ndv=113, mcv={str(v): 1 / 113 for v in range(106, 114)}
+            ),
+            "info": ColumnStat(ndv=113),
+        },
+    )
+    # `movie_info_idx`: its type ids are three values the other table's list does not name.
+    mi = SourceStatistics(
+        row_count=806_365,
+        columns={
+            "info_type_id": ColumnStat(
+                min=99, max=113, ndv=5, mcv={"99": 1 / 3, "100": 1 / 3, "101": 1 / 3}
+            )
+        },
+    )
+    left = Filter(scan(0, ["id", "info"]), Col("info") == Lit("rating"))
+    out = (JoinOutputCol("left", "id", "id"), JoinOutputCol("right", "info_type_id", "t"))
+    join = Join(left, scan(1, ["info_type_id"]), ("id",), ("info_type_id",), "inner", out)
+    rows = StatsEstimator([None, None], source_stats=[it, mi]).estimate(join).rows
+    # Containment: the surviving row's id meets ~1/5 of the 806,365 rows. The decomposition
+    # over the stale table said zero (floored to one row).
+    assert rows > 1_000

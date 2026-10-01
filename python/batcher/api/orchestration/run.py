@@ -630,7 +630,9 @@ def _run_relational_scoped(
         phases.begin("core.execute")
         mark = time.perf_counter()
         table = _execute_in_memory(logical_opt, plan, opt, ctx, resolved)
-        phases.record("core.execute", time.perf_counter() - mark)
+        elapsed = time.perf_counter() - mark
+        phases.record("core.execute", elapsed)
+        kyber.plan_cache.record_outcome(opt, elapsed * 1e3)  # the memo's regret guard
 
     _close_learning_loops(
         plan, logical_opt, ctx, rm, sources, resolved, table, decisions, started=started

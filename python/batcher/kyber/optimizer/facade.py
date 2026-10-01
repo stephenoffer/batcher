@@ -30,6 +30,7 @@ from batcher.kyber.rules.source_limits import (
     required_orderings_per_source,
 )
 from batcher.kyber.spill_rates import learned_spill_factor
+from batcher.kyber.stats.selectivity.join_edges import register_join_edges
 from batcher.metadata import MetadataHub
 from batcher.metadata.io_stats import relative_read_cost
 from batcher.plan.logical import LogicalPlan
@@ -282,6 +283,9 @@ class Optimizer:
             prefer_materializing_aggregate=_prefers_materializing_aggregate(plan, ctx),
             prefer_sideways=_prefers_sideways(plan, ctx),
         )
+        # The join structure Core's measurements will be filed under, so a later run can learn
+        # each edge's selectivity from this one (`join_edges`). Written once per join shape.
+        register_join_edges(self._hub, plan, ctx.estimator)
         return phys, plan, ctx.notes.get("build_side_decisions", [])
 
     def logical_rewrite(self, logical: LogicalPlan) -> LogicalPlan:
@@ -586,6 +590,7 @@ def optimize_full(
     cached = plan_cache.lookup(key, lambda deps, rounds: dependencies_hold(hub, deps, rounds))
     if cached is not None:
         phys, plan, decisions = cached
+        plan_cache.served(phys, key)
         return phys, plan, list(decisions)  # decisions are telemetry; hand out a copy
 
     optimizer = Optimizer(cfg, sources, hub, source_stats=source_stats, hardware=hardware)
@@ -593,6 +598,7 @@ def optimize_full(
     deps = dependency_snapshot(hub, getattr(optimizer, "consulted", set()))
     plan_cache.store(key, result, sources, max_entries, deps)
     phys, plan, decisions = result
+    plan_cache.served(phys, key)
     return phys, plan, list(decisions)
 
 

@@ -27,6 +27,7 @@ from batcher.config import CardinalityConfig, active_config
 from batcher.kyber.column_tables import (
     AVG_BYTES_KEY,
     CARDINALITY_CORRECTION_KEY,
+    JOIN_EDGE_KEY,
     MCV_KEY,
     NDV_KEY,
     QUANTILES_KEY,
@@ -46,6 +47,7 @@ from batcher.kyber.stats.distribution import (
 from batcher.kyber.stats.group_bound import key_origin_rows
 from batcher.kyber.stats.predicate_bounds import bounded_by_predicate
 from batcher.kyber.stats.selectivity import predicate_selectivity
+from batcher.kyber.stats.selectivity.join_edges import EDGE_PREFIX, Edge, OriginMemo, edge_key
 from batcher.kyber.stats.selectivity.scalars import _fraction_below_on_axis, _ordinal
 from batcher.metadata.udf_stats import udf_cost_key
 from batcher.plan.expr_ir import (
@@ -304,6 +306,11 @@ class StatsEstimator:
         # `scan_columns` — a `dataclasses.replace` per column of a 30-column dimension — was
         # 12% of the query's warm wall time, all of it computing nine answers 48 times.
         self._scan_cache: dict[tuple[int, int], RelStats] = {}
+        # Column origins and measured edge selectivities for `_edge_selectivity`, by node
+        # identity like the memos above: join ordering asks for both on thousands of candidate
+        # joins whose subtrees it shares.
+        self._origin_memo: OriginMemo = {}
+        self._edge_cache: dict[int, tuple[LogicalPlan, tuple[float, Edge] | None]] = {}
 
     def estimate(self, node: LogicalPlan) -> RelStats:
         """Cardinality + column stats for `node`, memoized by node identity for the
@@ -343,8 +350,8 @@ class StatsEstimator:
         """
         if not isinstance(node, _CORRECTABLE):
             return 1.0
-        if self._learned_rows_win(node):
-            return 1.0  # a measured absolute size supersedes any correction
+        if self._learned_rows_win(node) or self._learned_edge(node) is not None:
+            return 1.0  # a measured absolute size (or edge selectivity) supersedes any correction
         sig = self._sig(node)
         self.consulted.add(sig)
         factor = self._corrections.get(sig)
@@ -377,10 +384,68 @@ class StatsEstimator:
         """
         if not isinstance(node, _CORRECTABLE) or self._learned_rows_win(node):
             return 0.0
+        if self._learned_edge(node) is not None:
+            return 0.0  # priced from a measurement, so its q-error teaches nothing
         est = self.estimate(node)
         if est.provenance is Provenance.EXACT or est.rows >= self._cfg.unknown_rows:
             return 0.0
         return self._raw(node) if self._corrections else est.rows
+
+    def scan_identity(self, node: Scan) -> str | None:
+        """The name of the relation `node` reads, for keying what was measured about it.
+
+        The scan's data-stable key where it has one; otherwise the bound source's own
+        statistics key, the one its learned column statistics are filed under. That second
+        key is per source *object* rather than data-stable (see `stable_source_key`), which is
+        enough for a later run in the same session to recognise the relation.
+
+        Args:
+            node: The scan.
+
+        Returns:
+            The relation's key, or None when the scan has neither.
+        """
+        return node.source_key or self._source_key(node.source_id)
+
+    def key_is_unique(self, node: Scan, column: str) -> bool:
+        """Whether `column` is a key of the relation `node` reads, by its distinct count.
+
+        Args:
+            node: The scan.
+            column: One of its columns.
+
+        Returns:
+            True when the column's distinct count reaches `_UNIQUE_KEY_NDV_RATIO` of the rows.
+        """
+        stats = self.estimate(node)
+        stat = stats.columns.get(column)
+        ndv = stat.ndv if stat is not None else None
+        return bool(ndv) and stats.rows > 0 and ndv >= _UNIQUE_KEY_NDV_RATIO * stats.rows
+
+    def _learned_edge(self, node: LogicalPlan) -> tuple[float, Edge] | None:
+        """The measured selectivity of an inner join's edge, and the edge, or None.
+
+        Keyed by the base columns the join's keys trace to rather than by the join's subtree,
+        which is what lets it reach a candidate join order nobody has executed
+        (`join_edges`). Recorded in `consulted` (prefixed) so a memoized plan re-plans when
+        the measurement appears.
+        """
+        if not isinstance(node, Join) or node.join_type != "inner":
+            return None
+        table = self._learned.get(JOIN_EDGE_KEY)
+        if not table:
+            return None
+        cached = self._edge_cache.get(id(node))
+        if cached is not None and cached[0] is node:
+            return cached[1]
+        edge = edge_key(node, self, self._origin_memo)
+        found = None
+        if edge is not None:
+            self.consulted.add(EDGE_PREFIX + edge.key)
+            sel = table.get(edge.key)
+            found = (sel, edge) if sel is not None else None
+        self._edge_cache[id(node)] = (node, found)
+        return found
 
     def _learned_rows_win(self, node: LogicalPlan) -> bool:
         """Whether `_estimate_uncached` short-circuits to a measured absolute row count."""
@@ -1261,6 +1326,18 @@ class StatsEstimator:
                 return float(learned_rows), Provenance.LEARNED
         if self._is_cartesian(node):
             return self._cartesian_rows(node, left, right)
+        # A selectivity measured on this edge by some other join order: the containment
+        # estimate below is the guess it replaces (`join_edges`).
+        learned = self._learned_edge(node)
+        if learned is not None:
+            sel, edge = learned
+            rows = min(sel * left.rows * right.rows, left.rows * right.rows)
+            # A key on one side: each row of the other meets at most one of its rows.
+            if edge.left_unique:
+                rows = min(rows, right.rows)
+            if edge.right_unique:
+                rows = min(rows, left.rows)
+            return rows, Provenance.LEARNED
 
         left_ndv = self._side_ndv(node.left_keys, left)
         right_ndv = self._side_ndv(node.right_keys, right)
@@ -1387,13 +1464,7 @@ class StatsEstimator:
         if len(node.left_keys) >= 2 and _composite_pk_fk(
             left.rows, right.rows, left_ndv, right_ndv
         ):
-            # Each row of the foreign-key side meets at most one row of the unique side, so the
-            # FK side's rows bound the join -- `_unique_key_row_cap`. `max(|L|, |R|)` alone is
-            # that bound only while the unique side is the smaller one; once a filter has cut
-            # the *key* side below the FK side (a selective dimension), the larger input is the
-            # key side and the max priced the join above anything it can emit.
-            cap = _unique_key_row_cap(left, right, left_ndv, right_ndv)
-            return max(min(max(left.rows, right.rows), cap), skew)
+            return max(left.rows, right.rows, skew)
         # With both sides' key frequencies measured, the join decomposes exactly into the
         # matched-hot-value term plus a uniform estimate over the *residual* mass. That sum is
         # sharper than either part alone: the uniform estimate alone prices a 47%-frequent key
@@ -1454,13 +1525,16 @@ class StatsEstimator:
         rstat = right.columns.get(node.right_keys[0])
         if lstat is None or rstat is None:
             return None
+        left_d, right_d = left_ndv or lstat.ndv, right_ndv or rstat.ndv
+        if _stale_mcv(lstat.mcv, left_d) or _stale_mcv(rstat.mcv, right_d):
+            return None
         return mcv_join_rows(
             left.rows,
             right.rows,
             lstat.mcv,
             rstat.mcv,
-            left_ndv or lstat.ndv,
-            right_ndv or rstat.ndv,
+            left_d,
+            right_d,
             _key_non_null(node.left_keys, left),
             _key_non_null(node.right_keys, right),
         )
@@ -2037,6 +2111,22 @@ def _ordinal_range(stat: ColumnStat) -> tuple[float, float] | None:
     return lo, hi
 
 
+def _stale_mcv(mcv: dict[str, float] | None, ndv: float | None) -> bool:
+    """Whether a key's frequency table lists more values than the relation can still hold.
+
+    A filter on *another* column keeps the key's measured frequency table (it was measured on
+    the source) while capping the key's distinct count at the surviving rows. Past that point
+    the two disagree, and the skew+residual decomposition reads the disagreement as "every
+    surviving row holds one of the listed values" -- with no residual left for anything else.
+    JOB q4c's `info_type` filtered to its one `'rating'` row kept a table listing eight other
+    ids, none of which `movie_info_idx` held, and its join to 806,365 rows was priced at zero
+    against 448,969 actual. The plan built on that zero ran every other join over the "empty"
+    side first. A table that cannot describe the relation is not consulted; the containment
+    estimate answers instead.
+    """
+    return bool(mcv) and ndv is not None and ndv < len(mcv)
+
+
 def _key_non_null(keys: tuple, stats: RelStats) -> float:
     """The share of rows whose whole join key holds a value.
 
@@ -2318,7 +2408,7 @@ def _composite_pk_fk(
 
     True when either side's (capped) combination ndv saturates its row count — that
     side's composite key is then ~unique, so each row of the other side matches at most
-    one, and the result is bounded by the FK side's rows (`_unique_key_row_cap`).
+    one, and the result is the FK side's rows (the caller uses `max(left, right)`).
 
     A heuristic, not a key proof. At `_UNIQUE_KEY_NDV_RATIO` a side may still hold one value
     repeated on `(1 - ratio)` of its rows, and a join of two sides hot on the same value emits
