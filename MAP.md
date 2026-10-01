@@ -3108,7 +3108,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/parallel.rs` | 1604 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 181 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
-| `stream/runtime_filter.rs` | 510 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
+| `stream/runtime_filter.rs` | 574 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `stream/union_all.rs` | 114 | `UNION ALL` as a pipeline operator: yield each branch's morsels in turn, hold none of them. |
 | `union_coerce.rs` | 174 | One common column type for the branches of a set operation, before they are combined. |
 | `window_spill.rs` | 177 | Bounded-memory window execution via grace partitioning. |
