@@ -281,16 +281,41 @@ fn measure_usable_cores() -> usize {
 /// worker whose CPU affinity is applied after the process starts, which is the hazard
 /// `ExecOptions::workers` documents. On a host with no SMT it is every usable core, and it
 /// never exceeds what a cgroup quota grants.
+///
+/// **A small host runs every sibling.** The trade above was measured on a 96-CPU box, where
+/// dozens of cores saturate the socket's memory bandwidth and the second sibling mostly adds
+/// cache pressure. Four or eight physical cores do not saturate it, so the sibling's latency
+/// hiding is what remains. Measured on an 8-CPU (4 physical) Xeon 8259CL, two interleaved
+/// rounds, `b/duckdb` geomean at the old width (5) against all 8:
+///
+/// | suite | this rule's old width | all logical |
+/// |---|---:|---:|
+/// | TPC-H sf1 (22) | 0.64 / 0.63 | **0.53 / 0.53** |
+/// | ClickBench (43) | 0.52 / 0.51 | **0.47 / 0.46** |
+/// | H2O groupby (10) | 0.64 / 0.63 | **0.59 / 0.58** |
+///
+/// Stated rather than hidden: H2O q3 and q7 (`GROUP BY id3`, 100k string groups) are 11-17%
+/// slower at the full width in both rounds, the large-box pattern on its two most
+/// bandwidth-bound shapes, and still 0.62-0.68x DuckDB.
 #[must_use]
 pub fn operator_cores() -> usize {
-    let usable = usable_cores();
-    let smt = crate::CpuTopology::detect().smt_width();
+    operator_width(usable_cores(), crate::CpuTopology::detect().smt_width())
+}
+
+/// [`operator_cores`]' arithmetic, for `usable` logical cores at `smt` siblings per core.
+fn operator_width(usable: usize, smt: usize) -> usize {
     if smt <= 1 {
         return usable;
     }
     let physical = usable.div_ceil(smt);
+    if physical <= SMALL_HOST_PHYSICAL_CORES {
+        return usable;
+    }
     (physical + (usable - physical) / 3).clamp(1, usable)
 }
+
+/// Physical cores at or below which [`operator_cores`] runs every SMT sibling — see its doc.
+const SMALL_HOST_PHYSICAL_CORES: usize = 8;
 
 fn detect_raw() -> HardwareProfile {
     let logical_cores = usable_cores();
@@ -373,6 +398,18 @@ impl HardwareProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small SMT host runs every sibling; a large one keeps physical + a third of the
+    /// siblings; a host with no SMT runs every core either way.
+    #[test]
+    fn operator_width_runs_every_sibling_only_on_a_small_host() {
+        assert_eq!(operator_width(8, 2), 8, "4 physical cores: every sibling");
+        assert_eq!(operator_width(16, 2), 16, "8 physical cores: every sibling");
+        assert_eq!(operator_width(18, 2), 12, "9 physical cores: 9 + 9/3");
+        assert_eq!(operator_width(96, 2), 64, "48 physical cores: 48 + 48/3");
+        assert_eq!(operator_width(96, 1), 96, "no SMT: every core");
+        assert_eq!(operator_width(1, 2), 1);
+    }
 
     #[test]
     fn detect_is_internally_consistent() {
