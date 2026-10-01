@@ -53,9 +53,9 @@ _ray_session = ray_session_fixture(_WORKERS)
 
 
 @pytest.fixture(scope="module")
-def edge_dir(tmp_path_factory) -> str:
+def edge_dir(cluster_scratch) -> str:
     """A random directed graph: 80,000 edges among 20,000 nodes, in four files."""
-    root = tmp_path_factory.mktemp("graph_edges")
+    root = cluster_scratch("graph_edges")
     rng = np.random.default_rng(11)
     src = rng.integers(0, _NODES, _EDGES)
     dst = rng.integers(0, _NODES, _EDGES)

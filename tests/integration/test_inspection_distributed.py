@@ -45,9 +45,9 @@ _ray_session = ray_session_fixture(_WORKERS)
 
 
 @pytest.fixture(scope="module")
-def parquet_dir(tmp_path_factory) -> str:
+def parquet_dir(cluster_scratch) -> str:
     """Four files, 200,000 rows: past `MIN_ROWS_TO_SHARD`, with nulls, NaN and a key column."""
-    root = tmp_path_factory.mktemp("inspect")
+    root = cluster_scratch("inspect")
     rng = np.random.default_rng(7)
     for i in range(_FILES):
         n = _ROWS_PER_FILE
@@ -253,15 +253,15 @@ def _scd_run(root, mode: str) -> dict:
         }
 
 
-def test_scd_maintenance_is_identical_under_both_modes(tmp_path, monkeypatch):
+def test_scd_maintenance_is_identical_under_both_modes(cluster_tmp_path, monkeypatch):
     """Dimension maintenance is merges and joins, so it must route like any query and land
     the same history. These inputs are small, so this checks routing and results, not
     fan-out; the fan-out itself is `test_the_fixture_really_fans_out`'s job."""
     routes = _spy_routes(monkeypatch)
-    never = _scd_run(tmp_path, "never")
+    never = _scd_run(cluster_tmp_path, "never")
     assert routes and not any(routes)
     routes.clear()
-    always = _scd_run(tmp_path, "always")
+    always = _scd_run(cluster_tmp_path, "always")
     assert routes and all(routes)
     assert never == always
     assert never["type2"]["is_current"] == [True, False, True, True, True]

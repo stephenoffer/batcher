@@ -26,7 +26,13 @@ import pytest
 
 from batcher.dist.executors.ray_runtime.lifecycle import _platform_env_hook_disabled
 
-__all__ = ["init_test_ray", "local_ray_resources", "ray_session_fixture", "shutdown_test_ray"]
+__all__ = [
+    "init_test_ray",
+    "local_ray_resources",
+    "op_stats_all_classes",
+    "ray_session_fixture",
+    "shutdown_test_ray",
+]
 
 
 #: The managed-workspace variable that pins the resources of every Ray node started in this
@@ -151,3 +157,30 @@ def ray_session_fixture(num_cpus: int) -> Callable[[], Iterator[None]]:
         shutdown_test_ray(started)
 
     return _ray_session
+
+
+def op_stats_all_classes() -> dict[str, list[dict]]:
+    """Every machine class's operator feedback in the process hub, merged by `kind`.
+
+    A worker stamps its own fingerprint on every row it ships, and `op_stats_by_kind` reads
+    one class -- this process's, or the class a `planning_for` scope names. A test asserting
+    that a distributed measurement *arrived* has to read them all. Reading any single class
+    fails on an ordinary cluster in two ways, both observed on the Anyscale fleet this was
+    written on: the driver is a different instance type from its workers, so its own class
+    holds no worker row; and one node group mixes CPU models, so a two-reducer shuffle join
+    filed 18 of its 32 build rows under one worker class and 14 under another. The per-class
+    view is the hub's own (`MetadataHub._by_fp`). There is no public accessor, deliberately:
+    every *planning* reader must name the class it plans for.
+
+    Returns:
+        `{kind: rows}` across every class, each list a fresh copy.
+    """
+    from batcher.core import default_hub
+
+    hub = default_hub()
+    views = hub._by_fp if hub._by_fp is not None else hub._load_views()[0]
+    merged: dict[str, list[dict]] = {}
+    for kinds in views.values():
+        for kind, rows in kinds.items():
+            merged.setdefault(kind, []).extend(rows)
+    return merged

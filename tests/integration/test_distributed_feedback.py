@@ -24,6 +24,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _ray_cluster import op_stats_all_classes
 from batcher import Config, config_context
 
 pytest.importorskip("ray", reason="distributed path requires ray")
@@ -43,9 +44,7 @@ def _isolate_metadata_hub():
 
 
 def _kinds() -> set[str]:
-    from batcher.core import default_hub
-
-    return set(default_hub().op_stats_by_kind())
+    return set(op_stats_all_classes())
 
 
 def _rows(kind: str) -> list[dict]:
@@ -58,9 +57,7 @@ def _rows(kind: str) -> list[dict]:
     landed in the list it had already "snapshotted" and its 32 build rows read as 64. The
     comment there has always said it snapshots first; this is what makes that true.
     """
-    from batcher.core import default_hub
-
-    return list(default_hub().op_stats_by_kind().get(kind, []))
+    return list(op_stats_all_classes().get(kind, []))
 
 
 def _source(n: int = 4096) -> pa.Table:
