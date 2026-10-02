@@ -237,6 +237,9 @@ def ceiling(monkeypatch, releases):
 
     monkeypatch.setattr("batcher.carbonite.memory.probe.process_rss_bytes", lambda: rss["bytes"])
     monkeypatch.setattr("batcher._internal.hardware.engine.allocator.set_purge_delay", set_delay)
+    # By default the caller's own tables (pyarrow's pool) account for the whole resident set,
+    # so only the whole-process ceiling is in play; the engine-retention tests override it.
+    monkeypatch.setattr(reclaim, "_arrow_pool_bytes", lambda: rss["bytes"])
     return rss, delays, releases[0]
 
 
@@ -245,6 +248,28 @@ def test_under_the_ceiling_nothing_happens(ceiling):
     rss["bytes"] = int(_CEILING * 0.9)
     assert reclaim.reclaim_if_retaining(_ENVELOPE) == 0
     assert delays == [] and calls == []
+
+
+def test_the_engines_own_retention_has_a_tighter_ceiling(ceiling, monkeypatch):
+    """Under the whole-process ceiling, an engine arena past its own share still purges.
+
+    TPC-H q18 at sf100 left 9.4 GB of engine arena on a 30 GiB box, under the 18 GB process
+    ceiling, and the third run in that process was killed on top of it.
+    """
+    rss, delays, calls = ceiling
+    engine_ceiling = _ENVELOPE * reclaim.ENGINE_RETAINED_CEILING_FRACTION
+    rss["bytes"] = int(_CEILING * 0.9)  # the process ceiling alone would do nothing
+    monkeypatch.setattr(reclaim, "_arrow_pool_bytes", lambda: 0)  # all of it is engine arena
+    assert rss["bytes"] > engine_ceiling
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS] and calls == [True]
+    # Retention returns only once the engine arena is back under half its own ceiling.
+    rss["bytes"] = int(engine_ceiling * 0.8)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS]
+    rss["bytes"] = int(engine_ceiling * reclaim.RETAINED_RESTORE_FRACTION * 0.9)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS, -1]
 
 
 def test_over_the_ceiling_purges_until_back_under_half_of_it(ceiling):

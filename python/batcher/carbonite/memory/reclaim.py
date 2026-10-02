@@ -101,6 +101,15 @@ RECLAIM_WORTHWHILE_BYTES = 16 * 1024 * 1024
 #: than 24, and still leaves two fifths of the reach for the next query's working set.
 RETAINED_CEILING_FRACTION = 0.6
 
+#: Share of the reach the *engine's* retained arena may hold between queries: the resident set
+#: less what pyarrow's own pool has allocated, which is where a caller's in-memory tables live
+#: and what drove the fractions above up. The whole-process ceiling cannot be lowered for that
+#: reason, and on its own it let a large query's leftovers stand under the next one: TPC-H q18
+#: at sf100 left 9.4 GB resident on a 30 GiB box (a 0.6 ceiling is 18 GB), the third run in a
+#: process peaked on top of it and was killed at 22 GB, where the first run completed in 19 s.
+#: Nothing the caller holds counts against this one, so it can be tight.
+ENGINE_RETAINED_CEILING_FRACTION = 0.25
+
 #: The purge delay held while over the ceiling, in milliseconds. Not zero: a zero delay also
 #: returns the buffers a query frees and re-allocates *within itself*, so its next batch lands
 #: on fresh pages the kernel must clear. H2O join q5 run under a zero delay took 351 ms against
@@ -202,14 +211,28 @@ def reclaim_if_retaining(envelope_bytes: int) -> int:
     if envelope_bytes <= 0 or rss is None:
         return 0
     ceiling = envelope_bytes * RETAINED_CEILING_FRACTION
-    if rss > ceiling:
+    engine_ceiling = envelope_bytes * ENGINE_RETAINED_CEILING_FRACTION
+    engine_held = rss - _arrow_pool_bytes()
+    if rss > ceiling or engine_held > engine_ceiling:
         if not _STATE.purging:
             _STATE.purging = set_purge_delay(PURGING_DELAY_MS)
         return _attempt_reclaim("released retained allocator memory over the retention ceiling")
-    if _STATE.purging and rss < ceiling * RETAINED_RESTORE_FRACTION:
+    restore = RETAINED_RESTORE_FRACTION
+    if _STATE.purging and rss < ceiling * restore and engine_held < engine_ceiling * restore:
         set_purge_delay(-1)
         _STATE.purging = False
     return 0
+
+
+def _arrow_pool_bytes() -> int:
+    """Bytes pyarrow's own pool holds: the caller's tables, not the engine's arena."""
+    try:
+        import pyarrow as pa
+
+        return int(pa.total_allocated_bytes())
+    except Exception as exc:  # a reading must never fail a query
+        note_suppressed("carbonite", "read pyarrow's allocated bytes", exc)
+        return 0
 
 
 def _attempt_reclaim(message: str) -> int:

@@ -1651,7 +1651,7 @@ Carbonite memory governance: the buffer pool, pressure sensing, estimation.
 | `pool.py` | 422 | The buffer pool — Carbonite's reserve-before-allocate accounting. |
 | `pressure.py` | 466 | Live memory-pressure sensing — Carbonite's view of how full RAM is. |
 | `probe.py` | 387 | What this process may actually allocate — host RAM, the cgroup cap, and live headroom. |
-| `reclaim.py` | 273 | Handing the allocator's arena back when a query is about to go out of core. |
+| `reclaim.py` | 296 | Handing the allocator's arena back when a query is about to go out of core. |
 
 ### `batcher/carbonite/policies/` — 3 · subsystem
 
