@@ -359,6 +359,16 @@ def run_cut(
         units, [t for _r, _m, t in results], hoisted - started, gathered - hoisted, unit_cpus
     )
 
+    if cut.aggregate is not None and _past_string_offsets(batches):
+        # The driver merges every unit's partial groups as one relation, and a string column
+        # past 2 GiB cannot be one 32-bit-offset array. TPC-H q16 at SF1000 returns its
+        # `COUNT(DISTINCT ps_suppkey)` partials -- distinct (group, supplier) pairs, each with
+        # its `p_type` -- at 2.4 GB of `Utf8` and failed the query here. Partials that large
+        # are the shuffle route's to merge, on the workers, so decline to it.
+        get_logger("dist").info(
+            "aligned: partial groups carry a string column past 2 GiB; declined the cut"
+        )
+        return None
     if cut.aggregate is not None:
         if batches:
             nat = engine()
@@ -377,6 +387,21 @@ def run_cut(
         "aligned: combine %.2fs (%d rows)", time.perf_counter() - gathered, table.num_rows
     )
     return table
+
+
+#: The most bytes a 32-bit-offset string or binary column can address once concatenated.
+_STRING_OFFSET_LIMIT = (1 << 31) - 1
+
+
+def _past_string_offsets(batches: list[pa.RecordBatch]) -> bool:
+    """Whether some string or binary column, concatenated across `batches`, passes 2 GiB."""
+    if not batches:
+        return False
+    return any(
+        (pa.types.is_string(field.type) or pa.types.is_binary(field.type))
+        and sum(b.column(i).nbytes for b in batches) > _STRING_OFFSET_LIMIT
+        for i, field in enumerate(batches[0].schema)
+    )
 
 
 def run_plan(
