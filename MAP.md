@@ -3092,7 +3092,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/radix_sort/msd.rs` | 95 | A comparison sort for records ordered by a `u64` key, cut first into buckets by the key's live high bits. |
 | `ops/radix_sort/packed.rs` | 578 | The **composite** packed key: several sort columns narrowed into one integer. |
 | `ops/repartition.rs` | 600 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
-| `ops/reshape.rs` | 548 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
+| `ops/reshape.rs` | 631 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/run_sort.rs` | 275 | Natural-run detection for the fixed-width sort permutations. |
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 772 | Single-node parallel full sort by **sample-sort**. |

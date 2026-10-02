@@ -60,31 +60,25 @@ pub(crate) fn unnest_batch(
     let col = batch
         .column_by_name(column)
         .ok_or_else(|| InterpError::UnnestUnknownColumn(column.to_string()))?;
-    let plan = match col.data_type() {
-        DataType::List(_) => explode_list(col.as_any().downcast_ref::<ListArray>().unwrap(), outer),
-        DataType::LargeList(_) => explode_list(
+    let need_parent = batch.num_columns() > 1;
+    let need_pos = index_alias.is_some();
+    let sliced = match col.data_type() {
+        DataType::List(_) if !outer => explode_contiguous(
+            col.as_any().downcast_ref::<ListArray>().unwrap(),
+            need_parent,
+            need_pos,
+        ),
+        DataType::LargeList(_) if !outer => explode_contiguous(
             col.as_any().downcast_ref::<LargeListArray>().unwrap(),
-            outer,
+            need_parent,
+            need_pos,
         ),
-        DataType::FixedSizeList(_, _) => explode_fixed_size_list(
-            col.as_any().downcast_ref::<FixedSizeListArray>().unwrap(),
-            outer,
-        ),
-        other => {
-            return Err(InterpError::UnnestNotList {
-                column: column.to_string(),
-                got: other.to_string(),
-            })
-        }
-    }?;
-    let ExplodePlan {
-        parent_idx,
-        child_idx,
-        positions,
-    } = plan;
-    // A `None` child index gathers to NULL — which is exactly the element an `outer` row
-    // that had no element must carry, so the same `take` serves both modes.
-    let exploded = take(values_of(col), &UInt32Array::from(child_idx), None)?;
+        _ => None,
+    };
+    let (exploded, parent_idx, positions) = match sliced {
+        Some(found) => found,
+        None => gathered(col, column, outer)?,
+    };
     let parent_indices = UInt32Array::from(parent_idx);
 
     // Output preserves input column order, replacing the exploded column in place
@@ -115,6 +109,76 @@ pub(crate) fn unnest_batch(
         Arc::new(Schema::new(fields)),
         columns,
     )?)
+}
+
+/// An explosion's three outputs: the element column, each output row's parent row, and each
+/// element's 0-based position in its list (`None` for an `outer` placeholder row).
+type Exploded = (ArrayRef, Vec<u32>, Vec<Option<i64>>);
+
+/// The general explosion: an explicit gather plan, then a `take` of the child values.
+fn gathered(col: &ArrayRef, column: &str, outer: bool) -> Result<Exploded, InterpError> {
+    let plan = match col.data_type() {
+        DataType::List(_) => explode_list(col.as_any().downcast_ref::<ListArray>().unwrap(), outer),
+        DataType::LargeList(_) => explode_list(
+            col.as_any().downcast_ref::<LargeListArray>().unwrap(),
+            outer,
+        ),
+        DataType::FixedSizeList(_, _) => explode_fixed_size_list(
+            col.as_any().downcast_ref::<FixedSizeListArray>().unwrap(),
+            outer,
+        ),
+        other => {
+            return Err(InterpError::UnnestNotList {
+                column: column.to_string(),
+                got: other.to_string(),
+            })
+        }
+    }?;
+    let ExplodePlan {
+        parent_idx,
+        child_idx,
+        positions,
+    } = plan;
+    // A `None` child index gathers to NULL — which is exactly the element an `outer` row
+    // that had no element must carry, so the same `take` serves both modes.
+    let exploded = take(values_of(col), &UInt32Array::from(child_idx), None)?;
+    Ok((exploded, parent_idx, positions))
+}
+
+/// A non-`outer` explosion that is the list's child values themselves, sliced, with no gather.
+///
+/// Without `outer` an explosion emits every element of every non-null list, in order, so when
+/// no null row owns elements (a null list's offsets are almost always equal) the element
+/// column is exactly the contiguous run of child values between the first and last offsets.
+/// The gather plan this skips was an `Option<u32>` per element plus a `take` through it --
+/// most of the 102 ms of CPU a 6M-element explode spent. The parent index is built only when
+/// another column must repeat per element, and positions only when they are asked for.
+/// `None` sends the caller to the general path.
+fn explode_contiguous<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    need_parent: bool,
+    need_pos: bool,
+) -> Option<Exploded> {
+    let offsets = list.value_offsets();
+    let len = |i: usize| offsets[i + 1].as_usize() - offsets[i].as_usize();
+    if let Some(nulls) = list.nulls() {
+        if nulls.null_count() > 0 && nulls.iter().enumerate().any(|(i, ok)| !ok && len(i) > 0) {
+            return None;
+        }
+    }
+    let (first, last) = (offsets[0].as_usize(), offsets[list.len()].as_usize());
+    let values = list.values().slice(first, last - first);
+    let mut parent = Vec::with_capacity(if need_parent { last - first } else { 0 });
+    let mut positions = Vec::with_capacity(if need_pos { last - first } else { 0 });
+    for i in 0..list.len() {
+        if need_parent {
+            parent.extend(std::iter::repeat_n(i as u32, len(i)));
+        }
+        if need_pos {
+            positions.extend((0..len(i)).map(|p| Some(p as i64)));
+        }
+    }
+    Some((values, parent, positions))
 }
 
 /// The gather plan an explosion produces: which parent row each output row came from,
@@ -283,32 +347,23 @@ pub(crate) fn unpivot_batch(
             .ok_or_else(|| InterpError::UnpivotUnknownColumn(name.to_string()))
     };
 
-    // Parent index tiles 0..n once per `on` column, so each index column repeats
-    // and lines up with the stacked values below (column-major row order).
-    let mut parent: Vec<u32> = Vec::with_capacity(n * k);
-    for _ in 0..k {
-        parent.extend(0..n as u32);
-    }
-    let parent_indices = UInt32Array::from(parent);
-
     let mut fields: Vec<Field> = Vec::with_capacity(index.len() + 2);
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(index.len() + 2);
 
+    // Output rows are column-major -- every input row once per `on` column -- so each index
+    // column is itself repeated `k` times end to end: a concatenation, where a gather
+    // through a tiled `0..n` index did the same with a random read per row.
     for name in index {
-        let gathered = take(lookup(name)?.as_ref(), &parent_indices, None)?;
-        fields.push(Field::new(name, gathered.data_type().clone(), true));
-        columns.push(gathered);
+        let source = lookup(name)?;
+        let repeated = concat(&vec![source.as_ref(); k])?;
+        fields.push(Field::new(name, repeated.data_type().clone(), true));
+        columns.push(repeated);
     }
 
-    // The `variable` column: each `on` name repeated `n` times, in `on` order.
-    let mut var: Vec<&str> = Vec::with_capacity(n * k);
-    for name in on {
-        for _ in 0..n {
-            var.push(name);
-        }
-    }
+    // The `variable` column: each `on` name repeated `n` times, in `on` order, written
+    // straight into its byte and offset buffers rather than through a `&str` per row.
     fields.push(Field::new(variable_name, DataType::Utf8, false));
-    columns.push(Arc::new(StringArray::from(var)));
+    columns.push(Arc::new(repeated_names(on, n)?));
 
     // The `value` column: the `on` columns concatenated in order. `concat` requires a
     // single type, so a numeric mix (e.g. Int64 + Float64) is first promoted to a
@@ -333,6 +388,34 @@ pub(crate) fn unpivot_batch(
     Ok(RecordBatch::try_new(
         Arc::new(Schema::new(fields)),
         columns,
+    )?)
+}
+
+/// `on[0]` repeated `n` times, then `on[1]` `n` times, and so on, as one `Utf8` array.
+fn repeated_names(on: &[String], n: usize) -> Result<StringArray, InterpError> {
+    use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+
+    let total: usize = on.iter().map(|name| name.len() * n).sum();
+    // Past a 32-bit offset the names cannot be one `Utf8` array; the `&str` build this
+    // replaced panicked there, and Arrow's own error is the honest report.
+    i32::try_from(total).map_err(|_| arrow::error::ArrowError::OffsetOverflowError(total))?;
+    let mut bytes = Vec::with_capacity(total);
+    let mut offsets = Vec::with_capacity(on.len() * n + 1);
+    offsets.push(0i32);
+    let mut end = 0i32;
+    for name in on {
+        bytes.extend_from_slice(&name.as_bytes().repeat(n));
+        let width = name.len() as i32;
+        offsets.extend((0..n).map(|_| {
+            end += width;
+            end
+        }));
+    }
+    let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    Ok(StringArray::try_new(
+        offsets,
+        Buffer::from_vec(bytes),
+        None,
     )?)
 }
 
@@ -569,6 +652,110 @@ mod reshape_tests {
             Field::new("xs", list.data_type().clone(), true),
         ]));
         RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(list)]).unwrap()
+    }
+
+    /// `{id, xs}` where the null row 2 still *owns* element 99 in the child buffer -- legal
+    /// Arrow, and the one shape the sliced fast path cannot serve, so it must decline it.
+    fn null_owning_fixture() -> RecordBatch {
+        use arrow::array::ListArray;
+        use arrow::buffer::OffsetBuffer;
+
+        let values = Int64Array::from(vec![1, 2, 99, 3, 4]);
+        let offsets = OffsetBuffer::new(vec![0, 2, 2, 3, 5].into());
+        let field = Arc::new(Field::new("item", DataType::Int64, true));
+        let nulls = arrow::buffer::NullBuffer::from(vec![true, true, false, true]);
+        let list = ListArray::new(field, offsets, Arc::new(values), Some(nulls));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("xs", list.data_type().clone(), true),
+        ]));
+        let ids = Int64Array::from(vec![10, 20, 30, 40]);
+        RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(list)]).unwrap()
+    }
+
+    /// The sliced fast path and the general gather agree, on the shapes that separate them: a
+    /// null row owning elements (the fast path must decline), a batch sliced so the list's
+    /// first offset is not 0, positions, and the element column alone with no parent to repeat.
+    #[test]
+    fn the_sliced_explode_matches_the_general_gather() {
+        for batch in [
+            outer_fixture(),
+            null_owning_fixture(),
+            null_owning_fixture().slice(1, 3),
+        ] {
+            for index in [None, Some("pos")] {
+                let fast = unnest_batch(&batch, "xs", "xs", false, index).unwrap();
+                let col = batch.column_by_name("xs").unwrap();
+                let (want, parent, pos) = gathered(col, "xs", false).unwrap();
+                assert_eq!(
+                    i64_col(&fast, "xs"),
+                    want.as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>()
+                );
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                assert_eq!(
+                    i64_col(&fast, "id"),
+                    parent
+                        .iter()
+                        .map(|&p| Some(ids.value(p as usize)))
+                        .collect::<Vec<_>>()
+                );
+                if index.is_some() {
+                    assert_eq!(i64_col(&fast, "pos"), pos);
+                }
+            }
+            let alone = batch.project(&[1]).unwrap();
+            let out = unnest_batch(&alone, "xs", "xs", false, None).unwrap();
+            assert_eq!(out.num_columns(), 1);
+            assert_eq!(
+                i64_col(&out, "xs"),
+                i64_col(
+                    &unnest_batch(&batch, "xs", "xs", false, None).unwrap(),
+                    "xs"
+                )
+            );
+        }
+        let declined = null_owning_fixture();
+        let list = declined
+            .column_by_name("xs")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::ListArray>()
+            .unwrap();
+        assert!(explode_contiguous(list, true, false).is_none());
+        let out = unnest_batch(&declined, "xs", "xs", false, None).unwrap();
+        assert_eq!(
+            i64_col(&out, "xs"),
+            vec![Some(1), Some(2), Some(3), Some(4)]
+        );
+    }
+
+    /// The `variable` column built from buffers equals the per-row build it replaced,
+    /// including a zero-row batch and an empty name (zero-width entries).
+    #[test]
+    fn repeated_names_tile_each_name_in_order() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (on, n) in [
+            (names(&["ab", "", "xyz"]), 3),
+            (names(&["a"]), 0),
+            (names(&[]), 4),
+        ] {
+            let got = repeated_names(&on, n).unwrap();
+            let want: Vec<&str> = on
+                .iter()
+                .flat_map(|s| std::iter::repeat_n(s.as_str(), n))
+                .collect();
+            assert_eq!(got.iter().map(Option::unwrap).collect::<Vec<_>>(), want);
+            assert_eq!(got.null_count(), 0);
+        }
     }
 
     fn i64_col(batch: &RecordBatch, name: &str) -> Vec<Option<i64>> {
