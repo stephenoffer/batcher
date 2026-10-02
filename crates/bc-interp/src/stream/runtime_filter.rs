@@ -97,6 +97,19 @@ pub(crate) struct PendingFilter {
     force: bool,
 }
 
+/// The filters placed on a lazily-read scan, as the reader is handed them
+/// ([`crate::UnitSource::read_keyed`]).
+///
+/// Every filter, whatever its [`Gauge`] says: the gauge judges masking a decoded morsel, and a
+/// reader that tests the key during decode is judging a different trade -- `bc-io`'s late
+/// materialization times both ways and keeps the faster on its own.
+pub(crate) fn scan_keys(filters: &[PendingFilter]) -> Vec<crate::ScanKeyFilter> {
+    filters
+        .iter()
+        .map(|p| (p.column.clone(), Arc::clone(&p.filter)))
+        .collect()
+}
+
 /// The self-disabling counter described in the module note.
 #[derive(Default)]
 struct Gauge {

@@ -63,7 +63,7 @@ mod breaker;
 mod builds;
 pub mod chunked;
 use chunked::units::LazyScan;
-pub use chunked::units::{UnitSource, LOCATOR};
+pub use chunked::units::{ScanKeyFilter, UnitSource, LOCATOR};
 mod fanout;
 mod folds;
 mod meter;
@@ -301,14 +301,26 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
     match plan {
         RelOp::Scan { source_id } if ctx.lazy.is_some_and(|l| l.source_id == *source_id) => {
             let lazy = ctx.lazy.expect("guarded above");
-            Ok(Box::new(unit_stream(lazy.src, lazy.units.clone()).map(
-                move |b| {
+            // The runtime join filters `build_with` applies to this scan's output, handed to the
+            // reader too so it can test them before decoding the rest of each row. A reader that
+            // does then emits fewer rows than the relation holds, so the scan is marked the way
+            // the operators above a filter are: its count is not the relation's cardinality.
+            let keys = ctx
+                .cache
+                .filters_for(node_key(plan))
+                .map(runtime_filter::scan_keys)
+                .unwrap_or_default();
+            if let (false, Some(m)) = (keys.is_empty(), ctx.meter) {
+                m.mark_runtime_filtered(plan);
+            }
+            Ok(Box::new(
+                unit_stream(lazy.src, lazy.units.clone(), keys).map(move |b| {
                     let t = std::time::Instant::now();
                     let b = b?;
                     ctx.morsel(id, b.num_rows() as u64, &b, t);
                     Ok(b)
-                },
-            )))
+                }),
+            ))
         }
         RelOp::Scan { source_id } => {
             let batches = ctx

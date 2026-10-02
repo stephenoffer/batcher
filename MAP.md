@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1557 Python modules across 220 packages and 327 Rust files across 14 crates.
+Covering 1557 Python modules across 220 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -3042,7 +3042,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `chunked.rs` | 712 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
+| `chunked/mod.rs` | 611 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
@@ -3105,16 +3106,16 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
-| `stream/chunked/units.rs` | 57 | The driving relation as a sequence of units read on demand by the workers that scan it. |
+| `stream/chunked/units.rs` | 83 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 646 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 429 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 774 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/mod.rs` | 786 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
 | `stream/parallel.rs` | 1604 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
-| `stream/pipeline.rs` | 280 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
+| `stream/pipeline.rs` | 284 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
-| `stream/runtime_filter.rs` | 574 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
+| `stream/runtime_filter.rs` | 587 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `stream/union_all.rs` | 114 | `UNION ALL` as a pipeline operator: yield each branch's morsels in turn, hold none of them. |
 | `union_coerce.rs` | 174 | One common column type for the branches of a set operation, before they are combined. |
 | `window_spill.rs` | 177 | Bounded-memory window execution via grace partitioning. |
