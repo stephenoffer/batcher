@@ -69,7 +69,8 @@ _QUERIES = [
     f"SELECT f_ticket, f_item, r_amt {_LEFT}",
     # A filter on the null-extended side: keeps only the fact rows with no return.
     f"SELECT count(*) AS n, sum(f_amt) AS s {_LEFT} AND r_ticket IS NULL",
-    # The inner key names the null-supplying side, so this join must stay above the outer one.
+    # The inner key names the null-supplying side. A bare key rejects the padded rows, so
+    # `outer_to_inner_under_join` makes the left join inner (see the test of that below).
     "SELECT count(*) AS n, count(re_name) AS nm FROM fact "
     "LEFT JOIN returns ON f_item = r_item AND f_ticket = r_ticket "
     "JOIN reasons ON r_reason = re_sk JOIN dates ON f_date = d_sk WHERE d_year = 2002",
@@ -82,6 +83,11 @@ _QUERIES = [
     # TPC-DS q78's channel subquery: the `IS NULL` makes the left join an anti join, which must
     # end up above the selective date join rather than be sunk back below it.
     _ANTI_THEN_DATE,
+    # The null-side key again, coalesced: a padded row's NULL reason becomes 0, which `reasons`
+    # holds, so the padded rows match and the left join can be neither strengthened nor floated.
+    "SELECT count(*) AS n, count(re_name) AS nm FROM fact "
+    "LEFT JOIN returns ON f_item = r_item AND f_ticket = r_ticket "
+    "JOIN reasons ON coalesce(r_reason, 0) = re_sk JOIN dates ON f_date = d_sk WHERE d_year = 2002",
 ]
 
 _TABLES = {
@@ -144,13 +150,28 @@ def test_the_outer_join_really_floats():
 
 
 def test_a_key_on_the_null_side_does_not_float():
-    """The negative control: the `reasons` join reads `r_reason` and must stay above it."""
+    """The negative control: the `reasons` join reads `r_reason` and must stay above it.
+
+    Keyed on `coalesce(r_reason, 0)`, so the padded rows can match: with a bare `r_reason` key
+    the left join is strengthened to inner instead (the next test), and there is no left join
+    left for this control to watch.
+    """
+    from batcher.kyber import optimize
+
+    ds = _session().sql(_QUERIES[-1])
+    joins: list[tuple[str, list[str]]] = []
+    _joins_under(json.loads(optimize(ds._plan, sources=ds._sources).to_json()), joins)
+    assert any(kind == "inner" and "left" in below for kind, below in joins), joins
+
+
+def test_a_bare_key_on_the_null_side_makes_the_left_join_inner():
+    """`reasons ON r_reason = re_sk` never matches a padded row, so no left join survives."""
     from batcher.kyber import optimize
 
     ds = _session().sql(_QUERIES[3])
     joins: list[tuple[str, list[str]]] = []
     _joins_under(json.loads(optimize(ds._plan, sources=ds._sources).to_json()), joins)
-    assert any(kind == "inner" and "left" in below for kind, below in joins), joins
+    assert joins and all(kind == "inner" for kind, _ in joins), joins
 
 
 def test_an_anti_join_stays_above_a_more_selective_inner_join():

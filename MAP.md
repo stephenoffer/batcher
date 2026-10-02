@@ -1452,7 +1452,7 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | `outer_float.py` | 247 | Float a left/semi/anti join above the inner joins that only read its preserved side. |
 | `projection.py` | 191 | Push a derived projection through a join onto the side it reads, so the join |
 | `range_join.py` | 365 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
-| `rewrites.py` | 520 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
+| `rewrites.py` | 579 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
 | `runtime_range.py` | 227 | Runtime join filters — the key range one side of a join implies about the other. |
 
 ### `batcher/kyber/rules/math_algebra/` — 3 · subsystem
