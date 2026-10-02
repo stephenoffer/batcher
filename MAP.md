@@ -947,7 +947,7 @@ Window-function translation for the SQL front-end.
 | `executor.py` | 3297 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 894 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 544 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
-| `flight_join.py` | 561 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
+| `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
 | `flight_worker.py` | 1916 | The shared Arrow Flight shuffle worker actor. |
@@ -1025,7 +1025,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
 | `readiness.py` | 502 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
-| `reducers.py` | 292 | How finely a shuffle divides its work — on both sides of the exchange. |
+| `reducers.py` | 331 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 796 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 800 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 133 | Why this query got the fan-out it got. |

@@ -21,7 +21,7 @@ from __future__ import annotations
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
-__all__ = ["map_partitions", "shuffle_partitions"]
+__all__ = ["map_partitions", "memory_bounded_map_partitions", "shuffle_partitions"]
 
 
 def shuffle_partitions(workers: int) -> int:
@@ -201,6 +201,45 @@ def map_partitions(workers: int) -> int:
     n = workers * multiplier
     cap = cfg.max_shuffle_partitions
     return max(workers, n if cap <= 0 else min(n, cap))
+
+
+#: Share of the smallest worker node's RAM one join map task's input may project to. A node runs
+#: `map_slots_per_worker()` map tasks at once (four), and each holds its partition's whole
+#: bucketed output until it publishes (`streaming_map_buckets`), beside the chunk it is mapping;
+#: a quarter of a slot's quarter leaves room for both and for the store taking its copy.
+_MAP_TASK_NODE_SHARE = 1 / 16
+
+
+def memory_bounded_map_partitions(workers: int, input_bytes: int) -> int:
+    """`map_partitions`, raised until one partition's projected input fits a map task's memory.
+
+    `map_partitions` sizes the map stage for scheduling and, on a uniform fleet, settles on one
+    partition per worker -- so the task unit is a node's whole share of the input whatever the
+    input weighs. A join mapper holds its partition's bucketed output until it publishes, and
+    on 3 x m5.4xlarge (64 GB) at TPC-H SF1000 q9's `lineitem` side made that a third of 6B rows
+    per task, and the workers were OOM-killed before the reduce began. The store spills what
+    has been published; only the task's own unpublished output is unbounded, so this bounds the
+    task. It never lowers the count, and leaves it alone when the size is unknown.
+
+    Args:
+        workers: The shuffle's worker fan-out.
+        input_bytes: The larger side's projected input, from source metadata; `0` if unknown.
+
+    Returns:
+        The maximum number of map partitions, at least `map_partitions(workers)`.
+    """
+    from batcher.dist.executors.ray_runtime.scaling import worker_node_memory_bytes
+
+    base = map_partitions(workers)
+    node = worker_node_memory_bytes()
+    if node <= 0 or input_bytes <= 0:
+        return base
+    workers = max(1, workers)
+    per_task = max(1, int(node * _MAP_TASK_NODE_SHARE))
+    need = -(-input_bytes // per_task)
+    need = -(-need // workers) * workers
+    cap = active_config().distributed.max_shuffle_partitions
+    return max(base, need if cap <= 0 else min(need, cap))
 
 
 def _map_slots() -> int:

@@ -41,7 +41,12 @@ from .policies import (
 )
 from .readiness import await_autoscale, resolve_transport
 from .reduce import gather_in_windows, run_bucket_reduce
-from .reducers import buckets_for_envelope, map_partitions, shuffle_partitions
+from .reducers import (
+    buckets_for_envelope,
+    map_partitions,
+    memory_bounded_map_partitions,
+    shuffle_partitions,
+)
 from .scaling import (
     alive_node_count,
     clamp_workers,
@@ -91,6 +96,7 @@ __all__ = [
     "kill_workers",
     "map_barrier",
     "map_partitions",
+    "memory_bounded_map_partitions",
     "node_class_selector",
     "placement_actor_options",
     "record_worker_metrics",

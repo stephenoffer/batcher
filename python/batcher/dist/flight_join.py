@@ -14,6 +14,7 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.carbonite.resilience import SourcePlacement
 from batcher.dist.adaptive_sizing import row_shuffle_reducer_count
@@ -28,7 +29,7 @@ from batcher.dist.executors.ray_runtime import (
     engine_config_json,
     kill_workers,
     map_barrier,
-    map_partitions,
+    memory_bounded_map_partitions,
     shuffle_partitions,
     skew_join_salt,
 )
@@ -187,7 +188,10 @@ def execute_join_flight(
         # the two lists have to be the same length — and each side's count is bounded by its
         # own splits. Pad the shorter one with no-op partitions rather than re-planning the
         # longer one's splits, which on a star-schema join is the expensive side.
-        ceiling = map_partitions(workers)
+        ceiling = memory_bounded_map_partitions(
+            workers,
+            max(_side_bytes(sources[lsid], lproj), _side_bytes(sources[rsid], rproj)),
+        )
         lparts = partition_descriptors(
             sources[lsid],
             workers,
@@ -396,6 +400,21 @@ def _detect_hot_keys_flight(actors, left, right, fraction: float) -> tuple[list[
                 hot.add(v)
                 peak = max(peak, c / total)
     return sorted(hot), peak
+
+
+def _side_bytes(source: Source, projection: list[str] | None) -> int:
+    """A join side's projected input bytes from its declared row count, or `0` if unknown."""
+    from batcher.plan.source_stats import declared
+    from batcher.plan.types import projected_row_bytes
+
+    rows = declared(source, "row_count")
+    if not rows:
+        return 0
+    try:
+        return int(rows * projected_row_bytes(source.schema(), projection))
+    except Exception as exc:  # a source that cannot describe itself sizes nothing
+        note_suppressed("dist", "size a join side for its map partitions", exc)
+        return 0
 
 
 def _empty_fused(fused_agg: Aggregate) -> pa.Table:
