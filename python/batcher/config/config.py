@@ -24,6 +24,7 @@ import typing
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 
+from batcher._internal.errors import ConfigError
 from batcher.config.accelerator import AcceleratorConfig
 from batcher.config.env import falsy, truthy
 from batcher.config.fault_tolerance import FaultToleranceConfig
@@ -54,6 +55,7 @@ _ENGINE_CONFIG_FIELDS = (
     "morsel_bytes",
     "parallelism",
     "memory_budget_bytes",
+    "memory_soft_fraction",
     "spill_dir",
     "spill_compression",
     "fuse_linear",
@@ -87,6 +89,7 @@ def _engine_config_json_budgeted(
     values: tuple[object, ...],
     budgets: tuple[tuple[int, int], ...],
     prefer_materializing_aggregate: bool = False,
+    prefer_sideways: bool = False,
 ) -> str:
     """`_engine_config_json` plus per-operator spill budgets, memoized on both parts.
 
@@ -99,6 +102,8 @@ def _engine_config_json_budgeted(
     payload["op_budgets"] = {str(op_id): budget for op_id, budget in budgets}
     if prefer_materializing_aggregate:
         payload["prefer_materializing_aggregate"] = True
+    if prefer_sideways:
+        payload["prefer_sideways"] = True
     return json.dumps(payload)
 
 
@@ -630,17 +635,17 @@ class StreamingConfig:
     def __post_init__(self) -> None:
         """Reject a cadence or history that cannot mean anything."""
         if self.checkpoint_delta_interval < 0:
-            raise ValueError(
+            raise ConfigError(
                 "streaming.checkpoint_delta_interval must be >= 0 (0 = always snapshot "
                 f"whole state), got {self.checkpoint_delta_interval}"
             )
         if self.idle_poll_seconds <= 0:
-            raise ValueError(
+            raise ConfigError(
                 f"streaming.idle_poll_seconds must be > 0, got {self.idle_poll_seconds}: "
                 "a zero wait spins a core on every idle stream"
             )
         if self.progress_history < 1:
-            raise ValueError(
+            raise ConfigError(
                 f"streaming.progress_history must be >= 1, got {self.progress_history}"
             )
         # A floor at or below zero is the one setting that can stall a stream permanently: a
@@ -648,13 +653,13 @@ class StreamingConfig:
         # progress never revises the cap that stalled it. Rejected rather than clamped,
         # because unlike a transient tunable this one cannot recover on its own.
         if self.backpressure_min_rate <= 0:
-            raise ValueError(
+            raise ConfigError(
                 f"streaming.backpressure_min_rate must be > 0, got "
                 f"{self.backpressure_min_rate}: a floor of zero lets the rate controller "
                 "throttle a stream to a standstill it cannot measure its way out of"
             )
         if self.backpressure_max_rows_per_trigger < 0:
-            raise ValueError(
+            raise ConfigError(
                 "streaming.backpressure_max_rows_per_trigger must be >= 0 (0 = unbounded), "
                 f"got {self.backpressure_max_rows_per_trigger}"
             )
@@ -666,7 +671,7 @@ class StreamingConfig:
             ("derivative", self.backpressure_pid_derivative),
         ):
             if weight < 0:
-                raise ValueError(
+                raise ConfigError(
                     f"streaming.backpressure_pid_{name} must be >= 0, got {weight}: a "
                     "negative weight makes the controller speed up when it falls behind"
                 )
@@ -845,21 +850,19 @@ class CostCoefficients:
 class OptimizerConfig:
     """Knobs for the Kyber optimizer: join planning, cost, and cardinality.
 
-    Controls how hard the optimizer works (exact dynamic-programming join ordering up
-    to a table count, greedy beyond it), how it estimates cost and row counts from
-    learned statistics and sketches, and when a measured estimate is wrong enough to
-    trigger re-optimization mid-query. Defaults suit most workloads.
+    Controls how the optimizer estimates cost and row counts from learned statistics and
+    sketches, and when a measured estimate is wrong enough to trigger re-optimization
+    mid-query. How hard join ordering searches is priced per query rather than set here.
+    Defaults suit most workloads.
 
     Examples:
         .. doctest::
 
             >>> from batcher.config import OptimizerConfig
-            >>> OptimizerConfig().join_dp_max_tables
-            12
+            >>> OptimizerConfig().reoptimize_error
+            2.0
     """
 
-    join_dp_max_tables: int = 12  # DP-CCP exact threshold
-    greedy_max_tables: int = 25  # greedy heuristic threshold
     # Build a per-column membership bloom index when persisting a written source's
     # stats, so a later read can data-skip an equality/`IN` predicate whose value is
     # absent (a point lookup inside [min, max] that zone-map bounds can't prune).
@@ -896,6 +899,12 @@ class OptimizerConfig:
     # result until the query ends, so the budget is the whole gate. Sized like
     # `memory.result_cache_max_bytes` and for the same reason; `0` turns the rewrite off.
     common_subplan_max_bytes: int = 256 * 1024 * 1024  # 256 MiB
+    # ...raised to this share of the hard memory budget when that is larger, so the budget
+    # scales with the machine instead of capping every box at the laptop figure. A fixed cap
+    # is a scale threshold in disguise: TPC-DS q67's shared ROLLUP aggregate is 57 MB at sf1
+    # and 572 MB at sf10, so at sf10 it was materialized, refused, and then recomputed by every
+    # one of its nine levels. `0` keeps the cap fixed at `common_subplan_max_bytes`.
+    common_subplan_memory_fraction: float = 1 / 16
     # Build-side byte threshold below which a join is broadcast (the right side is
     # replicated to every worker) rather than shuffled — Spark's
     # autoBroadcastJoinThreshold. Both the planner's *estimate*-based decision and the
@@ -911,11 +920,8 @@ class OptimizerConfig:
     # probe: 52 ms partitioned vs 83 ms broadcast), so the table — not the machine's RAM —
     # is what this bounds.
     #
-    # NOTE: this is a *true* byte size. It was previously read against a flat 64 B/row
-    # width estimate that over-sized narrow relations ~4x (a two-`int64` key costed as
-    # 64 B/row, not 16), so the effective threshold was ~4x smaller than its nominal
-    # 10 MiB. `plan.types.widths` now makes the width type-exact; this value is the
-    # recalibrated equivalent.
+    # NOTE: this is a *true* byte size, compared against the type-exact widths of
+    # `plan.types.widths` (a two-`int64` key is 16 B/row), not a flat per-row estimate.
     # `0` (the default) means **detect it from the last-level cache** — see
     # `resolved_broadcast_max_bytes`. A positive value pins the threshold, for a machine whose
     # cache the probe cannot read (a non-Linux host) or to deliberately force a strategy.
@@ -1070,9 +1076,8 @@ class PIDConfig:
     """Gains for the adaptive batch-size PID controller over batch-latency error.
 
     The loop grows/shrinks the per-batch row count toward a target latency. It is
-    implemented identically in `bc-udf::BatchSizeController` (data plane) and
-    `ml.inference._LatencyController` (Python); shipped to Rust as `EngineConfig` so
-    the two never drift.
+    implemented by `ml.inference._LatencyController`, which reads these gains from the
+    active config.
 
     Examples:
         .. doctest::
@@ -1117,10 +1122,11 @@ class TenantConfig:
     #: structure behaves exactly as it did before this existed, which is what keeps this
     #: from changing anything for a single-workload deployment.
     tenant_id: str = ""
-    #: Share of the process result-cache budget this tenant may hold, 0.0-1.0. 0 means
-    #: unbounded (the historical behavior).
+    #: Reserved for a per-tenant share of the result-cache budget, 0.0-1.0. Not
+    #: implemented: validation refuses any value but 0.0 (unbounded).
     cache_share: float = 0.0
-    #: Maximum queries this tenant may run concurrently. 0 means unbounded.
+    #: Reserved for a per-tenant concurrency cap. Not implemented: validation refuses any
+    #: value but 0 (unbounded).
     max_concurrent_queries: int = 0
 
 
@@ -1202,7 +1208,11 @@ class MetadataConfig:
     # per-user file (see `metadata.backends.default_sqlite_uri`); pass `":memory:"` for
     # an ephemeral SQLite store.
     uri: str | None = None
-    decay_per_day: float = 0.1  # confidence half-life ~ a week
+    # Raise instead of degrading to `in_process` when the configured backend cannot be built.
+    # The default degrades, because learned stats are an optimization rather than a
+    # correctness input; a deployment that depends on cross-run learning sets this so a
+    # misconfigured store fails loudly instead of silently learning nothing across runs.
+    require_durable: bool = False
 
 
 # Sentinel `autoscale_wait_s` meaning "auto": the config layer resolves it to a bounded
@@ -1583,6 +1593,13 @@ class DistributedConfig:
     # appropriate on a trusted/isolated cluster network. Also read from the
     # `BATCHER_SHUFFLE_TOKEN` env var so it can be injected without a config file.
     shuffle_token: str | None = None
+    # Refuse to start a Flight shuffle fleet unless it is authenticated AND encrypted: a
+    # `shuffle_token` (or `BATCHER_SHUFFLE_TOKEN`) and `tls.enabled`. Both default off, so a
+    # fleet on a trusted network works with no setup, which is also how a deployment that
+    # moves regulated data ends up serving it in plaintext to anything that can reach the
+    # port. On, a missing token or TLS is a `ConfigError` before the first worker is spawned
+    # (checked there because the token may arrive by env var), never a silent downgrade.
+    require_secure_shuffle: bool = False
     # Closed port range the Flight shuffle listener may bind, as (min, max) inclusive.
     # None (default) takes an OS-ephemeral port, which never collides and needs no
     # configuration — the right default on a flat cluster network. A firewalled network
@@ -1619,6 +1636,12 @@ class DistributedConfig:
     # fleet resolves to "no placement" with no remote call at all and a multi-node one
     # pays a single fan-out for the per-mapper byte sizes.
     locality_aware_scheduling: bool = True
+    # Run a join over tables stored in join-key order without a shuffle: each worker takes
+    # one key range of every aligned table (files chosen from their Parquet footer ranges)
+    # and runs the join, and any aggregate above it, locally (`dist.executors.aligned`).
+    # Result-identical by construction (every aligned scan is filtered to its range); off
+    # sends every join through the shuffle executors as before.
+    aligned_execution: bool = True
     # Persistent shuffle-actor fleet for the adaptive Flight path. When on, an adaptive
     # multi-stage query reserves ONE placement group + worker fleet for the whole query
     # and reuses it across breaker stages: a stage's intermediate stays partitioned on
@@ -1784,6 +1807,16 @@ class DistributedConfig:
     # the device. Turn it on for benchmark and staging runs, and for any change to
     # `core/gpu_plan/`.
     gpu_shadow_verify: bool = False
+    # Make an explicit `backend="gpu"` fail instead of falling back. Off by default, because
+    # "always safe" is the tier's contract: a declined shape, a device out of memory or a
+    # GPU-less cluster answers on the CPU engine with the same rows. That is the wrong default
+    # for a benchmark or a capacity test, where a silent CPU run reports a timing for a device
+    # that never ran. On, every such decline raises `BackendError` naming the reason instead.
+    # It changes only whether a fallback is allowed, never what a device run computes, and it
+    # does not touch `backend="auto"`, which is a request for Kyber's choice rather than for
+    # the device. A shard's own CPU recovery is `gpu_shard_cpu_fallback`, so set that off too
+    # to require that every shard ran on a device.
+    gpu_require: bool = False
     # The most devices a single query may ask the autoscaler to grow to. The request is sized
     # from the working set (how many devices would hold it in one wave), so a badly-estimated
     # query would otherwise be able to ask a cluster to grow without bound. Reaching the cap is
@@ -1930,7 +1963,16 @@ class DistributedConfig:
     # mandate — while a GPU stage always distributes (it must reach the cluster's GPUs) and an
     # unknown/large size distributes as before. Result-identical either way; an explicit
     # `distributed=True/False` always overrides. Set to 0 to always distribute on a cluster.
-    distribute_min_rows: int = 1_000_000
+    # 20M, measured on 8 x 16-core workers reading TPC-H from S3: at SF1 (6M `lineitem` rows)
+    # every query ran faster on the driver (0.15-0.5 s) than distributed (0.25-2.0 s), and at
+    # SF10 (60M) distributed won by up to 10x (q1: 0.42 s against 6-10 s on the 8-core head).
+    distribute_min_rows: int = 20_000_000
+    # Projected input bytes (the columns the query reads, per the Parquet footers, each table
+    # counted once) past which `auto` distributes even under `distribute_min_rows`. Rows alone
+    # miss width: TPC-H q13 at SF10 reads 16.5M rows, 15M of them `o_comment` strings, and ran
+    # 1.72 s on the 8-core driver against 0.94 s on the cluster, while q22 reads as many rows
+    # of narrow keys and ran 0.78 s local against 1.60 s distributed.
+    distribute_min_bytes: int = 512 << 20
     # What `distributed="auto"` means, for every terminal that does not pass `distributed=`
     # itself. That is most of them: the scalar terminals (`count`, `min`, `sum`), the
     # `ds.meta` fallbacks, `ds.dq.validate()`/`fail()`, and `to_arrow`/`to_pydict` take no
@@ -2146,14 +2188,14 @@ class DistributedConfig:
         tasks that carry the replicated side. When they disagree the result is an
         out-of-memory on every device at once, so the number is defined once.
 
-        **What it replaces is the reason it is worth having.** Kyber's GPU router asked
-        `adaptive_build_side` for the broadcast verdict with no threshold, which resolves to
-        `resolved_broadcast_max_bytes(l3_cache_bytes=0, workers=1)` — the historical **4 MiB**
-        fallback, a share of a *CPU's L3 cache on one node*. Applied to a 15 GB device that is
-        wrong by three orders of magnitude, and it declined the fan-out for joins that fit a
-        device many times over: measured on a six-T4 fleet at TPC-H sf10, q4 and q12 have build
-        sides of roughly 240 MB and were refused, then ran the whole join on a single device —
-        8.7 s and 8.5 s against CPU-engine answers of 0.33 s and 1.28 s.
+        **The CPU broadcast threshold is the wrong ruler here.** Asking `adaptive_build_side`
+        for the verdict with no threshold resolves to
+        `resolved_broadcast_max_bytes(l3_cache_bytes=0, workers=1)` — the **4 MiB** fallback, a
+        share of a *CPU's L3 cache on one node*. Applied to a 15 GB device that is wrong by three
+        orders of magnitude and declines the fan-out for joins that fit a device many times
+        over: measured on a six-T4 fleet at TPC-H sf10, q4 and q12 have build sides of roughly
+        240 MB, and refused, they run the whole join on a single device in 8.7 s and 8.5 s
+        against CPU-engine answers of 0.33 s and 1.28 s.
 
         Over-estimating is bounded rather than fatal: a probe shard that does not fit its share
         falls into `dist.gpu.shards.run_subdivided`, which divides it and reruns it on the
@@ -2185,17 +2227,17 @@ class DistributedConfig:
         Kyber routes on this: a working set that fits one device is dispatched to it, one that
         does not is sharded across the cluster, and a GPU inference stage seeds its batch size
         from the VRAM left after the model. All three are wrong by the ratio of the real device
-        to the assumed one, and the assumed one used to be a hardcoded 12.0 — a T4. On an 80 GB
-        A100 that shards a working set six times over that one device would have held, and
-        seeds inference batches ~6x too small, which is exactly the "leaves the GPU idle"
+        to the assumed one, which is why it is detected rather than hardcoded: a fixed 12.0 (a
+        T4) on an 80 GB A100 shards a working set six times over that one device would hold,
+        and seeds inference batches ~6x too small, which is exactly the "leaves the GPU idle"
         failure this is supposed to prevent.
 
         Reports the device's **total** memory in decimal GB. It is a *capacity*, and every
-        caller subtracts `accelerator.vram_headroom` from it once, itself — which is the
-        contract that had drifted. Detection used to fold in a private `0.75`, so a stage
-        packed against it applied its own `0.85` on top and budgeted 64% of the board, while
-        the same stage on a Ray cluster took `cluster_gpu_memory_gb()`, which folded in
-        nothing, and budgeted 85%. One decision, two answers, chosen by whether Ray was up.
+        caller subtracts `accelerator.vram_headroom` from it once, itself. Detection folds in
+        no fraction of its own: a private `0.75` here, under a stage's own `0.85`, would budget
+        64% of the board while the same stage on a Ray cluster (`cluster_gpu_memory_gb()`,
+        which folds in nothing) budgets 85%, so one decision would get two answers depending
+        on whether Ray is up.
 
         The unit is decimal GB rather than GiB for the same single-meaning reason: Kyber sizes
         a working set as `rows x width / 1e9`, and dividing a device by `1 << 30` to compare
@@ -2454,8 +2496,6 @@ def _check_overrides(caller: str, kind: type, overrides: dict) -> None:
     unknown = sorted(set(overrides) - {f.name for f in dataclasses.fields(kind)})
     if not unknown:
         return
-    from batcher._internal.errors import ConfigError
-
     raise ConfigError(
         f"{caller}(): {unknown} " + ("is not a" if len(unknown) == 1 else "are not") + f" "
         f"{kind.__name__} field{'' if len(unknown) == 1 else 's'}.",
@@ -2534,6 +2574,51 @@ class Config:
         _check_overrides("Config.replace", Config, section_overrides)
         return replace(self, **section_overrides)  # type: ignore[arg-type]
 
+    def hardened(self, *, audit_path: str) -> Config:
+        """Return this Config with every deployment-safety switch turned on.
+
+        Each switch below defaults off, because each is wrong for a library imported into a
+        notebook and right for a deployment, and a deployment assembled one flag at a time
+        is one that forgets a flag. This sets them together:
+
+        * ``governance.mode="strict"``: a read no `security()` block covers is refused.
+        * ``governance.require_verified_principal=True``: an asserted principal is refused.
+        * ``governance.audit_path``: every decision is appended to a file. It is required
+          here because an audit trail a caller can omit is not one.
+        * ``execution.udf_isolation="strict"``: a UDF child gets a scrubbed environment and
+          resource ceilings. It is not a sandbox.
+        * ``distributed.require_secure_shuffle=True``: a shuffle fleet with no token or no
+          TLS refuses to start.
+
+        What it cannot supply is the material those switches need: a verifier installed with
+        `bt.set_verifier`, the shuffle token, and the TLS certificates. Each missing one fails
+        where it is first needed, rather than being defaulted.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.config import Config
+                >>> cfg = Config().hardened(audit_path="/var/log/batcher/audit.jsonl")
+                >>> cfg.governance.mode, cfg.distributed.require_secure_shuffle
+                ('strict', True)
+
+        Args:
+            audit_path: The JSONL file every governance decision is appended to.
+
+        Returns:
+            A new Config with those settings; the original is unchanged.
+        """
+        return self.replace(
+            governance=replace(
+                self.governance,
+                mode="strict",
+                require_verified_principal=True,
+                audit_path=audit_path,
+            ),
+            execution=replace(self.execution, udf_isolation="strict"),
+            distributed=replace(self.distributed, require_secure_shuffle=True),
+        )
+
     def engine_config_json(self) -> str:
         """Serialize the Rust-relevant execution knobs for the data plane.
 
@@ -2567,7 +2652,11 @@ class Config:
         return _engine_config_json(self._engine_config_values())
 
     def engine_config_json_with(
-        self, op_budgets: dict[int, int], *, prefer_materializing_aggregate: bool = False
+        self,
+        op_budgets: dict[int, int],
+        *,
+        prefer_materializing_aggregate: bool = False,
+        prefer_sideways: bool = False,
     ) -> str:
         """`engine_config_json` plus Kyber's per-operator spill budgets.
 
@@ -2595,17 +2684,21 @@ class Config:
                 aggregate is cheaper materialized than streamed, taken from the estimated
                 group count only the control plane has. A hint the engine may decline: it
                 re-checks the plan shape and ANDs in its own memory-affordability test.
+            prefer_sideways: Kyber's verdict that a join's build-side aggregate reads far more
+                rows than its probe side can match, so the executor that restricts it to the
+                probe side's keys is faster. A hint on the same terms as the one above.
 
         Returns:
             A JSON string extending `engine_config_json` with the per-operator
             budgets; an empty map reproduces `engine_config_json` exactly.
         """
-        if not op_budgets and not prefer_materializing_aggregate:
+        if not op_budgets and not prefer_materializing_aggregate and not prefer_sideways:
             return self.engine_config_json()
         return _engine_config_json_budgeted(
             self._engine_config_values(),
             tuple(sorted(op_budgets.items())),
             prefer_materializing_aggregate,
+            prefer_sideways,
         )
 
     def _engine_config_values(self) -> tuple[object, ...]:
@@ -2615,6 +2708,9 @@ class Config:
             self.execution.morsel_bytes,
             self.execution.parallelism,
             self.spill_budget_bytes(),
+            # The engine pool's soft line, at the fraction `PressureMonitor._classify` reads
+            # that pool's `used / limit` against, so the two ladders agree on one counter.
+            min(self.memory.soft_limit, self.memory.hard_limit),
             self.memory.spill_dir,
             self.memory.spill_compression,
             self.execution.fuse_linear,
@@ -2939,25 +3035,58 @@ class Config:
         return f"Config({shown}{more})"
 
 
-def _coerce(raw: str, to: object) -> object:
+def _coerce(key: str, raw: str, to: object) -> object:
+    """Parse env var `key`'s string `raw` into the declared field type `to`.
+
+    A sequence field takes a comma-separated list whose elements are coerced to the element
+    type, a mapping field takes a JSON object, and a malformed value raises `ConfigError`
+    naming the variable rather than a bare `ValueError` from deep inside `import batcher`.
+    """
+    try:
+        return _coerce_value(raw, to)
+    except (ValueError, TypeError) as exc:
+        name = getattr(to, "__name__", None) or str(to)
+        raise ConfigError(f"{key}={raw!r}: expected {name} ({exc})") from exc
+
+
+def _coerce_value(raw: str, to: object) -> object:
     if to is bool:
         return truthy(raw)
     if to is int:
-        return int(raw)
+        return int(raw.strip())
     if to is float:
-        return float(raw)
+        return float(raw.strip())
+    if to is str:
+        return raw
+    origin = typing.get_origin(to)
+    if origin is tuple:
+        return _coerce_tuple(raw, typing.get_args(to))
+    if origin is dict:
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ConfigError("a JSON object")
+        return value
     # A `bool | str` field (e.g. `runtime_bloom_join = "auto"`): a recognized boolean
-    # token coerces to a real bool, everything else stays the string. Without this the
-    # whole union was returned uncoerced, so `BATCHER_..._RUNTIME_BLOOM_JOIN=true` shipped
-    # the *string* "true" — which then failed validation ("must be True, False, or 'auto'")
-    # while the string literal "auto" happened to pass. Enabling/disabling the feature via
-    # env raised `ConfigError`; a string-valued sentinel like "auto" still passes through.
+    # token coerces to a real bool, everything else stays the string, so both
+    # `..._RUNTIME_BLOOM_JOIN=true` and the sentinel `"auto"` pass validation.
     members = [a for a in typing.get_args(to) if a is not type(None)]
     if bool in members and (truthy(raw) or falsy(raw)):
         return truthy(raw)
     if str in members:
         return raw
-    return raw
+    raise ConfigError("a type an environment variable cannot express")
+
+
+def _coerce_tuple(raw: str, args: tuple[object, ...]) -> tuple[object, ...]:
+    """Split a comma-separated `raw` and coerce each element to the tuple's element type."""
+    parts = [p.strip() for p in raw.split(",")] if raw.strip() else []
+    if len(args) == 2 and args[1] is Ellipsis:
+        element_types: list[object] = [args[0]] * len(parts)
+    else:
+        if len(parts) != len(args):
+            raise ConfigError(f"{len(args)} comma-separated values, got {len(parts)}")
+        element_types = list(args)
+    return tuple(_coerce_value(p, t) for p, t in zip(parts, element_types, strict=True))
 
 
 def _scalar_type(annotation: object) -> object:
@@ -2995,7 +3124,7 @@ def _overlay_env(obj: Config, prefix: str, env: dict[str, str]) -> Config:
         elif key in env:
             # Coerce against the *declared* field type, not `type(current)`: an optional
             # field defaulting to None would otherwise resolve to NoneType and skip coercion.
-            updates[field.name] = _coerce(env[key], field_types.get(field.name, type(current)))
+            updates[field.name] = _coerce(key, env[key], field_types.get(field.name, type(current)))
     return replace(obj, **updates) if updates else obj
 
 
@@ -3022,7 +3151,7 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
     return replace(obj, **updates) if updates else obj
 
 
-#: The last `(input, output)` pair `_resolved` produced, matched by *identity*. One slot,
+#: The recent `(input, output)` pairs `_resolved` produced, matched by *identity*. Memoized
 #: because the access pattern it exists for is one config object resolved over and over:
 #: `api.orchestration.with_auto_config` wraps every terminal op in a `config_context` over
 #: the object `resolve_auto_config` memoizes, so a `collect()` loop resolves the *same*
@@ -3036,13 +3165,21 @@ def _overlay_dict(obj: Config, data: dict[str, object]) -> Config:
 #: single config object is being reused — a node does not become preemptible mid-process,
 #: and a test that exports a spot variable builds a fresh `Config` (or calls
 #: `reset_resolution_memo`) and so re-detects.
-_RESOLUTION_MEMO: tuple[Config, Config] | None = None
+#:
+#: **Several slots, not one**, because a terminal op resolves more than one object: the
+#: auto-config object above, then -- whenever Carbonite adapts the execution knobs to live
+#: pressure or contention -- the adapted config `run_relational` scopes the run under. With
+#: one slot the two evicted each other on every query, so a busy machine paid a full
+#: re-validation (~100 us) per query for a config identical to the last query's
+#: (`ResourceManager.recommended_config` hands back the same object for the same
+#: adaptation). Entries hold their input, so an `id` is never recycled under one.
+_RESOLUTION_MEMO: dict[int, tuple[Config, Config]] = {}
+_RESOLUTION_MEMO_MAX = 8
 
 
 def reset_resolution_memo() -> None:
     """Forget the memoized resolution, so the next `_resolved` re-reads the environment."""
-    global _RESOLUTION_MEMO
-    _RESOLUTION_MEMO = None
+    _RESOLUTION_MEMO.clear()
 
 
 def _resolved(cfg: Config) -> Config:
@@ -3055,14 +3192,13 @@ def _resolved(cfg: Config) -> Config:
     Memoized on the input's identity; see `_RESOLUTION_MEMO` for why that is sound and for
     the one assumption it makes.
     """
-    global _RESOLUTION_MEMO
     from batcher.config.profiles import (
         apply_resilience_profile,
         detect_spot_environment,
         resolve_autoscale_wait,
     )
 
-    memo = _RESOLUTION_MEMO
+    memo = _RESOLUTION_MEMO.get(id(cfg))
     if memo is not None and memo[0] is cfg:
         return memo[1]
     original = cfg
@@ -3070,7 +3206,9 @@ def _resolved(cfg: Config) -> Config:
         cfg = cfg.replace(distributed=replace(cfg.distributed, resilience="spot"))
     cfg = resolve_autoscale_wait(apply_resilience_profile(cfg))
     out = cfg.validate()
-    _RESOLUTION_MEMO = (original, out)
+    if len(_RESOLUTION_MEMO) >= _RESOLUTION_MEMO_MAX:
+        _RESOLUTION_MEMO.clear()
+    _RESOLUTION_MEMO[id(original)] = (original, out)
     return out
 
 
@@ -3160,13 +3298,15 @@ def tenant(tenant_id: str, **overrides: object) -> Iterator[Config]:
 
     Args:
         tenant_id: Names the tenant. Empty restores un-tenanted behavior.
-        **overrides: Other `TenantConfig` fields, e.g. ``max_concurrent_queries=4``.
+        **overrides: Other `TenantConfig` fields. The per-tenant limits are not
+            implemented, so validation refuses a non-default value for them.
 
     Yields:
         The `Config` in effect inside the block.
 
     Raises:
-        ConfigError: If an override is not a `TenantConfig` field.
+        ConfigError: If an override is not a `TenantConfig` field, or sets a per-tenant
+            limit that is not implemented.
     """
     current = active_config()
     _check_overrides("tenant", TenantConfig, overrides)

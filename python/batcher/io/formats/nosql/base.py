@@ -37,6 +37,7 @@ from batcher.config import active_config
 from batcher.io.manifest import WrittenFile
 
 __all__ = [
+    "SCHEMA_SAMPLE_ROWS",
     "STORE_WRITE_MODES",
     "BulkSink",
     "ScanSource",
@@ -106,28 +107,66 @@ def rows_to_batches(
         yield pa.RecordBatch.from_pylist(buffer, schema=schema)
 
 
+#: Rows a connector samples to infer a schema. One row was the old sample, and a document
+#: store's first row says nothing about a field that only later documents carry, or about a
+#: field whose type changes between them. A bounded sample keeps inference a single cheap
+#: round trip; `schema=` on the source skips it entirely.
+SCHEMA_SAMPLE_ROWS = 100
+
+
 def schema_from_rows(rows: list[dict[str, Any]]) -> pa.Schema:
-    """Infer an Arrow schema from a list of sampled row dicts.
+    """Infer an Arrow schema from sampled row dicts, over every row rather than the first.
 
-    This is the schema half of the row->Arrow bridge: `_infer_schema` samples a
-    handful of rows from the store (usually a single ``LIMIT 1`` row) and needs
-    the Arrow schema those rows imply. Arrow derives it from the sample the same
-    way `rows_to_batches` builds data batches, so both halves agree by
-    construction.
+    Each column's type is inferred from all of its sampled values, so a field absent from
+    the first row still appears and a null in the first row does not fix the type to
+    ``null``. Columns appear in first-seen order. Numeric values widen the way Arrow widens
+    them (an int and a float make a double).
 
-    An empty sample carries no type information, so the result is the empty
-    schema (`pa.schema([])`). A connector that has a meaningful schema for the
-    empty case (a fixed key column, say) must keep its own guard rather than
-    call this.
+    Two values no Arrow type holds together -- a string in one document and a number in the
+    next -- are an error naming the column, rather than a schema taken from whichever row
+    came first and a conversion failure later on a worker. Declare the schema with the
+    source's ``schema=`` to read such a store.
+
+    An empty sample carries no type information, so the result is the empty schema. A
+    connector with a meaningful empty-case schema keeps its own guard.
 
     Args:
-        rows: The sampled row dictionaries (column name -> scalar value). Pass a
-            single-element list to infer from one sampled row.
+        rows: The sampled row dictionaries (column name -> scalar value).
 
     Returns:
         The Arrow schema the sample implies; the empty schema when `rows` is empty.
+
+    Raises:
+        FormatError: If one column holds values of irreconcilable types.
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.io.formats.nosql.base import schema_from_rows
+            >>> schema_from_rows([{"a": 1}, {"a": 2.5, "b": "x"}]).types
+            [DataType(double), DataType(string)]
     """
-    return pa.schema([]) if not rows else pa.RecordBatch.from_pylist(rows).schema
+    if not rows:
+        return pa.schema([])
+    names: dict[str, None] = {}
+    for row in rows:
+        names.update(dict.fromkeys(row))
+    fields = []
+    for name in names:
+        values = [row.get(name) for row in rows]
+        try:
+            dtype = pa.array(values).type
+        except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+            from batcher._internal.errors import FormatError
+
+            kinds = sorted({type(v).__name__ for v in values if v is not None})
+            raise FormatError(
+                f"field {name!r} holds values of incompatible types ({', '.join(kinds)}) "
+                f"across the {len(rows)} sampled rows, so no single column type fits it: "
+                f"{exc}. Pass schema= to the source to declare the column's type."
+            ) from exc
+        fields.append(pa.field(name, dtype))
+    return pa.schema(fields)
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,11 +298,16 @@ class ScanSource(ABC):
         self,
         *,
         partition_spec: PartitionSpec | None = None,
+        schema: pa.Schema | None = None,
         **conn_kwargs: Any,
     ) -> None:
+        # A declared schema is the answer to `schema()` and inference never runs. It rides in
+        # the kwargs a split rebuilds its source from, so a worker never re-infers either.
+        if schema is not None:
+            conn_kwargs["schema"] = schema
         self._conn_kwargs = conn_kwargs
         self._partition_spec = partition_spec or PartitionSpec()
-        self._schema_cache: pa.Schema | None = None
+        self._schema_cache: pa.Schema | None = schema
 
     # ---- shared, do-not-override ------------------------------------------
     def schema(self) -> pa.Schema:

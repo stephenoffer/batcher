@@ -16,7 +16,6 @@ from __future__ import annotations
 from batcher._internal.errors.hierarchy import (
     AccessDeniedError,
     BackendError,
-    BackpressureAbort,
     BatcherError,
     ColumnNotFoundError,
     CommitError,
@@ -60,7 +59,6 @@ from batcher._internal.errors.validate import (
 __all__ = [
     "AccessDeniedError",
     "BackendError",
-    "BackpressureAbort",
     "BatcherError",
     "ColumnNotFoundError",
     "CommitError",

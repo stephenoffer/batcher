@@ -563,7 +563,13 @@ class Writer:
                 required_privileges(mode if dml_mode else "append"),
             )
             sink = self._stream_sink_for(
-                path, fmt, opts, query_name, max_rows_per_file, mode=mode if dml_mode else None
+                path,
+                fmt,
+                opts,
+                query_name,
+                max_rows_per_file,
+                mode=mode if dml_mode else None,
+                checkpoint=checkpoint,
             )
             return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
 
@@ -910,12 +916,15 @@ class Writer:
         query_name: str | None = None,
         max_rows_per_file: int | None = None,
         mode: str | None = None,
+        checkpoint: str | None = None,
     ) -> Any:
         """Build the per-micro-batch `StreamSink` for a path/format streaming write.
 
-        `query_name` becomes the transactional sink's ``txn`` application id, which is
-        what makes a restarted query's replayed micro-batch idempotent — so it has to
-        reach the sink, not just the query engine.
+        The transactional sink's ``txn`` application id is what makes a restarted query's
+        replayed micro-batch idempotent, so it has to reach the sink, not just the query
+        engine. `stream_app_id` derives it from `query_name` and `checkpoint`: the
+        checkpoint's persisted stream id for an unnamed checkpointed query, and an id unique
+        to the run without a checkpoint, whose batch counter restarts at 0.
 
         `fmt` reaches the sink too, and used not to: every mode-aware format was handed to
         a Delta-pinned sink, so a streaming ``format="iceberg"`` write produced a Delta
@@ -942,7 +951,10 @@ class Writer:
                 )
             if mode is not None:
                 opts = {**opts, "mode": mode}
-            return TransactionalStreamSink(path, fmt, query_name=query_name, **opts)
+            from batcher.io.formats.streaming.checkpoint.identity import stream_app_id
+
+            app_id = stream_app_id(query_name, checkpoint, path)
+            return TransactionalStreamSink(path, fmt, query_name=app_id, **opts)
         return FileStreamSink(path, fmt, max_rows_per_file=max_rows_per_file, **opts)
 
     def console(
@@ -1952,6 +1964,7 @@ class Writer:
         *,
         mode: str = "append",
         key_columns: str | list[str] | None = None,
+        sequence_by: str | list[str] | None = None,
         **opts: Any,
     ) -> WriteManifest:
         """Write to a database table — bulk append, or row-level upsert/update/delete.
@@ -1983,9 +1996,18 @@ class Writer:
         ``ds.write(table, "adbc", ...)`` or ``ds.write(table, "dbapi", ...)``.
 
         Each shard of a distributed write runs its own transaction against the same table.
-        ``append``, ``upsert``, ``update`` and ``delete`` are all safe that way, because a
-        shard only ever touches the keys its own rows name; ``overwrite`` is refused,
-        because every shard would discard the shards before it.
+        ``upsert``, ``update`` and ``delete`` are safe that way, because a shard only ever
+        touches the keys its own rows name; ``overwrite`` is refused, because every shard
+        would discard the shards before it. Pass ``staged=True`` to make an ``append`` or
+        ``overwrite`` atomic across every shard: each writes into its own staging table,
+        and one transaction on the driver publishes them all.
+
+        **A repeated key needs `sequence_by` to have a defined winner.** A keyed mode binds
+        one statement per row, so without it the row that runs last wins, and that is frame
+        order, which a distributed write does not fix. With it, only the greatest
+        `sequence_by` row per key is written: a batch write deduplicates across every shard
+        before writing, and a streaming write deduplicates each micro-batch, which is its
+        unit of commit.
 
         Args:
             table: Destination table name, optionally schema-qualified.
@@ -1993,9 +2015,11 @@ class Writer:
             key_columns: The column, or columns, identifying a row. Required by
                 ``upsert``/``update``/``delete``/``delete_insert``, and used as the
                 primary key when the table is created.
+            sequence_by: The column, or columns, ordering two rows that share a key, for
+                the keyed modes. A null in it is refused.
             opts: Connection options — ``uri=``, ``password=``, or an explicit
                 ``module=``/``connect_kwargs=`` pair (PEP 249) or ``driver=``/``db_kwargs=``
-                pair (ADBC) — plus the sink's own options, such as
+                pair (ADBC) — plus the sink's own options, such as ``staged=``,
                 ``rows_per_statement=`` and ``retries=``.
 
         Returns:
@@ -2019,7 +2043,23 @@ class Writer:
         """
         if key_columns is not None:
             opts["key_columns"] = tuple(one_or_many(key_columns))
-        return self(table, write_backend(mode, opts), mode=mode, **opts)
+        writer: Writer = self
+        if sequence_by is not None:
+            opts["sequence_by"] = tuple(one_or_many(sequence_by))
+            from batcher.io.source import is_bounded
+
+            keys = opts.get("key_columns")
+            sources = self._ds._sources
+            bounded = opts.get("trigger") is None and all(is_bounded(s) for s in sources)
+            if keys and bounded:
+                # Collapse repeated keys across the *whole* frame first, as one mergeable
+                # reduction, so two shards holding one key cannot each commit their own
+                # winner. The sink applies the same rule again per shard (a no-op here) and
+                # is the only dedupe a micro-batch gets.
+                writer = Writer(
+                    self._ds.distinct(list(keys), keep="last", order_by=list(opts["sequence_by"]))
+                )
+        return writer(table, write_backend(mode, opts), mode=mode, **opts)
 
     def snowflake(self, table: str, **opts: Any) -> WriteManifest:
         """Write to a Snowflake table.

@@ -16,18 +16,14 @@ import pytest
 
 import batcher as bt
 from _harness import assert_tables_equal
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 
 pytestmark = pytest.mark.integration
 
 pytest.importorskip("ray", reason="ray not installed")
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(2)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(2)
 
 
 @pytest.fixture(scope="module")

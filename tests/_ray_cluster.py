@@ -9,7 +9,7 @@ reuses the engine's neutralize-the-broken-hook fix and falls back to attaching t
 the running cluster, so the distributed suite runs both on a laptop (a fresh local
 cluster) and against a managed cluster (attach) instead of erroring at setup.
 
-These live here rather than in `tests/integration/conftest.py` for the same reason
+These live in a uniquely-named module rather than a `conftest` for the same reason
 `tests/_harness.py` exists: a `conftest` is imported under the bare name ``conftest``,
 so ``from conftest import init_test_ray`` binds to whichever `conftest` pytest imported
 first. In a run spanning `tests/differential` and `tests/integration` that is the wrong
@@ -18,9 +18,49 @@ module, and the import fails. A uniquely-named module is unambiguous from anywhe
 
 from __future__ import annotations
 
+import contextlib
+import os
+from collections.abc import Callable, Iterator
+
+import pytest
+
 from batcher.dist.executors.ray_runtime.lifecycle import _platform_env_hook_disabled
 
-__all__ = ["init_test_ray", "shutdown_test_ray"]
+__all__ = [
+    "init_test_ray",
+    "local_ray_resources",
+    "op_stats_all_classes",
+    "ray_session_fixture",
+    "shutdown_test_ray",
+]
+
+
+#: The managed-workspace variable that pins the resources of every Ray node started in this
+#: process. The Anyscale head exports it with `"CPU": 0` so no work lands on the head.
+_RESOURCE_OVERRIDE = "RAY_OVERRIDE_RESOURCES"
+
+
+@contextlib.contextmanager
+def local_ray_resources() -> Iterator[None]:
+    """Let a test's own `ray.init(address="local", num_cpus=N)` really get its `N` CPUs.
+
+    A managed head exports `RAY_OVERRIDE_RESOURCES={"CPU": 0, ...}`, and Ray applies it to
+    *every* node started in the process, a local one included — so the local instance a test
+    asked for came back advertising no CPU, and anything submitted to it pended forever. That
+    is why `tests/migrate/test_executed_ray_data.py` hung for 600 s per case on a groupby of
+    three rows, and why the local fan-out in `test_gpu_fanout.py` skipped. With the variable
+    unset the same groupby finishes in about 6 s.
+
+    The variable is restored on exit: a later module attaching to the session's cluster does
+    not start a node, so it never read the override, but leaving the process environment as it
+    was found keeps modules order-independent.
+    """
+    prior = os.environ.pop(_RESOURCE_OVERRIDE, None)
+    try:
+        yield
+    finally:
+        if prior is not None:
+            os.environ[_RESOURCE_OVERRIDE] = prior
 
 
 def init_test_ray(num_cpus: int) -> bool:
@@ -65,13 +105,11 @@ def _require_schedulable_cpu(ray, num_cpus: int) -> None:
     `memory`, `object_store_memory` and node labels and **no `CPU` key at all**, while the
     real 1,024-core cluster ran on a different port.
 
-    Deliberately an error rather than a repair, because the repair does not exist here.
-    Starting a *local* Ray is the obvious fallback and it is the one thing that cannot work
-    on this platform: `ray.init(address="local", num_cpus=4)` came back with `CPU: None` and a
-    one-CPU task pending on `No available node types can fulfill resource request {'CPU': 1.0}`
-    — the workspace's head runs no work, and only the autoscaled fleet schedules. A helper
-    that silently substitutes some other cluster would also be worse than one that says what
-    it got.
+    Deliberately an error rather than a repair: a helper that silently substitutes some other
+    cluster would be worse than one that says what it got. A local Ray on such a head came back
+    with `CPU: None` only because the platform's `RAY_OVERRIDE_RESOURCES` pins every node
+    started there to zero CPUs; a test that wants a local instance starts it under
+    [`local_ray_resources`].
 
     The fix is an address, and it is verified rather than suggested: with `RAY_ADDRESS` set to
     the scheduling cluster, `test_distributed_unordered_limit` goes from hanging indefinitely
@@ -101,3 +139,48 @@ def shutdown_test_ray(started: bool) -> None:
         import ray
 
         ray.shutdown()
+
+
+def ray_session_fixture(num_cpus: int) -> Callable[[], Iterator[None]]:
+    """Return a module-scoped, autouse fixture holding Ray up for the whole test module.
+
+    Bind it to the name `_ray_session` at module level so pytest collects it:
+    ``_ray_session = ray_session_fixture(4)``. The fixture starts (or attaches to) Ray
+    with `init_test_ray(num_cpus)` before the module's first test and calls
+    `shutdown_test_ray` after its last one.
+    """
+
+    @pytest.fixture(scope="module", autouse=True)
+    def _ray_session() -> Iterator[None]:
+        started = init_test_ray(num_cpus)
+        yield
+        shutdown_test_ray(started)
+
+    return _ray_session
+
+
+def op_stats_all_classes() -> dict[str, list[dict]]:
+    """Every machine class's operator feedback in the process hub, merged by `kind`.
+
+    A worker stamps its own fingerprint on every row it ships, and `op_stats_by_kind` reads
+    one class -- this process's, or the class a `planning_for` scope names. A test asserting
+    that a distributed measurement *arrived* has to read them all. Reading any single class
+    fails on an ordinary cluster in two ways, both observed on the Anyscale fleet this was
+    written on: the driver is a different instance type from its workers, so its own class
+    holds no worker row; and one node group mixes CPU models, so a two-reducer shuffle join
+    filed 18 of its 32 build rows under one worker class and 14 under another. The per-class
+    view is the hub's own (`MetadataHub._by_fp`). There is no public accessor, deliberately:
+    every *planning* reader must name the class it plans for.
+
+    Returns:
+        `{kind: rows}` across every class, each list a fresh copy.
+    """
+    from batcher.core import default_hub
+
+    hub = default_hub()
+    views = hub._by_fp if hub._by_fp is not None else hub._load_views()[0]
+    merged: dict[str, list[dict]] = {}
+    for kinds in views.values():
+        for kind, rows in kinds.items():
+            merged.setdefault(kind, []).extend(rows)
+    return merged

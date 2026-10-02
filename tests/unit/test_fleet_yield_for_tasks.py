@@ -100,3 +100,19 @@ def test_no_cached_fleet_is_a_no_op(monkeypatch):
     """The common case — nothing warm to release — costs nothing and answers False."""
     monkeypatch.setattr(_fleet, "_SESSION", None, raising=False)
     assert _fleet.yield_session_fleet(1.0) is False
+
+
+def test_free_cores_scattered_across_nodes_do_not_fit_one_task(monkeypatch):
+    """One free core on each of eight nodes is not room for an 8-CPU task.
+
+    The cluster-wide sum said it was, so the fleet was kept and the task waited out the
+    fleet's 30 s idle timer (TPC-H q10 at SF1). A task is placed on one node, so the free
+    count that decides the yield is the largest on any one node.
+    """
+    import ray._private.state as state
+
+    per_node = {f"node{i}": {"CPU": 1.0} for i in range(8)}
+    monkeypatch.setattr(state, "available_resources_per_node", lambda: per_node)
+    assert _fleet._free_cluster_cpus() == 1.0
+    per_node["node3"] = {"CPU": 9.0}
+    assert _fleet._free_cluster_cpus() == 9.0

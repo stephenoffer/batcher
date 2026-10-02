@@ -86,6 +86,8 @@ _AGG_WIDEN_INPUT = frozenset(
     # narrow type does.
     {"sum", "bit_and", "bit_or", "bit_xor", "any_value"}
 )  # widen(input)
+# A decimal `SUM`'s result precision: `Decimal128`'s maximum, whatever the input's.
+_DECIMAL_SUM_PRECISION = 38
 
 
 def _agg_output_type(agg: AggExpr, input_schema: SchemaRef) -> pa.DataType | None:
@@ -114,6 +116,11 @@ def _agg_output_type(agg: AggExpr, input_schema: SchemaRef) -> pa.DataType | Non
         t = pa.int64()
     elif func not in _AGG_INPUT:
         t = widen(t)
+    if func == "sum" and pa.types.is_decimal128(t):
+        # `SUM(decimal(p, s))` is `decimal(38, s)` (DuckDB, the SQL standard): the input's
+        # precision cannot hold a sum of its values. Mirrors `bc_runtime::agg`'s
+        # `DECIMAL_SUM_PRECISION`, which the accumulators build their state with.
+        return pa.decimal128(_DECIMAL_SUM_PRECISION, t.scale)
     if func in _AGG_LIST_OF_INPUT:
         return pa.list_(t)
     if func in _AGG_MAP_COUNT_OF_INPUT:

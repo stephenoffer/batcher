@@ -21,8 +21,10 @@ pure running mean never forgets a regime the workload has left.
 The floor is `learned_scalar_alpha_floor` and deliberately not `learning_smoothing_alpha`.
 The latter is a *static blend weight* used elsewhere, and at its value of 0.5 it would
 dominate `1/(n+1)` from the second observation onward — which is to say the floor would
-never bind and the running-mean phase would not exist. `kyber.learning._smooth` makes the
-same distinction for the same reason; this is the neutral-layer twin of it.
+never bind and the running-mean phase would not exist. `convergent_step` is that step, stated
+once for every learner in the tree — this module's Huber-clamped scalars, Kyber's learned row
+counts, selectivities and per-signature priors — and `blend` is the plain exponential
+average the fixed-weight learners use.
 
 # Dispersion, and the two things it buys
 
@@ -71,7 +73,66 @@ if TYPE_CHECKING:
     from batcher.config import Config
     from batcher.metadata.hub import MetadataHub
 
-__all__ = ["ScalarEstimate", "load_scalar", "load_scalar_estimate", "record_smoothed_scalar"]
+__all__ = [
+    "ScalarEstimate",
+    "blend",
+    "convergent_blend",
+    "convergent_step",
+    "load_scalar",
+    "load_scalar_estimate",
+    "record_smoothed_scalar",
+]
+
+
+def convergent_step(n_obs: float, floor: float) -> float:
+    """The weight a new observation gets after `n_obs` earlier ones: `max(floor, 1/(n_obs+1))`.
+
+    A running mean while evidence is thin, decaying into an exponential average with a
+    `~1/floor`-observation memory once `n_obs` passes `1/floor` (see the module docstring for
+    why the floor is `learned_scalar_alpha_floor`).
+
+    Args:
+        n_obs: Observations already folded into the prior.
+        floor: The smallest weight a new observation may carry.
+
+    Returns:
+        The step for the next observation.
+    """
+    return max(floor, 1.0 / (n_obs + 1.0))
+
+
+def blend(prior: float, observed: float, step: float) -> float:
+    """Exponentially average `observed` into `prior` with weight `step`.
+
+    Args:
+        prior: The stored estimate.
+        observed: The new observation.
+        step: The observation's weight, in [0, 1].
+
+    Returns:
+        `step * observed + (1 - step) * prior`.
+    """
+    return step * observed + (1.0 - step) * prior
+
+
+def convergent_blend(
+    prior: float, observed: float, n_obs: float, config: Config | None = None
+) -> float:
+    """`blend` with the `convergent_step` for `n_obs`, floored at the configured alpha floor.
+
+    Args:
+        prior: The stored estimate.
+        observed: The new observation.
+        n_obs: Observations already folded into `prior`.
+        config: Config to read `optimizer.learned_scalar_alpha_floor` from; defaults to the
+            active one.
+
+    Returns:
+        The updated estimate.
+    """
+    floor = (config or active_config()).optimizer.learned_scalar_alpha_floor
+    return blend(prior, observed, convergent_step(n_obs, floor))
+
 
 #: How many standard deviations an observation may sit from the mean before it is clamped.
 #:
@@ -267,7 +328,7 @@ def load_scalar(hub: MetadataHub | None, namespace: str, key: str) -> float | No
         return None
     try:
         stored = hub.get_keyed_param(namespace, key)
-    except Exception as exc:  # pragma: no cover - a learned read must never break a query
+    except Exception as exc:  # a learned read must never break a query
         note_suppressed("metadata", "load a smoothed scalar", exc)
         return None
     return _value_of(stored)
@@ -353,7 +414,7 @@ def record_smoothed_scalar(
             # sign and moves the estimate *away* from every observation. Clamping to at least
             # one observation makes the worst case "smooths as if this were the second run".
             count = max(1.0, _count_of(stored))
-            step = min(1.0, max(floor, 1.0 / (count + 1.0)))
+            step = min(1.0, convergent_step(count, floor))
             prior_var = _variance_of(stored) or 0.0
             # The true deviation drives the variance; a clamped one drives the mean.
             delta = value - prior

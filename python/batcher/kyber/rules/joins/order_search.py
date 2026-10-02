@@ -22,7 +22,7 @@ from itertools import combinations
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.rules.joins import order_budget
-from batcher.kyber.rules.joins.order_residual import Residual, attach_residuals
+from batcher.kyber.rules.joins.order_residual import Residual, attach_residuals, residual_refs
 from batcher.plan.expr_ir import Col, Lit
 from batcher.plan.logical import Join, JoinOutputCol, LogicalPlan, Project, Projection
 
@@ -55,11 +55,6 @@ def _needed_cols(
 def _bits(mask: int) -> frozenset[int]:
     """The leaf indices a `_rebuild_dphyp` bitmask stands for."""
     return frozenset(i for i in range(mask.bit_length()) if mask >> i & 1)
-
-
-def _residual_refs(residuals: list[Residual]) -> set[ColRef]:
-    """Every logical column the residual predicates read (carried like a join key)."""
-    return {ref for r in residuals for ref in r.by_name.values()}
 
 
 def _base_leaf(
@@ -96,7 +91,7 @@ def _rebuild_greedy(
     # projection pushdown already pruned them from the scans, leaving the join
     # output referencing a column its (pruned) input no longer provides.
     residuals = residuals or []
-    needed = _needed_cols(required, edges) | _residual_refs(residuals)
+    needed = _needed_cols(required, edges) | residual_refs(residuals)
 
     # Start from the smallest leaf, then repeatedly add the connected leaf that
     # yields the smallest estimated intermediate result.
@@ -143,7 +138,7 @@ def _rebuild_greedy(
                 best = (score, j, with_res, cand_schema)
         if best is None:
             return None  # disconnected graph → would be a cross join; skip reorder
-        _, j, current, schema = best  # type: ignore[assignment]
+        _, j, current, schema = best
         joined.add(j)
 
     return _final_projection(current, schema, required)
@@ -194,7 +189,7 @@ def _rebuild_dp(
     if n > _MAX_EXHAUSTIVE_LEAVES:
         return None
     residuals = residuals or []
-    needed = _needed_cols(required, edges) | _residual_refs(residuals)
+    needed = _needed_cols(required, edges) | residual_refs(residuals)
     cost = ctx.costs()
 
     # best[subset] = (plan, schema, accumulated_cost). Base case: each singleton leaf.
@@ -265,7 +260,7 @@ def _rebuild_dphyp(
     if budget is None:
         budget = order_budget.max_pairs()
     residuals = residuals or []
-    needed = _needed_cols(required, edges) | _residual_refs(residuals)
+    needed = _needed_cols(required, edges) | residual_refs(residuals)
     cost = ctx.costs()
 
     # Adjacency between leaf indices as bitmasks (edge endpoints carry their leaf id).
@@ -392,21 +387,7 @@ def _join_plans(
     or `None` when no edge connects them. The bushy generalization of `_make_join`."""
     left_alias = {ref: alias for alias, ref in left_schema}
     right_alias = {ref: alias for alias, ref in right_schema}
-
-    left_keys: list[str] = []
-    right_keys: list[str] = []
-    seen: set[tuple[str, str]] = set()
-    for a, b in edges:
-        if a in left_alias and b in right_alias:
-            pair = (left_alias[a], right_alias[b])
-        elif b in left_alias and a in right_alias:
-            pair = (left_alias[b], right_alias[a])
-        else:
-            continue
-        if pair not in seen:
-            seen.add(pair)
-            left_keys.append(pair[0])
-            right_keys.append(pair[1])
+    left_keys, right_keys = _crossing_keys(left_alias, right_alias, edges)
     if not left_keys:
         return None
 
@@ -428,6 +409,75 @@ def _join_plans(
     return join, new_schema
 
 
+def _crossing_keys(
+    left_alias: dict[ColRef, str],
+    right_alias: dict[ColRef, str],
+    edges: list[tuple[ColRef, ColRef]],
+) -> tuple[list[str], list[str]]:
+    """The key pairs joining two sub-plans: one per equality the two sides do not already imply.
+
+    Every edge with both endpoints inside one side was applied when that side was built --
+    each builder here joins on all the edges its two halves share, so by induction a sub-plan
+    already enforces every equality among its own leaves. Equality is transitive, so a crossing
+    edge whose endpoints are *already* connected, through edges inside either side plus the
+    crossing edges kept so far, adds no condition a row could fail: it is implied, exactly. Only
+    a spanning forest of the crossing edges is kept.
+
+    The redundant pairs were not free. JOB writes every pairwise equality among the tables
+    joined on a movie, so the fourth table to join met its partner on four copies of one key:
+    the hash table hashed and compared four columns where one decides the match, and the
+    estimator read those four columns as a composite key whose distinct count combines four
+    copies of one value domain. That combination saturates the side's row count, which the
+    composite primary-key test reads as a unique key, and the join was priced at the larger
+    input's size -- `hash_join [inner on id, id, id, id, id]` estimated at 160,809 rows against
+    743 on q27c. With the implied pairs gone the same join is a single-key join, priced by the
+    single-key containment estimate and its unique-key cap.
+
+    Inner equi-joins only (the region `order.py` extracts): a NULL key matches nothing, so every
+    row that survives an applied edge holds equal, non-null values on both of its endpoints, and
+    the transitive step is sound for every row the join can see.
+
+    Args:
+        left_alias: Each logical column the left sub-plan carries, to its name there.
+        right_alias: The same for the right sub-plan.
+        edges: The region's equi-join edges.
+
+    Returns:
+        The left and right key names, in edge order, with implied pairs dropped. Empty when
+        no edge crosses between the two sides.
+    """
+    parent: dict[ColRef, ColRef] = {}
+
+    def find(ref: ColRef) -> ColRef:
+        while parent.get(ref, ref) != ref:
+            ref = parent[ref]
+        return ref
+
+    def union(a: ColRef, b: ColRef) -> bool:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return False
+        parent[ra] = rb
+        return True
+
+    for a, b in edges:
+        if (a in left_alias and b in left_alias) or (a in right_alias and b in right_alias):
+            union(a, b)  # already applied inside one side
+    left_keys: list[str] = []
+    right_keys: list[str] = []
+    for a, b in edges:
+        if a in left_alias and b in right_alias:
+            lref, rref = a, b
+        elif b in left_alias and a in right_alias:
+            lref, rref = b, a
+        else:
+            continue
+        if union(lref, rref):
+            left_keys.append(left_alias[lref])
+            right_keys.append(right_alias[rref])
+    return left_keys, right_keys
+
+
 def _make_join(
     current: LogicalPlan,
     schema: list[tuple[str, ColRef]],
@@ -440,23 +490,7 @@ def _make_join(
     is not connected to the already-joined set."""
     alias_of = {ref: alias for alias, ref in schema}
     leaf_cols = leaf.available_columns()
-    leaf_refs = {(leaf_idx, c) for c in leaf_cols}
-
-    left_keys: list[str] = []
-    right_keys: list[str] = []
-    seen_pairs: set[tuple[str, str]] = set()
-    for a, b in edges:
-        # Orient the edge so one endpoint is in `current` and the other in `leaf`.
-        if a in alias_of and b in leaf_refs:
-            pair = (alias_of[a], b[1])
-        elif b in alias_of and a in leaf_refs:
-            pair = (alias_of[b], a[1])
-        else:
-            continue
-        if pair not in seen_pairs:
-            seen_pairs.add(pair)
-            left_keys.append(pair[0])
-            right_keys.append(pair[1])
+    left_keys, right_keys = _crossing_keys(alias_of, {(leaf_idx, c): c for c in leaf_cols}, edges)
     if not left_keys:
         return None  # no join condition connects them
 

@@ -23,14 +23,14 @@ import batcher as bt
 from batcher import col
 from batcher.config import active_config
 from batcher.kyber.pass_base import OptimizerContext
-from batcher.kyber.rules import agg_pushdown
 from batcher.kyber.rules.agg_pushdown import (
     eager_aggregation,
     pre_aggregate_join_measures,
     pre_aggregation_through_join,
 )
+from batcher.kyber.rules.agg_pushdown import rules as agg_pushdown
 from batcher.kyber.stats.estimator import StatsEstimator
-from batcher.plan.logical import Aggregate
+from batcher.plan.logical import Aggregate, Project
 
 
 def _ctx(ds):
@@ -82,5 +82,11 @@ def test_pre_aggregation_through_join_idempotent(monkeypatch):
     _force_gate_open(monkeypatch)
 
     once = pre_aggregation_through_join(ds._plan, ctx)
-    assert isinstance(once, Aggregate)
-    assert pre_aggregation_through_join(once, ctx) is None
+    # Grouped by exactly the join key, so every pushed group is its own outer group and the
+    # outer aggregate collapses to a projection; either way nothing may re-fire on the result.
+    assert isinstance(once, (Aggregate, Project))
+    from batcher.plan.visitor import walk
+
+    aggregates = [n for n in walk(once) if isinstance(n, Aggregate)]
+    assert aggregates, "the pushed partial aggregate must be in the rewritten plan"
+    assert all(pre_aggregation_through_join(a, ctx) is None for a in aggregates)

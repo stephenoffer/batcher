@@ -32,6 +32,7 @@ mod key_filter;
 mod probe_par;
 mod radix;
 mod range;
+mod slots;
 mod sort_merge;
 mod stream;
 
@@ -72,17 +73,17 @@ fn use_probe_bloom_with(build_rows: usize, probe_rows: usize, min_build_rows: us
 /// Extra resident bytes a hash-join build side costs *beyond* its Arrow columns.
 ///
 /// The build phase allocates a chained hash table over the right side — a
-/// `HashTable<u32>` of ~`rows` entries (hashbrown holds them at a 7/8 load factor,
-/// one control byte each), a `next: Vec<u32>` chain, and a per-row null mask — none
-/// of which `RecordBatch::get_array_memory_size` (columns only) counts. On narrow
-/// keys that hidden overhead is 2–10× the column bytes, so an admission estimate
-/// based on columns alone undercounts the resident build table and can OOM before
-/// spilling. This is a tight, measured estimate (not worst case) so it never spills
+/// [`slots::SlotTable`] of two 8-byte slots per build row (a load factor of one half,
+/// so a probe can prefetch where a key starts), a `next: Vec<u32>` chain, and a per-row
+/// null mask — none of which `RecordBatch::get_array_memory_size` (columns only) counts.
+/// On narrow keys that hidden overhead is 2–10× the column bytes, so an admission
+/// estimate based on columns alone undercounts the resident build table and can OOM
+/// before spilling. This is the table's exact size, not a worst case, so it never spills
 /// an in-memory join that would actually have fit.
 #[must_use]
 pub fn estimate_build_bytes(rows: usize) -> usize {
-    // heads (u32 slot + control byte at the load factor) + next (u32) + null mask (1B).
-    rows.saturating_mul(2 * std::mem::size_of::<u32>() + 4)
+    // heads (two u64 slots) + next (u32) + null mask (1B).
+    rows.saturating_mul(2 * std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + 1)
 }
 
 /// Join flavors.
@@ -845,7 +846,7 @@ struct JoinTable {
     /// common small table is exactly the flat one it always was. A key's shard is a function of
     /// its hash alone, so a chain never spans shards and the build parallelizes with no
     /// synchronization; `next` stays a single absolute-indexed chain either way.
-    heads: Vec<HashTable<u32>>,
+    heads: Vec<slots::SlotTable>,
     /// A perfect hash over a small-range single-`Int64` build key, replacing `heads`.
     ///
     /// When present, `heads` is empty and every lookup is one indexed load with no hashing
@@ -1024,7 +1025,7 @@ impl JoinTable {
             };
         }
 
-        let mut heads: HashTable<u32> = HashTable::with_capacity(right_rows);
+        let mut heads = slots::SlotTable::with_rows(right_rows);
         let mut next: Vec<u32> = vec![u32::MAX; right_rows];
         let mut bloom =
             use_bloom.then(|| BloomFilter::with_params(right_rows as u64, bloom_fp_rate));
@@ -1038,21 +1039,12 @@ impl JoinTable {
             if let Some(b) = bloom.as_mut() {
                 b.add_hash(hash);
             }
-            match heads.entry(
-                hash,
-                |&h| keys.right_eq_right(h as usize, i),
-                |&h| keys.hash_right(&state, h as usize),
-            ) {
-                // Prepend i to the chain — order within a key is irrelevant (the join
-                // output is an unordered relation).
-                Entry::Occupied(mut e) => {
-                    next[i] = *e.get();
-                    *e.get_mut() = i as u32;
-                    unique = false;
-                }
-                Entry::Vacant(e) => {
-                    e.insert(i as u32);
-                }
+            // Prepend i to the chain — order within a key is irrelevant (the join output is an
+            // unordered relation), but it is the order every other build path reproduces.
+            if let Some(prev) = heads.upsert(hash, i as u32, |h| keys.right_eq_right(h as usize, i))
+            {
+                next[i] = prev;
+                unique = false;
             }
         }
         Self {
@@ -1076,11 +1068,7 @@ impl JoinTable {
     /// again, and a caller checking only the relation under-reads its own envelope by that
     /// much on every join it prepares.
     fn heap_bytes(&self) -> usize {
-        let heads: usize = self
-            .heads
-            .iter()
-            .map(|h| h.capacity() * (std::mem::size_of::<u32>() + 1))
-            .sum();
+        let heads: usize = self.heads.iter().map(slots::SlotTable::heap_bytes).sum();
         let dense = self.dense.as_ref().map_or(0, dense::DenseHeads::heap_bytes)
             + self
                 .key_bits
@@ -1152,7 +1140,20 @@ impl JoinTable {
                 return None;
             }
         }
-        let hash = keys.hash_left(&self.state, l);
+        self.head_hashed(keys, l, keys.hash_left(&self.state, l), pre, rejected)
+    }
+
+    /// [`Self::head_for`]'s hash-table half, for a non-null probe row whose key is already
+    /// hashed — the form the block-prefetching probe loops call, having hashed the block ahead.
+    #[inline]
+    fn head_hashed<K: JoinKeys>(
+        &self,
+        keys: &K,
+        l: usize,
+        hash: u64,
+        pre: Prefilter<'_>,
+        rejected: &mut u64,
+    ) -> Option<u32> {
         // The build put this key in exactly one shard, chosen from its hash — so the probe
         // finds it there without any coordination. One shard (the small-build case) reduces to
         // the flat lookup this always was. The shard index serves the bloom too: that shard's
@@ -1165,9 +1166,29 @@ impl JoinTable {
             *rejected += 1;
             return None;
         }
-        self.heads[shard]
-            .find(hash, |&h| keys.right_eq_left(h as usize, l))
-            .copied()
+        self.heads[shard].find(hash, |h| keys.right_eq_left(h as usize, l))
+    }
+
+    /// Prefetch the start slot of every hashed probe row in `block`, recording its hash in
+    /// `hashes`, so the lookups that follow find their lines arriving rather than waiting on
+    /// them one at a time. See [`slots`] for why this is the whole point of that table.
+    ///
+    /// Does nothing — and the caller's per-row path hashes as before — on a dense table, which
+    /// has no hash to compute. Null or pre-filtered rows are hashed and prefetched too: a
+    /// branch-free pass is cheaper than deciding, and a prefetch never changes a result.
+    #[inline]
+    fn prefetch_block<K: JoinKeys>(
+        &self,
+        keys: &K,
+        block: std::ops::Range<usize>,
+        hashes: &mut [u64; PROBE_BLOCK],
+    ) {
+        let shards = self.heads.len();
+        for (slot, l) in hashes.iter_mut().zip(block) {
+            let hash = keys.hash_left(&self.state, l);
+            *slot = hash;
+            self.heads[build::shard_of(hash, shards)].prefetch(hash);
+        }
     }
 
     /// Probe left rows `range` against the table, appending index pairs for the
@@ -1200,68 +1221,79 @@ impl JoinTable {
             self.bloom_trial.observe(seen, rejected);
             return;
         }
+        if let (Some(dense), Some((_, left))) = (self.dense.as_ref(), keys.dense_keys()) {
+            if right_matched.is_none() && matches!(join_type, JoinType::Inner | JoinType::Semi) {
+                let seen = range.len() as u64;
+                self.probe_range_dense(
+                    dense, left, range, left_null, join_type, left_out, right_out,
+                );
+                // `head_for` answers a dense table before it consults any pre-filter, so the
+                // per-row loop would have tallied no rejections either.
+                if !matches!(pre, Prefilter::None) {
+                    self.bloom_trial.observe(seen, 0);
+                }
+                return;
+            }
+        }
         let mut rejected = 0u64;
         let seen = range.len() as u64;
-        for i in range {
-            // `None` ⇒ no key column had a null, so no row is null-keyed — the check is skipped
-            // entirely and the caller never allocated the mask. The `Option` is loop-invariant,
-            // so this is a predicted null-pointer test, not the 16 KB per-morsel mask a foreign-key
-            // probe (its key never null) used to allocate and zero for nothing.
-            let is_null = left_null.is_some_and(|m| m[i]);
-            let head = if inline_bits.is_some_and(|(b, k)| !b.contains(k[i])) {
-                rejected += 1;
-                None
-            } else {
-                self.head_for(keys, i, is_null, pre, &mut rejected)
-            };
-            match join_type {
-                JoinType::Semi => {
-                    if head.is_some() {
-                        left_out.push(i as u32);
-                        right_out.push_null();
-                    }
-                }
-                JoinType::Anti => {
-                    if head.is_none() {
-                        left_out.push(i as u32);
-                        right_out.push_null();
-                    }
-                }
-                _ => match head {
-                    // Unique build key ⇒ the chain is exactly one row, so emit it and skip the
-                    // `next[r]` load that would only confirm the end. Same `(i, r)` pair, same
-                    // order, one fewer random multi-megabyte access per emitted row.
-                    Some(r) if self.unique => {
-                        if let Some(rm) = right_matched.as_deref_mut() {
-                            rm[r as usize] = true;
+        self.for_each_head(
+            keys,
+            range,
+            left_null,
+            pre,
+            inline_bits,
+            &mut rejected,
+            |i, head| {
+                match join_type {
+                    JoinType::Semi => {
+                        if head.is_some() {
+                            left_out.push(i as u32);
+                            right_out.push_null();
                         }
-                        left_out.push(i as u32);
-                        right_out.push(r);
                     }
-                    Some(mut r) => {
-                        // Walk the chain of right rows sharing this key.
-                        loop {
+                    JoinType::Anti => {
+                        if head.is_none() {
+                            left_out.push(i as u32);
+                            right_out.push_null();
+                        }
+                    }
+                    _ => match head {
+                        // Unique build key ⇒ the chain is exactly one row, so emit it and skip the
+                        // `next[r]` load that would only confirm the end. Same `(i, r)` pair, same
+                        // order, one fewer random multi-megabyte access per emitted row.
+                        Some(r) if self.unique => {
                             if let Some(rm) = right_matched.as_deref_mut() {
                                 rm[r as usize] = true;
                             }
                             left_out.push(i as u32);
                             right_out.push(r);
-                            let nxt = self.next[r as usize];
-                            if nxt == u32::MAX {
-                                break;
+                        }
+                        Some(mut r) => {
+                            // Walk the chain of right rows sharing this key.
+                            loop {
+                                if let Some(rm) = right_matched.as_deref_mut() {
+                                    rm[r as usize] = true;
+                                }
+                                left_out.push(i as u32);
+                                right_out.push(r);
+                                let nxt = self.next[r as usize];
+                                if nxt == u32::MAX {
+                                    break;
+                                }
+                                r = nxt;
                             }
-                            r = nxt;
                         }
-                    }
-                    None => {
-                        if emit_left_unmatched {
-                            left_out.push(i as u32);
-                            right_out.push_null();
+                        None => {
+                            if emit_left_unmatched {
+                                left_out.push(i as u32);
+                                right_out.push_null();
+                            }
                         }
-                    }
-                },
-            }
-        }
+                    },
+                }
+            },
+        );
         // Only meaningful while the bloom was actually consulted; once it is latched off the
         // rate is frozen at whatever the trial measured.
         if inline_bits.is_some() || !matches!(pre, Prefilter::None) {
@@ -1299,36 +1331,108 @@ impl JoinTable {
         let (inline_bits, pre) = Self::hoist_bits(keys, pre);
         let mut rejected = 0u64;
         let seen = range.len() as u64;
-        for i in range {
-            if inline_bits.is_some_and(|(b, k)| !b.contains(k[i])) {
-                rejected += 1;
-                continue;
-            }
-            let is_null = probe_null.is_some_and(|m| m[i]);
-            let Some(mut r) = self.head_for(keys, i, is_null, pre, &mut rejected) else {
-                continue;
-            };
-            matched[r as usize].store(true, Relaxed);
-            // A unique build key ⇒ the chain is exactly one row, so skip the `next[r]` load
-            // whose answer (`u32::MAX`) is already known — the same reasoning, and the same
-            // random multi-megabyte access avoided, as in `probe_range`.
-            if self.unique {
-                continue;
-            }
-            loop {
-                let nxt = self.next[r as usize];
-                if nxt == u32::MAX {
-                    break;
-                }
-                r = nxt;
+        self.for_each_head(
+            keys,
+            range,
+            probe_null,
+            pre,
+            inline_bits,
+            &mut rejected,
+            |_, head| {
+                let Some(mut r) = head else {
+                    return;
+                };
                 matched[r as usize].store(true, Relaxed);
-            }
-        }
+                // A unique build key ⇒ the chain is exactly one row, so skip the `next[r]` load
+                // whose answer (`u32::MAX`) is already known — the same reasoning, and the same
+                // random multi-megabyte access avoided, as in `probe_range`.
+                if self.unique {
+                    return;
+                }
+                loop {
+                    let nxt = self.next[r as usize];
+                    if nxt == u32::MAX {
+                        break;
+                    }
+                    r = nxt;
+                    matched[r as usize].store(true, Relaxed);
+                }
+            },
+        );
         if inline_bits.is_some() || !matches!(pre, Prefilter::None) {
             self.bloom_trial.observe(seen, rejected);
         }
     }
+
+    /// Visit every probe row of `range` in order with its chain head (`None` for a null key, a
+    /// pre-filter rejection or no match) — the one row loop [`Self::probe_range`] and
+    /// [`Self::mark_range`] share.
+    ///
+    /// Over a hash table the rows are taken a block at a time, and the *next* block's start
+    /// slots are prefetched before the current block is looked up, so a block's misses overlap
+    /// one another and the lookups that follow find their lines already in flight. A dense map
+    /// is one indexed load with nothing to hash, and keeps the per-row path.
+    ///
+    /// `left_null` is `None` when no key column has a null, so no row is null-keyed: the check
+    /// is a predicted null-pointer test, not a 16 KB per-morsel mask a foreign-key probe (its
+    /// key never null) would allocate and zero for nothing.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn for_each_head<K: JoinKeys>(
+        &self,
+        keys: &K,
+        range: std::ops::Range<usize>,
+        left_null: Option<&[bool]>,
+        pre: Prefilter<'_>,
+        inline_bits: Option<(&key_bits::KeyBits, &[i64])>,
+        rejected: &mut u64,
+        mut visit: impl FnMut(usize, Option<u32>),
+    ) {
+        // `Bits` is hoisted into `inline_bits` whenever the key can carry it, so a `Bits` left in
+        // `pre` would only be tested by `head_for`; route it there rather than skip the test.
+        let hashed = self.dense.is_none() && !matches!(pre, Prefilter::Bits(_));
+        if !hashed {
+            for i in range {
+                let is_null = left_null.is_some_and(|m| m[i]);
+                let head = if inline_bits.is_some_and(|(b, k)| !b.contains(k[i])) {
+                    *rejected += 1;
+                    None
+                } else {
+                    self.head_for(keys, i, is_null, pre, rejected)
+                };
+                visit(i, head);
+            }
+            return;
+        }
+        let mut cur = [0u64; PROBE_BLOCK];
+        let mut ahead = [0u64; PROBE_BLOCK];
+        let block_at = |start: usize| start..(start + PROBE_BLOCK).min(range.end);
+        let mut block = block_at(range.start);
+        self.prefetch_block(keys, block.clone(), &mut cur);
+        while !block.is_empty() {
+            let following = block_at(block.end);
+            self.prefetch_block(keys, following.clone(), &mut ahead);
+            for (i, &hash) in block.clone().zip(cur.iter()) {
+                let head = if inline_bits.is_some_and(|(b, k)| !b.contains(k[i])) {
+                    *rejected += 1;
+                    None
+                } else if left_null.is_some_and(|m| m[i]) {
+                    None
+                } else {
+                    self.head_hashed(keys, i, hash, pre, rejected)
+                };
+                visit(i, head);
+            }
+            std::mem::swap(&mut cur, &mut ahead);
+            block = following;
+        }
+    }
 }
+
+/// Probe rows per prefetch block in [`JoinTable::for_each_head`]: enough independent misses
+/// in flight to cover a DRAM round trip (a core tracks ten to twelve), few enough that the
+/// block's slots are still resident when it is walked.
+const PROBE_BLOCK: usize = 16;
 
 /// Whether an integer-keyed join of this build size should take the cache-radix path.
 ///

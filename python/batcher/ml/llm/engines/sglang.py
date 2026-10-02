@@ -254,7 +254,7 @@ def _render(request: Any, *, chat: bool, system: str | None, tokenizer: Any) -> 
     messages.append({"role": "user", "content": prompt})
     try:
         return apply(messages, tokenize=False, add_generation_prompt=True)
-    except Exception:  # pragma: no cover - a model with no template raises here
+    except Exception:  # a model with no template raises here
         return prompt
 
 

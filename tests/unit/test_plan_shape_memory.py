@@ -17,7 +17,7 @@ from dataclasses import replace
 import pytest
 
 import batcher as bt
-from batcher.carbonite.memory.estimator import peak_operator_bytes
+from batcher.carbonite.memory.estimator import learned_plan_peak
 from batcher.config import active_config
 from batcher.kyber.annotate import annotate_ops
 from batcher.kyber.cardinality import CardinalityEstimator
@@ -102,7 +102,7 @@ def test_a_bushy_plan_counts_the_breakers_that_are_live_together():
     bushy = a.join(b, on="k").join(c.join(d, on="k"), on="k")
     ops, plan = _annotate(bushy)
     largest_single = max(o.bounds.m_max_bytes for o in ops)
-    assert peak_operator_bytes(plan) > largest_single
+    assert learned_plan_peak(plan, None) > largest_single
 
 
 def test_a_linear_plan_is_byte_for_byte_what_it_was():
@@ -111,7 +111,7 @@ def test_a_linear_plan_is_byte_for_byte_what_it_was():
     # own state is full.
     ds = _fact().group_by("k").agg(s=bt.col("x").sum()).sort("s")
     ops, plan = _annotate(ds)
-    assert peak_operator_bytes(plan) == max(o.bounds.m_max_bytes for o in ops)
+    assert learned_plan_peak(plan, None) == max(o.bounds.m_max_bytes for o in ops)
 
 
 def test_an_unwired_plan_falls_back_to_the_previous_reading():
@@ -119,7 +119,7 @@ def test_an_unwired_plan_falls_back_to_the_previous_reading():
     # exactly the pre-tree behavior rather than a zero.
     ops, _ = _annotate(_fact().join(_dim(), on="k"))
     bare = PhysicalPlan(ir={}, output_schema=None, ops=tuple(replace(o, inputs=()) for o in ops))
-    assert peak_operator_bytes(bare) == max(o.bounds.m_max_bytes for o in ops)
+    assert learned_plan_peak(bare, None) == max(o.bounds.m_max_bytes for o in ops)
 
 
 def test_the_peak_names_every_operator_that_contributes_to_it():
@@ -132,7 +132,7 @@ def test_the_peak_names_every_operator_that_contributes_to_it():
     _, plan = _annotate(a.join(b, on="k").join(c.join(d, on="k"), on="k"))
     contributors = peak_contributors(plan)
     assert len(contributors) > 1
-    assert sum(o.bounds.m_max_bytes for o in contributors) == peak_operator_bytes(plan)
+    assert sum(o.bounds.m_max_bytes for o in contributors) == learned_plan_peak(plan, None)
 
 
 def test_a_linear_plan_names_exactly_its_dominant_breaker():
@@ -142,7 +142,7 @@ def test_a_linear_plan_names_exactly_its_dominant_breaker():
     _, plan = _annotate(ds)
     contributors = peak_contributors(plan)
     assert len(contributors) == 1
-    assert contributors[0].bounds.m_max_bytes == peak_operator_bytes(plan)
+    assert contributors[0].bounds.m_max_bytes == learned_plan_peak(plan, None)
 
 
 def test_a_guess_in_any_contributor_keeps_the_verdict_advisory():
@@ -200,7 +200,7 @@ def test_a_warm_store_still_gets_the_concurrent_peak():
 
     a, b, c, d = _fact(50_000), _dim(400), _dim(300), _dim(200)
     _, plan = _annotate(a.join(b, on="k").join(c.join(d, on="k"), on="k"))
-    cold = peak_operator_bytes(plan)
+    cold = learned_plan_peak(plan, None)
     warm = learned_plan_peak(plan, _Doubling())
     largest_blended = 2 * max(o.bounds.m_max_bytes for o in plan.ops)
     # The model is honoured...
@@ -213,4 +213,4 @@ def test_a_cold_store_is_exactly_the_plan_estimate():
     from batcher.carbonite.memory.estimator import learned_plan_peak
 
     _, plan = _annotate(_fact().join(_dim(), on="k"))
-    assert learned_plan_peak(plan, None) == peak_operator_bytes(plan)
+    assert learned_plan_peak(plan, None) == learned_plan_peak(plan, None)

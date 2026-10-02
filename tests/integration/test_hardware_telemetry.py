@@ -88,19 +88,27 @@ def test_counters_are_measured_on_the_materializing_path():
 def test_streaming_cpu_utilization_is_measured_not_a_constant():
     # The streaming tier is the default path, and it used to report `1 / threads` for every
     # operator of every query — a constant dressed as a measurement, which `explain(analyze)`
-    # printed as a verdict and the learned CPU-share model fitted against. The property that
-    # catches a return to that is not the absolute value but that it *moves with the work*:
-    # a query with twenty times the rows must keep the cores busier.
-    def utilization(rows: int) -> float:
-        ds = bt.from_pydict({"k": [i % 50_000 for i in range(rows)], "v": list(range(rows))})
-        q = ds.filter(bt.col("v") % 7 > 1).group_by("k").agg(s=bt.col("v").sum())
-        return json.loads(q.explain(analyze=True, format="json"))["cpu_utilization"]
-
-    small, large = utilization(200_000), utilization(4_000_000)
-    assert small > 0.0, "the streaming tier must report a measured CPU figure, not zero"
-    assert large > small, (
-        f"utilization must rise with real work ({small:.4f} -> {large:.4f}); "
-        "a figure that does not move with the workload is a constant, not a measurement"
+    # printed as a verdict and the learned CPU-share model fitted against.
+    #
+    # This checks that shape within ONE run rather than comparing two: an earlier version
+    # asserted that 20x the rows raised utilization, which observes the box's load as much as
+    # the engine and failed on a busy shared node. The bug made every operator report exactly
+    # `1 / threads`, whatever the load, so that is what is asserted against here. The formula's
+    # own positive control — the same inputs yielding exactly `1 / threads` without a wall
+    # span — is `test_the_wall_span_is_what_makes_the_streaming_figure_possible` below.
+    rows = 200_000
+    ds = bt.from_pydict({"k": [i % 50_000 for i in range(rows)], "v": list(range(rows))})
+    q = ds.filter(bt.col("v") % 7 > 1).group_by("k").agg(s=bt.col("v").sum())
+    doc = json.loads(q.explain(analyze=True, format="json"))
+    assert doc["cpu_utilization"] > 0.0, "the streaming tier must report a measured CPU figure"
+    ops = [o for o in doc["ops"] if o["measured"]]
+    assert len(ops) >= 2, "the filter and the aggregate must both be measured"
+    for o in ops:
+        assert 0.0 < o["cpu_util"] <= 1.0, o
+    constant = [o["cpu_util"] == pytest.approx(1 / o["threads"], rel=1e-9) for o in ops]
+    assert not all(constant), (
+        f"every operator reports 1/threads ({[o['cpu_util'] for o in ops]}); "
+        "that is the constant the wall span exists to replace, not a measurement"
     )
 
 

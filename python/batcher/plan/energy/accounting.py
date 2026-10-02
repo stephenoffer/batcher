@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-__all__ = ["EnergyLedger", "StageEnergy", "merge_ledgers"]
+__all__ = ["EnergyLedger", "StageEnergy"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,22 +319,3 @@ class EnergyLedger:
         if rpj is not None:
             out["rows_per_joule"] = rpj
         return out
-
-
-def merge_ledgers(ledgers: list[EnergyLedger] | tuple[EnergyLedger, ...]) -> EnergyLedger:
-    """Combine per-worker ledgers into the one a distributed run reports.
-
-    The `combine` half of the same mergeable shape the stateful operators use: partial ledgers
-    from any number of workers fold into a single result that equals the single-node one, in
-    any order.
-
-    Args:
-        ledgers: Per-worker ledgers; an empty sequence yields an empty ledger.
-
-    Returns:
-        A new ledger holding every record, leaving the inputs unmodified.
-    """
-    out = EnergyLedger()
-    for ledger in ledgers:
-        out.stages.extend(ledger.stages)
-    return out

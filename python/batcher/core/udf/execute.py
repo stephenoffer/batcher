@@ -40,7 +40,6 @@ __all__ = [
     "has_map_batches",
     "prebuild_factories",
     "release_prebuilt",
-    "stream_with_udfs",
 ]
 
 
@@ -67,6 +66,14 @@ def has_map_batches(plan: LogicalPlan) -> bool:
     """Whether the plan contains any `map_batches` operator."""
     if isinstance(plan, MapBatches):
         return True
+    # A `map_batches` node has no engine IR (its `to_ir` raises), and every parent's `to_ir`
+    # propagates that, so a plan whose IR serializes cannot contain one. `ir_json` is what
+    # `content_key` already computed for this very tree, so the common relational query is
+    # answered without the field-by-field walk below, which executor selection paid on every
+    # execution (~0.8 ms profiled per TPC-H q8).
+    ir_json = getattr(plan, "ir_json", None)
+    if ir_json is not None and ir_json() is not None:
+        return False
     for f in dataclasses.fields(plan):
         v = getattr(plan, f.name)
         if isinstance(v, LogicalPlan) and has_map_batches(v):
@@ -95,9 +102,9 @@ def execute_with_udfs(
 
     `source_projections` is the per-source column list Kyber decided (Core executes the plan it
     is given; it does not compute projections — see `.claude/rules/architecture.md`). Without it
-    the scan beneath a UDF reads **every** column of the source, which is what a `map_batches`
-    over one column of a wide table used to do. `None` means "read everything", the old
-    behavior, which is what an undeclared (`input_columns=None`) UDF still requires.
+    the scan beneath a UDF reads **every** column of the source, even for a `map_batches` over
+    one column of a wide table. `None` means "read everything", which is what an undeclared
+    (`input_columns=None`) UDF requires.
 
     A linear ``Scan → map_batches → … → map_batches`` chain (the batch-inference /
     multimodal-preprocessing shape) runs through the **streaming, stage-overlapped**
@@ -109,9 +116,7 @@ def execute_with_udfs(
     and the GPU-autobatch / multiprocessing strategies keep the materializing path.
 
     **This returns a list, so peak memory is the whole output** — the stage overlap is real
-    but the bounded-memory half of streaming is not available here. A caller that consumes
-    batches incrementally (a distributed map task that writes from the worker) should use
-    `stream_with_udfs` instead, which is the same execution with the materialization removed.
+    but the bounded-memory half of streaming is not available here.
 
     `recorder` is the optional per-stage measurement sink (`stats()` / `explain(analyze=True)`
     for an ML pipeline). `None` — every caller but the profiling one — costs nothing: no
@@ -137,37 +142,6 @@ def execute_with_udfs(
     return batches
 
 
-def stream_with_udfs(
-    plan: LogicalPlan,
-    sources: list,
-    source_projections: dict[int, list[str]] | None = None,
-    engine_config: str | None = None,
-) -> Iterator[pa.RecordBatch]:
-    """Execute a `map_batches` pipeline, yielding output batches **as they are produced**.
-
-    The incremental form of `execute_with_udfs`, with the same arguments and the same rows in
-    the same order. The difference is memory: for a linear ``Scan -> map -> ... -> map`` chain
-    on the streaming path, nothing accumulates. Resident memory is the bounded prefetch windows
-    between the stages (a few morsels each), not the query's whole output — so a worker can
-    read, infer, and write a partition far larger than its RAM. `execute_with_udfs` cannot do
-    this by construction: it hands back a `list`.
-
-    A plan the streaming path can't take (a join or union between maps, a multiprocessing
-    stage, a CPU-only chain) falls back to `execute_with_udfs` and is yielded from the
-    materialized result. That is a scheduling difference only — same rows either way — but the
-    memory bound does *not* hold for it, so don't read "iterator" as "bounded" unconditionally.
-    """
-    projections = source_projections or {}
-    if has_map_batches(plan):
-        gen = _linear_stream(plan, sources, projections)
-        if gen is not None:
-            from batcher.core.udf.stream import reconcile_stream
-
-            yield from reconcile_stream(gen)
-            return
-    yield from execute_with_udfs(plan, sources, source_projections, engine_config)
-
-
 def _linear_stream(
     plan: LogicalPlan,
     sources: list,
@@ -177,8 +151,7 @@ def _linear_stream(
 ) -> Iterator[pa.RecordBatch] | None:
     """The stage-overlapped batch stream for `plan`, or `None` if it isn't eligible.
 
-    The one place the streaming route is decided, so the listing caller and the streaming
-    caller can never disagree about which plans stream.
+    The one place the streaming route is decided.
     """
     from batcher.core.udf.stream import linear_map_chain, stream_eligible, stream_linear_chain
 

@@ -399,6 +399,7 @@ def _iter_batches(
             stream_spilling_join,
             stream_spilling_sort,
             stream_spilling_window,
+            supports_bounded_window,
             supports_spilling_join,
             supports_spilling_sort,
             supports_spilling_window,
@@ -412,19 +413,18 @@ def _iter_batches(
         # a *column*, so without it the identical query distributed, and then fell out of the
         # streaming path here and materialized its whole result -- from `iter_batches()`,
         # whose entire promise is that it does not.
-        #
-        # Applied only where the predicate then accepts the rewrite, so a shape that still
-        # declines falls through with its original plan rather than one carrying a hidden
-        # column. `keep` is the operator's own output, and each emitted batch is cut back to
-        # it below.
+        # Kept only where the predicate accepts the rewrite AND the input streams, as both
+        # branches below require; otherwise the hidden column would leak into the fallback.
+        # `keep` is the operator's own output, and each emitted batch is cut back to it.
         keep: tuple[str, ...] | None = None
-        if isinstance(plan, Sort) and not supports_spilling_sort(plan, sources):
+        hoistable = isinstance(plan, (Sort, Window)) and is_streamable(plan.input)
+        if hoistable and isinstance(plan, Sort) and not supports_spilling_sort(plan, sources):
             hoisted = hoist_sort_key(plan)
             if hoisted is not None and supports_spilling_sort(hoisted[0], sources):
                 plan, keep = hoisted
-        elif isinstance(plan, Window) and not supports_spilling_window(plan):
+        elif hoistable and isinstance(plan, Window) and not supports_bounded_window(plan):
             hoisted = hoist_window_keys(plan)
-            if hoisted is not None and supports_spilling_window(hoisted[0]):
+            if hoisted is not None and supports_bounded_window(hoisted[0]):
                 plan, keep = hoisted
 
         gen = None

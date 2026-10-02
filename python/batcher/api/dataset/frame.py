@@ -3226,15 +3226,12 @@ class Dataset:
                 >>> a.union(b).to_pydict()
                 {'x': [1, 2, 3, 4]}
         """
-        # Sources are concatenated, never merged by identity, and that is a measured trade
-        # rather than an oversight. Merging them lets plan-level CSE see two branches over one
-        # relation as the same computation (TPC-DS q77's plan goes from 0 repeated subtrees to
-        # 75) -- but `stream::parallel::streaming_parallelizes` refuses to shard a plan whose
-        # source is read more than once, so the merge *also* takes the whole query off the
-        # parallel union path. Measured both ways on 2026-08-08: merging gained q80 1.6x and
-        # q5 1.3x, and cost q22 2.0x, q18 2.9x and q14 2.0x -- a net loss, and a loss
-        # concentrated in the queries the parallel union had just fixed. Making both work
-        # wants CSE to weigh the parallelism it forfeits, which is a cost-model change.
+        # Sources are concatenated, never merged by identity. Merging would let plan-level CSE
+        # see two branches over one relation as one computation, but
+        # `stream::parallel::streaming_parallelizes` refuses to shard a plan that reads a source
+        # more than once, so it would also take the query off the parallel union path. Measured
+        # on TPC-DS that is a net loss (q80 1.6x faster, q18 2.9x slower). Doing both needs CSE
+        # to weigh the parallelism it forfeits, which is a cost-model change.
         others = flatten_varargs(others)
         plans: list[LogicalPlan] = [self._plan]
         sources = list(self._sources)
@@ -6328,6 +6325,9 @@ class Dataset:
         )
         batches = cached_batches(self._plan, self._sources, self._cache, batch_size)
         if batches is None:
+            from batcher.api.streaming._diagnostics import warn_if_emits_only_at_end
+
+            warn_if_emits_only_at_end(self._plan, self._sources)
             batches = _iter_batches(
                 self._plan,
                 self._sources,

@@ -30,7 +30,12 @@ from batcher.dist.executors.partition_io import (
     sample_probs,
     stage_pushdown,
 )
-from batcher.dist.executors.plan_analysis import _relabel_single_source, empty_result_table
+from batcher.dist.executors.plan_analysis import (
+    _relabel_single_source,
+    empty_result_table,
+    stack_above_ir,
+    stackable_on_buckets,
+)
 from batcher.dist.executors.ray_runtime import (
     _ensure_ray,
     _rmtree,
@@ -96,21 +101,29 @@ def _distributed_sort(
     desc, nulls_first = key.descending, key.nulls_first
     map_plan, sid = _relabel_single_source(sort.input)
     map_ir = json.dumps(map_plan.to_ir())
-    sort_ir = json.dumps(
-        {
-            **sort.shape_ir(),
-            "input": task_scan_ir(),
-        }
-    )
+    # Row-local work above an unlimited sort (a `Filter` Kyber could not push below it, the
+    # `Project` that drops a hoisted key) runs inside each reducer over its range bucket: a
+    # filter or projection of each range, listed in range order, is the filter or projection
+    # of the sorted relation. Folding it in is what lets the buckets stay on the workers
+    # rather than every row crossing the driver to have the same per-row work applied there.
+    fold_above = sort.limit is None and stackable_on_buckets(above)
+    reduce_ir = {**sort.shape_ir(), "input": task_scan_ir()}
+    sort_ir = json.dumps(stack_above_ir(above, reduce_ir) if fold_above else reduce_ir)
     # A sort exchanges raw rows and sorts one bucket at a time, so the bucket count bounds
     # the run a reducer materializes; size it by volume (`row_shuffle_reducer_count`), never
     # below the one-per-worker floor. `map_plan` reads relabeled source 0, so hand the
     # estimator exactly that source.
     n_buckets = row_shuffle_reducer_count(map_plan, shuffle_partitions(workers), sources, sid)
 
-    # A `limit` slices the assembled result, so it needs the assembly; `above` has nothing
-    # to be applied to without it. Everything else can stay where it was computed.
-    keep_partitioned = materialize is False and not above and sort.limit is None
+    # A `limit` is resolved across the ordered buckets below, and anything above it has to
+    # see the limited rows, so both of those keep the assembly. Everything else -- including
+    # row-local work folded into the reducers -- can stay where it was computed.
+    keep_partitioned = materialize is False and (fold_above or not above) and sort.limit is None
+    # The node whose columns the result carries: the outermost folded operator, or the sort.
+    top = above[0] if fold_above else sort
+    stage_above = above  # the read is narrowed against the whole stage either way
+    if fold_above:
+        above = []  # applied by every reducer; nothing is left to apply on the driver
     keep_dir = False  # set when a MaterializedSource takes ownership of work_dir
 
     work_dir = distributed_work_dir("batcher_dsort_")
@@ -122,7 +135,7 @@ def _distributed_sort(
         # one where the saving is doubled. `map_plan`'s scan was relabeled to source 0.
         # Asked of the whole stage (`above` over the sort), keyed by the source's own id:
         # a sort narrows nothing itself, so the projection lives above it. See `stage_pushdown`.
-        projection, predicate = stage_pushdown(above, sort, sid)
+        projection, predicate = stage_pushdown(stage_above, sort, sid)
         # A sort carrying a `limit` too large for the shuffle-free top-N still *slices*, so
         # it selects among rows tied at the cut and needs the same source-ordered partitions
         # `_distributed_topn` does. An unlimited sort returns every row, so the pick is free
@@ -254,17 +267,14 @@ def _distributed_sort(
             return materialize_reduce_output(
                 [sorted_paths[r] for r in order],
                 work_dir,
-                empty_result_table(sort, sort.available_columns()).schema,
+                empty_result_table(top, top.available_columns()).schema,
             )
 
         out: list[pa.RecordBatch] = []
-        for r in order:
-            if sorted_paths[r][0] is not None:
-                out.extend(read_ipc(sorted_paths[r][0]))
+        for r in _buckets_through_limit([sorted_paths[r] for r in order], sort.limit):
+            out.extend(read_ipc(r))
         result = (
-            pa.Table.from_batches(out)
-            if out
-            else empty_result_table(sort, sort.available_columns())
+            pa.Table.from_batches(out) if out else empty_result_table(top, top.available_columns())
         )
         if sort.limit is not None:
             result = result.slice(0, sort.limit)
@@ -273,6 +283,33 @@ def _distributed_sort(
             _rmtree(work_dir)
 
     return result if not above else _apply_above(above, result)
+
+
+def _buckets_through_limit(ordered: list[tuple[str | None, int]], limit: int | None) -> list[str]:
+    """The reducer files, in range order, that hold the first `limit` rows of the sort.
+
+    Each bucket is a range, globally ordered against the others, and each reducer already
+    kept only its own first `limit` rows (the reduce IR carries the sort's `limit`). So the
+    first `limit` rows of the relation are in the leading buckets whose row counts first
+    reach `limit`, and nothing past them is read. Reading every bucket and then slicing,
+    which this replaced, held up to `buckets x limit` rows on the driver to return `limit`.
+
+    Args:
+        ordered: `(path, rows)` per bucket in range order; `path` is None for an empty one.
+        limit: The sort's `limit`, or None to keep every bucket.
+
+    Returns:
+        The paths to read, in order.
+    """
+    paths: list[str] = []
+    held = 0
+    for path, rows in ordered:
+        if limit is not None and held >= limit:
+            break
+        if path is not None:
+            paths.append(path)
+            held += rows
+    return paths
 
 
 def _distributed_topn(

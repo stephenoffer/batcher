@@ -436,7 +436,7 @@ def _narrow_host_link() -> str:
         from batcher._internal.hardware.fabric import degraded_device_links
 
         links = degraded_device_links()
-    except Exception as exc:  # pragma: no cover - advice must never fail
+    except Exception as exc:  # advice must never fail
         note_suppressed("ml", "read the device host links", exc)
         return ""
     if not links:

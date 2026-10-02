@@ -36,18 +36,14 @@ import pytest
 
 import batcher as bt
 from _engagement_shapes import _BUILDERS, _R, _T, EXPECTED_DISTRIBUTED
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 
 pytestmark = pytest.mark.integration
 
 pytest.importorskip("ray", reason="ray not installed")
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(4)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(4)
 
 
 #: The distributed executors each shape must reach, as `(attribute, modules binding the name)`.
@@ -94,6 +90,10 @@ _DIST_ENTRY_POINTS = {
     # can match across the cut. Asserting *which* ran is the point — routing a keyless ASOF
     # through the hash path would put every row in one bucket and still return the right rows.
     "asof_by": ("_distributed_asof", ("batcher.dist.executor",)),
+    # The key-range-aligned executor (`dist.executors.aligned`), which `_dispatch` tries
+    # before every other path: split the Parquet side by file (or by a key range its footers
+    # store in order), broadcast the small side, and join on each worker with no shuffle.
+    "aligned": ("_distributed_aligned", ("batcher.dist.executors.aligned.route",)),
     "asof_keyless": ("_distributed_asof_keyless", ("batcher.dist.executor",)),
 }
 

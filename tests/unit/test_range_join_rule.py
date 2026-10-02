@@ -165,6 +165,8 @@ def test_mismatched_key_types_do_not_fire():
         # Two point masses.
         ((1.0, 1.0, 2.0, 2.0), 1.0),
         ((2.0, 2.0, 1.0, 1.0), 0.0),
+        # Two *equal* point masses: `P(1 < 1)` is 0. `b1 <= a2` alone answered 1.
+        ((1.0, 1.0, 1.0, 1.0), 0.0),
     ],
 )
 def test_uniform_p_less_closed_form(ranges, expected):
@@ -182,6 +184,60 @@ def test_uniform_p_less_agrees_with_a_monte_carlo_draw():
         n = 200_000
         hits = sum(1 for _ in range(n) if rng.uniform(a1, b1) < rng.uniform(a2, b2))
         assert _uniform_p_less(a1, b1, a2, b2) == pytest.approx(hits / n, abs=0.01)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [("lt", 0.0), ("le", 1.0), ("gt", 0.0), ("ge", 1.0)],
+)
+def test_two_equal_constants_split_strict_from_inclusive(op, expected):
+    """Two constant columns holding one value: `<`/`>` keep nothing and `<=`/`>=` keep all.
+
+    `lt` and `le` used to share one `p_less`, so the inclusive operators lost the tie mass
+    and two equal constants priced `x <= y` (every row) at the selectivity floor.
+    """
+    from batcher.kyber.stats.estimator import _range_comparison_probability
+
+    assert _range_comparison_probability(op, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0) == expected
+
+
+@pytest.mark.unit
+def test_the_four_operators_match_an_exhaustive_discrete_count():
+    """With distinct counts known, each operator's tie share matches a brute-force count.
+
+    Both keys take the integers 0..9 uniformly, the discrete shape the continuous model
+    cannot tell `<` from `<=` on. The exact answers are `P(X<Y) = 0.45` and `P(X=Y) = 0.1`.
+    """
+    from batcher.kyber.stats.estimator import _range_comparison_probability
+
+    values = range(10)
+    pairs = [(x, y) for x in values for y in values]
+    exact = {
+        "lt": sum(x < y for x, y in pairs) / len(pairs),
+        "le": sum(x <= y for x, y in pairs) / len(pairs),
+        "gt": sum(x > y for x, y in pairs) / len(pairs),
+        "ge": sum(x >= y for x, y in pairs) / len(pairs),
+    }
+    for op, want in exact.items():
+        got = _range_comparison_probability(op, 0.0, 9.0, 0.0, 9.0, 10.0, 10.0)
+        assert got == pytest.approx(want, abs=1e-9), op
+    # Without distinct counts it is the continuous model, where `<` and `<=` coincide.
+    assert _range_comparison_probability("lt", 0.0, 9.0, 0.0, 9.0, None, None) == 0.5
+    assert _range_comparison_probability("le", 0.0, 9.0, 0.0, 9.0, None, None) == 0.5
+
+
+@pytest.mark.unit
+def test_inequality_selectivity_prices_a_tie_on_constant_keys():
+    """End to end through the estimator: equal constant keys under `le` keep every pair."""
+    from batcher.kyber.stats import StatsEstimator
+    from batcher.plan.logical import RangeCondition
+
+    est = StatsEstimator([])
+    left = RelStats(100.0, Provenance.DEFAULT, {"x": ColumnStat(min=5, max=5, ndv=1.0)})
+    right = RelStats(100.0, Provenance.DEFAULT, {"y": ColumnStat(min=5, max=5, ndv=1.0)})
+    assert est._inequality_selectivity(left, right, RangeCondition("x", "y", "le")) == 1.0
+    assert est._inequality_selectivity(left, right, RangeCondition("x", "y", "lt")) < 1e-5
 
 
 @pytest.mark.unit

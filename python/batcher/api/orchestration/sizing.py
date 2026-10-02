@@ -17,6 +17,7 @@ import pyarrow as pa
 
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.logging import note_suppressed
+from batcher._internal.registry import MISSING, IdentityMemo, KeyedMemo
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -33,6 +34,7 @@ __all__ = [
     "partitions_from_physical",
     "projected_input_bytes",
     "proven_empty_table",
+    "resident_input_bytes",
 ]
 
 # When the user leaves a knob unset, fill it from the same analyses Kyber and Carbonite
@@ -143,10 +145,49 @@ def projected_input_bytes(
             return 0
         try:
             width = projected_row_bytes(src.schema(), projections.get(i))
-        except Exception:  # pragma: no cover - a source that cannot describe itself
+        except Exception:  # a source that cannot describe itself
             return 0
         total += rows * width
     return int(total)
+
+
+def resident_input_bytes(
+    sources: list[Source],
+    projections: dict[int, list[str]],
+    scanned: Collection[int] | None = None,
+) -> int:
+    """The share of `projected_input_bytes` this process already held, under a sensed envelope.
+
+    A `resident` source (an in-memory table) is resolved by handing its batches over without
+    a copy, so reading it allocates nothing: its bytes were spent when it was built, and they
+    stay held whichever path the query takes -- the out-of-core path spills partitioned
+    *copies* while the original stays referenced by its owner. An envelope **sensed** from
+    live free RAM (`memory.max_memory_bytes_sensed`) was measured with those bytes already
+    held, so charging them against it again counts them twice, for memory spilling cannot
+    release. TPC-DS sf10 with its tables preloaded is that shape: under a 2 GiB envelope q47
+    counted its resident `store_sales` as new input, went out of core, wrote 3.7 GiB of spill
+    and ran 7.1 s against 0.9 s in memory.
+
+    An envelope the caller *set* is different: it caps the process, held tables included, so
+    nothing is subtracted from it and this returns `0`.
+
+    Args:
+        sources: The plan's bound sources.
+        projections: Pushed column projections, keyed by source index.
+        scanned: The source indices the plan reads, or `None` to count them all.
+
+    Returns:
+        The projected bytes of the scanned resident sources under a sensed envelope; `0`
+        under a configured one, when there are none, or when they cannot be sized.
+    """
+    from batcher.config import active_config
+
+    if not active_config().memory.max_memory_bytes_sensed:
+        return 0
+    held = [i for i, src in enumerate(sources) if getattr(src, "resident", False)]
+    if scanned is not None:
+        held = [i for i in held if i in scanned]
+    return projected_input_bytes(sources, projections, held) if held else 0
 
 
 def _estimated_row_count(src: Source) -> int | None:
@@ -165,7 +206,7 @@ def _estimated_row_count(src: Source) -> int | None:
     """
     try:
         stats = src.statistics()
-    except Exception:  # pragma: no cover - a source with no statistics at all
+    except Exception:  # a source with no statistics at all
         return None
     rows = getattr(stats, "row_count", None) if stats is not None else None
     if rows is None or rows < 0:
@@ -206,35 +247,43 @@ def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table 
     Returns:
         A zero-row table, or `None` to execute normally.
     """
-    from batcher.plan.logical import Limit
+    from batcher.plan.logical import is_empty_relation
 
-    if not (isinstance(logical_opt, Limit) and logical_opt.n == 0):
+    if not is_empty_relation(logical_opt):
         return None
     inferred = plan.available_schema()
     return None if inferred is None else inferred.arrow.empty_table()
 
 
-#: `id(plan) -> (plan, carried)`, pinning the plan so a recycled id cannot answer for another.
 #: A re-issued query hands back the *same* plan object, and this analysis walks every node's
 #: schema and reruns Kyber's projection analysis: ~0.5 ms of a TPC-H q8 `collect()` whose whole
 #: control plane is a few milliseconds, recomputed for an immutable plan.
-_CARRIED_MEMO: dict[int, tuple[object, frozenset[str] | None]] = {}
-_CARRIED_MEMO_MAX = 256
+_CARRIED_MEMO: IdentityMemo[frozenset[str] | None] = IdentityMemo(256)
+
+
+#: The same answers by plan *content*: a query built afresh for every run (any DataFrame
+#: pipeline, and the plan a `Session.sql` misses its parse cache on) is a new object each time,
+#: so the identity memo above never hits for it. See `plan.logical.content_memo_key` for why
+#: the content key is a sound key for an answer read off the plan's structure and schemas.
+_CARRIED_BY_CONTENT: KeyedMemo[frozenset[str] | None] = KeyedMemo(256)
 
 
 def carried_columns(plan) -> frozenset[str] | None:
-    """Column names that can actually flow through `plan`, memoized per plan instance.
+    """Column names that can actually flow through `plan`, memoized per plan and by content.
 
     See `_carried_columns` for what they are. A plan is immutable, so its answer cannot change.
     """
-    hit = _CARRIED_MEMO.get(id(plan))
-    if hit is not None and hit[0] is plan:
-        return hit[1]
-    carried = _carried_columns(plan)
-    if len(_CARRIED_MEMO) >= _CARRIED_MEMO_MAX:
-        _CARRIED_MEMO.clear()
-    _CARRIED_MEMO[id(plan)] = (plan, carried)
-    return carried
+    if (hit := _CARRIED_MEMO.get(plan)) is not MISSING:
+        return hit
+    from batcher.plan.logical import content_memo_key
+
+    key = content_memo_key(plan)
+    if key is not None and (hit := _CARRIED_BY_CONTENT.get(key)) is not MISSING:
+        return _CARRIED_MEMO.put(plan, hit)
+    value = _carried_columns(plan)
+    if key is not None:
+        _CARRIED_BY_CONTENT.put(key, value)
+    return _CARRIED_MEMO.put(plan, value)
 
 
 def _carried_columns(plan) -> frozenset[str] | None:
@@ -258,13 +307,23 @@ def _carried_columns(plan) -> frozenset[str] | None:
     settle where it takes two (`test_the_memo_stops_missing_once_there_is_nothing_left_to_learn`).
     A sizing hint must not move the learning loop.
 
+    Answered after **projection pruning** (`rewrite_projection`), though, which is not the
+    optimizer: it is one pure plan-to-plan pass with no statistics, no plan cache and nothing
+    learned, so the warmup argument above does not reach it. The analysis needs it because it
+    reads each node's *declared* output, and before pruning a SQL comma join declares every
+    column of every table in its `FROM`. TPC-DS q5's shared subplan was charged 187 columns
+    and 1,312 bytes a row for a query that moves eight, so its morsel was cut to 799 rows
+    where 16,384 fit, and the stage ran in 89 ms against 17 ms for the same plan sized right.
+
     `None` on any failure, which restores the previous behaviour of charging every column:
     this decides what a query *costs*, never what it returns, so a miss must be a cost.
     """
     try:
         from batcher import kyber
+        from batcher.kyber.rules.projections import rewrite_projection
         from batcher.plan.visitor import walk
 
+        plan = rewrite_projection(plan)
         supplied: set[str] = set()
         for names in kyber.required_columns_per_source(plan).values():
             supplied.update(names)
@@ -278,6 +337,6 @@ def _carried_columns(plan) -> frozenset[str] | None:
                 continue
             (source_names if type(node).__name__ == "Scan" else node_names).update(arrow.names)
         return frozenset(supplied | (node_names - source_names))
-    except Exception as exc:  # pragma: no cover - a sizing hint must never fail a query
+    except Exception as exc:  # a sizing hint must never fail a query
         note_suppressed("carbonite", "derive carried columns", exc)
         return None

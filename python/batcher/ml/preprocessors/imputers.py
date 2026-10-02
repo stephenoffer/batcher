@@ -21,6 +21,9 @@ from batcher.ml.preprocessors.base import (
     columns_arg,
     fit_aggregate,
     nan_as_null,
+    nan_free,
+    output_columns_arg,
+    output_pairs,
 )
 from batcher.plan.expr_ir import coalesce, col, count, lit, when
 
@@ -46,13 +49,19 @@ class SimpleImputer(Preprocessor):
             >>> SimpleImputer(["a"]).fit_transform(ds).to_pydict()
             {'a': [1.0, 2.0, 3.0]}
 
+            >>> SimpleImputer("a", output_columns="a_filled").fit_transform(ds).to_pydict()
+            {'a': [1.0, None, 3.0], 'a_filled': [1.0, 2.0, 3.0]}
+
     Args:
         columns: the columns to impute in place.
         strategy: ``"mean"``, ``"median"``, ``"most_frequent"``, or ``"constant"``.
         fill_value: the constant to use when ``strategy="constant"`` (required then).
+        output_columns: write each filled column to this name instead of over its input,
+            one name per column in order, keeping the inputs unchanged (Ray Data's
+            ``output_columns``). ``None`` (the default) fills the columns in place.
     """
 
-    __slots__ = ("columns", "fill_value", "statistics_", "strategy")
+    __slots__ = ("columns", "fill_value", "output_columns", "statistics_", "strategy")
 
     def __init__(
         self,
@@ -60,8 +69,10 @@ class SimpleImputer(Preprocessor):
         *,
         strategy: str = "mean",
         fill_value: Any = None,
+        output_columns: str | Sequence[str] | None = None,
     ) -> None:
         self.columns = columns_arg(columns, what="SimpleImputer")
+        self.output_columns = output_columns_arg(self.columns, output_columns, what="SimpleImputer")
         if not self.columns:
             raise PlanError("SimpleImputer requires at least one column")
         if strategy not in _STRATEGIES:
@@ -174,12 +185,14 @@ class SimpleImputer(Preprocessor):
             A new lazy `Dataset` with nulls in the fitted columns filled.
         """
         self._require_fitted()
-        ds = nan_as_null(ds, self.columns)
         cast_float = self.strategy in ("mean", "median")
         new = {}
-        for c in self.columns:
-            base = col(c).cast("float64") if cast_float else col(c)
-            new[c] = coalesce(base, lit(self.statistics_[c]))
+        for c, out in output_pairs(self.columns, self.output_columns):
+            # NaN is read as missing per column rather than by rewriting `ds`, so an input
+            # kept beside its output (`output_columns`) keeps its NaN.
+            base = nan_free(ds, c)
+            base = base.cast("float64") if cast_float else base
+            new[out] = coalesce(base, lit(self.statistics_[c]))
         return ds.with_columns(**new)
 
 

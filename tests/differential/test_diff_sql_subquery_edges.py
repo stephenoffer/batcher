@@ -270,3 +270,15 @@ def test_comma_join_beside_a_scalar_subquery_is_an_equi_join(duck, query):
     """
     _check(duck, query)
     assert "__cross_key" not in _session().sql(query).explain()
+
+
+def test_a_comma_join_with_no_equality_does_render_its_cross_key(duck):
+    """The positive control for the absence assertion above.
+
+    A comma join whose `WHERE` relates the two tables by nothing is a genuine cartesian
+    product, and `explain()` must show its `__cross_key`. Without this, the test above would
+    keep passing if the renderer stopped printing the key at all.
+    """
+    query = "SELECT t.id, u.w FROM t, u WHERE u.w > 5"
+    _check(duck, query)
+    assert "__cross_key" in _session().sql(query).explain()

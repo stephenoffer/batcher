@@ -42,14 +42,25 @@ if TYPE_CHECKING:
 __all__ = ["infer_type"]
 
 
-def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
-    """The Arrow type `expr` produces over `schema`, or ``None`` if not certain.
+# `infer_type` recurses over every expression the planner builds a schema for — 165,000 calls
+# in the first planning of TPC-DS q64 — and it needs the node classes, which it cannot import
+# at module level (see the module docstring). Importing them *inside* the function ran nine
+# `from ... import` statements, some sixty names, on every call: 1.8 s of that planning under
+# the profiler, more than the type inference itself. The laziness is kept and paid once: the
+# first call binds the classes into this module's globals.
+_NODES_BOUND = False
 
-    ``None`` is always a sound answer — it means "fall back to executing a zero-row
-    query for this column" — so a new or opaque expression never yields a wrong
-    type. The schema passed in is the operator's *input* schema (already widened at
-    the scan leaf), so a bare ``Col`` reports the engine's post-widening type.
-    """
+
+def _bind_nodes() -> None:
+    """Import the expression node classes `infer_type` dispatches on into module globals."""
+    global _NODES_BOUND
+    global Aliased, Array, AudioFunc, Binary, Case, Cast, Coalesce, Col, ConvertTimezone
+    global DateFunc, DateOffset, DateTrunc, GeoFunc, Greatest, HashRows, ImageCrop, ImageFunc
+    global InList, IsInf, IsNan, IsNotNull, IsNull, Least, ListBinary, ListContains, ListFilter
+    global ListFunc, ListGet, ListGetDyn, ListJoin, ListPosition, ListSet, ListSimhash
+    global ListSlice, ListTransform, ListZip, Lit, MakeMap, MakeStruct, MakeTemporal, MapFunc
+    global Math2Expr, MathExpr, Not, NullIf, SeqFunc, Sequence, SpatialFunc, StrFunc
+    global StrFuncDyn, Strftime, Strptime, StructField, VideoFunc, WindowBuckets, WindowStart
     from batcher.plan.expr_ir.audio import AudioFunc
     from batcher.plan.expr_ir.core import (
         Aliased,
@@ -113,6 +124,20 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         Sequence,
     )
     from batcher.plan.expr_ir.video import VideoFunc
+
+    _NODES_BOUND = True
+
+
+def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
+    """The Arrow type `expr` produces over `schema`, or ``None`` if not certain.
+
+    ``None`` is always a sound answer — it means "fall back to executing a zero-row
+    query for this column" — so a new or opaque expression never yields a wrong
+    type. The schema passed in is the operator's *input* schema (already widened at
+    the scan leaf), so a bare ``Col`` reports the engine's post-widening type.
+    """
+    if not _NODES_BOUND:
+        _bind_nodes()
 
     if isinstance(expr, Col):
         return schema.field(expr.name).type if schema.has(expr.name) else None

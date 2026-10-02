@@ -19,7 +19,7 @@ use arrow::array::{
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, TimeUnit};
 
-use super::{float_rank, is_ordered, ranks};
+use super::{array_from_ranks, float_rank, is_ordered, ranks};
 /// Columns a composite packed key will consider. Past this the per-column rank passes cost
 /// more than the comparison sort they replace, and a key that wide has almost certainly
 /// exhausted the bit budget anyway.
@@ -129,7 +129,7 @@ pub(crate) fn packed_multi_sort_indices(
     // budget proves the whole column does — while a sample that fits proves nothing and the
     // exact scan below still runs. Without this a pair of full-width `Int64` keys scanned all
     // 8 M rows to learn what its first 4,096 already showed.
-    if !prefix_could_fit(vals, opts, n) {
+    if !prefix_could_fit(vals, opts, n, PACKED_U128_BITS) {
         return None;
     }
 
@@ -182,6 +182,86 @@ pub(crate) fn packed_multi_sort_indices(
     Some(UInt32Array::from(sorted))
 }
 
+/// The key columns themselves, sorted, for a multi-key sort whose output is exactly its keys —
+/// `SELECT a, b FROM t ORDER BY a, b` — or `None` when the composite key does not fit one `u64`.
+///
+/// The multi-key twin of [`super::sorted_values`], and correct for the same reason: rows equal on
+/// the packed word are equal in every field, every field is a bijection of its column's value,
+/// and the caller passes keys nothing has rewritten — so tied rows are identical in every output
+/// column and which one comes first is invisible. That removes the row position from the word,
+/// which both lets a key of up to 64 bits sort as a plain `u64` (the position-carrying form stops
+/// at 32) and removes the permutation and every column's gather by it, which `perf` put at a
+/// third of `ORDER BY l_shipdate, l_suppkey` between the word sort and the two `take`s.
+///
+/// Each field decodes back to its column through the encoding's inverse: the field less its
+/// null-slot offset, plus the measured minimum, is the column's rank (complemented back for a
+/// `DESC` key), and [`array_from_ranks`] turns a rank into the value it came from.
+pub(crate) fn packed_multi_sorted_values(
+    vals: &[ArrayRef],
+    opts: &[SortOptions],
+) -> Option<Vec<ArrayRef>> {
+    use arrow::buffer::{BooleanBuffer, NullBuffer};
+
+    let n = vals.first()?.len();
+    if vals.len() < 2 || vals.len() > PACKED_MAX_KEYS || n < PACKED_MIN_ROWS {
+        return None;
+    }
+    // Declining has to be cheap, because a decline hands the same keys to
+    // `packed_multi_sort_indices`, which measures them again: a key that cannot fit a word
+    // (`ORDER BY <int>, <float>`, whose float alone is ~56 bits) is refused on a prefix.
+    if !prefix_could_fit(vals, opts, n, u64::BITS) {
+        return None;
+    }
+    let mut widths: Vec<FieldWidth> = Vec::with_capacity(vals.len());
+    let mut total_bits = 0u32;
+    for (v, o) in vals.iter().zip(opts) {
+        if v.len() != n || !is_packable_key(v.data_type()) {
+            return None;
+        }
+        let w = FieldWidth::measure(v, *o)?;
+        total_bits += w.bits;
+        if total_bits > u64::BITS {
+            return None;
+        }
+        widths.push(w);
+    }
+    let mut packed = vec![0u64; n];
+    let mut shift = total_bits;
+    for (w, (v, o)) in widths.iter().zip(vals.iter().zip(opts)) {
+        shift -= w.bits;
+        w.write(v, *o, shift, &mut packed)?;
+    }
+    if !is_ordered(&packed, false) {
+        super::msd::sort_by_high_bits(&mut packed, |w| *w);
+    }
+
+    let mut out = Vec::with_capacity(vals.len());
+    let mut shift = total_bits;
+    for (w, (v, o)) in widths.iter().zip(vals.iter().zip(opts)) {
+        shift -= w.bits;
+        let mask = u64::MAX.checked_shr(u64::BITS - w.bits).unwrap_or(0);
+        let field = |word: u64| word.checked_shr(shift).unwrap_or(0) & mask;
+        let nulls = w.null_value.map(|nv| {
+            NullBuffer::new(BooleanBuffer::from_iter(
+                packed.iter().map(|&p| field(p) != nv),
+            ))
+        });
+        let ranks: Vec<u64> = packed
+            .iter()
+            .map(|&p| {
+                let rank = (field(p).wrapping_sub(w.live_offset)).wrapping_add(w.low);
+                if o.descending {
+                    !rank
+                } else {
+                    rank
+                }
+            })
+            .collect();
+        out.push(array_from_ranks(v.data_type(), &ranks, nulls)?);
+    }
+    Some(out)
+}
+
 /// The permutation that sorts `idx` by `keys`, by ordering one `u64` per row that holds the key
 /// in its high bits and the row's **position in `idx`** in its low [`ROW_POSITION_BITS`].
 ///
@@ -204,7 +284,7 @@ fn position_word_sort(idx: Vec<u32>, keys: &[u64]) -> Vec<u32> {
         .enumerate()
         .map(|(pos, &row)| (keys[row as usize] << ROW_POSITION_BITS) | pos as u64)
         .collect();
-    words.sort_unstable();
+    super::msd::sort_by_high_bits(&mut words, |w| *w);
     words
         .into_iter()
         .map(|w| idx[(w & u64::from(u32::MAX)) as usize])
@@ -262,7 +342,7 @@ const PACKED_PROBE_ROWS: usize = 4_096;
 /// One-sided on purpose: `false` is a proof (a range measured over a subset can only widen), and
 /// `true` is only the absence of one. That asymmetry is what makes this safe to consult before
 /// the exact measurement rather than instead of it.
-fn prefix_could_fit(vals: &[ArrayRef], opts: &[SortOptions], n: usize) -> bool {
+fn prefix_could_fit(vals: &[ArrayRef], opts: &[SortOptions], n: usize, budget: u32) -> bool {
     if n <= PACKED_PROBE_ROWS {
         return true;
     }
@@ -273,7 +353,7 @@ fn prefix_could_fit(vals: &[ArrayRef], opts: &[SortOptions], n: usize) -> bool {
             return false;
         };
         bits += w.bits;
-        if bits > PACKED_U128_BITS {
+        if bits > budget {
             return false;
         }
     }
@@ -897,7 +977,8 @@ mod packed_multi_key_tests {
         assert!(prefix_could_fit(
             &[a.clone(), b.clone()],
             &[asc(), asc()],
-            N
+            N,
+            PACKED_U128_BITS
         ));
         assert!(packed_multi_sort_indices(&[a, b], &[asc(), asc()]).is_none());
     }
@@ -907,7 +988,12 @@ mod packed_multi_key_tests {
     fn a_wide_prefix_rejects_before_the_exact_scan() {
         let a: ArrayRef = Arc::new(Int64Array::from(full_width(N, 1_000_000_007)));
         let b: ArrayRef = Arc::new(Int64Array::from(full_width(N, 999_999_937)));
-        assert!(!prefix_could_fit(&[a, b], &[asc(), asc()], N));
+        assert!(!prefix_could_fit(
+            &[a, b],
+            &[asc(), asc()],
+            N,
+            PACKED_U128_BITS
+        ));
     }
 
     /// Already-ordered input short-circuits to the identity permutation, which must still be
@@ -923,5 +1009,90 @@ mod packed_multi_key_tests {
         let packed = packed_multi_sort_indices(&[a.clone(), b.clone()], &[asc(), asc()]).unwrap();
         assert_eq!(packed.values().to_vec(), (0..N as u32).collect::<Vec<_>>());
         assert_eq!(packed.values().to_vec(), oracle(&[a, b], &[asc(), asc()]));
+    }
+}
+
+#[cfg(test)]
+mod packed_sorted_values_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, Int8Array};
+    use std::sync::Arc;
+
+    /// The sorted key columns must be exactly the columns gathered by arrow's lexicographic sort
+    /// — values, nulls, types — for every direction and null placement of each key.
+    fn check(vals: &[ArrayRef]) {
+        let flags = [(false, false), (false, true), (true, false), (true, true)];
+        for &(d0, n0) in &flags {
+            for &(d1, n1) in &flags {
+                let mut opts = vec![
+                    SortOptions {
+                        descending: d0,
+                        nulls_first: n0,
+                    },
+                    SortOptions {
+                        descending: d1,
+                        nulls_first: n1,
+                    },
+                ];
+                opts.resize(vals.len(), opts[1]);
+                let got = packed_multi_sorted_values(vals, &opts).expect("fits a u64");
+                let columns: Vec<arrow::compute::SortColumn> = vals
+                    .iter()
+                    .zip(&opts)
+                    .map(|(v, o)| arrow::compute::SortColumn {
+                        values: v.clone(),
+                        options: Some(*o),
+                    })
+                    .collect();
+                let idx = arrow::compute::lexsort_to_indices(&columns, None).unwrap();
+                for (c, v) in vals.iter().enumerate() {
+                    let want = arrow::compute::take(v.as_ref(), &idx, None).unwrap();
+                    assert_eq!(got[c].data_type(), want.data_type());
+                    assert_eq!(got[c].to_data(), want.to_data(), "col {c} {opts:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sorted_key_columns_match_arrows_lexsort_gather() {
+        let n = 5_000usize;
+        let a: ArrayRef = Arc::new(Int32Array::from_iter(
+            (0..n as i32).map(|i| (i % 17 != 0).then_some((i * 31) % 40 - 20)),
+        ));
+        let d: ArrayRef = Arc::new(Date32Array::from_iter_values(
+            (0..n as i32).map(|i| 18_000 + (i * 7) % 300),
+        ));
+        let s: ArrayRef = Arc::new(Int8Array::from_iter(
+            (0..n).map(|i| (i % 5 != 1).then_some(((i * 3) % 7) as i8 - 3)),
+        ));
+        check(&[a.clone(), d.clone()]);
+        check(&[d.clone(), a.clone(), s.clone()]);
+        // A float beside a one-bit key: 56-ish bits plus one, inside the word with no position.
+        let f: ArrayRef =
+            Arc::new(Float64Array::from_iter((0..n).map(|i| {
+                (i % 23 != 0).then_some(((i * 13) % 900) as f64 / 8.0 + 1.0)
+            })));
+        let b: ArrayRef = Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| i % 2)));
+        check(&[b, f]);
+        // An all-null column and a constant one contribute no bits.
+        let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>; n]));
+        let constant: ArrayRef = Arc::new(Int64Array::from(vec![7i64; n]));
+        check(&[nulls, a.clone(), constant]);
+    }
+
+    #[test]
+    fn a_key_wider_than_a_word_declines() {
+        let n = 1_000usize;
+        let wide: ArrayRef = Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| {
+            if i % 2 == 0 {
+                i64::MIN + i
+            } else {
+                i64::MAX - i
+            }
+        })));
+        let other: ArrayRef = Arc::new(Int64Array::from_iter_values((0..n as i64).map(|i| i % 3)));
+        let opts = [SortOptions::default(); 2];
+        assert!(packed_multi_sorted_values(&[wide, other], &opts).is_none());
     }
 }

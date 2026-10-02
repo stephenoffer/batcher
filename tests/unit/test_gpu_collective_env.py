@@ -19,7 +19,6 @@ from batcher.dist.gpu.fabric.placement import (
     adaptive_shard_factor,
     device_shard_counts,
     fleet_spread,
-    shard_device_assignment,
 )
 
 RAILS = {0: "mlx5_0", 1: "mlx5_1", 2: "mlx5_2", 3: "mlx5_3"}
@@ -133,20 +132,6 @@ def test_a_fleet_with_no_measurements_is_dealt_evenly() -> None:
 def test_no_devices_and_no_shards_are_handled() -> None:
     assert device_shard_counts(8, []) == ()
     assert device_shard_counts(0, [1.0, 1.0]) == (0, 0)
-
-
-def test_shards_are_interleaved_so_the_fast_device_starts_its_second_early() -> None:
-    assert shard_device_assignment(3, [2.0, 1.0]) == (0, 1, 0)
-
-
-def test_every_shard_is_placed_exactly_once() -> None:
-    placed = shard_device_assignment(11, [3.0, 1.0, 2.0])
-    assert len(placed) == 11
-    assert set(placed) <= {0, 1, 2}
-
-
-def test_no_devices_places_nothing() -> None:
-    assert shard_device_assignment(4, []) == ()
 
 
 def test_a_uniform_fleet_keeps_the_configured_shard_factor() -> None:

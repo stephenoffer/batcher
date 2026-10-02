@@ -126,6 +126,7 @@ def group_by_clustering(splits: Sequence[object]) -> list[list[object]] | None:
     groups: dict[tuple[object, ...], list[object]] = {}
     for split in splits:
         got = clustering_of(split)
-        assert got is not None  # `declared_clustering` above proved every split declares one
+        if got is None:  # `declared_clustering` above proved every split declares one
+            return None
         groups.setdefault(got[1], []).append(split)
     return list(groups.values())

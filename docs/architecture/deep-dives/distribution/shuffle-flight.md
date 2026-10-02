@@ -119,7 +119,7 @@ The reducer's gather is `crates/bc-py/src/shuffle/gather.rs::drive`. It works in
 1. Each remote fetch tries shared memory for a same-host peer, then falls back to Flight. When `distributed.shuffle_replication` placed copies of a bucket on other workers, those addresses follow the primary in the candidate list, so a lost mapper is re-fetched rather than recomputed.
 1. Arriving batches are folded into a running partial *in Rust* (`gather_combine`) or concatenated (`gather_concat`), so the reducer never materializes every mapper's bucket as a Python object first.
 
-Step 2 exists because a hash shuffle cuts one bucket per reducer out of every mapper. A cluster of `W` workers makes `W^2` buckets, each smaller as the cluster grows, and one stream per bucket makes the transfer rate a function of the cluster's width rather than the link. Holding the stream count fixed and packing buckets by bytes makes the rate width-independent. The rationale recorded beside the defaults in `config/config.py` measured 1.4 GiB across one 25 Gbps link at 1,608 MiB/s with 4,096 buckets, against 7,470 MiB/s at the same total when the stream count landed right.
+Step 2 exists because a hash shuffle cuts one bucket per reducer out of every mapper. A cluster of `W` workers makes `W^2` buckets, each smaller as the cluster grows, and one stream per bucket makes the transfer rate a function of the cluster's width rather than the link. Holding the stream count fixed and packing buckets by bytes makes the rate width-independent. The rationale recorded beside the defaults in `config/config.py` measured 1.4 GiB across one 25 Gbps link at 1,608 MiB/s with 4,096 buckets, against 7,470 MiB/s at the same total when the stream count landed right. Those rates are *logical* bytes, the decoded Arrow data a reducer receives, with LZ4 on the wire. A 25 Gbps link carries at most about 2,980 MiB/s, so a rate above that is only possible because the wire bytes are compressed. The run recorded in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md) (2026-08-29, [`benchmarks/cluster/carbonite/bucket_shape.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/carbonite/bucket_shape.py)) puts the uncompressed wire at 2,684 MiB/s, 86% of line rate, and LZ4 at 2.67x on that data, so its roughly 7,400 MiB/s is the saturated NIC rather than headroom beyond it. Compare a rate against a link only after dividing by the compression ratio of the data it carried.
 
 Step 4 matters more than it reads. Folding in Rust is what keeps the join reducer's intermediate out of Python. On TPC-H sf10 that intermediate is 3.75M rows and roughly 106 MB per reducer, which would otherwise be built as Python `RecordBatch` objects and handed straight back into the engine for the partial aggregate. The `execute_plan_aggregated` FFI entry runs the join and folds the aggregate inside the engine instead, so the intermediate never crosses the boundary.
 
@@ -133,7 +133,7 @@ Several fan-in numbers exist, and they bound different things.
 | `flow_control.gather_streams` | 48 | concurrent Flight streams one reducer runs across all its peers |
 | `flow_control.gather_inflight_bytes` | 768 MiB | decoded bytes those streams may hold between them |
 
-A flat gather holds all its data anyway, so throttling its fetch buys no memory. It only serializes the network. Sharing one value of 8 between the tree and the flat fetch once made a 16-worker shuffle pull its buckets in two half-idle waves.
+A flat gather holds all its data anyway, so throttling its fetch buys no memory. It only serializes the network. The way to hold less is not to gather flat at all: a breaker asked to leave its result in place publishes one bucket per reducer and hands back handles, and {py:meth}`iter_batches(distributed=True) <batcher.Dataset.iter_batches>` reads those one bucket at a time, as {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>` describes. Sharing one value of 8 between the tree and the flat fetch once made a 16-worker shuffle pull its buckets in two half-idle waves.
 :::
 
 ## Scaling
@@ -152,6 +152,8 @@ Setting `"flight"` forces the network shuffle described above. `"auto"` chooses 
 
 Setting `"disk"` forces the Arrow IPC file shuffle, where only paths pass through Ray. It's safe only when every worker sees the same filesystem at the same path. `"auto"` chooses it on a single node, and whenever `distributed.shared_filesystem` is set. On one node the disk shuffle is the *better* choice: there's no gRPC and no server, and the page cache does the work. The work directory is driver-local, which is why `"auto"` won't choose it across nodes.
 
+`shared_filesystem = True` and an explicit `"disk"` both *assert* that every node sees the same files, and a mount missing on one node used to surface as a `FileNotFoundError` inside a reducer. So before the disk shuffle runs on more than one node, `resolve_transport` proves it: the driver writes a random token under the scratch base, a task pinned to each other worker node reads it back at the same path, and a node that can't open it or reads different bytes fails the query up front with a {py:exc}`ConfigError <batcher.ConfigError>` that names the node (`dist/shuffle_io.py::verify_shared_scratch`). A node that doesn't answer within 30 seconds proves nothing either way, so it's logged rather than failed. The check runs once per cluster shape per process, and a single-node cluster skips it, because the driver's own node reads its own write by construction.
+
 ### Compressing what the disk shuffle writes
 
 The Flight wire compresses its batches under `distributed.flight_compression`. The disk shuffle makes the same trade the way the spill store does, by looking at where the bytes are going rather than at what's in them.
@@ -168,6 +170,8 @@ The shared-memory file is a second copy of the bucket, in tmpfs, on top of the i
 
 So `ShuffleSession._shm_mirror_ok()` skips writing the mirror in two cases. The first is memory pressure, when the pressure monitor reports `SPILL` or worse. The second is a worker that shares its node with no other worker process. There the mirror has no possible reader: a same-address fetch is served from the local store and every other fetch comes from another machine.
 
+The mirror is charged to the worker's cgroup, because tmpfs pages count toward `memory.current`, so the pressure monitor's footprint reading sees it. The buffer pool and the shuffle store's cap don't. The mirror also outlives the bucket it copies: `release` evicts a fetched bucket from the in-memory store, and its tmpfs file stays until the plan is torn down (`clear_plan`). So a same-node shuffle can hold `bytes_retained` in the store plus every bucket mirrored for the plan so far in tmpfs. `ShuffleSession.stats()` reports the mirrored volume as `bytes_mirrored_shm`, cumulative over the session like `bytes_published`, and the buckets the gate declined to mirror as `shm_mirrors_skipped`. Size a node that packs several workers against the store and the mirror together.
+
 A skipped mirror is harmless. The reducer's shared-memory read misses, `fetch_shared` returns `Ok(None)`, and the fetch falls back to Flight, which carries the same batches. It costs a memcpy's worth of latency and changes nothing else.
 
 The mmap read itself is zero-copy. `read_mmap_zero_copy` wraps the mapping as an Arrow `Buffer::from_custom_allocation`, so the decoded arrays point *into* it and the mapping outlives the batches.
@@ -177,6 +181,10 @@ The mmap read itself is zero-copy. `read_mmap_zero_copy` wraps the mapping as an
 Two independent layers protect the shuffle, and both are off by default.
 
 A shuffle token, set as `distributed.shuffle_token` or through the `BATCHER_SHUFFLE_TOKEN` environment variable, is checked in constant time against `path[1]` before any data is served. Separately, `distributed.tls` enables TLS on the Flight channel through {py:class}`ShuffleTlsConfig <batcher.config.config.ShuffleTlsConfig>`, and setting `require_client_auth` there turns that into mutual TLS.
+
+Off by default means a fleet serves shuffle data to anything that can reach a worker's port, which binds on every interface. `distributed.require_secure_shuffle=True` turns that into a startup failure: a config with TLS off fails validation, and a fleet with no token raises {py:exc}`ConfigError <batcher.ConfigError>` before any worker is spawned (`config/validation/distributed.py::require_secure_shuffle`).
+
+The token is one shared secret for the whole cluster. It authenticates a peer as a member of the fleet, not as a principal or a query, so it grants no per-query authorization, and any process holding it can fetch any partition it can name. It's read when the fleet is spawned, so rotating it takes effect for the next fleet and doesn't revoke a running one.
 
 ## Code map
 

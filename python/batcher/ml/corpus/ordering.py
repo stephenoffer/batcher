@@ -36,11 +36,6 @@ _ROW = "__bt_row"
 _MEGABATCH = "__bt_megabatch"
 
 
-def _require_column(ds: Dataset, column: str) -> None:
-    """Fail at the API edge, naming the columns that do exist."""
-    require_columns(ds, column)
-
-
 def _length_of(ds: Dataset, column: str):
     """A row's length, whichever way the column expresses one.
 
@@ -119,7 +114,7 @@ def length_grouped_order(
     """
     from batcher.plan.expr_ir.constructors import col
 
-    _require_column(ds, column)
+    require_columns(ds, column)
     if batch_size < 1:
         raise PlanError(f"length_grouped_order: batch_size must be at least 1, got {batch_size}")
     if megabatch_factor < 1:
@@ -175,7 +170,7 @@ def padding_waste(ds: Dataset, column: str, *, batch_size: int) -> float:
             >>> round(padding_waste(grouped, "tokens", batch_size=2), 3)
             0.091
     """
-    _require_column(ds, column)
+    require_columns(ds, column)
     if batch_size < 1:
         raise PlanError(f"padding_waste: batch_size must be at least 1, got {batch_size}")
     lengths = ds.select(**{_LENGTH: _length_of(ds, column)}).to_pydict()[_LENGTH]

@@ -211,6 +211,8 @@ print(stats.to_pydict())
 
 Exact distinct counts and quantiles get expensive on large inputs. The sketch-backed aggregates trade a little accuracy for bounded memory and mergeability: `approx_count_distinct` uses HyperLogLog, and `approx_quantile(q)` and `approx_median` use DDSketch, with roughly 1% relative error. Both merge to the same state in any order: HyperLogLog takes the register-wise max and DDSketch sums fixed logarithmic buckets. So each estimate is identical single-node or distributed, and on small inputs `approx_count_distinct` typically matches the exact count. Each also has a top-level spelling: {py:obj}`bt.approx_count_distinct(x) <batcher.approx_count_distinct>`, {py:obj}`bt.approx_quantile(x, q) <batcher.approx_quantile>`, and {py:obj}`bt.approx_median(x) <batcher.approx_median>`. They sit alongside the exact {py:obj}`bt.quantile(x, q) <batcher.quantile>` and the value-tally {py:obj}`bt.histogram(x) <batcher.histogram>`.
 
+The DDSketch-backed estimates skip non-finite inputs: a NaN or an infinity has no logarithmic bucket, so it is not counted at all. On a column holding infinities the estimate therefore describes the finite values only, where the exact `quantile` and `median` rank the infinities like any other value. Over `[1, 2, 3, inf, inf, inf]`, `median` is `inf` and `approx_median` is about `2.0`, and over a column of only infinities `approx_quantile` is NULL. Filter or replace non-finite values first when the two must agree.
+
 ```python
 approx = (
     ds.group_by("category")

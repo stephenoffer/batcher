@@ -134,7 +134,8 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "regexp_count", "regexp_extract", "regexp_extract_all", "regexp_matches",
         "regexp_replace", "regexp_replace_all", "regexp_split", "repeat", "replace",
         "reverse",
-        "right", "rpad", "sha1", "sha256", "soundex", "split", "split_part",
+        "right", "rpad", "sha1", "sha224", "sha256", "sha384", "sha512", "soundex",
+        "split", "split_part",
         "starts_with", "strip_html", "substr", "substring_index", "to_case",
         "squad_normalize", "token_ngrams", "translate",
         # Per-document text quality — the Gopher/C4/RefinedWeb pretraining-corpus
@@ -226,6 +227,8 @@ GEO_FNS: Final[frozenset[str]] = frozenset(
         "st_force3d", "st_force_polygon_ccw", "st_force_polygon_cw",
         "st_flip_coordinates", "st_translate", "st_scale", "st_rotate", "st_affine",
         "st_snap_to_grid", "st_segmentize", "st_expand", "st_collect",
+        # Polygon overlay.
+        "st_union", "st_intersection", "st_difference",
         "st_remove_repeated_points", "st_line_interpolate_point", "st_line_locate_point",
         "st_line_substring", "st_closest_point", "st_shortest_line", "st_project",
         "st_transform",
@@ -256,6 +259,12 @@ SPATIAL_FNS: Final[frozenset[str]] = frozenset(
         "quat_from_euler_x", "quat_from_euler_y", "quat_from_euler_z", "quat_from_euler_w",
         "quat_from_rotmat_x", "quat_from_rotmat_y", "quat_from_rotmat_z",
         "quat_from_rotmat_w",
+        # The rotation nearest a drifted matrix, and Euler angles in any axis sequence.
+        "quat_from_rotmat_nearest_x", "quat_from_rotmat_nearest_y",
+        "quat_from_rotmat_nearest_z", "quat_from_rotmat_nearest_w",
+        "quat_from_euler_seq_x", "quat_from_euler_seq_y", "quat_from_euler_seq_z",
+        "quat_from_euler_seq_w", "quat_to_euler_seq_first", "quat_to_euler_seq_second",
+        "quat_to_euler_seq_third",
         # Composing and comparing two rotations.
         "quat_multiply_x", "quat_multiply_y", "quat_multiply_z", "quat_multiply_w",
         "quat_angular_distance",

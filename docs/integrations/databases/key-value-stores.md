@@ -135,11 +135,11 @@ A distributed write is one operation per shard, with no transaction across them.
 
 An HBase `Put` replaces only the cells it names and leaves the rest of the row alone, so an upsert there is a *merge* of columns rather than a replacement of the row. That differs from DynamoDB and Cassandra, where the write replaces the item or row, and it matters when two pipelines maintain different columns of the same key.
 
-Schema inference on DynamoDB, Cassandra, and HBase samples a single item or row. (Redis is exempt: its rows are always the fixed `(key, value)` pair.) A store whose records disagree gives back a schema that does not describe it, and later batches then fail to convert or arrive null. The disagreement that bites is a field that is a number in some items and a string in others, or one missing from whichever item the sample happened to draw. Project the fields you need, or pin the shape with a predicate the connector can push.
+Schema inference on DynamoDB, Cassandra, and HBase samples up to 100 items or rows and unions them column by column, so a field only some records carry still appears, and a null first value doesn't fix a column's type. Redis is exempt, because its rows are always the fixed `(key, value)` pair. A field that's a number in some sampled items and a string in others raises {py:exc}`FormatError <batcher.FormatError>` naming the field. A field no sampled record holds is still missing. Pass `schema=` with a `pyarrow.Schema` to declare the columns instead: inference is skipped, on the driver and on every worker.
 
 Rows cross into Python on both the read and the write for all four stores. That is the drivers' shape. It makes these good sinks for a serving or feature dataset and poor ones for moving a billion analytical rows, which belong in Parquet or a lakehouse table.
 
-Redis reads every matching key's value with a round trip per key inside its slot range. `match=` is what keeps that bounded. A read with no pattern walks the whole keyspace.
+Redis reads a slot range one `SCAN` page at a time, asking for 1,000 keys a page, and fetches that page's values in one non-transactional pipeline, so a page costs two round trips rather than one per key. Each worker still walks the whole keyspace with `SCAN` to find the keys in its slot range, so `match=` is what keeps the scan bounded. A read with no pattern walks every key once per partition.
 
 ## See also
 

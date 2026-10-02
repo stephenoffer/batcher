@@ -121,7 +121,7 @@ print([(train.count(), validate.count()) for train, validate in ds.ml.time_serie
 
 ## Requirements and limitations
 
-Fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed split. Grouped folds (`group=`, or {py:obj}`batcher.ml.splitting.group_kfold <batcher.ml.splitting.group_kfold>`) vary further, because groups differ in size.
+Plain fold sizes are binomial around `n / k` rather than exact, as with any hash-keyed split, and a small dataset can get visibly uneven folds. Stratified folds are exact: each label's rows are ranked by their hash and dealt round-robin, so every fold's count of each label is within one of every other fold's. That costs a rank over each label's rows, where a plain fold is a row-wise filter. Grouped folds (`group=`, or {py:obj}`batcher.ml.splitting.group_kfold <batcher.ml.splitting.group_kfold>`) vary further, because groups differ in size.
 
 ## See also
 

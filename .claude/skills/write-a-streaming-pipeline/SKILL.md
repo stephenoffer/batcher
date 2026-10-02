@@ -194,12 +194,17 @@ sink.** Know which one you have:
   the log first, so a replay writes nothing. Exactly-once.
 - **File/path** — one atomic `part-batch<NNNNN>` per micro-batch, idempotent *by position*;
   exactly-once only if the plan is deterministic.
-- **Iceberg** — **no** transaction-id check; a replayed micro-batch duplicates rows.
+- **Iceberg** — single-node: the `(app_id, batch_id)` rides in the snapshot summary, so a
+  replay commits nothing. `distributed=True` is still refused (no check on that path).
 - **`for_each_batch`** — no idempotency at all; you get `batch_id`, build your own key.
 
 `query_name` is the transaction application id and **must be stable across restarts**, or
-the idempotency check never finds the previous run's transactions. Unnamed queries derive
-it from the destination, so two unnamed queries on one table collide — always name them.
+the idempotency check never finds the previous run's transactions. An unnamed checkpointed
+query gets an id created on its first run and stored in the checkpoint, and a query with no
+checkpoint gets one unique to the run (its batch counter restarts at 0). A name is shared
+by whoever uses it, so two queries on one table must never share one. A checkpoint is
+locked to one running driver (`CommitError` for a second), and a stateful restart under a
+different plan raises `PlanError` (`python/batcher/io/formats/streaming/checkpoint/identity.py`).
 Changing the checkpoint location resets the stream to the beginning. A `files_incremental`
 source keeps its own `state_dir` alongside the checkpoint; both must survive a restart.
 

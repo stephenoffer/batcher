@@ -31,6 +31,7 @@ import pyarrow as pa
 from batcher.api.terminal.stream.watermark._state import _event_micros, _stream_tracker
 from batcher.io.source import Source
 from batcher.plan.logical import StreamingSessionWindow
+from batcher.plan.streaming.driver_stats import report_state
 
 __all__ = ["stream_session_window"]
 
@@ -141,6 +142,12 @@ class _SessionBuffer:
         # checking first turned that into a spurious failure on a query whose state was
         # about to shrink.
         self._check_bounded()
+        report_state(
+            "session_window",
+            self._buffer,
+            watermark=self.watermark,
+            late_dropped=arrived.num_rows - table.num_rows,
+        )
 
     def drain(self) -> Iterator[pa.Table]:
         """Close every remaining session, because the stream has ended."""

@@ -13,6 +13,7 @@ import functools
 import operator
 from collections.abc import Callable
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import (
     Expr,
     IntoExpr,
@@ -55,7 +56,7 @@ def sum_horizontal(*exprs: IntoExpr) -> Expr:
             {'s': [11, 20]}
     """
     if not exprs:
-        raise ValueError("sum_horizontal() requires at least one argument")
+        raise PlanError("sum_horizontal() requires at least one argument")
     parts = [coalesce(_wrap(e), lit(0)) for e in exprs]
     return functools.reduce(operator.add, parts)
 
@@ -81,7 +82,7 @@ def mean_horizontal(*exprs: IntoExpr) -> Expr:
             {'m': [2.0, 20.0]}
     """
     if not exprs:
-        raise ValueError("mean_horizontal() requires at least one argument")
+        raise PlanError("mean_horizontal() requires at least one argument")
     wrapped = [_wrap(e) for e in exprs]
     total = functools.reduce(operator.add, [coalesce(e, lit(0)) for e in wrapped])
     count = functools.reduce(operator.add, [e.is_not_null().cast("int64") for e in wrapped])
@@ -111,7 +112,7 @@ def all_horizontal(*exprs: IntoExpr) -> Expr:
             {'ok': [True, False]}
     """
     if not exprs:
-        raise ValueError("all_horizontal() requires at least one argument")
+        raise PlanError("all_horizontal() requires at least one argument")
     return functools.reduce(operator.and_, [_wrap(e) for e in exprs])
 
 
@@ -137,7 +138,7 @@ def any_horizontal(*exprs: IntoExpr) -> Expr:
             {'hit': [True, False]}
     """
     if not exprs:
-        raise ValueError("any_horizontal() requires at least one argument")
+        raise PlanError("any_horizontal() requires at least one argument")
     return functools.reduce(operator.or_, [_wrap(e) for e in exprs])
 
 
@@ -163,7 +164,7 @@ def count_horizontal(*exprs: IntoExpr) -> Expr:
             {'n': [2, 2]}
     """
     if not exprs:
-        raise ValueError("count_horizontal() requires at least one argument")
+        raise PlanError("count_horizontal() requires at least one argument")
     return functools.reduce(operator.add, [_wrap(e).is_not_null().cast("int64") for e in exprs])
 
 
@@ -188,7 +189,7 @@ def product_horizontal(*exprs: IntoExpr) -> Expr:
             {'p': [20, 20]}
     """
     if not exprs:
-        raise ValueError("product_horizontal() requires at least one argument")
+        raise PlanError("product_horizontal() requires at least one argument")
     parts = [coalesce(_wrap(e), lit(1)) for e in exprs]
     return functools.reduce(operator.mul, parts)
 
@@ -211,7 +212,7 @@ def reduce_horizontal(function: Callable[[Expr, Expr], Expr], *exprs: IntoExpr) 
         A column holding the per-row reduction.
 
     Raises:
-        ValueError: If no columns are given.
+        PlanError: If no columns are given.
 
     Examples:
         .. doctest::
@@ -223,7 +224,7 @@ def reduce_horizontal(function: Callable[[Expr, Expr], Expr], *exprs: IntoExpr) 
             {'r': [111, 222]}
     """
     if not exprs:
-        raise ValueError("reduce_horizontal() requires at least one argument")
+        raise PlanError("reduce_horizontal() requires at least one argument")
     return functools.reduce(function, [_wrap(e) for e in exprs])
 
 

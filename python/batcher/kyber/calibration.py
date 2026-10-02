@@ -244,8 +244,8 @@ def _settled(prior: CostCoefficients, fresh: CostCoefficients) -> CostCoefficien
 
     Successive fits estimate the same stationary quantity from different windows of the same
     history, so averaging them reduces the estimator's variance — which is exactly the
-    treatment `learning._smooth` gives every other learned scalar, applied here for a second
-    reason on top of accuracy.
+    treatment `metadata.smoothed.convergent_blend` gives every other learned scalar, applied
+    here for a second reason on top of accuracy.
 
     That reason is the plan cache. The coefficients *are* its key
     (`plan_cache._bucketed`), so a fit that wanders inside its own noise band is not a neutral

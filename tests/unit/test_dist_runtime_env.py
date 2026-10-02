@@ -333,3 +333,56 @@ def test_ray_session_key_is_none_when_ray_is_down_or_the_api_drifts(monkeypatch)
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(ray, "get_runtime_context", _boom)
     assert scheduling.ray_session_key() is None
+
+
+def test_ray_session_key_differs_across_clusters_that_reuse_a_job_id(monkeypatch):
+    """Job ids restart at `01000000` on every cluster, so they cannot key a session alone.
+
+    Two sessions that share a job id but not a node — a reconnect to a restarted or a
+    different cluster — must produce different keys, or the upload cache serves the first
+    cluster's `gcs://` URI to the second and every task fails runtime-env setup.
+    """
+    import ray
+
+    from batcher.dist.executors.ray_runtime import scheduling
+
+    node = {"id": "node-a"}
+
+    class _Ctx:
+        @staticmethod
+        def get_job_id():
+            return "01000000"
+
+        @staticmethod
+        def get_node_id():
+            return node["id"]
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray, "get_runtime_context", lambda: _Ctx())
+    first = scheduling.ray_session_key()
+    assert first == scheduling.ray_session_key()  # stable within one session
+    node["id"] = "node-b"
+    assert scheduling.ray_session_key() != first
+
+
+def test_self_ship_yields_the_fields_an_enclosing_ray_job_already_sets(monkeypatch):
+    """Inside a Ray job that declared `pip`, the self-shipped `pip: None` made `ray.init` fail.
+
+    Ray refuses to merge a job's `runtime_env` with a driver's when both set a field, so the
+    self-shipped env must leave the job's own fields alone and still ship the package.
+    """
+    import json
+
+    monkeypatch.setattr(lifecycle, "package_dir", lambda: "/repo/python/batcher")
+    job = {"runtime_env": {"working_dir": "s3://pkg.zip", "pip": {"packages": ["duckdb"]}}}
+    monkeypatch.setenv("RAY_JOB_CONFIG_JSON_ENV_VAR", json.dumps(job))
+    env = lifecycle._self_ship_runtime_env()
+    assert "pip" not in env, "the job's pip must win; setting it too makes ray.init refuse"
+    assert env["py_modules"] == ["/repo/python/batcher"], "the package is still shipped"
+    assert env["excludes"] == _EXCLUDES
+
+
+def test_self_ship_is_unchanged_outside_a_ray_job(monkeypatch):
+    monkeypatch.setattr(lifecycle, "package_dir", lambda: "/repo/python/batcher")
+    monkeypatch.delenv("RAY_JOB_CONFIG_JSON_ENV_VAR", raising=False)
+    assert lifecycle._self_ship_runtime_env()["pip"] is None

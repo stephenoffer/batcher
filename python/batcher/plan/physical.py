@@ -13,7 +13,7 @@ per-operator `PhysicalOp` DAG is filled in as the optimizer and runtime grow.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -116,10 +116,44 @@ class PhysicalPlan:
     #: `EngineConfig.prefer_materializing_aggregate` for the measurements behind the
     #: threshold, and `MATERIALIZE_AGG_MIN_GROUPS` for the threshold itself.
     prefer_materializing_aggregate: bool = False
+    #: Kyber's verdict that a join's build-side aggregate reads far more rows than the join's
+    #: probe side can match (`EngineConfig.prefer_sideways`): the engine then evaluates that
+    #: probe side first and restricts the aggregate to its keys, after its own structural check.
+    prefer_sideways: bool = False
     #: One-slot memo for `to_json`. A list rather than a plain string because the dataclass
     #: is frozen: appending to a mutable default needs no `object.__setattr__` escape, and
     #: `compare=False` keeps the memo out of plan equality. See `to_json` for why it exists.
     _json_memo: list[str] = field(default_factory=list, init=False, repr=False, compare=False)
+    #: One-slot memo for `scanned_source_ids`, for the same reason and by the same trick as
+    #: `_json_memo`: a plan-cache hit hands back this very object, and three conductor steps
+    #: (`run._run_relational_scoped`, `chunked._driving_source`, `stages.resolve_sources`)
+    #: each re-walked the whole IR per execution to ask which sources it reads.
+    _scans_memo: list[frozenset[int]] = field(
+        default_factory=list, init=False, repr=False, compare=False
+    )
+    #: Named memos for pure derivations a consumer outside this module computes from the
+    #: plan on every execution (see `derived`). Mutable-default for the same frozen-dataclass
+    #: reason as `_json_memo`, and out of equality for the same reason.
+    _derived: dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
+
+    def derived(self, name: str, compute: Callable[[PhysicalPlan], Any]) -> Any:
+        """`compute(self)`, computed once per plan instance under `name`.
+
+        For a pure function of this frozen plan that a caller re-derives per execution — a
+        plan-cache hit hands back this very object, so the second execution is a lookup. The
+        result is shared, so `compute` must return a value nobody mutates.
+
+        Args:
+            name: Unique per derivation, so two callers never share an entry.
+            compute: The derivation.
+
+        Returns:
+            What `compute(self)` returned the first time.
+        """
+        memo = self._derived
+        if name not in memo:
+            memo[name] = compute(self)
+        return memo[name]
 
     def to_json(self) -> str:
         """Serialize the relational IR for the engine, memoized per plan instance.
@@ -157,9 +191,12 @@ class PhysicalPlan:
             Every `source_id` reachable in the IR document. Empty for a plan that scans
             nothing.
         """
-        found: set[int] = set()
-        _collect_scans(self.ir, found)
-        return frozenset(found)
+        memo = self._scans_memo
+        if not memo:
+            found: set[int] = set()
+            _collect_scans(self.ir, found)
+            memo.append(frozenset(found))
+        return memo[0]
 
     def op_budgets(self) -> dict[int, int]:
         """Per-operator spill budgets (bytes) keyed by pre-order `op_id`.

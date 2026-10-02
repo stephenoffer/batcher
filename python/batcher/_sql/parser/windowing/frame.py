@@ -239,9 +239,17 @@ def _const_int(node, ctx: str) -> int:
     naive ``int(node.this)`` reads the inner node and raises ``TypeError``. ``to_py()``
     folds ``Neg``/``Literal`` to a Python value; a non-constant argument is rejected.
     """
-    if isinstance(node, (exp.Literal, exp.Neg)):
+    from sqlglot.optimizer.simplify import simplify
+
+    # A constant *expression* (`ntile(2 * 2)`, `nth_value(x, 1 + 1)`) is folded first: it
+    # is as constant as a literal, and refusing it confused "constant" with "literal".
+    folded = node if isinstance(node, (exp.Literal, exp.Neg)) else simplify(node.copy())
+    if isinstance(folded, (exp.Literal, exp.Neg)):
         try:
-            return int(node.to_py())
+            return int(folded.to_py())
         except (TypeError, ValueError):
             pass  # a non-constant frame bound -> fall through and reject it below
-    raise NotImplementedError(f"window function {ctx!r} requires a constant integer argument")
+    raise NotImplementedError(
+        f"window function {ctx!r} requires a constant integer argument, got "
+        f"{node.sql()}: the window operator fixes it per query, not per row"
+    )

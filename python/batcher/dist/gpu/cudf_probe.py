@@ -226,12 +226,11 @@ def cudf_pip_spec() -> list[str]:
     unpickle. Reading the version off the driver makes the two sides the same build by
     construction, which is the property the whole fan-out depends on.
 
-    **numpy is deliberately not pinned.** It used to be, to `1.26.4`, and that pin was actively
-    harmful: RAPIDS 25.04 and later support numpy 2, so the pin dragged a numpy-2 driver's
-    workers *back* to numpy 1 — and Ray pickles arrays by module path, so every array the task
-    returned then failed to unpickle on the driver with
-    `ModuleNotFoundError: No module named 'numpy._core'`. It made the exact failure it was
-    written to prevent, in the direction nobody tested.
+    **numpy is deliberately not pinned.** A pin (such as `1.26.4`) is actively harmful:
+    RAPIDS 25.04 and later support numpy 2, so the pin drags a numpy-2 driver's workers *back*
+    to numpy 1 — and Ray pickles arrays by module path, so every array the task returns then
+    fails to unpickle on the driver with `ModuleNotFoundError: No module named 'numpy._core'`.
+    A pin causes the exact failure it would be written to prevent.
 
     Returns:
         The requirement list, or `[]` when the driver has no cuDF to describe — in which case

@@ -217,3 +217,117 @@ def test_the_manager_reports_the_trim_and_what_overshooting_means_here():
     stats = ResourceManager().stats()
     assert set(stats["reclaim"]) == {"attempts", "released_bytes", "cooldown_s"}
     assert isinstance(stats["swap"], bool)
+
+
+# --- the retention ceiling, checked as every query finishes ---------------------------------
+
+_ENVELOPE = 100 * _MIB
+_CEILING = _ENVELOPE * reclaim.RETAINED_CEILING_FRACTION
+
+
+@pytest.fixture
+def ceiling(monkeypatch, releases):
+    """A scripted resident set and a recording purge-delay setter."""
+    rss = {"bytes": 0}
+    delays: list[int] = []
+
+    def set_delay(ms: int) -> bool:
+        delays.append(ms)
+        return True
+
+    monkeypatch.setattr("batcher.carbonite.memory.probe.process_rss_bytes", lambda: rss["bytes"])
+    monkeypatch.setattr("batcher._internal.hardware.engine.allocator.set_purge_delay", set_delay)
+    # By default the caller's own tables (pyarrow's pool) account for the whole resident set,
+    # so only the whole-process ceiling is in play; the engine-retention tests override it.
+    monkeypatch.setattr(reclaim, "_arrow_pool_bytes", lambda: rss["bytes"])
+    return rss, delays, releases[0]
+
+
+def test_under_the_ceiling_nothing_happens(ceiling):
+    rss, delays, calls = ceiling
+    rss["bytes"] = int(_CEILING * 0.9)
+    assert reclaim.reclaim_if_retaining(_ENVELOPE) == 0
+    assert delays == [] and calls == []
+
+
+def test_the_engines_own_retention_has_a_tighter_ceiling(ceiling, monkeypatch):
+    """Under the whole-process ceiling, an engine arena past its own share still purges.
+
+    TPC-H q18 at sf100 left 9.4 GB of engine arena on a 30 GiB box, under the 18 GB process
+    ceiling, and the third run in that process was killed on top of it.
+    """
+    rss, delays, calls = ceiling
+    engine_ceiling = _ENVELOPE * reclaim.ENGINE_RETAINED_CEILING_FRACTION
+    rss["bytes"] = int(_CEILING * 0.9)  # the process ceiling alone would do nothing
+    monkeypatch.setattr(reclaim, "_arrow_pool_bytes", lambda: 0)  # all of it is engine arena
+    assert rss["bytes"] > engine_ceiling
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS] and calls == [True]
+    # Retention returns only once the engine arena is back under half its own ceiling.
+    rss["bytes"] = int(engine_ceiling * 0.8)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS]
+    rss["bytes"] = int(engine_ceiling * reclaim.RETAINED_RESTORE_FRACTION * 0.9)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS, -1]
+
+
+def test_over_the_ceiling_purges_until_back_under_half_of_it(ceiling):
+    """Over the ceiling: purge at once and release. Back under half of it: retain again.
+
+    A forced collect alone could not bound this -- from the control plane's thread it reached
+    0.5 GB of ~15 GB retained by back-to-back joins -- so the purge delay is the lever, and the
+    hysteresis between the two thresholds keeps a query at the boundary from toggling it.
+    """
+    rss, delays, calls = ceiling
+    rss["bytes"] = int(_CEILING * 1.2)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS] and calls == [True]
+    # Still over: already purging, so the mode is not set again (the release is backed off).
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS]
+    # Under the ceiling but above the restore threshold: keep purging.
+    rss["bytes"] = int(_CEILING * 0.8)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS]
+    # Under the restore threshold: the engine's retention comes back.
+    rss["bytes"] = int(_CEILING * reclaim.RETAINED_RESTORE_FRACTION * 0.9)
+    reclaim.reclaim_if_retaining(_ENVELOPE)
+    assert delays == [reclaim.PURGING_DELAY_MS, -1]
+
+
+def test_an_unreadable_footprint_or_no_envelope_does_nothing(ceiling, monkeypatch):
+    rss, delays, calls = ceiling
+    rss["bytes"] = 10**12
+    assert reclaim.reclaim_if_retaining(0) == 0
+    monkeypatch.setattr("batcher.carbonite.memory.probe.process_rss_bytes", lambda: None)
+    assert reclaim.reclaim_if_retaining(_ENVELOPE) == 0
+    assert delays == [] and calls == []
+
+
+def test_the_ceiling_does_not_fall_as_the_process_holds_more(monkeypatch):
+    """The ceiling's basis is the process's reach, which its own resident set does not shrink.
+
+    The live envelope is available memory, so every page the process keeps comes off it: a
+    ceiling taken as a fraction of that fell as the resident set rose, and a benchmark process
+    holding 21 GB sat over its own ceiling and purged on half its queries.
+    """
+    from batcher.carbonite.memory import probe
+    from batcher.carbonite.memory.pressure import PressureMonitor
+    from batcher.config import Config, MemoryConfig
+
+    total = 100 * _MIB
+    monkeypatch.setattr(probe, "total_memory_bytes", lambda: total)
+    monitor = PressureMonitor(Config())
+    readings = []
+    for held in (10 * _MIB, 40 * _MIB):
+        monkeypatch.setattr(probe, "process_rss_bytes", lambda held=held: held)
+        monkeypatch.setattr(PressureMonitor, "_available_bytes", lambda _s, _t, h=held: total - h)
+        monkeypatch.setattr(PressureMonitor, "_oom_history_factor", lambda _s: 1.0)
+        readings.append((monitor.envelope_bytes(), monitor.reach_bytes()))
+    (env_small, reach_small), (env_large, reach_large) = readings
+    assert env_large < env_small, "control: the live envelope does fall as the process holds more"
+    assert reach_small == reach_large == total
+
+    pinned = PressureMonitor(Config().replace(memory=MemoryConfig(max_memory_bytes=7 * _MIB)))
+    assert pinned.reach_bytes() == 7 * _MIB, "a configured cap is an instruction"

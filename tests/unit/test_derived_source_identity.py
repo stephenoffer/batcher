@@ -24,11 +24,11 @@ def _src(**kwargs) -> InMemorySource:
 
 def test_an_ephemeral_source_without_a_derivation_is_still_unkeyable():
     """The rule this is an exception to: an `id()`-keyed relation can never be read back."""
-    assert plan_cache._source_keys([_src(ephemeral=True)]) is None
+    assert plan_cache.keys._source_keys([_src(ephemeral=True)]) is None
 
 
 def test_a_derivation_makes_an_ephemeral_source_cacheable():
-    keys = plan_cache._source_keys([_src(ephemeral=True, derivation="abc123")])
+    keys = plan_cache.keys._source_keys([_src(ephemeral=True, derivation="abc123")])
     assert keys is not None and keys[0].endswith("derived:abc123")
 
 
@@ -75,7 +75,7 @@ def test_a_derived_source_is_not_pinned_by_the_cache():
     derived = _src(ephemeral=True, derivation="abc123")
     ordinary = _src()
     plan_cache.store("k", "plan", [derived, ordinary], 8)
-    _, keepalive = plan_cache._CACHE["k"]
+    keepalive = plan_cache.memo._CACHE["k"][1]
     assert ordinary in keepalive
     assert derived not in keepalive
     plan_cache.clear()

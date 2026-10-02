@@ -102,6 +102,48 @@ def blame_host_for_reduce_failure(exc: BaseException, host: int | None) -> int |
     return host
 
 
+def kill_workers(actors, ids, timeout_s: float = 30.0) -> None:
+    """Kill workers `ids` for a fault-injection hook, returning only once each is dead.
+
+    `ray.kill` is asynchronous, and treating it as instant made the hooks inject no fault at
+    all. Measured on one node: the killed actor's Flight port still accepted connections
+    ~30 ms after the call, which is long enough for a reducer launched straight afterwards
+    to fetch every bucket from the dying worker. The loss the test asked for never happened,
+    nothing was recomputed, and every "the replica served it" / "unreplicated loss
+    recomputes" assertion was then decided by that race rather than by the code it names.
+
+    What is awaited is the thing the hooks promise — the worker's published buckets being
+    unreachable — so it is read off the worker's shuffle address refusing connections. A
+    Ray-level signal is not enough and was tried first: a call on the killed handle raises
+    almost at once, while the process and its Flight server are still up, and with that as
+    the wait the reducer still read every bucket from the "dead" worker. Bounded by
+    `timeout_s` so a hook can never hang a test on a slow teardown.
+
+    Args:
+        actors: The worker actor handles, indexed by worker id.
+        ids: The worker ids to kill.
+        timeout_s: Upper bound on the total wait for every worker's address to close.
+    """
+    import socket
+    import time
+
+    import ray
+
+    ids = list(ids)
+    addrs = ray.get([actors[i].addr.remote() for i in ids])  # read while they can answer
+    for i in ids:
+        ray.kill(actors[i])
+    deadline = time.monotonic() + timeout_s
+    for addr in addrs:
+        host, _, port = str(addr).rpartition("://")[2].rpartition(":")
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection((host, int(port)), timeout=0.5).close()
+            except OSError:  # refused: the Flight server, and every bucket on it, is gone
+                break
+            time.sleep(0.01)
+
+
 def _reduce_failure_is_worker_loss(exc: BaseException) -> bool:
     """Whether a failed bucket reduce lost a host, rather than hitting a deterministic bug."""
     if _is_fatal_ray_error(exc):
@@ -136,11 +178,10 @@ def _is_transient_udf_error(exc: BaseException) -> bool:
     job on it throws away hours of completed inference.
 
     The classification itself lives in `carbonite.resilience.classify`, which is the one
-    taxonomy the single-node executor and this scheduler share. It used to be a marker list
-    here and a second, different marker list nowhere — and a retry rule that two subsystems
-    disagree about is a retry rule that behaves differently depending on which path a failure
-    took to reach it. The classifier also answers the question this predicate structurally
-    cannot: *where* the retry should land. See `must_move`.
+    taxonomy the single-node executor and this scheduler share, because a retry rule that
+    two subsystems disagree about is a retry rule that behaves differently depending on which
+    path a failure took to reach it. The classifier also answers the question this predicate
+    structurally cannot: *where* the retry should land. See `must_move`.
     """
     from batcher.carbonite.resilience import is_retryable
 

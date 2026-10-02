@@ -40,9 +40,8 @@ if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
     # `Fit`/`Predict` are the unbound pair (this module refits per fold) and `Scorer` grades
-    # the result; all three are defined once in `ml._estimator`. They stay plain callables
-    # rather than requiring the `Estimator` protocol, so a framework model composes without an
-    # adapter — which is the reason this module took callables in the first place.
+    # the result; all three are defined once in `ml._estimator`. They are plain callables
+    # rather than an estimator type, so a framework model composes without an adapter.
     from batcher.ml._estimator import Fit, Predict, Scorer
 
 __all__ = [

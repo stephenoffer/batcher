@@ -104,7 +104,7 @@ def test_a_node_local_path_of_known_size_is_unaffected(multinode):
     footer row count. Grounding those would have turned every recorded distributed benchmark
     single-node, so the size decision still runs first and still wins.
     """
-    assert resolve_distributed("auto", None, [_Src(10_000_000, node_local=True)]) is True
+    assert resolve_distributed("auto", None, [_Src(100_000_000, node_local=True)]) is True
     assert resolve_distributed("auto", None, [_Src(1, node_local=True)]) is False
     # And an explicit request always beats the inference: the caller may know it is shared.
     assert resolve_distributed(True, None, [_Src(None, node_local=True)]) is True
@@ -323,3 +323,53 @@ def test_mode_is_validated_and_scoped():
     assert active_config().distributed.mode == "auto"
     with pytest.raises(ConfigError, match=r"distributed\.mode"):
         set_option("distributed.mode", "sometimes")
+
+
+def _parquet_table(tmp_path, rows: int, width: int) -> str:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "t.parquet"
+    # Distinct strings, stored plain: the footers must report the width the read will decode.
+    pq.write_table(
+        pa.table({"k": list(range(rows)), "s": [f"{i:08d}" + "x" * width for i in range(rows)]}),
+        path,
+        compression="none",
+        use_dictionary=False,
+    )
+    return str(path)
+
+
+def _limits(rows: int, nbytes: int):
+    import dataclasses
+
+    from batcher.config import active_config, config_context
+
+    cfg = active_config()
+    return config_context(
+        dataclasses.replace(
+            cfg,
+            distributed=dataclasses.replace(
+                cfg.distributed, distribute_min_rows=rows, distribute_min_bytes=nbytes
+            ),
+        )
+    )
+
+
+def test_a_table_scanned_three_times_counts_once(multinode, tmp_path):
+    """TPC-H q21 scans `lineitem` three times: three passes over one table, not three tables."""
+    t = bt.read.parquet(_parquet_table(tmp_path, 1_000, 1)).select("k")
+    ds = t.join(t, on="k").join(t, on="k")
+    with _limits(rows=2_500, nbytes=1 << 40):
+        assert resolve_distributed("auto", ds._plan, ds._sources) is False
+    # Positive control: past the threshold on its own rows, it does distribute.
+    with _limits(rows=900, nbytes=1 << 40):
+        assert resolve_distributed("auto", ds._plan, ds._sources) is True
+
+
+def test_a_wide_read_under_the_row_threshold_distributes(multinode, tmp_path):
+    """Few rows of long strings are a big read; the same rows' narrow key column is not."""
+    t = bt.read.parquet(_parquet_table(tmp_path, 2_000, 2_000))
+    with _limits(rows=1 << 40, nbytes=1 << 20):
+        assert resolve_distributed("auto", t.select("s")._plan, t._sources) is True
+        assert resolve_distributed("auto", t.select("k")._plan, t._sources) is False

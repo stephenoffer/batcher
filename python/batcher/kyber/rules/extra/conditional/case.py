@@ -15,13 +15,12 @@ from batcher.kyber.rule import Phase
 from batcher.kyber.rules.extra.boolean_algebra import _key, _rewrite_node
 from batcher.kyber.rules.extra.conditional.shared import (
     _droppable,
-    _is_false_lit,
     _is_null_lit,
-    _is_true_lit,
     _lit_class,
     _pure,
     _rewrite_typed,
 )
+from batcher.kyber.rules.literals import is_false_lit, is_true_lit
 from batcher.plan.expr_ir import (
     Case,
     Coalesce,
@@ -41,8 +40,8 @@ if TYPE_CHECKING:
 def _drop_unreachable(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     if not isinstance(expr, Case):
         return expr
-    kept = [b for b in expr.branches if not _is_false_lit(b[0])]
-    dropped = [t for c, t in expr.branches if _is_false_lit(c)]
+    kept = [b for b in expr.branches if not is_false_lit(b[0])]
+    dropped = [t for c, t in expr.branches if is_false_lit(c)]
     if not dropped or not _droppable(dropped, [t for _, t in kept] + [expr.otherwise], schema):
         return expr
     return Case(kept, expr.otherwise)
@@ -72,7 +71,7 @@ def case_drop_unreachable_branches(node: SchemaNode, _ctx: OptimizerContext) -> 
 def _first_true(expr: Expr, schema: SchemaRef | None = None) -> Expr:
     if not isinstance(expr, Case):
         return expr
-    i = next((i for i, (c, _) in enumerate(expr.branches) if _is_true_lit(c)), None)
+    i = next((i for i, (c, _) in enumerate(expr.branches) if is_true_lit(c)), None)
     if i is None:
         return expr
     head, winner, tail = expr.branches[:i], expr.branches[i][1], expr.branches[i + 1 :]

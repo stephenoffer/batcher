@@ -110,6 +110,14 @@ def _canonical_kind(kind: str) -> str:
 # affects *sizing*, never results, so a slightly old fit is safe.
 _REFIT_AFTER = 64
 
+# ...and, past that floor, after new rows reach this fraction of the history already fitted.
+# "Barely moves with one more sample among many" is a statement about the *ratio*, so a fixed
+# count is right only at one history size: a TPC-H q8 records ~40 operators, so 64 rows meant
+# a refit on every other query — 3.5% of a warm q8, sampled — long after thousands of rows
+# had settled every figure. Refitting once the new rows are an eighth of the old keeps a cold
+# store responsive (64 rows) and a warm one cheap.
+_REFIT_FRACTION = 8
+
 # Per-hub memo, keyed weakly so a dropped hub (a test reset) evicts its entry. Value is
 # `(version, fingerprint, model)`: reused while the hub absorbed no new feedback and the
 # relevant config is unchanged.
@@ -162,6 +170,10 @@ class LearnedMemoryModel:
     # grant and once per adaptive flow-control round — the shuffle's per-fetch path — where
     # rescanning the dict is a linear pass to recover a constant of the fit.
     _widest_bytes_per_row: float | None = dataclasses.field(init=False, default=None)
+    # Measured bytes per *output* row per family (`result_bytes / n_actual`): how wide a row
+    # flowing out of the operator is, as opposed to how much state it held per input row.
+    # See `max_row_width`, the one reader.
+    _row_width: dict[str, float] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         positive = [w for w in self._bytes_per_row.values() if w > 0]
@@ -284,6 +296,23 @@ class LearnedMemoryModel:
         widths = [w for k, w in self._bytes_per_row.items() if k in wanted and w > 0]
         return max(widths) if widths else None
 
+    def max_row_width(self, kinds: Iterable[str] | None = None) -> float | None:
+        """The widest measured *output* row among `kinds`' families, or `None` if unlearned.
+
+        The quantity a morsel's row cap needs. A morsel holds rows, and a row's width is what
+        the operator emits per row, not the state it held per input row. The two differ by
+        the operator's fan-out: TPC-DS q59's store join held 125 MB for 2,190 input rows, a
+        57 KB-per-row footprint that is right for sizing the join and wrong for sizing the
+        morsels around it, which it cut to 173 rows. Its output rows are 157 bytes. A wide
+        payload (an embedding, a decoded image) is wide in the output too, so this still sees
+        what the cap exists for.
+        """
+        wanted = None if kinds is None else {_canonical_kind(k) for k in kinds}
+        widths = [
+            w for k, w in self._row_width.items() if w > 0 and (wanted is None or k in wanted)
+        ]
+        return max(widths) if widths else None
+
     def blend_peak(
         self,
         kind: str,
@@ -355,6 +384,33 @@ class LearnedMemoryModel:
         return int(clamp_factor(blended, plan_estimate, self._clamp))
 
 
+#: The most an operator's measured RSS growth may exceed its own Arrow working set before the
+#: excess is taken to be someone else's. Fragmentation and transient scratch are real and are
+#: why RSS is read at all (see `_attributable_peak`), but they are a multiple of what the
+#: operator holds, not an unbounded quantity.
+_RSS_ATTRIBUTION_FACTOR = 4.0
+
+
+def _attributable_peak(row: dict) -> float:
+    """The peak bytes an operator can be charged with: its working set, plus bounded RSS.
+
+    The true peak is the greater of the Arrow working-set estimate (`m_peak_bytes`) and the
+    measured growth of the process's RSS high-water (`peak_rss_bytes`), because RSS captures
+    transient scratch, allocator fragmentation and off-pool buffers the estimate cannot see.
+    But RSS is a *process* high-water and operators run concurrently, so its growth during one
+    operator is not that operator's alone. A 12-row dimension scan that happened to run while
+    a fact join built its table was charged the join's gigabyte: divided by 12 input rows it
+    became a family width of tens of megabytes, the morsel budget cut TPC-DS q77's shared
+    subplan to 19-row morsels, and the query ran 62 -> 605 ms, getting worse each run as the
+    polluted samples accumulated. RSS may therefore raise the charge to at most
+    `_RSS_ATTRIBUTION_FACTOR` times the operator's own working set; beyond that the growth
+    belongs to whatever else was running.
+    """
+    arrow = float(row.get("m_peak_bytes", 0) or 0.0)
+    rss = float(row.get("peak_rss_bytes", 0) or 0.0)
+    return max(arrow, min(rss, _RSS_ATTRIBUTION_FACTOR * arrow))
+
+
 def _memory_basis_rows(row: dict) -> float:
     """The row count an operator's peak memory actually scales with.
 
@@ -390,6 +446,7 @@ class _KindSamples:
     consumed: int
     footprints: list[float]
     spills: list[float]
+    widths: list[float]
 
 
 def _derive_samples(rows: list[dict], prior: _KindSamples | None) -> _KindSamples:
@@ -422,28 +479,31 @@ def _derive_samples(rows: list[dict], prior: _KindSamples | None) -> _KindSample
     ):
         start = prior.consumed
         footprints, spills = list(prior.footprints), list(prior.spills)
+        widths = list(prior.widths)
     else:
-        start, footprints, spills = 0, [], []
+        start, footprints, spills, widths = 0, [], [], []
     for r in rows[start:]:
         # The true peak is the greater of the Arrow working-set estimate and the measured
         # process RSS high-water (`peak_rss_bytes`): the latter captures transient scratch,
         # allocator fragmentation, and off-pool buffers the estimate cannot see, so fitting
         # against the max sizes admission/spill against reality and never under-provisions.
-        peak = max(
-            float(r.get("m_peak_bytes", 0) or 0.0),
-            float(r.get("peak_rss_bytes", 0) or 0.0),
-        )
+        peak = _attributable_peak(r)
         basis = _memory_basis_rows(r)
         if peak > 0.0 and basis > 0.0:
             footprints.append(peak / basis)
         spill = float(r.get("spill_bytes", 0) or 0.0)
         if spill > 0.0 and basis > 0.0:
             spills.append(spill / basis)
+        emitted = float(r.get("result_bytes", 0) or 0.0)
+        out_rows = float(r.get("n_actual", 0) or 0.0)
+        if emitted > 0.0 and out_rows > 0.0:
+            widths.append(emitted / out_rows)
     return _KindSamples(
         anchor=rows[0] if rows else None,
         consumed=len(rows),
         footprints=footprints,
         spills=spills,
+        widths=widths,
     )
 
 
@@ -455,6 +515,7 @@ def _fit(hub: MetadataHub, cfg: Config) -> LearnedMemoryModel:
     cached = _SAMPLE_CACHE.setdefault(hub, {})
     bpr: dict[str, float] = {}
     spr: dict[str, float] = {}
+    rw: dict[str, float] = {}
     for kind, rows in by_kind.items():
         derived = _derive_samples(rows, cached.get(kind))
         cached[kind] = derived
@@ -463,7 +524,10 @@ def _fit(hub: MetadataHub, cfg: Config) -> LearnedMemoryModel:
             bpr[canon] = _upper_quantile(derived.footprints)
         if len(derived.spills) >= min_samples:
             spr[canon] = _upper_quantile(derived.spills)
+        if len(derived.widths) >= min_samples:
+            rw[canon] = _upper_quantile(derived.widths)
     return LearnedMemoryModel(
+        _row_width=rw,
         _bytes_per_row=bpr,
         _alpha=opt.learning_smoothing_alpha,
         _clamp=max(1.0, opt.cost_calibration_clamp),
@@ -497,8 +561,10 @@ def learned_memory_model(
     )
     version = hub.version
     cached = _MODEL_CACHE.get(hub)
-    if cached is not None and cached[1] == fingerprint and 0 <= version - cached[0] < _REFIT_AFTER:
-        return cached[2]
+    if cached is not None and cached[1] == fingerprint:
+        fresh = version - cached[0]
+        if 0 <= fresh < max(_REFIT_AFTER, cached[0] // _REFIT_FRACTION):
+            return cached[2]
     try:
         model = _fit(hub, cfg)
     except Exception as exc:  # pragma: no cover - sizing must never break a query

@@ -76,6 +76,9 @@ def test_event_log_written_on_collect(tmp_path):
     )
     try:
         _ds().collect()
+        from batcher.api.terminal.event_log import flush_event_log
+
+        assert flush_event_log(10.0)  # the document is written off the query's critical path
         files = list(tmp_path.glob("*.json"))
         assert len(files) == 1
         doc = json.loads(files[0].read_text())
@@ -95,6 +98,9 @@ def test_distributed_run_surfaces_worker_map_metrics(tmp_path):
     try:
         t = pa.table({"k": (np.arange(20_000) % 100).astype("int64"), "v": np.arange(20_000) % 7})
         bt.from_arrow(t).group_by("k").agg(s=col("v").sum()).collect(distributed=True)
+        from batcher.api.terminal.event_log import flush_event_log
+
+        assert flush_event_log(10.0)  # the document is written off the query's critical path
         doc = json.loads(max(tmp_path.glob("*.json")).read_text())
         assert doc["distributed"] is True
         # The distributed map sub-plan is surfaced as its own measured section (a separate

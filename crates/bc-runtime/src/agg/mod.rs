@@ -62,9 +62,10 @@ mod inputs;
 ///
 /// `i128` cannot itself overflow here: 2^64 rows of `i64::MAX` is below 2^127.
 ///
-/// **Residual limit, deliberately not fixed:** a partial's state is still an `i64` column, so
-/// a single partition whose own true sum exceeds `i64` still errors even when the grand total
-/// would fit. Closing that needs a wider intermediate schema, which is a wire-contract change.
+/// This retry fixes the *running* total inside one partial. The other half of the problem --
+/// a partition whose own true total exceeds `i64` while the grand total fits -- is closed by
+/// the partial *state*, which is an exact `i128` narrowed only in `finalize`: see
+/// [`int_sum`].
 pub(crate) fn promote_wide(sums: &[i64]) -> Vec<i128> {
     sums.iter().copied().map(i128::from).collect()
 }
@@ -129,6 +130,10 @@ mod distinct;
 mod distinct_on;
 mod fused;
 mod group;
+mod int_sum;
+/// Widen every bare `Int64` `SUM` state to its 128-bit form: what a partial must carry
+/// wherever it is pooled with others under one schema (see `int_sum`). `None` when none.
+pub use int_sum::widen_bare as widen_int_sum_states;
 pub(crate) mod median;
 mod ordered_list;
 mod sketch;
@@ -150,15 +155,26 @@ mod var;
 /// `AVG` over three 10M-row integer columns that widening was most of the query.
 pub(crate) const MEAN_INT_ACCUMULATOR: DataType = DataType::Decimal128(38, 0);
 
+/// The precision of a decimal `SUM`'s state and result: `SUM(decimal(p, s))` is
+/// `decimal(38, s)`, the DuckDB / SQL-standard rule.
+///
+/// Keeping the input's precision, which the accumulators used to do, declared a type the
+/// result does not fit: three `99999.99`s and a `1.10` in a `decimal(7, 2)` sum to
+/// `300001.07`, eight digits under a seven-digit type. Nothing rejected it, because the `i128`
+/// holds the value either way, but the column claimed a range its own rows leave, and a
+/// consumer that trusts the declared precision (a Parquet writer, the GPU tier's schema
+/// contract, another engine reading the Arrow) is entitled to. 38 is `Decimal128`'s maximum,
+/// so a sum past it is the `i128` overflow `checked_add` already reports. The control plane's
+/// type inference (`plan/logical/aggregate.py`) states the same rule, so `Dataset.schema`
+/// matches what runs.
+pub(crate) const DECIMAL_SUM_PRECISION: u8 = arrow::datatypes::DECIMAL128_MAX_PRECISION;
+
 use accum::{
     bitfold_acc, bool_acc, concat_col, kahan_acc, minmax_acc, product_acc, require, sum_acc,
 };
 use argextreme::{arg_extreme_state, merge_arg_extreme};
 use counted::{counted_state, merge_counted};
-use distinct::{
-    bucket_values_into_list, distinct_state, finalize_count_distinct, flatten_list_state,
-    merge_distinct,
-};
+use distinct::{bucket_values_into_list, distinct_state, finalize_count_distinct, merge_distinct};
 pub use distinct::{distinct_dense, distinct_parts, distinct_prefix, DistinctPrefix};
 pub use distinct_on::{distinct_on, distinct_on_parts, OrderKey};
 pub(crate) use group::assign_groups;
@@ -483,8 +499,10 @@ pub struct GroupAggResult {
     pub agg_columns: Vec<ArrayRef>,
 }
 
-/// Single-node convenience: `finalize(partial(...))`.
-pub fn group_aggregate(
+/// Single-node convenience: `finalize(partial(...))` — the serial oracle the mergeable-path
+/// tests compare against.
+#[cfg(test)]
+pub(crate) fn group_aggregate(
     group_keys: &[ArrayRef],
     calls: &[AggCall],
     num_rows: usize,
@@ -614,6 +632,9 @@ pub fn combine_sized(
     estimated_groups: usize,
 ) -> Result<Partial, RuntimeError> {
     assert!(!parts.is_empty(), "combine requires at least one partial");
+    // A persisted partial from before `int_sum` carries a bare `Int64` SUM state.
+    let upgraded = int_sum::upgrade_all(parts, funcs)?;
+    let parts = upgraded.as_deref().unwrap_or(parts);
     let radix_parallel_threshold = self::radix_parallel_threshold(radix_parallel_threshold);
 
     // A single partial is already grouped (`combine([p]) ≡ p`), so re-folding it is
@@ -693,6 +714,8 @@ pub fn combine_partitioned(
     radix_parallel_threshold: usize,
 ) -> Result<Vec<Partial>, RuntimeError> {
     assert!(!parts.is_empty(), "combine requires at least one partial");
+    let upgraded = int_sum::upgrade_all(parts, funcs)?;
+    let parts = upgraded.as_deref().unwrap_or(parts);
     let radix_parallel_threshold = self::radix_parallel_threshold(radix_parallel_threshold);
     let n_keys = parts[0].group_columns.len();
     let total_rows = partial_rows(parts);
@@ -1003,6 +1026,69 @@ mod tests {
         let pg = partial(&[], &[AggCall::new(AggFunc::Mean, Some(v2))], 3).expect("global");
         let og = finalize(&[AggFunc::Mean], &pg).expect("finalize");
         assert!((og[0].as_primitive::<Float64Type>().value(0) - 2.5).abs() < 1e-9);
+    }
+
+    /// `SUM(decimal(7, 2))` is `decimal(38, 2)` on every path that builds its state — the
+    /// per-call kernel (one aggregate), the fused one (several), and the keyless one — and a
+    /// sum split across partials and combined is the single-node sum, value **and** type.
+    #[test]
+    fn decimal_sum_is_decimal_38_and_merges() {
+        use arrow::array::Decimal128Array;
+        use arrow::datatypes::Decimal128Type;
+        let dec = |v: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(
+                Decimal128Array::from(v)
+                    .with_precision_and_scale(7, 2)
+                    .unwrap(),
+            )
+        };
+        // 3 x 99999.99 + 1.10 = 300001.07: eight digits, past the input's seven.
+        let rows = vec![
+            Some(9_999_999i128),
+            Some(9_999_999),
+            None,
+            Some(9_999_999),
+            Some(110),
+            Some(-5),
+        ];
+        let keys = vec![1i64, 1, 2, 1, 1, 2];
+        let want_type = DataType::Decimal128(38, 2);
+        let run = |ks: &[i64], vs: Vec<Option<i128>>, fused: bool| {
+            let n = ks.len();
+            let k: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ks.to_vec()))];
+            let v = dec(vs);
+            let mut calls = vec![AggCall::new(AggFunc::Sum, Some(Arc::clone(&v)))];
+            if fused {
+                calls.push(AggCall::new(AggFunc::Sum, Some(Arc::clone(&v))));
+                calls.push(AggCall::new(AggFunc::Count, Some(v)));
+            }
+            partial(&k, &calls, n).unwrap()
+        };
+        for fused in [false, true] {
+            let funcs: Vec<AggFunc> = if fused {
+                vec![AggFunc::Sum, AggFunc::Sum, AggFunc::Count]
+            } else {
+                vec![AggFunc::Sum]
+            };
+            let whole = run(&keys, rows.clone(), fused);
+            assert_eq!(whole.states[0][0].data_type(), &want_type, "fused={fused}");
+            let single = finalize(&funcs, &whole).unwrap();
+            assert_eq!(single[0].data_type(), &want_type, "fused={fused}");
+            let s = single[0].as_primitive::<Decimal128Type>();
+            assert_eq!((s.value(0), s.value(1)), (30_000_107, -5), "fused={fused}");
+
+            // The mergeable invariant: any split, combined, finalizes to the same column.
+            let parts = vec![
+                run(&keys[..2], rows[..2].to_vec(), fused),
+                run(&keys[2..], rows[2..].to_vec(), fused),
+            ];
+            let merged = finalize(&funcs, &combine(&parts, &funcs).unwrap()).unwrap();
+            assert_eq!(merged[0].as_ref(), single[0].as_ref(), "fused={fused}");
+        }
+        let global = partial(&[], &[AggCall::new(AggFunc::Sum, Some(dec(rows)))], 6).unwrap();
+        let g = finalize(&[AggFunc::Sum], &global).unwrap();
+        assert_eq!(g[0].data_type(), &want_type);
+        assert_eq!(g[0].as_primitive::<Decimal128Type>().value(0), 30_000_102);
     }
 
     #[test]
@@ -1406,18 +1492,15 @@ mod tests {
         );
     }
 
-    /// The mergeable invariant for the wide-retry path, and the exact edge of what it can
-    /// promise: `combine(partial(p_k))` equals the single-node answer for every split whose
-    /// **partials each fit an `i64`**, even when the running total inside a partial does not.
+    /// The mergeable invariant for integer `SUM`: `combine(partial(p_k))` equals the
+    /// single-node answer for **every** split, even when the running total inside a partial
+    /// does not fit an `i64`, and even when a partial's *own* total does not.
     ///
-    /// Before the retry this held for almost no split at all: `[M,-M][M,-M]` returned 0 while
-    /// every other arrangement of the same rows raised, so the operator's answer depended on a
-    /// scheduling decision.
-    ///
-    /// `step == 2` is the documented residual and is asserted, not skipped. It puts both
-    /// positives in one partial, whose own true sum is 2^63, and a partial's state is an
-    /// `i64` column — so there is nothing for it to hold. Widening the *intermediate schema*
-    /// is what would close that, and it is a wire-contract change.
+    /// Before the wide retry this held for almost no split: `[M,-M][M,-M]` returned 0 while
+    /// every other arrangement raised. Before the 128-bit partial state (`agg::int_sum`),
+    /// `step == 2` still raised: it puts both positives in one partial, whose own true sum is
+    /// 2^63, and an `i64` state had nothing to hold it in. Both made the operator's answer
+    /// depend on a scheduling decision.
     #[test]
     fn a_partitioned_int_sum_that_overflows_partway_still_merges_to_the_true_total() {
         const M: i64 = 1 << 62;
@@ -1453,18 +1536,13 @@ mod tests {
                 .value(0))
         };
 
-        // Every partial fits an i64; the running total inside one of them does not.
-        for step in [1usize, 3, 4, 5, 6] {
+        // Some partials' running totals overflow; at `step == 2` the first partial's own true
+        // total (`[M, M]` = 2^63) does. None of that is visible in the answer.
+        for step in [1usize, 2, 3, 4, 5, 6] {
             let got =
                 split(step).unwrap_or_else(|e| panic!("chunks of {step} should merge, got {e:?}"));
             assert_eq!(got, oracle_sum, "split into chunks of {step}");
         }
-
-        // The residual: `[M, M]` is a partial whose own true sum is 2^63.
-        assert!(
-            matches!(split(2), Err(RuntimeError::SumOverflow)),
-            "a partial that cannot fit its own true sum must still say so"
-        );
     }
 
     #[test]
@@ -1510,6 +1588,62 @@ mod tests {
         ));
         let b: ArrayRef = Arc::new(StringArray::from(
             (0..n).map(|i| format!("g{}", i % 400)).collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 9) as i64).collect::<Vec<_>>(),
+        ));
+        assert_radix_combine_sum_matches(&[a, b], &vals, n);
+    }
+
+    #[test]
+    fn radix_combine_matches_serial_on_nullable_multikey() {
+        // NULLs in both a string and an Int64 key column: the tagged mixed fold must bucket
+        // every NULL of a column together, and apart from the empty string and from zero.
+        let n = 250_000usize;
+        let a: ArrayRef = Arc::new(StringArray::from(
+            (0..n)
+                .map(|i| match i % 13 {
+                    0 => None,
+                    1 => Some(String::new()),
+                    _ => Some(format!("g{}", i % 300)),
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let b: ArrayRef = Arc::new(Int64Array::from(
+            (0..n)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        None
+                    } else {
+                        Some((i % 7) as i64)
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 9) as i64).collect::<Vec<_>>(),
+        ));
+        assert_radix_combine_sum_matches(&[a, b], &vals, n);
+    }
+
+    #[test]
+    fn radix_combine_matches_serial_when_only_the_last_rows_hold_nulls() {
+        // Early partials are null-free and later ones are not: the relation-wide gate must
+        // still hash one key identically in both, or the same group lands in two buckets.
+        let n = 250_000usize;
+        let a: ArrayRef = Arc::new(StringArray::from(
+            (0..n)
+                .map(|i| {
+                    if i + 500 > n && i % 2 == 0 {
+                        None
+                    } else {
+                        Some(format!("g{}", i % 300))
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let b: ArrayRef = Arc::new(Int64Array::from(
+            (0..n).map(|i| (i % 7) as i64).collect::<Vec<_>>(),
         ));
         let vals: ArrayRef = Arc::new(Int64Array::from(
             (0..n).map(|i| (i % 9) as i64).collect::<Vec<_>>(),

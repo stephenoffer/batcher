@@ -222,7 +222,7 @@ class _Render:
         return node.visit(_Substitute(self))
 
 
-class _Substitute(cst.CSTTransformer):  # type: ignore[misc]
+class _Substitute(cst.CSTTransformer):
     def __init__(self, render: _Render) -> None:
         super().__init__()
         self.render = render

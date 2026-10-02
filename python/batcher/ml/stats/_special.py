@@ -21,9 +21,7 @@ from collections.abc import Callable
 __all__ = [
     "chi2_ppf",
     "chi2_sf",
-    "f_ppf",
     "f_sf",
-    "normal_sf",
     "normal_two_sided_p",
     "safe_ratio",
     "students_t_ppf",
@@ -199,11 +197,6 @@ def students_t_sf(t: float, df: float) -> float:
     return half if t >= 0.0 else 1.0 - half
 
 
-def normal_sf(z: float) -> float:
-    """The one-sided upper tail ``P(Z >= z)`` for a standard normal."""
-    return 0.5 * math.erfc(z / math.sqrt(2.0))
-
-
 def _invert_decreasing(sf: Callable[[float], float], target: float, hi_start: float) -> float:
     """The ``x >= 0`` where a decreasing survival function `sf` crosses `target`.
 
@@ -253,14 +246,3 @@ def chi2_ppf(p: float, df: float) -> float:
     if p == 1.0:
         return math.inf
     return _invert_decreasing(lambda x: chi2_sf(x, df), 1.0 - p, max(df, 1.0))
-
-
-def f_ppf(p: float, df1: float, df2: float) -> float:
-    """The F quantile: the ``x`` with ``P(X <= x) == p``, for ``(df1, df2)`` degrees of freedom."""
-    if df1 <= 0 or df2 <= 0 or not 0.0 <= p <= 1.0:
-        return math.nan
-    if p == 0.0:
-        return 0.0
-    if p == 1.0:
-        return math.inf
-    return _invert_decreasing(lambda x: f_sf(x, df1, df2), 1.0 - p, 1.0)

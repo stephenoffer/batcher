@@ -1,5 +1,361 @@
 # Batcher CPU benchmark results
 
+## Sideways restriction on every executor, a join-order search priced by its best cheap order, and learned statistics that stop poisoning other queries (2026-09-27)
+
+**Conditions.** Two kinds of measurement, kept apart on purpose. Every speed claim below is an
+**interleaved A/B on one box** (the 48-core, 92 GiB workspace, arms alternated in fresh processes,
+best of the run after warm-up), because the Anyscale nodes vary run to run. The suite boards are
+Anyscale jobs on one `m6id.16xlarge` each (64 vCPU, 247 GiB, local NVMe), image
+`anyscale/ray:2.58.0-py311`, DuckDB 1.5.5, Polars 1.40.0, pyarrow 23.0.1, `benchmarks/run.py`, one
+job per suite group, every result checked against DuckDB before it was timed. The job script
+waits for the load average to fall between suites, because the harness now refuses to time
+behind its own previous suite.
+
+### What changed, and what each change measured
+
+- **The join-order DP was priced by the written order** (`kyber.rules.joins.order`). A comma join
+  is a cross product under a filter until reordering, so every such query was granted the
+  200,000-pair ceiling. JOB q29c (17 leaves) spent 45 s evaluating 200,000 pairs, hit the
+  ceiling, and returned the greedy order anyway: its operators took 22 ms. The budget is now a
+  share of the cost of the better of the greedy and GOO orders, which are built first. JOB q29c
+  **38.6 s -> 0.39 s**, q33b 2.7 s -> 216 ms, q24b 1.5 s -> 280 ms (JOB board: 32 -> 42 wins of 109).
+- **The runtime join filter never engaged at sf10 or sf100.** Its digest refused any build side
+  past 65,536 distinct keys unless they were dense, and on the row-group read the driving
+  relation is a zero-row carrier, so the filter's own size gate read it as empty. The driving
+  relation's footer row count now reaches placement (`UnitSource::rows`), and a probe side at
+  least 16x its build side gets the one-pass bitmap bounds (`KeyFilter::build_for_probe`). TPC-H
+  sf100, two interleaved rounds: q3 2.34 -> 2.00 s, q5 3.30 -> 2.43 s, q10 3.30 -> 2.86 s.
+- **A decorrelated aggregate is restricted to its outer keys on the streaming executor too**
+  (`bc_interp::stream::builds`). Only the materializing executor did it, and routing to that
+  executor lost more than the restriction saved. On Kyber's `prefer_sideways` verdict the probe
+  side is evaluated first, the aggregate's source is restricted to its keys, and the probe side
+  is kept as a finished leaf. Only a join with no join above it on the spine takes it, since the
+  leaf cannot be sharded through. TPC-H sf10: q21 **648 -> 215 ms** (DuckDB 266), q20 87 -> 67 ms,
+  q18 unchanged. The verdict no longer reroutes a plan to the materializing executor.
+- **The chunked path runs the same restriction in two stages**
+  (`api.orchestration.chunked_sideways`): the outer spine first, then the rest with the
+  aggregate's scan wrapped in a semi join on the outer keys and driving the chunks itself. TPC-H
+  sf100 q21: **15.0 s -> 4.3 s** on the workspace box (DuckDB 6.1 s), and on the job board
+  **8,047 ms -> 3,175 ms against DuckDB's 4,204** (1.94x -> 0.76x). Peak RSS 34 -> 20 GB.
+- **The plan cache re-planned on every warm run of a join-heavy query.** Its key carried the
+  learning generation and the full source statistics, which the loop moves after nearly every
+  run. The key is now split: an exact half (plan, config, sources, and the statistics' data
+  facts) that always misses on change, and a learned half that re-plans for one round, with a
+  plan's own new measurements admitted for two (`kyber.plan_cache`, `optimizer.plan_deps`). TPC-H
+  sf10 q8: re-planning for 30-220 ms on every warm run -> hits from run 4, 68 ms steady.
+- **The string-key pre-aggregation push fired on a coarse outer grouping**
+  (`agg_pushdown.gates._moves_string_keys`). `lineitem JOIN orders GROUP BY o_orderpriority`
+  pre-aggregated 6M rows into 1.5M groups to feed 5: **95 -> 27 ms** (DuckDB 33) now that the
+  outer grouping must keep a quarter of the pushed groups. TPC-DS q4 (126 ms), q11 (111) and
+  q74 (38), the shapes the push exists for, keep it.
+- **Range bounds derived from a string `IN` list were evaluated per row**
+  (`or_to_in_and_range`). JOB q21a spent 530 ms of CPU comparing 14.8M strings against two bounds
+  ahead of the membership test they are implied by: 56 -> 35 ms. Numeric lists keep their bounds.
+- **One query's measurements planned another's.** Two defects, each passing every gate. An
+  equality's literal was normalized out of the plan signature, so `country_code = '[ru]'` (0.6%
+  of `company_name`) and `= '[us]'` (39%) shared a learned selectivity. And a node whose size a
+  past run measured was estimated with no column statistics at all, so every join above it
+  divided by one side's distinct count and went cartesian. Inside a full JOB run, q23b was 1.5 s
+  (26 ms alone) and q29a 3.0 s (88 ms alone), both sent out of core on estimates of 1e12 rows.
+  After both fixes they run at 29 ms and ~90 ms after the whole preceding suite.
+- **The plan over an adaptive stage's result was re-derived on every run.** A stage result is an
+  ephemeral in-memory source, keyed by object identity, so the plan cache could store the next
+  stage's plan and never read it back. The result is now named by its derivation, the stage
+  subplan's content key over its inputs' keys (`plan.source_stats.derivation_key`), as
+  `subplan_reuse` already named its intermediates. Statistics writers still skip it. TPC-H sf10
+  q7 warm: 30 ms of re-planning per run removed, **107 -> 76 ms**. Every staged sf10 query now
+  hits the cache on every stage once warm.
+- **A runtime join filter's reduced counts taught the plan a false correction.** Every operator
+  between the filtered scan and its join counted only the rows the filter let through. Whether a
+  filter sits there depends on the plan, so the learned correction moved with each re-plan, and
+  q7 alternated between a 76 ms and a 95 ms plan every few runs, forever. The engine now lists
+  those operators (`ExecMetrics::runtime_filtered`) and Core records them with no estimate. In
+  the same process A/B over all 22 sf10 queries, median of the last ten of 14 runs: q7 92 -> 77,
+  q8 74 -> 64, q3 78 -> 72, q4 115 -> 106, q1 138 -> 130 ms, with the others within 4%.
+- **The staged-vs-one-shot route bandit learned from runs that were still planning.** A plan's
+  first few runs pay for derivation and learning. q10 at sf10 ran one-shot at 183, 149 and 143 ms
+  before settling at 105 ms against 125 staged, so the bandit chose staging in about half of the
+  processes it ran in. It now records only runs that replayed every plan from the cache
+  (`kyber.plan_cache.misses`). Four fresh processes after the q1-q9 prelude now all settle at
+  103-105 ms, where three of four stayed at 123-127 ms before.
+- **A cold route bandit started every staged-eligible query on staging.** The r6 sf10 board
+  recorded q5 at 271 ms in its first pass and 94 ms in its second, because the harness's warm-up
+  plus five timed runs all fell inside the staged start. Cold, the route is now one-shot, and
+  staging is explored once one-shot has a steady-state sample. On the workspace box, all 22 sf10
+  queries in one process, best of runs 2-6 (the harness's first-pass window), one-shot start
+  against staged start: q5 **170 -> 101 ms**, q10 126 -> 106, q11 16 -> 13, q1 135 -> 123. Two
+  shapes where staging wins get worse in that window, q7 77 -> 89 and q15 50 -> 67; exploration
+  finds staging for them later (q15 settles at 49 ms by run 12). The rest are within 5%.
+- **Exploring staging then cost four slow runs, and the r7 board caught them.** sf10 q5 read
+  92 ms in its first pass and 296 ms in its second, because the second pass fell entirely inside
+  the staged exploration: only settled runs were recorded, and staging's stage plans take four
+  runs to settle. A staged run is now recorded whatever it cost, which ends exploration after
+  two runs (q5: 319, 271, then 101-102 ms from the seventh run on). The price is that a shape
+  where converged staging wins is no longer found: q15 settles at 81 ms one-shot, against 49
+  staged, and q7 at 90 against 76.
+- **Harness.** An `--isolate` child re-ran the busy-box check against the load its own previous
+  case left, so 21 of 22 sf100 queries recorded KILLED; the check now runs once, in the parent.
+  In scan mode Polars ran its SQL frontend, which parses neither comma joins nor `EXISTS`, and
+  reported 20 of 22 PARTIAL at sf100; it now runs the same lazy pipelines it runs in memory.
+
+### Still losing, and why
+
+TPC-H sf100 loses 18 of 22 on the r4 board, mostly by 1.1-1.7x, and the gap is the scan: the
+same Parquet decode, filter and probe that q1 and q6 are made of. On the 48-core workspace box
+q1 (3.09 vs 3.14 s) and q6 (1.19 vs 1.27 s) are *wins*; on the 64-vCPU job node they lose by 1.04x
+and 1.38x, so Batcher gains less from the extra cores than DuckDB does. An `x86-64-v3` build was
+measured and moved nothing at sf100 (within 2%). q4 at sf100 (2.2x) is `orders SEMI lineitem`
+hashing 379M `lineitem` keys; it wants a build-left mark join. JOB still loses about half its
+queries, by 2-3x, on plans that are now stable but not yet as good as DuckDB's.
+
+## TPC-H sf100 streams its largest table into the engine: 481 s -> 60 s, 3.53x -> 1.75x DuckDB (2026-09-25)
+
+**Conditions.** Anyscale job, one `m6id.16xlarge` (64 vCPU, 240 GiB, local NVMe), TPC-H sf100
+from `s3://ray-benchmark-data/tpch/parquet/sf100/` copied to the NVMe first, `benchmarks/run.py
+--benchmark tpch --scale 100 --scan --isolate --engines batcher,duckdb`. The before and after runs
+are the same instance type on the same day, one wheel built from `2594078c` and one from the
+working tree carrying the changes below. DuckDB 1.5.5 in both. Every result was checked against
+DuckDB before it was timed; q11 returns zero rows on both engines at this scale.
+
+| q | before (ms) | after (ms) | DuckDB (ms) | after vs DuckDB |
+|---|---:|---:|---:|---:|
+| q1 | 67,421 | **2,371** | 2,038 | 1.16x |
+| q2 | 750 | 733 | 291 | 2.52x |
+| q3 | 6,634 | **2,295** | 1,228 | 1.87x |
+| q4 | 2,959 | 2,595 | 1,023 | 2.54x |
+| q5 | 2,976 | 2,562 | 1,226 | 2.09x |
+| q6 | 2,281 | 1,309 | 892 | 1.47x |
+| q7 | 5,003 | 1,948 | 1,263 | 1.54x |
+| q8 | 3,443 | 2,562 | 1,402 | 1.83x |
+| q9 | 8,696 | 3,477 | 3,221 | 1.08x |
+| q10 | 3,872 | 2,973 | 1,333 | 2.23x |
+| q12 | 4,029 | 2,253 | 1,236 | 1.82x |
+| q13 | 3,182 | 3,396 | 1,995 | 1.70x |
+| q14 | 2,737 | 1,424 | 1,113 | 1.28x |
+| q15 | 4,397 | 1,464 | 1,024 | 1.43x |
+| q16 | 562 | 544 | 365 | 1.49x |
+| q17 | 2,344 | 2,101 | 1,249 | 1.68x |
+| q18 | 6,088 | 3,912 | 2,291 | 1.71x |
+| q19 | 4,055 | 2,653 | 1,732 | 1.53x |
+| q20 | 3,322 | 2,134 | 1,202 | 1.78x |
+| q21 | 345,968 | **16,349** | 4,062 | 4.03x |
+| q22 | 554 | 539 | 343 | 1.57x |
+
+Geomean against DuckDB **3.53x -> 1.75x**, suite total **481 s -> 60 s** against DuckDB's 31 s.
+Still a loss on every query. q13 moved the wrong way by 7%, one run each, and nothing in the
+change touches its plan; it is recorded rather than explained.
+
+On a 48-core, 92 GiB workspace box the same sf100 suite ran in the same harness, and there the
+change is the difference between finishing and not: before it, q5 took 233 s and q8 193 s on the
+out-of-core path and q9 was OOM-killed at 71 GB; after it, all 21 comparable queries finish, q5 in
+5.9 s and q9 in 10.1 s, 1.3x-3.4x DuckDB on that box.
+
+### What was wrong
+
+The in-memory path reads every source to Arrow before the engine starts (`stages.resolve_sources`).
+At sf100 that is ~19-35 GB of `lineitem` for most queries, so the query either paid the whole read
+before any compute (the 64-core box) or was routed out of core (the 92 GiB box), where
+`execute_spilling_aggregate` ran the plan once per **8 MiB** morsel from Python: 2,448 engine calls
+for q1's 600M rows, each too small to fill the cores, the read serialized in front of every one.
+Profiled on the 92 GiB box, q1 spent 7.1 s in `partial_aggregate`, 5.0 s compacting morsels and
+2.3 s in the engine proper.
+
+### What changed
+
+- **`bc_interp::stream::chunked`** runs a plan with one source streamed in chunks. Join builds are
+  prepared once; each chunk is sharded across the workers and folded into the aggregate's partial
+  state, the same `partial -> combine -> finalize` the sharded executor and the cluster use; the
+  rest of the plan runs over the aggregate's result. It serves an aggregate over a probe spine of
+  inner, left, semi and anti joins wherever it sits in the plan, and a join spine with no aggregate
+  (collecting its rows). An inner join whose build side holds the driving scan is swapped onto the
+  probe side first. Right and full joins, and a source scanned twice, are declined.
+- Chunks come from **`ParquetSource.iter_chunks`**, a group of files at a time through the same
+  concurrent native reader and pruning as `read`, prefetched on a thread so decode overlaps compute
+  (`dist.spill.iter_spill_chunks`). The out-of-core aggregate reads through the same tap in 1/16 of
+  the envelope per chunk rather than 8 MiB: q1 on the 92 GiB box 15.7 s -> 5.9 s before streaming
+  replaced that path.
+- In chunked mode every build takes a flat per-morsel probe. The resident admission refuses one to
+  a large or semi/anti build because it can hand off to the materializing executor; the chunked
+  path cannot, and the radix join it fell back to rebuilt its partitions per morsel. q3's stage:
+  12.0 s -> 2.3 s, with `join_partition_into` at 46% of the profile before.
+- **The adaptive loop does not stage a plan that can stream its largest input whole**
+  (`gating._streams_whole`). It cut q9 at a join and materialized `lineitem JOIN orders`, 600M rows,
+  as its first stage.
+- What the chunked path holds (aggregate state, or collected rows) is bounded by half the envelope;
+  past it the engine raises `MemoryBudgetExceededError` and the query takes the out-of-core path.
+
+### A wrong answer found on the way
+
+q15 compares a grouped `sum` with a `max` of the same sums that the control plane evaluates first
+and folds in as a literal. With only one of the two streamed, they summed in different orders,
+disagreed in the last bit, and q15 returned **0 rows where the answer is 1**. The chunked path now
+finds the aggregate over the spine wherever it sits, so both evaluations take the same chunks,
+shards and combine; `test_diff_chunked_scan.py` carries the shape with inexact float factors.
+
+## Two memory blow-ups, a 37x decimal sort, and ROLLUP levels that share one aggregate (2026-09-23)
+
+**Read the conditions first.** 48 cores, 92 GiB, a ~60 GiB cgroup envelope, shared all day with
+two or three other agent sessions running builds and suites. The harness refused to time without
+`--allow-busy-box`, and whole-suite numbers moved by 20-40% between identical runs. So every
+speed claim below is an **interleaved A/B**: the same engine binary, fresh processes, arms
+alternated, repeated until the outliers were visibly outliers. Suite tables from this day are
+correctness evidence only. TPC-H here is DuckDB `dbgen` sf1 written to Parquet, which types money
+as `DECIMAL(15,2)`; the harness's own copy uses `Float64`.
+
+### Two queries that took the process down
+
+**TPC-H q17 planned a cartesian product.** A decorrelated scalar subquery projects its value
+through a `CASE` (the empty-group rule), and `push_filter_through_project` refused the *whole*
+`WHERE` because one conjunct read that computed column. The comma join's
+`p_partkey = l_partkey` stayed above it, out of `derive_join_keys`' reach, and `lineitem x part`
+ran as 1.2e12 rows: past 34 GiB at sf1, and the kernel OOM-killed it. The rule now decides per
+conjunct. q17: killed -> **11.7 ms** (DuckDB native 13.6, DuckDB on Arrow 92).
+
+**Back-to-back large joins grew RSS by one result per query.** The allocator keeps freed regions
+for 10 s so a repeat lands on warm pages (`bc-py/src/hardware.rs`), and on repeats of H2O join q1
+those regions were not reused: 6.5 -> 8.8 -> 10.4 -> 11.6 GiB with Python holding nothing, and the
+H2O join suite passed 40 GiB before it was stopped. `carbonite.memory.reclaim` now switches the
+allocator to immediate purging when the process is over two fifths of its envelope and back once
+it is under half of that. On the repeated-join loop, measured at a quarter: peak 19.4 GiB (and
+rising) -> 14.0-14.5 GiB, q1 unchanged, q5's best 233 -> 247-265 ms. The harness then completed at
+34 GiB for the whole five-engine process.
+
+### Decimal sort keys took the comparator path on one core
+
+No fast sort path knew `Decimal128`: `ORDER BY l_extendedprice` over 6M `DECIMAL(15,2)` values
+took **3,565 ms**, against DuckDB's 216 ms native and 266 ms on Arrow. A decimal key is now
+reinterpreted as its unscaled `i64`s when they fit (always, at precision <= 18), which every path
+already handles. **96 ms**; `bc-interp` tests pin serial, parallel and top-N against the
+comparator order on the decimal itself.
+
+### ROLLUP / CUBE / GROUPING SETS
+
+Each level re-ran the whole input, and common-subplan reuse declined to share it because the
+join's *estimate* (16.5M rows, 2.3M actual) was over its cap. `api.multi_group` now aggregates once
+at the finest grouping into partial states and derives every level from that, and the estimator
+caps a group count by the rows of the relation its keys come from (`kyber.stats.group_bound`), so
+the shared aggregate is estimated at the 18,000 `item` rows it can hold rather than 2M. Interleaved,
+two rounds each:
+
+| query | before | after |
+|---|---:|---:|
+| TPC-DS q22 | 542 / 560 ms | **188 / 195 ms** |
+| TPC-DS q67 | 910 / 919 ms | **200 / 204 ms** |
+
+All 22 TPC-H queries were alternated the same way against the estimator change, the one change
+here that could move unrelated plans; none moved outside the noise both arms showed (q21 read
+86.8/124.1, 85.8/86.0 and 214.5/95.0 across three rounds). All 99 TPC-DS queries match DuckDB
+on both arms (q67's recorded tie divergence aside).
+
+### Also on this day
+
+- A FULL join under an order-insensitive consumer (a `COUNT(*)`, or a grouped aggregate sorted on
+  every group key) runs the partitioned join instead of the order-preserving serial one:
+  `op-join-full-outer` **66 -> 45 ms** over three rounds (DuckDB ~27).
+- Distributed scans return rows in source order, which also fixed a recorded distributed sort
+  defect (`test_sql_catalog_distributed`'s strict xfail now passes); distributed global
+  `nth_value` has a decomposition; a resident inference pool is found again on the next run.
+
+## `tests/integration` on a real 3-node cluster: three distributed defects found, and one lossy default withdrawn (2026-09-24)
+
+**The recorded cluster run** (`CLAUDE.md`, `dist/` row) for `release/prod-readiness-v2`.
+Anyscale jobs on 3x `m5.4xlarge` (head + 2 workers, 48 CPUs, Ray 2.58.0), image
+`anyscale/ray:2.58.0-py311`, the engine built from the branch in release profile, every file of
+`tests/integration` run as its own `pytest` process against the attached cluster. Three runs:
+
+| run | commit | passed | failed | errors |
+|---|---|---:|---:|---:|
+| 1 | `8e8a387e` | 3,079 | 224 | 8 |
+| 2 | `0b12c892` | 3,267 | 22 | 15 |
+| 3 | `f03ec9bb` | 3,272 | 17 | 3 |
+
+Found, and fixed with a test that fails on the previous code:
+
+- **Batcher's own `ray.init` failed inside any Ray job that declared `pip` dependencies**
+  ("Failed to merge the Job's runtime env"): the self-shipped env always sets `pip`. 96 of run
+  1's failures. It now leaves the fields the job owns (`2839020e`).
+- **A shuffle row wider than 4 MiB failed the fetch** -- tonic's default decode limit; the
+  Flight encoder splits only between rows. Never seen single-node, where same-host buckets use
+  shared memory (`8a3f6247`).
+- **A peer reset mid-stream was classified fatal**, so worker-loss recovery never ran: the
+  status was `Unknown` "h2 protocol error: error reading a body from connection" over an
+  `io::ErrorKind::ConnectionReset`, and `h2::Error` exposes no `source()` (`f03ec9bb`).
+  `test_carbonite_recovery_e2e` went from 1 failure to 14 of 14.
+
+Reproduced, not fixed: **`shuffle_replication > 1` drops a lost worker's rows** (109,832 against
+146,582 in a replicated sum), the defect `tests/integration/test_shuffle_replication.py` already
+recorded. The `spot` profile, auto-selected on preemptible clusters, set it to 2; it no longer
+does (`0b12c892`), so replication is off unless a user sets it.
+
+What run 3's remaining 17 failures and 3 errors are, so none is read as a pass:
+
+- `test_shuffle_replication` (6): the replication defect above; those tests set it directly.
+- Placement-dependent positive controls (5, in `test_schema_and_csv_distributed`,
+  `test_stats_text_metrics_distributed`, `test_inspection_distributed`, `test_udf_edges_distributed`,
+  `test_map_granularity`): they infer "the work was split" from the unordered-`LIMIT`
+  divergence, which is allowed but not guaranteed, or from a concurrency shape this cluster did
+  not produce. A harness limitation, not a result.
+- Resource shapes this cluster lacks (4): `test_governance_enforcement` (2, unschedulable) and
+  `test_udf_edges_distributed`'s two device-request cases.
+- `test_ml_writers_ray_interop` (3 errors): a hand-rolled `ray.init(num_cpus=2)` the cluster
+  refuses; fixed after run 3 (`50496b4b`).
+- `test_graph_distributed`: OOM-killed on this instance size. `test_spill_bounded_memory`: its
+  spill directory sat on the NFS mount the runs used for `--basetemp`, and it timed out.
+- `test_inspection_distributed::test_scd_maintenance_is_identical_under_both_modes`: distributed
+  SCD type 2 kept only the initial load (3 rows) where single-node applied the update (5). The
+  table lived on that NFS mount, which fits a cross-node listing lag but is **not established**;
+  recorded as open.
+
+## The device tier on cuDF 26.08 / pandas 3: three defects found, and `gpu_shadow_verify` clean (2026-09-23)
+
+**The device tier's recorded hardware run** (`.claude/rules/device-tier.md`) for the three GPU
+changes on `release/prod-readiness-v2`. Anyscale jobs, image `anyscale/ray:2.58.0-py311-cu128`,
+cuDF 26.08.01 (which requires pandas >= 3; the jobs ran pandas 3.0.3), pyarrow 23.0.1, numpy
+2.2.6, the engine built from the branch in release profile and shipped in the job's working
+directory. Two steps: (A) `pytest` over `tests/unit/test_gpu_{plan,vocabulary_contract,
+schema_contract,result_types}.py` and `tests/differential/test_diff_gpu_{operator_matrix,
+join_mirror}.py`, whose backend parameter includes cuDF when a GPU is visible; then (B)
+`benchmarks/gpu_backend/cluster_suite.py` over TPC-H sf10 (the public `ray-benchmark-data`
+parquet, positional column names) with `BATCHER_DISTRIBUTED_GPU_SHADOW_VERIFY=true`,
+`BENCH_RAPIDS_DIR=` and `BENCH_RUNS=2`.
+
+**Result on the final commit (`8e8a387e`, 1x A10G, `g5.2xlarge`):**
+
+    reached a device 11 of 22; matched the CPU engine 11 of 11; schema-contract refusals 0
+    device-tier tests on cuDF: 364 passed, 0 failed (213 skipped: pandas-3 NaN declines)
+
+Earlier the same day, before the fixes below, a 4x A10G run (`g5.12xlarge`) reached a device
+on 9 of 22, matched the CPU on 9 of 9, and had the schema contract refuse q16 and q22.
+
+What the runs found, each fixed on the branch with a test that fails on the previous code:
+
+- **pandas 3 has `DataFrame.from_arrow`, and `DfBackend` took that to mean cuDF.** The host
+  backend then called cuDF's `to_arrow` on a pandas frame: 501 of the device-tier cases
+  failed with `'DataFrame' object has no attribute 'to_arrow'` before any cuDF code ran. The
+  host backend is not test-only: the router's rehearsal and `dist/gpu/aggregate.py`'s fold
+  build `DfBackend(pandas)`. Now decided by module name.
+- **pandas 3 reads a float `NaN` as missing.** On the operator matrix's pandas cases a NaN
+  group came back NULL and a distinct returned 8 rows for 9, against both the engine and
+  DuckDB; every cuDF case passed. The host backend now declines a NaN-bearing input under
+  pandas >= 3 (the CPU engine answers). The rehearsal runs on zero-row frames, so routing is
+  unaffected.
+- **cuDF 26.08 returns strings as `large_string`.** The unconditional schema contract refused
+  q16 (`p_brand`) and q22 (`cntrycode`) -- correct values, wrong offset width -- and both fell
+  back to the CPU. The contract now casts a column that differs from the declared type only
+  in offset width; any other difference is still refused.
+
+**Speed is reported, not claimed.** On one A10G the forced-GPU total was 1.01x the CPU engine
+(95.99 s against 95.02 s over 21 queries; 8 of 21 faster, best 8.62x), and `backend="auto"`
+was **0.82x** -- it routed 8 queries to the device and on balance they lost, which is a routing
+finding, not recorded as fixed. The 4-GPU run measured 1.14x forced and 1.19x `auto`. The
+runs differ in GPU count and commit, so neither number is a comparison with the other.
+
+Environment notes for whoever runs this next: a job must pass an explicit `requirements:`
+list, or Anyscale adds the workspace's editable `batcher` install, which fails on the node;
+the stock Ray image has the same `pyarrow`-then-`sqlite3` `libstdc++` clash as the dev box
+(10 collection errors in the broad `-k gpu` sweep); and two submissions for 4-GPU nodes
+(`g5.12xlarge`, `g6.12xlarge`) never got a cluster, while `g5.2xlarge` started at once.
+
 ## Two distributed shapes that had no path: a broadcast join's write, and an aggregate over a range join (2026-09-22)
 
 **A correctness record, not a timing one.** Both changes are in `dist/`, which

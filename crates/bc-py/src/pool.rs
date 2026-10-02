@@ -24,7 +24,8 @@ use pyo3::types::PyDict;
 ///
 /// Returns:
 ///     A dict of `limit_bytes`, `used_bytes`, `available_bytes`, `peak_used_bytes`,
-///     `denied`, `spill_requests`, `utilization`, `soft_limit_bytes` and `pressure`, or
+///     `denied`, `spill_requests`, `over_released_bytes`, `utilization`, `soft_limit_bytes`
+///     and `pressure`, or
 ///     `None` when no query has run under a memory budget in this process. `None` is
 ///     deliberately distinct from a dict of zeros, which would assert something about a pool
 ///     that has never existed.
@@ -49,6 +50,9 @@ pub(crate) fn engine_pool_stats(py: Python<'_>) -> PyResult<Option<Py<PyDict>>> 
     out.set_item("peak_used_bytes", stats.peak_used as u64)?;
     out.set_item("denied", stats.denied as u64)?;
     out.set_item("spill_requests", stats.spill_requests as u64)?;
+    // Non-zero only when a release outran its reservation — a bookkeeping defect the
+    // underflow clamp would otherwise hide, and one that leaves `used` optimistically low.
+    out.set_item("over_released_bytes", stats.over_released as u64)?;
     out.set_item("utilization", stats.utilization())?;
     out.set_item("soft_limit_bytes", stats.soft_limit as u64)?;
     // The level as a name rather than an ordinal: it is read by a person in a diagnostic and
@@ -150,5 +154,12 @@ impl MemoryPool {
     #[getter]
     fn spill_requests(&self) -> u64 {
         self.inner.spill_requests() as u64
+    }
+
+    /// Bytes released past what this pool held — `0` when every release matched a
+    /// reservation. The underflow clamp keeps `used` sane; this keeps the defect visible.
+    #[getter]
+    fn over_released(&self) -> u64 {
+        self.inner.over_released() as u64
     }
 }

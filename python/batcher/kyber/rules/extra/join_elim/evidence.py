@@ -20,18 +20,14 @@ from collections.abc import Callable
 from functools import reduce
 
 from batcher.kyber.pass_base import OptimizerContext
+from batcher.kyber.stats.columns import has_exact_range
 from batcher.plan.expr_ir import Col, Expr
-from batcher.plan.logical import Join, LogicalPlan, Scan, is_cartesian_key_pair
+from batcher.plan.logical import Join, LogicalPlan, MapBatches, Scan, is_cartesian_key_pair
 from batcher.plan.logical.transforms import constant_column_value
-from batcher.plan.stats import ColumnStat, Provenance
+from batcher.plan.stats import Provenance
 from batcher.plan.visitor import walk
 
 __all__: list[str] = []
-
-
-def _exact_range(stat: ColumnStat) -> bool:
-    """Whether `stat` carries an EXACT, fully-populated ``[min, max]`` range."""
-    return stat.provenance is Provenance.EXACT and stat.min is not None and stat.max is not None
 
 
 def _disjoint_keys(node: Join, ctx: OptimizerContext) -> bool:
@@ -49,7 +45,7 @@ def _disjoint_keys(node: Join, ctx: OptimizerContext) -> bool:
     right = ctx.estimator.estimate(node.right)
     for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
         a, b = left.column(lk), right.column(rk)
-        if not (_exact_range(a) and _exact_range(b)):
+        if not (has_exact_range(a) and has_exact_range(b)):
             continue
         # A NaN or zero float bound proves no disjointness: the engine's key equality is
         # *canonicalized* (`-0.0` folds into `0.0`, every NaN into one value) while this
@@ -105,7 +101,8 @@ def _relation_key(plan: LogicalPlan, ctx: OptimizerContext) -> tuple | None:
     (every `source_id` blanked) and the bound source objects are carried alongside, in walk
     order. Returns `None` — never a match — when a scan is unbound (a plan-shape-only
     optimize) or there is no scan: an identity we cannot resolve to data is not one we may
-    act on.
+    act on. Also `None` for a plan holding a `map_batches` node, which has no IR to compare:
+    a user function's output is not known to equal anything, and lowering it would raise.
     """
     # Memoized per run: the answer is a pure function of `(plan, ctx)`, plan nodes are
     # immutable and `ctx` is fixed, but the three self-join rules ask for the same two
@@ -117,6 +114,9 @@ def _relation_key(plan: LogicalPlan, ctx: OptimizerContext) -> tuple | None:
         return hit[1]
     identities: list[int] = []
     for node in walk(plan):
+        if isinstance(node, MapBatches):
+            memo[id(plan)] = (plan, None)
+            return None
         if isinstance(node, Scan):
             if node.source_id >= len(ctx.sources):
                 memo[id(plan)] = (plan, None)

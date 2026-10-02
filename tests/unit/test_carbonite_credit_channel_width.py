@@ -195,3 +195,27 @@ def test_the_manager_publishes_the_ceiling_it_clamps_to(small_node) -> None:
         for channels in (None, 3, 128):
             ceiling = rm.credit_window_ceiling(channels=channels)
             assert rm.grant_credits(1_000_000, channels=channels) == ceiling
+
+
+# --- striping: every credited stream is a channel -----------------------------
+
+
+def test_a_narrow_cluster_counts_the_gathers_streams_not_its_peers(small_node) -> None:
+    """A two-worker shuffle still opens `gather_streams` credited streams per reducer.
+
+    The gather holds its stream count fixed and splits it across the peers it has, striping
+    a bucket over several shards when a peer holds few, and every shard is seeded with the
+    full window. Dividing the transit share by the two *peers* therefore let one reducer
+    hold `gather_streams / 2` shares at once: 64 credits x 48 streams x 1 MiB = 3 GiB on a
+    16 GiB node whose share is 1.6 GiB.
+    """
+    streams = small_node.flow_control.gather_streams
+    window = credit_ceiling(small_node, channels=2)
+    assert _in_flight_bytes(window, streams) <= _TRANSIT_SHARE
+    # Positive control: the per-peer division would have exceeded the share, so the bound
+    # above is measuring the striping and not a coincidence of this node's size.
+    per_peer = min(
+        small_node.flow_control.default_credits * small_node.flow_control.credit_ceiling_factor,
+        min(small_node.flow_control.credit_byte_budget, _TRANSIT_SHARE // 2) // (1 << 20),
+    )
+    assert _in_flight_bytes(per_peer, streams) > _TRANSIT_SHARE

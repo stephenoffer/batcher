@@ -208,7 +208,8 @@ def accessor_function(tr, node) -> Expr | None:
         return None
     namespace, method, fn = entry
     kinds = parameter_kinds(fn, skip_first=True)
-    assert kinds is not None  # a method with unclassifiable parameters is not in the vocabulary
+    if kinds is None:  # a method with unclassifiable parameters is not in the vocabulary
+        return None
     required, total = arity(fn, skip_first=True)
     if kinds and kinds[-1] is STRINGS:
         total = max(total, len(args) - 1)  # the tail takes as many strings as are written

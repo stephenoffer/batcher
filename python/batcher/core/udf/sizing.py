@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import contextlib
 import math
-import os
 import time
 from collections.abc import Iterator
 
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
+from batcher.config.env import env_int
+from batcher.core.runtime import default_hub
 from batcher.metadata.hardware_scope import scoped
 from batcher.plan.logical import MapBatches
 from batcher.plan.types import retained_bytes
@@ -48,11 +49,11 @@ __all__ = [
 # Bounded look-ahead between pipelined map stages: a stage may run this many morsels ahead
 # of its consumer (so a CPU stage overlaps the GPU stage draining it) while keeping resident
 # memory to ~`depth` morsels per stage. Env-overridable.
-_STREAM_PREFETCH_DEPTH = max(0, int(os.environ.get("BATCHER_STREAM_PREFETCH_DEPTH", "2")))
+_STREAM_PREFETCH_DEPTH = env_int("BATCHER_STREAM_PREFETCH_DEPTH", 2, floor=0)
 # The deepest source-read look-ahead the learned readahead may request (a slow source hides
 # more of its latency behind compute); bounds resident memory to ~this many morsels.
-_STREAM_MAX_PREFETCH_DEPTH = max(
-    _STREAM_PREFETCH_DEPTH, int(os.environ.get("BATCHER_STREAM_MAX_PREFETCH_DEPTH", "8"))
+_STREAM_MAX_PREFETCH_DEPTH = env_int(
+    "BATCHER_STREAM_MAX_PREFETCH_DEPTH", 8, floor=_STREAM_PREFETCH_DEPTH
 )
 # Adaptive GPU-inference batch when a GPU stage has no explicit `batch_size` (the truly
 # zero-config `ds.map_batches(Model, num_gpus=1)` call). `_GPU_STREAM_BATCH_ROWS` is the row
@@ -61,18 +62,14 @@ _STREAM_MAX_PREFETCH_DEPTH = max(
 # row count SHRINKS on wide rows (a decoded frame, a float embedding tensor) that would
 # otherwise OOM the GPU at the row cap, and stays at the cap for narrow rows. Floored so the
 # batch always fills the SMs. An explicit `batch_size` always wins; env-overridable.
-_GPU_STREAM_BATCH_ROWS = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_ROWS", "256")))
-_GPU_STREAM_BATCH_BYTES = max(
-    1 << 20, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_BYTES", str(64 << 20)))
-)
-_GPU_STREAM_BATCH_MIN = max(1, int(os.environ.get("BATCHER_GPU_STREAM_BATCH_MIN", "8")))
+_GPU_STREAM_BATCH_ROWS = env_int("BATCHER_GPU_STREAM_BATCH_ROWS", 256, floor=1)
+_GPU_STREAM_BATCH_BYTES = env_int("BATCHER_GPU_STREAM_BATCH_BYTES", 64 << 20, floor=1 << 20)
+_GPU_STREAM_BATCH_MIN = env_int("BATCHER_GPU_STREAM_BATCH_MIN", 8, floor=1)
 # Per-batch input-byte budget for a CPU (decode/preprocess) stage with no explicit
 # `batch_size`: like the GPU budget, this SHRINKS the chunk below the morsel when a stage's
 # rows are huge so a transient per-thread output stays bounded, and keeps the full morsel for
 # narrow rows. Result-invariant -- the chunk only shards. Env-overridable.
-_CPU_STREAM_BATCH_BYTES = max(
-    1 << 20, int(os.environ.get("BATCHER_CPU_STREAM_BATCH_BYTES", str(128 << 20)))
-)
+_CPU_STREAM_BATCH_BYTES = env_int("BATCHER_CPU_STREAM_BATCH_BYTES", 128 << 20, floor=1 << 20)
 
 
 def gpu_batch_rows(batch: pa.RecordBatch, row_cap: int = _GPU_STREAM_BATCH_ROWS) -> int:
@@ -107,17 +104,6 @@ _GPU_BATCH_NS = "udf_gpu_batch"  # learned VRAM-safe GPU batch rows per model si
 _SCAN_TPUT_NS = "udf_scan_tput"  # learned source read throughput (rows/sec) per source identity
 
 
-def _stream_hub():
-    """The process-wide MetadataHub, or `None` if unreachable — learned reads are best-effort."""
-    try:
-        from batcher.core.runtime import default_hub
-
-        return default_hub()
-    except Exception as exc:  # pragma: no cover - learning must never break a query
-        note_suppressed("core", "resolve metadata hub", exc)
-        return None
-
-
 def stage_sig(op: MapBatches) -> str | None:
     """A stable per-stage signature for `op` (its UDF's ``module.qualname``), or `None`."""
     fn = op.fn
@@ -143,9 +129,7 @@ def fold_ema(namespace: str, key: str | None, value: float) -> None:
     # spells the argument out; `dist.adaptive_sizing._ema` carries the same guard.
     if key is None or not math.isfinite(value) or value <= 0.0:
         return
-    hub = _stream_hub()
-    if hub is None:
-        return
+    hub = default_hub()
     try:
         from batcher.config import active_config
 
@@ -163,11 +147,8 @@ def _read_ema(namespace: str, key: str | None) -> float | None:
     """The learned EMA for a signature (best-effort), or `None` when cold/unreachable."""
     if key is None:
         return None
-    hub = _stream_hub()
-    if hub is None:
-        return None
     try:
-        s = hub.get_keyed_param(scoped(namespace), key) or {}
+        s = default_hub().get_keyed_param(scoped(namespace), key) or {}
     except Exception as exc:  # pragma: no cover
         note_suppressed("core", "read learned ema", exc)
         return None

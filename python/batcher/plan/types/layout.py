@@ -32,20 +32,10 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-from batcher.plan.types.lattice import widen
+# `_is` guards the predicates newer than the oldest supported `pyarrow`; one copy, in the lattice.
+from batcher.plan.types.lattice import _is, widen
 
 __all__ = ["importable_array", "importable_batch", "importable_type"]
-
-
-def _is(t: pa.DataType, *predicates: str) -> bool:
-    """Whether `t` matches any of `predicates`, on a `pyarrow` that defines them.
-
-    The view predicates arrived in `pyarrow` well after the types they test for, so calling
-    one unguarded turns an older runtime into an `AttributeError` at import of this module.
-    """
-    return any(
-        check(t) for name in predicates if (check := getattr(pa.types, name, None)) is not None
-    )
 
 
 def _has_unimportable(dt: pa.DataType) -> bool:

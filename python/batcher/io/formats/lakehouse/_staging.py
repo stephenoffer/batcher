@@ -31,14 +31,16 @@ __all__ = [
     "staging_root",
 ]
 
-# Subdirectory (under the table root) that holds shard Parquet files. The name says
-# "staging" but the files are **permanent**: `IcebergSink.commit` calls `add_files`,
-# which registers each staged path as the table's own data file rather than copying it
-# (`iceberg/sink.py::commit`). So this directory holds live table data after a successful
-# commit, and deleting its contents destroys the table. A failed commit leaves the same
-# files behind unregistered, where the deterministic `part-{shard}-{chunk}.parquet` name
-# lets a retry overwrite them in place.
-_STAGING = "_batcher_staging"
+# Subdirectory (under the table root) that holds shard Parquet files. The files are
+# **permanent**: `IcebergSink.commit` calls `add_files`, which registers each path as the
+# table's own data file rather than copying it (`iceberg/sink.py::commit`). The directory
+# used to be called ``_batcher_staging``, which invites exactly the cleanup that destroys
+# a table: sweeping a "staging" prefix deleted files every live snapshot still referenced.
+# It is now ``data``, Iceberg's own name for a table's data directory. Files written under
+# the old name stay where they are and stay valid, since a snapshot names each file by its
+# full path. A failed commit leaves its files behind unregistered, where the deterministic
+# `part-{token}-{shard}-{chunk}.parquet` name lets a retry of the same write overwrite them.
+_STAGING = "data"
 
 
 def staging_root(table_path: str) -> str:

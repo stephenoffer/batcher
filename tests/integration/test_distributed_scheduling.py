@@ -16,6 +16,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _ray_cluster import op_stats_all_classes
 from batcher import col
 
 pytest.importorskip("batcher._native", reason="native engine not built")
@@ -62,21 +63,19 @@ def test_distributed_workers_feed_the_metadata_hub():
     # A distributed aggregate's mappers run scan/filter sub-plans on worker
     # processes and ship their measured metrics back; the driver records them so the
     # cost model calibrates from distributed runs, not only single-node ones.
-    from batcher import core
-
-    hub = core.default_hub()
-    before = len(hub.op_stats_by_kind().get("filter", []))
+    # Every machine class: see `_ray_cluster.op_stats_all_classes`.
+    before = len(op_stats_all_classes().get("filter", []))
 
     t = pa.table({"k": [i % 7 for i in range(2000)], "v": [float(i) for i in range(2000)]})
     ds = bt.from_arrow(t).filter(col("v") > 10).group_by("k").agg(s=col("v").sum())
     ds.collect(distributed=True, num_workers=4)
 
-    by_kind = hub.op_stats_by_kind()
-    after = len(by_kind.get("filter", []))
+    rows = op_stats_all_classes()
+    after = len(rows.get("filter", []))
     assert after > before, "distributed mappers must record operator feedback"
     # The recorded feedback carries real measurements (no more m_peak_bytes=0 stub).
-    assert any(r["m_peak_bytes"] > 0 for r in by_kind["scan"])
-    assert any(r["kind"] == "filter" for r in by_kind["filter"])
+    assert any(r["m_peak_bytes"] > 0 for r in rows["scan"])
+    assert any(r["kind"] == "filter" for r in rows["filter"])
 
 
 def test_distributed_equals_single_node_with_scheduling():

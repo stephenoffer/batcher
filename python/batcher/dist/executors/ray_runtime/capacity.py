@@ -18,8 +18,8 @@ be placed — and the two must keep using the same `floor(node_cores / num_cpus)
 `describe_pending_demand` is that same question asked about a request Ray has *already*
 refused to place, and phrased for a person: a task waiting on a busy cluster finishes
 eventually, a task asking for more CPUs than any node has never runs, and `ray.wait` cannot
-tell the two apart. Neither could the engine, which is why every stalled barrier used to
-report the same "go run `ray status`" whichever it was.
+tell the two apart, so without this every stalled barrier would report the same "go run
+`ray status`" whichever it was.
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def _live_free_cpus_by_node() -> dict[str, float] | None:
         }
     except Exception as exc:
         # A private Ray API, so a version that moves it must degrade rather than fail: the
-        # caller falls back to nameplate sizing, which is what it did before this existed.
+        # caller falls back to nameplate sizing.
         note_suppressed("dist", "read per-node free CPU", exc)
         free = None
     scaling._free_cpus_cache = (now + scaling._LIVE_TTL_S, free)
@@ -121,9 +121,9 @@ def placeable_workers(
     small to host one worker contributes zero instead of a fraction of one.
 
     The count must be taken over the nodes the fleet may actually land on, and against
-    every resource its bundle reserves. Both were previously ignored, and each produces the
-    same failure — a fan-out above what any arrangement of nodes can host, which leaves the
-    gang-scheduling placement group permanently unsatisfiable and hangs the job:
+    every resource its bundle reserves. Ignoring either produces the same failure — a
+    fan-out above what any arrangement of nodes can host, which leaves the gang-scheduling
+    placement group permanently unsatisfiable and hangs the job:
 
     * `cpu_only` mirrors the node-class restriction (`scaling.node_class_selector`). When a
       relational fleet is held off accelerator nodes, those nodes' cores cannot host it, so
@@ -299,7 +299,7 @@ def describe_pending_demand(demand: Demand) -> str | None:
 
     try:
         nodes = node_class_census()
-    except Exception as exc:  # pragma: no cover - a diagnosis never fails its caller
+    except Exception as exc:  # a diagnosis never fails its caller
         note_suppressed("dist", "read node classes for the demand diagnosis", exc)
         return None
     if not nodes:
@@ -370,7 +370,7 @@ def preferred_fleet_zone(workers: int, demand: Demand) -> dict[str, str]:
 
     try:
         nodes = node_class_census()
-    except Exception as exc:  # pragma: no cover - a cost hint never fails a placement
+    except Exception as exc:  # a cost hint never fails a placement
         note_suppressed("dist", "read node classes for zone-aware placement", exc)
         return {}
     zoned = [n for n in nodes if n.get("zone")]
@@ -543,8 +543,8 @@ def slot_actor_options(base: dict, env, index: int, in_group: bool) -> dict:
     27-node fleet: when the group timed out, every one of the sixteen large actors stayed
     `PENDING_CREATION` and the fleet came up at half width after a two-minute wait, while the
     uniform fleet the same fallback produces — small, interchangeable actors — placed
-    immediately. Degrading to the uniform grant is what the fleet had before this existed, and
-    it is the only figure that is still true once the pinning is gone.
+    immediately. The uniform grant is the only figure that is still true once the pinning
+    is gone.
 
     Args:
         base: The fleet-uniform actor options.
@@ -587,7 +587,7 @@ def fleet_worker_cpus(workers: int) -> list[float] | None:
 
     try:
         env = current_envelope()
-    except Exception as exc:  # pragma: no cover - a sizing hint never fails an assignment
+    except Exception as exc:  # a sizing hint never fails an assignment
         note_suppressed("dist", "read the fleet's per-worker grants", exc)
         return None
     if env is None or len(env.worker_cpus) != workers:

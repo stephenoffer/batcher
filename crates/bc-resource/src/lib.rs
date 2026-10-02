@@ -26,8 +26,10 @@ use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
 
 /// Default soft-pressure line as basis points of the limit (8000 = 80%). Above it the pool
-/// reports [`Pressure::Elevated`]. Nothing overrides it today — see
-/// [`MemoryPool::set_soft_fraction`] for what that would take and why it has not been done.
+/// reports [`Pressure::Elevated`]. This is the line of a pool nobody configured (a
+/// `cargo test`, an ad-hoc embedding); `bc-py` moves the process pool's line to the control
+/// plane's `memory.soft_limit` on every query through [`MemoryPool::set_soft_fraction`], so
+/// the two ladders put the line at the same fraction of this pool.
 const DEFAULT_SOFT_BPS: usize = 8000;
 
 /// Hard cap on cooperative-spill rounds inside one reservation attempt.
@@ -64,8 +66,9 @@ const MAX_SPILL_ROUNDS: usize = 32;
 pub enum Pressure {
     /// Below the soft line — the fast path, no throttling.
     Nominal,
-    /// At/above the soft line but below the hard cap — spill proactively / narrow
-    /// the in-flight window before the cap forces a stall.
+    /// At/above the soft line but below the hard cap. Reported to the control plane
+    /// (where it matches Carbonite's `SPILL` reading of this pool); nothing in the data
+    /// plane spills early on it yet — see the type's own doc.
     Elevated,
     /// At/above the hard cap — no headroom; a new reservation can only succeed after
     /// something spills.
@@ -152,6 +155,14 @@ pub struct PoolStats {
     pub denied: usize,
     /// Times a registered consumer was asked to spill.
     pub spill_requests: usize,
+    /// Bytes released that were never held: the excess of every `release_bytes` over the
+    /// pool's `used`, plus every `MemoryReservation::shrink` past the reservation's size.
+    ///
+    /// Both are clamped so the counter cannot underflow, and a clamp is exactly what hides a
+    /// bookkeeping defect: a release charged to the wrong owner leaves `used` *too low*, so the
+    /// pool admits more than the envelope holds while every reading looks healthy. Zero on
+    /// a correct run; anything else names a mismatched reserve/release pair somewhere.
+    pub over_released: usize,
     /// The soft-pressure line in bytes (see [`Pressure`]).
     ///
     /// Carried in the snapshot rather than left to the reader to recompute, because the
@@ -193,8 +204,9 @@ impl PoolStats {
     }
 
     /// `peak_used / limit` in `[0, 1]` — the pressure the workload actually reached.
+    #[cfg(test)]
     #[must_use]
-    pub fn peak_utilization(&self) -> f64 {
+    pub(crate) fn peak_utilization(&self) -> f64 {
         if self.limit == 0 {
             return 1.0;
         }
@@ -227,6 +239,8 @@ pub struct MemoryPool {
     /// Times the cooperative path had to ask a consumer to spill. Distinguishes "the
     /// budget was tight" from "the budget was tight and operators paid for it".
     spill_requests: AtomicUsize,
+    /// Bytes released past what was held (see [`PoolStats::over_released`]).
+    over_released: AtomicUsize,
     /// Registered [`Spillable`] consumers (held by `Weak` so a finished operator's
     /// entry is harmless dead weight, swept lazily on the next slow-path entry). The
     /// `Mutex` is taken only on the cooperative slow path / registration — never per
@@ -256,6 +270,7 @@ impl MemoryPool {
             peak: AtomicUsize::new(0),
             denied: AtomicUsize::new(0),
             spill_requests: AtomicUsize::new(0),
+            over_released: AtomicUsize::new(0),
             consumers: Mutex::new(Vec::new()),
         })
     }
@@ -275,6 +290,11 @@ impl MemoryPool {
         self.spill_requests.load(Ordering::Acquire)
     }
 
+    /// Bytes released that were never held — `0` on a run whose reservations all balance.
+    pub fn over_released(&self) -> usize {
+        self.over_released.load(Ordering::Acquire)
+    }
+
     /// A snapshot of everything this pool measured. Read together, the four figures say
     /// *why* a query spilled: a high `peak` with no `denied` means it ran close and made
     /// it, and `denied` with `spill_requests` means operators had to give memory back.
@@ -285,6 +305,7 @@ impl MemoryPool {
             peak_used: self.peak_used(),
             denied: self.denied(),
             spill_requests: self.spill_requests(),
+            over_released: self.over_released(),
             soft_limit: self.soft_limit(),
         }
     }
@@ -361,17 +382,32 @@ impl MemoryPool {
 
     /// Release `bytes` back to the pool. Clamped to the current `used` so a
     /// double-release can never underflow the counter.
+    ///
+    /// The clamp keeps the counter sane but would also keep a defect silent, so whatever it
+    /// discards is added to [`PoolStats::over_released`] rather than dropped.
     pub fn release_bytes(&self, bytes: usize) {
         let mut cur = self.used.load(Ordering::Acquire);
         loop {
-            let new = cur - cur.min(bytes);
-            match self
-                .used
-                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return,
+            let freed = cur.min(bytes);
+            match self.used.compare_exchange_weak(
+                cur,
+                cur - freed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.note_over_release(bytes - freed);
+                    return;
+                }
                 Err(actual) => cur = actual,
             }
+        }
+    }
+
+    /// Record `excess` bytes of a release that had nothing to release.
+    fn note_over_release(&self, excess: usize) {
+        if excess > 0 {
+            self.over_released.fetch_add(excess, Ordering::Relaxed);
         }
     }
 
@@ -457,15 +493,19 @@ impl MemoryPool {
         guard.iter().filter_map(Weak::upgrade).collect()
     }
 
-    /// Set the soft-pressure line as a fraction of the limit (clamped to `[0, 1]`).
+    /// Set the soft-pressure line as a fraction of the limit (clamped to `[0, 1]`; a
+    /// non-finite fraction is ignored).
     ///
-    /// **Nothing calls this in production**, so the line sits at [`DEFAULT_SOFT_BPS`]. The
-    /// control plane's own soft line is `memory.soft_limit` of the *cap* while the pool's
-    /// limit is `hard_limit` of it, so the two are different absolute figures — and saying
-    /// they were the same, as this used to, hid that. Carrying the fraction across the
-    /// engine-config boundary is what would make them agree; it is a two-sided change and
-    /// belongs with the work that gives the level a consumer.
+    /// `bc-py` calls this on every query with the engine config's `memory_soft_fraction`,
+    /// which the control plane derives from `memory.soft_limit`. Carbonite classifies this
+    /// pool's `used / limit` against that same fraction, so the pool's
+    /// [`Pressure::Elevated`] and the control plane's `SPILL` reading of this pool begin at
+    /// the same byte. Before it was wired the line sat at [`DEFAULT_SOFT_BPS`] while the
+    /// control plane drew its own at 85%, and the two disagreed about the same counter.
     pub fn set_soft_fraction(&self, fraction: f64) {
+        if !fraction.is_finite() {
+            return;
+        }
         let bps = (fraction.clamp(0.0, 1.0) * 10_000.0).round() as usize;
         self.soft_bps.store(bps, Ordering::Release);
     }
@@ -530,10 +570,12 @@ impl MemoryReservation {
     }
 
     /// Shrink this reservation by `bytes` (clamped to its current size),
-    /// returning that budget to the pool.
+    /// returning that budget to the pool. A shrink past the reservation's size is counted
+    /// in [`PoolStats::over_released`]: the clamp is safe, the caller's arithmetic is not.
     pub fn shrink(&mut self, bytes: usize) {
         let freed = bytes.min(self.size);
         self.pool.release_bytes(freed);
+        self.pool.note_over_release(bytes - freed);
         self.size -= freed;
     }
 
@@ -618,6 +660,63 @@ mod tests {
         pool.release_bytes(100);
         pool.release_bytes(100); // extra release is clamped, not an underflow
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn an_over_release_is_counted_rather_than_silently_clamped() {
+        let pool = MemoryPool::new(1000);
+        pool.try_reserve_bytes(100).unwrap();
+        pool.release_bytes(100);
+        assert_eq!(
+            pool.stats().over_released,
+            0,
+            "a balanced pair over-releases nothing"
+        );
+        pool.release_bytes(70); // nothing is held: all 70 bytes are excess
+        pool.try_reserve_bytes(50).unwrap();
+        pool.release_bytes(80); // 50 held, 30 excess
+        assert_eq!(pool.used(), 0);
+        assert_eq!(pool.over_released(), 100);
+        assert_eq!(pool.stats().over_released, 100);
+    }
+
+    #[test]
+    fn a_reservation_shrunk_past_its_size_is_counted_and_the_pool_stays_whole() {
+        let pool = MemoryPool::new(1000);
+        let other = pool.try_reserve(300).unwrap();
+        let mut r = pool.try_reserve(200).unwrap();
+        r.shrink(250); // 200 held by this reservation, 50 excess
+        assert_eq!(r.size(), 0);
+        // The excess never reaches the pool's counter, so the neighbour keeps its 300.
+        assert_eq!(pool.used(), 300);
+        assert_eq!(pool.over_released(), 50);
+        drop(other);
+        drop(r);
+        assert_eq!(pool.used(), 0);
+        assert_eq!(
+            pool.over_released(),
+            50,
+            "RAII drops are balanced and add nothing"
+        );
+    }
+
+    #[test]
+    fn set_soft_fraction_moves_the_elevated_line_and_ignores_nan() {
+        let pool = MemoryPool::new(1000);
+        pool.set_soft_fraction(0.85);
+        assert_eq!(pool.soft_limit(), 850);
+        pool.try_reserve_bytes(849).unwrap();
+        assert_eq!(pool.pressure(), Pressure::Nominal);
+        pool.try_reserve_bytes(1).unwrap();
+        assert_eq!(pool.pressure(), Pressure::Elevated);
+        pool.set_soft_fraction(f64::NAN);
+        assert_eq!(
+            pool.soft_limit(),
+            850,
+            "a non-finite fraction leaves the line alone"
+        );
+        pool.set_soft_fraction(7.0);
+        assert_eq!(pool.soft_limit(), 1000, "clamped to the limit");
     }
 
     #[test]

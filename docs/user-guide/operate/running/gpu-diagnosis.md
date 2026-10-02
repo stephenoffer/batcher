@@ -185,7 +185,7 @@ print(isinstance(kvikio_status().direct, bool))
 ```
 
 `direct` is the only state in which a device-direct read is worth preferring. When it is false,
-`reason` names why, which is what an operator can act on.
+`reason` names why, which is what an operator can act on. The device read's GPUDirect Storage eligibility check consults the same status, so on a compat-mode host every local file is reported ineligible with the reason `compat` rather than counted as a direct read.
 
 ## Decode on the device to shrink the transfer
 
@@ -247,7 +247,10 @@ does not silently stop evaluating the day a container loses its driver mount.
   Without it the sampler collects nothing, the report says so, and every verdict is `unknown`.
 - Real occupancy and tensor-core activity come from DCGM, which ships as a separate daemon and
   separate Python bindings that are not on PyPI. Without it, `occupancy_limited` is never
-  reported and a badly shaped kernel reads as `compute_bound`.
+  reported and a badly shaped kernel reads as `compute_bound`. Every verdict lists the signals
+  it was reached without, such as `occupancy` or `shared`, on an `unmeasured:` line of the
+  report and in the snapshot's `unmeasured` field, so a verdict without them isn't mistaken
+  for a complete one.
 - Per-process attribution needs the driver to see the process, which it cannot across a PID
   namespace boundary. Inside most containers, "who else is on this device" is unanswerable, and
   Batcher reports that rather than guessing.

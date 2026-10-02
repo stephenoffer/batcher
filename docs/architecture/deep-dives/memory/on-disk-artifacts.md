@@ -158,7 +158,12 @@ copy.
 Two cases survive a crash by design. The streaming checkpoint is durable on purpose, and
 `prune_state` bounds it by deleting snapshots older than the last commit. A spill directory
 orphaned by a killed process is swept by name on the next run, which is what the pid in
-`bc-spill-{pid}-{seq}` is for.
+`bc-spill-{pid}-{seq}` is for. The control plane's scratch directories follow the same rule. The
+work directory of a distributed out-of-core breaker and the result cache's disk tier are
+created by `carbonite/spill/scratch.py::scratch_dir` as `{prefix}{pid}-{suffix}`, and the first
+allocation under a root in each process removes the directories with that prefix whose pid is
+no longer a live process. A directory named any other way, or one belonging to a live process,
+is never touched.
 
 ## See also
 

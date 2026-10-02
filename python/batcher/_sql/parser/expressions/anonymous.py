@@ -469,9 +469,11 @@ def anonymous_scalar(tr, node):
 
     if len(args) == 3:
         if name in _SLICE_NAMES:
+            from batcher._sql.parser.expressions.collections import sql_list_slice
+
             begin = _const_int_arg(args[1], f"{name}(): begin")
             end = _const_int_arg(args[2], f"{name}(): end")
-            return tr._scalar(args[0]).list.slice(begin - 1, max(end - begin + 1, 0))
+            return sql_list_slice(tr._scalar(args[0]), begin, end)
         builder = _TERNARY_FN.get(name)
         if builder is not None:
             return builder(*(tr._scalar(a) for a in args))

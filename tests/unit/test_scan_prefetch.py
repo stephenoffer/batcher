@@ -123,7 +123,7 @@ def test_native_windows_are_read_in_file_order(monkeypatch, per_file):
     splits = _row_group_splits(6, per_file)
     got = [b.column("i")[0].as_py() for b in pio._native_scan_batches(splits, None, None)]
 
-    monkeypatch.setattr(pio, "_native_read_depth", lambda _units: 1)  # force serial
+    monkeypatch.setattr(pio, "_native_read_depth", lambda *_: 1)  # force serial
     serial = [b.column("i")[0].as_py() for b in pio._native_scan_batches(splits, None, None)]
     assert got == serial
     assert got == [f * 100 + g for f in range(6) for g in range(per_file)]

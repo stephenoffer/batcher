@@ -109,7 +109,7 @@ fn collect_parts<'a>(
     }
 }
 
-fn from_polygons(mut ps: Vec<Polygon>) -> Geometry {
+pub(crate) fn from_polygons(mut ps: Vec<Polygon>) -> Geometry {
     ps.retain(|p| !p.exterior.is_empty());
     match ps.len() {
         0 => Geometry::Polygon(Polygon::default()),

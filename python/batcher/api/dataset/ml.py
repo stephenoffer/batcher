@@ -2034,7 +2034,7 @@ class DatasetML:
                 local_shuffle_buffer_size=window,
             )
 
-        class _StreamDataset(IterableDataset):  # type: ignore[misc]
+        class _StreamDataset(IterableDataset):
             # Re-iterable (one fresh engine stream per epoch) and worker-strided, so
             # DataLoader(num_workers=k) partitions the batches instead of replicating the
             # whole stream into every worker — the classic IterableDataset duplication bug.

@@ -20,6 +20,7 @@ from batcher.api.terminal.stream.watermark._state import (
     _stream_tracker,
 )
 from batcher.io.source import Source
+from batcher.plan.streaming.driver_stats import report_state
 
 __all__ = ["stream_watermark_dedup"]
 
@@ -113,6 +114,7 @@ def stream_watermark_dedup(
             seen = seen.filter(keep)
         seen = _compact(seen)
         _check_stream_state(seen, "watermark-dedup")
+        report_state("dedup", seen, watermark=wm)
         if new.num_rows:
             rebatch = batch_size is not None
             yield from (new.to_batches(max_chunksize=batch_size) if rebatch else new.to_batches())

@@ -33,6 +33,7 @@ use pyo3::prelude::*;
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod bloom;
+mod chunked;
 mod errors;
 mod flight;
 mod hardware;
@@ -235,7 +236,12 @@ fn prepare_exec(
     // pool (per-query pools would let N concurrent queries each hold `budget` and OOM).
     // Zero budget ⇒ no pool ⇒ the fast path pays nothing.
     if cfg.memory_budget_bytes > 0 {
-        opts.pool = Some(shared_memory_pool(cfg.memory_budget_bytes));
+        let pool = shared_memory_pool(cfg.memory_budget_bytes);
+        // The control plane classifies this pool's `used / limit` against `memory.soft_limit`;
+        // drawing the pool's own soft line at the same fraction keeps the `pressure` it reports
+        // (`engine_pool_stats`) from disagreeing with Carbonite about the same counter.
+        pool.set_soft_fraction(cfg.memory_soft_fraction);
+        opts.pool = Some(pool);
     }
     // Look the token up rather than creating one: the control plane registered the id before
     // it started optimizing, so a cancel that arrived during planning is already recorded on
@@ -747,6 +753,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parquet_file_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_aggregated, m)?)?;
+    chunked::register(m)?;
     m.add_function(wrap_pyfunction!(combine, m)?)?;
     m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
     // The shuffle surface registers itself, because it is the one family that grows a pair of

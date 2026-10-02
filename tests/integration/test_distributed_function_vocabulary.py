@@ -34,7 +34,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import AggExpr
 from batcher.plan.ir_tags import AGG_FNS
@@ -65,11 +65,7 @@ _NO_GLOBAL_DECOMPOSITION = {
 }
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(4)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(4)
 
 
 @pytest.fixture(scope="module")

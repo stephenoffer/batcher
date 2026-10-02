@@ -28,6 +28,7 @@ from batcher._internal.errors import BackendError
 from batcher._internal.logging import note_suppressed
 from batcher._internal.paths import package_dir
 from batcher.config import active_config
+from batcher.dist.executors.ray_runtime.scheduling import job_owned_runtime_env_fields
 from batcher.io.source import Source, read_source
 from batcher.plan.logical import LogicalPlan
 
@@ -199,6 +200,7 @@ _TASK_FUNCS: dict[str, tuple[str, ...]] = {
     # registered under the module that owns them rather than under either operator.
     "batcher.dist.executors.keyed_shuffle": ("_map_task", "_reduce_task"),
     "batcher.dist.executors.write": ("_write_shard", "_write_plan_shard"),
+    "batcher.dist.executors.aligned.run": ("_aligned_units_task",),
     # The keyless ASOF's range task lives beside the dispatch that routes to it (the
     # `executors` subpackage is at its file-count ceiling), so it registers under
     # `dist.executor` rather than under an operator module.
@@ -370,13 +372,11 @@ def _self_ship_runtime_env() -> dict | None:
     `distributed.trust_cluster_image` is set — a production image that bakes a matching
     batcher into every node and wants to skip the upload.
     """
-    if active_config().distributed.trust_cluster_image:
-        return {"pip": None, "excludes": list(_BUILD_ARTIFACT_EXCLUDES)}
-    return {
-        "py_modules": [package_dir()],
-        "pip": None,
-        "excludes": list(_BUILD_ARTIFACT_EXCLUDES),
-    }
+    env: dict = {"pip": None, "excludes": list(_BUILD_ARTIFACT_EXCLUDES)}
+    if not active_config().distributed.trust_cluster_image:
+        env = {"py_modules": [package_dir()], **env}
+    owned = job_owned_runtime_env_fields()
+    return {field: value for field, value in env.items() if field not in owned}
 
 
 @contextlib.contextmanager
@@ -421,10 +421,10 @@ def _platform_env_hook_disabled():
 # answer is fixed **for that Ray session** — a later `_ensure_ray` must not flip it just
 # because Ray now reports initialized.
 #
-# It was previously fixed for the *process*, which is wrong across a session change. If the
-# cluster restarts, or a driver calls `ray.shutdown()` and reconnects, the next `_ensure_ray`
-# sees Ray initialized and keeps the previous session's answer — so a foreign re-init is
-# treated as "the job already ships batcher" and the workers never receive the package.
+# Fixing it for the *process* would be wrong across a session change. If the cluster
+# restarts, or a driver calls `ray.shutdown()` and reconnects, the next `_ensure_ray` would
+# see Ray initialized and keep the previous session's answer — a foreign re-init read as
+# "the job already ships batcher", and workers that never receive the package.
 # Storing the session the decision belongs to makes the re-decision automatic; `None` means
 # no decision has been made yet.
 _ship_session: str | None = None
@@ -458,10 +458,10 @@ def _import_ray():
 
 
 def _ensure_ray(workers: int) -> None:
-    ray = _import_ray()
+    from .readiness import bring_up_outliving_caller
 
-    with _RAY_INIT_LOCK:
-        _ensure_ray_locked(ray, workers)
+    ray = _import_ray()
+    bring_up_outliving_caller(ray, _RAY_INIT_LOCK, lambda: _ensure_ray_locked(ray, workers))
 
 
 def _ensure_ray_locked(ray, workers: int) -> None:
@@ -559,25 +559,13 @@ def _report_attachment(ray) -> None:
             # where Batcher performed the `ray.init` itself, so it is the honest witness —
             # and it is also the fact that decides whether workers get the driver's package.
             started_by="batcher" if job_ships_batcher() else "another process",
+            # What losing a node costs: an auto-selected profile can miss a preemptible site,
+            # and `shuffle_replication == 1` recomputes every lost node's buckets from source.
+            resilience=active_config().distributed.resilience,
+            shuffle_replication=int(active_config().distributed.shuffle_replication),
         )
-    except Exception as exc:  # pragma: no cover - a report must never fail a query
+    except Exception as exc:  # a report must never fail a query
         note_suppressed("dist", "report the Ray attachment", exc)
-
-
-def resolve_transport(transport: str, workers: int) -> str:
-    """Resolve `transport == "auto"` to a concrete shuffle transport.
-
-    Flight (Carbonite) on a genuine multi-node cluster — the disk shuffle writes to
-    a driver-local `work_dir` that worker nodes can't reach, so disk is correct only
-    on a single node or a configured shared filesystem. Explicit `"flight"`/`"disk"`
-    pass through unchanged.
-    """
-    if transport != "auto":
-        return transport
-    if active_config().distributed.shared_filesystem:
-        return "disk"
-    _ensure_ray(workers)
-    return "flight" if cluster_topology()["nodes"] > 1 else "disk"
 
 
 def restore_unwrapped_tasks() -> None:
@@ -682,6 +670,9 @@ def _single_node(plan: LogicalPlan, sources: list[Source]) -> pa.Table:
     # `strategy="broadcast"` on the single-node path, for the identical query. The UDF
     # branch directly above already passes `sources`; this branch did not.
     physical = kyber.optimize(plan, sources=sources, hub=core.default_hub())
+    # Only what the plan scans: a late adaptive stage (TPC-H q15's `Project` over one row) keeps
+    # every query source bound, and reading them all OOM-killed the SF10 driver at 22 GB.
+    scanned = set(physical.scanned_source_ids())
     resolved = [
         read_source(
             src,
@@ -690,6 +681,8 @@ def _single_node(plan: LogicalPlan, sources: list[Source]) -> pa.Table:
             physical.source_limits.get(i),
             physical.source_orderings.get(i),
         )
+        if i in scanned
+        else []
         for i, src in enumerate(sources)
     ]
     batches = core.execute_local(physical, resolved)

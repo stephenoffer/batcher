@@ -60,11 +60,12 @@ def _numeric_edges(ds: Dataset, column: str, buckets: int) -> list[float]:
     several identical quantiles, and keeping them would create empty bins whose zero counts
     dominate every ratio below.
 
-    A **constant** reference column returns no edges at all, and the caller turns that into
-    an error. It has to: every quantile of a constant column is the same number, so the
-    dedup leaves one edge, every row on both sides lands above it, and the drift measure
-    comes back as exactly 0.0 — reporting "no drift" for a column that moved from 1.0 to
-    2.0. A silent zero is far worse here than a refusal.
+    A **constant** reference column returns no edges at all. It has to: every quantile of a
+    constant column is the same number, so the dedup leaves one edge, every row on both sides
+    lands above it, and the drift measure comes back as exactly 0.0 — reporting "no drift"
+    for a column that moved from 1.0 to 2.0. The drift measures bin it with
+    `_point_mass_edges` instead; `woe_table` refuses it, since a constant feature has nothing
+    to bin.
     """
     fractions = [i / buckets for i in range(1, buckets)]
     aggregates: dict[str, Any] = {f"q{i}": col(column).quantile(f) for i, f in enumerate(fractions)}
@@ -75,15 +76,40 @@ def _numeric_edges(ds: Dataset, column: str, buckets: int) -> list[float]:
     high = row.column("__bt_max")[0].as_py()
     if low is None or high is None or low == high:
         return []
-    values = [row.column(f"q{i}")[0].as_py() for i in range(len(fractions))]
+    quantiles = [row.column(f"q{i}")[0].as_py() for i in range(len(fractions))]
+    values = [float(value) for value in quantiles if value is not None]
     edges: list[float] = []
-    for value in values:
-        if value is None:
+    for index, number in enumerate(values):
+        if edges and number <= edges[-1]:
             continue
-        number = float(value)
-        if not edges or number > edges[-1]:
-            edges.append(number)
+        edges.append(number)
+        # A value several quantiles land on, or the column's minimum, is a point mass: rows
+        # equal to it and rows just above it fall in the same bin, so the edge separates
+        # nothing on its high side. 99% of rows at 1.0 moving to 2.0 then scored a PSI of
+        # 0.0. A second edge just above the value gives the point mass a bin of its own.
+        repeated = index + 1 < len(values) and values[index + 1] == number
+        if repeated or number == float(low):
+            edges.append(math.nextafter(number, math.inf))
     return edges
+
+
+def _point_mass_edges(ds: Dataset, column: str) -> list[float]:
+    """Edges isolating the single value of a constant column: below it, it, above it.
+
+    A constant reference is a point mass, and that is a distribution a drift measure can be
+    exact about. Three bins, ``< v``, ``== v`` and ``> v``, hold all of it in the middle one,
+    so a current column still at ``v`` scores exactly 0.0 and one that moved anywhere else
+    lands its mass in an outer bin and scores as a total shift. Quantile edges cannot express
+    this: every quantile of a constant is ``v``, so they collapse to one edge and a column
+    that moved from 1.0 to 2.0 would land in the same bin and score 0.0. An entirely null
+    column returns no edges.
+    """
+    row = ds.agg(__bt_v=col(column).min()).collect()
+    value = row.column("__bt_v")[0].as_py()
+    if value is None:
+        return []
+    point = float(value)
+    return [point, math.nextafter(point, math.inf)]
 
 
 def _bin_expr(column: str, edges: list[float]) -> Any:
@@ -113,12 +139,11 @@ def _aligned_shares(
     A full outer join so a bin present on only one side still appears, with the missing
     side floored at `_EPSILON` — the case that *is* the drift signal.
     """
-    edges = _numeric_edges(reference, column, buckets)
+    edges = _numeric_edges(reference, column, buckets) or _point_mass_edges(reference, column)
     if not edges:
         raise PlanError(
-            f"column {column!r} is constant (or entirely null) in the reference data, so it "
-            "has no distribution to compare against. Drop it from the check, or use "
-            "`categorical_drift` if it is really a category."
+            f"column {column!r} is entirely null in the reference data, so it has no "
+            "distribution to compare against. Drop it from the check."
         )
     left = _binned_shares(reference, column, edges, "__bt_ref")
     right = _binned_shares(current, column, edges, "__bt_cur")
@@ -154,7 +179,7 @@ def population_stability_index(
         The PSI, at least 0.
 
     Raises:
-        PlanError: If the reference column is constant or entirely null.
+        PlanError: If the reference column is entirely null.
 
     Examples:
         .. doctest::

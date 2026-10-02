@@ -58,7 +58,6 @@ ARCHITECTURES: dict[int, str] = {
 #: Compute capability at which the tensor cores gain each precision natively. Below the BF16
 #: threshold the type is emulated, which is slower than the FP16 it would have replaced — the
 #: precise case a name-matched table gets wrong on an unfamiliar part.
-_NATIVE_FP8 = (8, 9)
 _NATIVE_BF16 = (8, 0)
 _FAST_FP16 = (7, 0)
 
@@ -113,11 +112,6 @@ class DeviceIdentity:
     def native_bf16(self) -> bool:
         """Whether the tensor cores implement BF16 rather than emulating it."""
         return self.compute_capability >= _NATIVE_BF16
-
-    @property
-    def native_fp8(self) -> bool:
-        """Whether the tensor cores implement FP8 rather than emulating it."""
-        return self.compute_capability >= _NATIVE_FP8
 
     @property
     def fast_fp16(self) -> bool:

@@ -43,7 +43,7 @@ use arrow::array::{
 };
 use arrow::compute::SortOptions;
 use arrow::datatypes::DataType;
-use bc_runtime::byte_key::{pack_word, ByteKeyColumn, ByteKeys};
+use bc_runtime::byte_key::{pack_word, ByteKeys};
 
 /// The widest key the pack covers: one `u64` word.
 ///
@@ -63,7 +63,7 @@ const MAX_PACK_BYTES: usize = 8;
 ///
 /// **The type is resolved once, here, and the sort below it is monomorphic.** That is the split
 /// `bc_runtime::byte_key` documents — the generic [`ByteKeys`] for a caller that reads a key
-/// `n log n` times, the erased [`ByteKeyColumn`] for one that reads each row once — and this
+/// `n log n` times, the erased [`ByteKeyColumn`](bc_runtime::byte_key::ByteKeyColumn) for one that reads each row once — and this
 /// path was on the wrong side of it: it built a `ByteKeyColumn` and handed *that* to the
 /// generic sort, so every one of the sort's key reads paid a five-arm match it had already
 /// decided. Measured on `op-sort-string`, `ByteKeyColumn::key` was **10.5%** of the operator's
@@ -199,14 +199,32 @@ fn packs_discriminate<A: ByteKeys>(arr: &A) -> bool {
         return true; // too small for the difference to matter; the packed path is no worse
     }
     let step = (live / PREFIX_SAMPLE_ROWS).max(1);
-    let (mut packs, mut values): (Vec<u64>, Vec<&[u8]>) = (0..arr.len())
-        .filter(|&i| nulls.is_none_or(|nb| nb.is_valid(i)))
-        .step_by(step)
-        .take(PREFIX_SAMPLE_ROWS)
-        .map(|i| (pack_word(arr.key(i), 0), arr.key(i)))
-        .unzip();
+    let sample = |i: usize| (pack_word(arr.key(i), 0), arr.key(i));
+    // The same rows either way: with no null to skip the filter is the identity, and indexing
+    // directly keeps `step_by` from walking every row of the morsel through it.
+    let (mut packs, mut values): (Vec<u64>, Vec<&[u8]>) =
+        match nulls.filter(|nb| nb.null_count() > 0) {
+            None => (0..arr.len())
+                .step_by(step)
+                .take(PREFIX_SAMPLE_ROWS)
+                .map(sample)
+                .unzip(),
+            Some(nb) => (0..arr.len())
+                .filter(|&i| nb.is_valid(i))
+                .step_by(step)
+                .take(PREFIX_SAMPLE_ROWS)
+                .map(sample)
+                .unzip(),
+        };
     packs.sort_unstable();
     packs.dedup();
+    // The sample holds at most `sample` distinct values, so a pack already distinct that often
+    // answers the question below without ordering the values: the same verdict, minus the
+    // string sort, which on a column whose prefixes discriminate was most of this check's cost
+    // and was paid once per morsel of a top-N.
+    if packs.len() * 2 >= values.len() {
+        return true;
+    }
     values.sort_unstable();
     values.dedup();
     packs.len() * 2 >= values.len()
@@ -487,8 +505,43 @@ fn sort_live<A: ByteKeys>(arr: &A, mut live: Vec<u32>, opts: SortOptions) -> Vec
 /// every member of the true top-`k` is at or below. The second pass collects exactly the rows at
 /// or below it, which the third sorts for real. Only rows the prefix could not separate are ever
 /// compared byte-by-byte, and on a discriminating column there are about `k` of them.
-pub(super) fn top_k_live(values: &ArrayRef, descending: bool, k: usize) -> Option<Vec<u32>> {
-    top_k_generic(&ByteKeyColumn::new(values)?, descending, k)
+///
+/// Rows whose pack is strictly above `bound` are skipped, and a full selection publishes its
+/// threshold to it — see [`super::RankBound`]. A strictly larger pack proves a strictly larger key
+/// (see [`pack_word`]), which is the monotonicity the bound needs.
+pub(super) fn top_k_live(
+    values: &ArrayRef,
+    descending: bool,
+    k: usize,
+    bound: &super::RankBound,
+) -> Option<Vec<u32>> {
+    let any = values.as_any();
+    // Resolved once, so the selection's per-row pack reads a concrete array's offsets inline —
+    // the split `stable_sort_indices_bytes` documents. Through the erased `ByteKeyColumn` the
+    // accessor stayed an out-of-line call and was 13% of `ORDER BY <utf8>, … LIMIT 100`.
+    match values.data_type() {
+        DataType::Utf8 => top_k_generic(any.downcast_ref::<StringArray>()?, descending, k, bound),
+        DataType::LargeUtf8 => top_k_generic(
+            any.downcast_ref::<LargeStringArray>()?,
+            descending,
+            k,
+            bound,
+        ),
+        DataType::Binary => top_k_generic(any.downcast_ref::<BinaryArray>()?, descending, k, bound),
+        DataType::LargeBinary => top_k_generic(
+            any.downcast_ref::<LargeBinaryArray>()?,
+            descending,
+            k,
+            bound,
+        ),
+        DataType::FixedSizeBinary(_) => top_k_generic(
+            any.downcast_ref::<FixedSizeBinaryArray>()?,
+            descending,
+            k,
+            bound,
+        ),
+        _ => None,
+    }
 }
 
 /// A **weak** order-preserving `u64` per row: the packed prefix, inverted for `descending`.
@@ -498,7 +551,18 @@ pub(super) fn top_k_live(values: &ArrayRef, descending: bool, k: usize) -> Optio
 /// never to order one. `None` for a non-byte-key array, or for a column whose prefix is too
 /// undiscriminating to narrow anything (see [`packs_discriminate`]).
 pub(super) fn prefix_ranks(values: &ArrayRef, descending: bool) -> Option<Vec<u64>> {
-    packed(&ByteKeyColumn::new(values)?, descending)
+    let any = values.as_any();
+    // Resolved once, for the reason `top_k_live` gives.
+    match values.data_type() {
+        DataType::Utf8 => packed(any.downcast_ref::<StringArray>()?, descending),
+        DataType::LargeUtf8 => packed(any.downcast_ref::<LargeStringArray>()?, descending),
+        DataType::Binary => packed(any.downcast_ref::<BinaryArray>()?, descending),
+        DataType::LargeBinary => packed(any.downcast_ref::<LargeBinaryArray>()?, descending),
+        DataType::FixedSizeBinary(_) => {
+            packed(any.downcast_ref::<FixedSizeBinaryArray>()?, descending)
+        }
+        _ => None,
+    }
 }
 
 fn packed<A: ByteKeys>(arr: &A, descending: bool) -> Option<Vec<u64>> {
@@ -532,7 +596,12 @@ fn packed<A: ByteKeys>(arr: &A, descending: bool) -> Option<Vec<u64>> {
     )
 }
 
-fn top_k_generic<A: ByteKeys>(arr: &A, descending: bool, k: usize) -> Option<Vec<u32>> {
+fn top_k_generic<A: ByteKeys>(
+    arr: &A,
+    descending: bool,
+    k: usize,
+    bound: &super::RankBound,
+) -> Option<Vec<u32>> {
     let n = arr.len();
     let nulls = arr.null_buffer();
     // A key the packed prefix cannot narrow still has a selection: compare the bytes
@@ -540,12 +609,14 @@ fn top_k_generic<A: ByteKeys>(arr: &A, descending: bool, k: usize) -> Option<Vec
     let Some(packs) = packed(arr, descending) else {
         return Some(top_k_by_comparison(arr, descending, k));
     };
-    let seeds = super::heap_select_k(n, nulls, k, |i| packs[i]);
-    // Fewer live rows than `k`: they are all in the answer, so there is no threshold to find.
+    let seeds = super::heap_select_k(n, nulls, k, bound.get(), |i| packs[i]);
+    // Fewer live rows than `k` (or fewer the bound leaves): they are all in the answer, so
+    // there is no threshold to find.
     let Some(&last) = seeds.last().filter(|_| seeds.len() == k) else {
         return Some(exact_order(arr, seeds, descending));
     };
     let threshold = packs[last as usize];
+    bound.publish(threshold);
     let budget =
         k.saturating_add((k * super::TOP_K_CANDIDATE_SLACK).max(super::TOP_K_CANDIDATE_FLOOR));
     let mut candidates: Vec<u32> = Vec::with_capacity(budget.min(n));
@@ -571,14 +642,14 @@ fn top_k_generic<A: ByteKeys>(arr: &A, descending: bool, k: usize) -> Option<Vec
 /// empty on ~93% of ClickBench's rows; a URL column, where every value starts `https://`; an ISO
 /// timestamp rendered as text. Both decline paths above reach it.
 ///
-/// **It exists because declining used to mean a full sort, and a full sort is the wrong shape
-/// for a `LIMIT`.** `stable_sort_indices_bytes` orders all `n` rows in `O(n log n)` string
+/// **It exists because declining would otherwise mean a full sort, and a full sort is the wrong
+/// shape for a `LIMIT`.** `stable_sort_indices_bytes` orders all `n` rows in `O(n log n)` string
 /// comparisons to keep `k` of them; a quickselect partitions in `O(n)` expected comparisons and
 /// then orders only the `k` survivors. The caller's gate (`k * TOP_K_SELECT_RATIO <= num_rows`)
 /// already confines this to `k <= n / 2`, where the second is strictly less work.
 ///
-/// The survivors are returned **sorted**, which is not incidental: an earlier attempt at a
-/// quickselect here returned them unordered and made `LIMIT 100000` slower (893 -> 1139 ms),
+/// The survivors are returned **sorted**, which is not incidental: a quickselect that returns
+/// them unordered makes `LIMIT 100000` slower (893 -> 1139 ms),
 /// because `parallel_top_n`'s merge relies on each morsel handing back a sorted run. Ordering
 /// `k` rows costs `O(k log k)` and restores that.
 ///
@@ -714,6 +785,7 @@ mod ordered_shortcut_tests {
 #[cfg(test)]
 mod undiscriminating_prefix_tests {
     use arrow::array::StringArray;
+    use bc_runtime::byte_key::ByteKeyColumn;
     use std::sync::Arc;
 
     use super::*;
@@ -735,7 +807,8 @@ mod undiscriminating_prefix_tests {
                 .filter(|&i| arr.is_valid(i as usize))
                 .collect();
             for &k in ks {
-                let got = top_k_live(&arr, descending, k).expect("a Utf8 column selects");
+                let got = top_k_live(&arr, descending, k, &super::super::RankBound::unbounded())
+                    .expect("a Utf8 column selects");
                 let want: Vec<u32> = live.iter().copied().take(k).collect();
                 assert_eq!(got, want, "descending={descending} k={k}");
             }
@@ -1225,6 +1298,7 @@ mod byte_key_tests {
     };
 
     use super::*;
+    use bc_runtime::byte_key::ByteKeyColumn;
 
     /// The permutation a full byte comparison with an input-order tie-break produces — the
     /// definition every path in this module is held to.
@@ -1577,12 +1651,11 @@ mod byte_key_tests {
     ///
     /// `cargo test --release -p bc-interp --lib -- --ignored --nocapture report_the_packed_prefix_alternatives`
     ///
-    /// Recorded because each is the obvious next idea and each costs a day to re-derive.
-    /// `competitor_technique_review.md` item 9 lists "an adaptive-width key" as its one open
-    /// lead; this is that lead, measured. Both helpers are local to this test, so no product
-    /// code carries a rejected design.
+    /// Each is the obvious next idea. `competitor_technique_review.md` item 9 lists "an
+    /// adaptive-width key" as its one open lead, and this measures that lead. Both helpers are
+    /// local to this test, so no product code carries a rejected design.
     ///
-    /// Measured 2026-09-11, 48-core Xeon 8275CL, quiet box. `skip` is `packed@0 / packed@lcp`
+    /// Measured on a 48-core Xeon 8275CL, quiet box. `skip` is `packed@0 / packed@lcp`
     /// and `n/p` is the narrow key against `packed@lcp`; above 1.00x favours the alternative.
     ///
     /// | rows | shape | lcp | narrow | packed@lcp | packed@0 | n/p | skip |

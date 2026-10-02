@@ -65,12 +65,13 @@ families: `partial_aggregate`/`combine_finalize` for the first, and `partition_b
 out again, bounded by a shared cut-off (`bc-runtime/src/topn.rs`) rather than by either.
 
 What all of them guarantee is the same: the rows, every column name, and every column type
-match the single-node result. Three things the query itself does not pin down are allowed to
+match the single-node result. Four things the query itself does not pin down are allowed to
 differ, and they are not defects. A float reduction reassociates, because `combine` is
 associative in exact arithmetic and IEEE addition is not. A window function that must break a
 tie its `ORDER BY` leaves open may break it differently. A `LIMIT` over a relation with no
 order may keep a different set of rows, because a hash-table walk order is not part of the
-query. Anything else that differs is a bug.
+query. An `array_agg` with no `order_by` may list a group's elements in a different order,
+though never a different multiset of them. Anything else that differs is a bug.
 
 ## Why associative *and* commutative
 
@@ -81,6 +82,15 @@ the result independent of thread scheduling and of network arrival order. If `co
 only associative, a cluster would have to impose a total order on its reducers' inputs, and
 the answer would depend on which worker finished first.
 :::
+
+Commutativity is exact for most states, and holds only up to an equivalence for two. A float
+sum commutes but does not associate, which is the reassociation exception above. The list
+state of `array_agg` combines by concatenation, and `[a] ++ [b]` is not `[b] ++ [a]`. It
+commutes as a multiset, so an unordered `array_agg` promises the multiset of a group's elements
+and leaves their order open. `array_agg(order_by=...)` sorts at finalize, which turns the
+multiset back into one list, so its result does not depend on the merge order. The
+list-state aggregates that finalize to a scalar (`median`, `quantile`, `count_distinct`) sort
+or deduplicate first, so their answers are exact whatever order the lists arrived in.
 
 This is what forces the *shape* of the partial state. The state isn't the answer. It's
 whatever is enough to compute the answer from any partition:
@@ -114,7 +124,7 @@ bounds, which breaks the guarantee this whole design exists to give. KLL still s
 The list-state aggregates (`median`, `count_distinct`) are **exact and mergeable, at the cost
 of memory linear in the group's values**. That is a real trade. When you can't afford it,
 `approx_count_distinct` and `approx_quantile` give you a bounded-error sketch state instead
-([`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches)), which merges in constant space with a fixed seed.
+([`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches)), whose size does not grow with the row count. An HLL is a fixed register array. A DDSketch stores only occupied logarithmic buckets, so its size grows with the data's dynamic range and with `1/α`: at the default 1% accuracy, values spanning `1e-9` to `1e9` occupy at most 2,074 buckets per sign.
 
 Both of those sketches reach the *same state* in any merge order, which is stronger than
 merging correctly and is why they are the two the aggregates use. A HyperLogLog folds
@@ -201,6 +211,14 @@ partition, every partial row for a group lands together, so running `combine` + 
 **one partition at a time** is the global aggregate, with peak memory bounded to one
 partition.
 
+That bound is only as small as the largest group. No hash split separates one key from
+itself, so a partition always holds all of a group's partial state. For a fixed-size state
+such as `sum` or `mean` that's one row. For a list state such as `median`, `count_distinct` or
+`array_agg` it's every value of the group, so one hot key's list can exceed the budget on its
+own. The same holds for a window partition, and for a join whose output for one key is the
+product of both sides' rows for it. {doc}`Spilling </architecture/deep-dives/memory/spilling>`
+covers what the engine does when a bucket stays over budget.
+
 This isn't a special spilling algorithm. It's the distributive equivalence property, used
 locally to bound memory. The same grace machinery, on the `PARTITION BY` keys, bounds a window
 ([`crates/bc-interp/src/window_spill.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/window_spill.rs)).
@@ -284,12 +302,12 @@ If your operator genuinely has no mergeable form, that's a design conversation, 
 - [`crates/bc-runtime/src/agg/spill/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/spill/mod.rs): grace aggregation (the same algebra, bounded)
 - [`crates/bc-interp/src/dist.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/dist.rs): the distributed primitives
 - [`crates/bc-runtime/src/agg/sketch.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/agg/sketch.rs): the HLL and DDSketch aggregate states
-- [`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches): the mergeable sketches (HLL, DDSketch, KLL, TDigest, Count-Min), fixed seed
+- [`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches): the mergeable sketches (HLL, DDSketch, KLL, TDigest, Misra-Gries, Bloom), fixed seed
 
 ## See also
 
 - {doc}`Architecture </architecture/index>`: the invariant this page is the implementation of.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the algebraic statement and its proofs.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the algebraic statement and its proofs.
 - {doc}`Execution engine </architecture/internals/execution>`: where `partial`/`combine`/`finalize` are called from.
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the surface this algebra is hiding behind.
 - {doc}`Scaling benchmarks </benchmarks/results/scaling>`: what bounded per-node memory buys as the cluster grows.

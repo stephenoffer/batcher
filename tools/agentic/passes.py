@@ -147,8 +147,9 @@ REVIEW_BENCH = _p(
     "Find the most promising performance work from benchmark evidence",
     """Identify Batcher's best available performance wins, from evidence rather than intuition.
 
-Read `.claude/rules/performance.md`, `docs/architecture/internals/competitive_architecture.md`, and the
-benchmark results in `benchmarks/BENCHMARK_RESULTS.md` / `TPCH_FINDINGS.md`.
+Read `.claude/rules/performance.md`,
+`docs/architecture/internals/competitive_architecture.md`, and the benchmark results in
+`benchmarks/BENCHMARK_RESULTS.md` / `TPCH_FINDINGS.md`.
 
 Report the shapes where Batcher currently loses to DuckDB or Polars, worst ratio first. For
 each: name the operator and the code path that dominates, state the hypothesis for why it is

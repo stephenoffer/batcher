@@ -24,27 +24,31 @@ use parquet::file::metadata::ParquetMetaData;
 mod avro;
 mod bloom;
 mod footer_stats;
+mod late;
+mod mapped;
 mod page_index;
 mod predicate;
 mod projection;
+pub(crate) use projection::reorder_to_projection;
 mod row_filter;
+mod row_groups;
 mod split_read;
 mod store;
 
 /// Below this many candidate rows a read is short enough that the row-filter probe would cost
 /// a larger share of it than the filter could save, so neither runs.
-const ROW_FILTER_MIN_ROWS: usize = 200_000;
+pub(crate) const ROW_FILTER_MIN_ROWS: usize = 200_000;
 
 /// How many rows the row-filter selectivity probe reads before deciding. Enough for a stable
 /// selected-fraction, small enough that a decision *not* to filter costs ~1 ms.
-const ROW_FILTER_PROBE_ROWS: usize = 8_192;
+pub(crate) const ROW_FILTER_PROBE_ROWS: usize = 8_192;
 
 /// Whether row-level filter pushdown is enabled (`BATCHER_PARQUET_ROW_FILTER=0` disables).
 ///
 /// An escape hatch in the shape the rest of this module already uses, and the A/B switch the
 /// feature was measured with: comparing two *builds* on a shared machine could not separate
 /// the effect from the noise, whereas one binary run both ways can.
-fn row_filter_enabled() -> bool {
+pub(crate) fn row_filter_enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var("BATCHER_PARQUET_ROW_FILTER").as_deref() != Ok("0"))
 }
@@ -53,6 +57,12 @@ pub use avro::read_avro_bytes;
 pub use footer_stats::{
     parquet_file_manifest, parquet_footer_stats, ColumnFooterStats, FooterStats,
 };
+pub use late::{LateFilter, MaskFn, RowPredicate};
+pub use row_groups::{
+    parquet_column_bytes, parquet_row_groups, parquet_row_groups_surviving, read_parquet_row_group,
+    read_parquet_row_group_late, read_parquet_rows, ROW_NUMBER,
+};
+pub use split_read::block_cache::{stats as object_cache_stats, CacheStats};
 
 /// How many row-groups to fetch+decode concurrently. The single-stream reader processes
 /// row-groups one at a time, so a worker reading a many-row-group file waited on each
@@ -70,7 +80,7 @@ pub use footer_stats::{
 /// regardless — so this caps the transient decode set, not the result. The floor of 16 keeps
 /// a small cgroup quota from serializing a *remote* read, where the concurrency hides latency
 /// rather than spreading CPU.
-fn rg_concurrency() -> usize {
+pub(crate) fn rg_concurrency() -> usize {
     static C: OnceLock<usize> = OnceLock::new();
     *C.get_or_init(|| {
         std::env::var("BATCHER_PARQUET_RG_CONCURRENCY")
@@ -181,9 +191,10 @@ pub fn read_parquet(
 /// *during* the decode.
 ///
 /// The first three are superset-safe: they only skip provably-empty blocks. The row filter is
-/// not — it removes individual rows — which is sound because `to_native_predicate` is
-/// all-or-nothing, so a predicate that arrives here is a *complete* translation of the
-/// `Filter` above the scan rather than a weakening of it. The result is therefore anywhere
+/// not — it removes individual rows — which is sound because `to_native_predicate` only ever
+/// *widens*: it drops a conjunct it cannot express and declines a disjunction it cannot, so a
+/// predicate that arrives here keeps every row the `Filter` above the scan keeps. The result is
+/// therefore anywhere
 /// between the exact matching rows and every requested row-group, and the engine keeps its
 /// `Filter` either way (`core/scan_only.py` refuses its shortcut whenever a predicate was
 /// pushed). An unparseable or non-pushable predicate simply reads every requested row-group.
@@ -409,7 +420,7 @@ impl parquet::arrow::async_reader::AsyncFileReader for PrefetchedFooter {
     }
 }
 
-async fn load_metadata_cached(
+pub(crate) async fn load_metadata_cached(
     uri: &str,
     resolved: &store::Resolved,
 ) -> Result<(u64, ArrowReaderMetadata), IoError> {
@@ -482,8 +493,55 @@ async fn read_parquet_async(
     batch_size: usize,
     predicate: Option<&str>,
 ) -> Result<Vec<RecordBatch>, IoError> {
+    read_parquet_inner(
+        uri,
+        row_groups,
+        columns,
+        batch_size,
+        predicate,
+        &Unit::default(),
+    )
+    .await
+}
+
+/// How a read serves a caller scheduling its own units (`read_parquet_row_group_late`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Unit<'a> {
+    /// Decode on the polling thread rather than spawning onto the runtime's pool.
+    pub(crate) inline: bool,
+    /// The caller's own filter, decoded first.
+    pub(crate) late: Option<&'a Arc<late::LateFilter>>,
+    /// Append each row's position in its file as [`ROW_NUMBER`].
+    pub(crate) locate: bool,
+}
+
+/// [`read_parquet_async`], optionally decoding each row group on the polling thread (`inline`)
+/// rather than spawning it onto the runtime's pool.
+///
+/// Spawning is what spreads a many-row-group read across cores. A caller that is itself one of
+/// many workers each reading its own row group wants the opposite: a spawned decode leaves the
+/// worker blocked and idle while a pool thread does its work, which measured as 44% of every
+/// worker's time on TPC-H sf10 q6 (3.2 s of waiting summed over 46 workers, per query).
+pub(crate) async fn read_parquet_inner(
+    uri: &str,
+    row_groups: &[usize],
+    columns: Option<&[String]>,
+    batch_size: usize,
+    predicate: Option<&str>,
+    unit: &Unit<'_>,
+) -> Result<Vec<RecordBatch>, IoError> {
+    let Unit {
+        inline,
+        late,
+        locate,
+    } = *unit;
     let resolved = store::resolve(uri)?;
     let (size, arrow_meta) = load_metadata_cached(uri, &resolved).await?;
+    let arrow_meta = if locate {
+        row_groups::with_row_numbers(&arrow_meta)?
+    } else {
+        arrow_meta
+    };
 
     // Which row-groups: the requested subset, else all of them.
     let all: Vec<usize> = (0..arrow_meta.metadata().num_row_groups()).collect();
@@ -535,82 +593,20 @@ async fn read_parquet_async(
     // the un-probed path reports it as a clean `row group N out of bounds` error. So the row
     // counts come from `.get()`, and an out-of-range first target skips the probe entirely and
     // leaves the index for the decoder to report exactly as it does today.
-    let row_groups = arrow_meta.metadata().row_groups();
-    let probe_rows: usize = targets
-        .iter()
-        .filter_map(|&rg| row_groups.get(rg))
-        .map(|rg| rg.num_rows() as usize)
-        .sum();
-    let mut row_filter_cols: Option<Vec<String>> = None;
-    if let Some(pred) = parsed.as_ref() {
-        // Under this size the whole read is already short and the probe would be a larger
-        // share of it than anything the filter could save.
-        if row_filter_enabled()
-            && probe_rows >= ROW_FILTER_MIN_ROWS
-            && row_groups.get(targets[0]).is_some()
-        {
-            // Free pre-check before the probe: if the zone maps already say the predicate keeps
-            // most rows, there is nothing for the filter to save and the probe itself would be
-            // the only cost anyone measured. The estimate is only ever allowed to *decline*
-            // (see `row_filter::estimate`) — installing stays a measured decision, because the
-            // interpolation behind it is wrong on skewed data and a wrong install is a
-            // slowdown while a wrong decline is only a missed speed-up.
-            let permissive = {
-                let (mut weighted, mut rows) = (0.0f64, 0.0f64);
-                let mut usable = true;
-                // Column positions resolved once for the file; the loop below asks for the
-                // same columns in every row group.
-                let col_index = predicate::ColumnIndex::build(arrow_meta.metadata());
-                for &rg in &targets {
-                    let Some(meta) = row_groups.get(rg) else {
-                        continue;
-                    };
-                    if let Some(f) = row_filter::estimate(pred, meta, &col_index) {
-                        weighted += f * meta.num_rows() as f64;
-                        rows += meta.num_rows() as f64;
-                    } else {
-                        usable = false;
-                        break;
-                    }
-                }
-                usable && rows > 0.0 && !row_filter::worth_it_frac(weighted / rows)
-            };
-            if !permissive {
-                if let Some(cols) = row_filter::plan(pred, arrow_meta.schema()) {
-                    let reader = split_read::object_reader(&resolved.store, &resolved.path, size);
-                    let mask = projection::exact_columns(
-                        arrow_meta.parquet_schema(),
-                        cols.iter().map(String::as_str),
-                    );
-                    let mut probe = ParquetRecordBatchStreamBuilder::new_with_metadata(
-                        reader,
-                        arrow_meta.clone(),
-                    )
-                    .with_batch_size(batch_size.max(1))
-                    .with_row_groups(vec![targets[0]])
-                    .with_projection(mask)
-                    .build()?;
-                    // Stop as soon as the estimate is good enough. Decoding the *whole* first row
-                    // group to measure it cost more than the filter saved on a permissive
-                    // predicate (~18 ms, turning a 179 ms read into 198 ms); a few thousand rows
-                    // answer "is this selective?" just as well and cost ~1 ms. The estimate is a
-                    // sample, so a clustered column can mislead it — which changes only speed.
-                    let (mut selected, mut total) = (0usize, 0usize);
-                    while total < ROW_FILTER_PROBE_ROWS {
-                        let Some(batch) = probe.try_next().await? else {
-                            break;
-                        };
-                        let m = row_filter::mask_of(pred, &batch);
-                        total += m.len();
-                        selected += m.true_count();
-                    }
-                    if row_filter::worth_it(selected, total) {
-                        row_filter_cols = Some(cols);
-                    }
-                }
-            }
+    let row_filter_cols = match parsed.as_ref() {
+        Some(pred) => {
+            row_filter::verdict(row_filter::Probe {
+                pred,
+                resolved: &resolved,
+                size,
+                meta: &arrow_meta,
+                targets: &targets,
+                batch_size,
+            })
+            .await?
         }
-    }
+        None => None,
+    };
 
     // Read row-groups CONCURRENTLY: each as its own short stream over a cloned reader
     // (which shares the Arc'd store + connection pool and the already-parsed metadata).
@@ -624,13 +620,20 @@ async fn read_parquet_async(
     let store = resolved.store;
     let loc = resolved.path;
     let remote = resolved.remote;
+    let local = resolved.local;
     let batch_size = batch_size.max(1);
     let per_rg = targets.into_iter().map(|rg| {
         // Over the network a row group's contiguous column chunks coalesce into one enormous
         // GET, which one connection then serves at a fraction of the link — see `split_read`.
         // Local reads keep the plain reader: the page cache has no such limit.
         let base = split_read::object_reader(&store, &loc, size);
-        let reader = split_read::maybe_split(base, &store, &loc, remote);
+        let reader = split_read::maybe_split(
+            base,
+            &store,
+            &loc,
+            remote.then_some((uri, size)),
+            local.as_deref().map(|p| (p, size)),
+        );
         let amd = arrow_meta.clone();
         let proj = projection.clone();
         // Page-level pruning *within* a surviving row group. Computed here, on the metadata
@@ -643,7 +646,29 @@ async fn read_parquet_async(
         let bloom_pred = parsed.clone();
         let bloom_meta = arrow_meta.clone();
         let rf_cols = row_filter_cols.clone();
-        tokio::spawn(async move {
+        // The caller's own filter, decoded first (`late`), whenever the scan's measurement says
+        // it pays — and every read, either way, reports what it cost to that measurement. It
+        // replaces the native row filter rather than stacking on it: the caller's predicate is
+        // the whole `Filter`, of which the native one is at most a translation.
+        let group = arrow_meta.metadata().row_groups().get(rg);
+        let late = late
+            .filter(|l| group.is_some_and(|g| l.worth_deferring(g, columns)))
+            .map(|l| (l.clone(), l.install()));
+        let rg_rows = group.map_or(0, |g| u64::try_from(g.num_rows()).unwrap_or(0));
+        // An installed filter whose stages accept dictionaries reads their low-cardinality
+        // string columns as `Dictionary`, cast back before returning (`late::DictionaryRead`).
+        // A locating read keeps the plain decode: its metadata carries the row-number column,
+        // which a supplied schema would have to restate.
+        let dictionary = match (late.as_ref(), group) {
+            (Some((l, true)), Some(g)) if !locate => l.dictionary_read(arrow_meta.schema(), g),
+            _ => None,
+        };
+        let (amd, dictionary) = match dictionary.and_then(|d| d.reader_metadata(&amd)) {
+            Some((m, d)) => (m, Some(d)),
+            None => (amd, None),
+        };
+        let decode = async move {
+            let started = std::time::Instant::now();
             let mut b = ParquetRecordBatchStreamBuilder::new_with_metadata(reader, amd)
                 .with_batch_size(batch_size)
                 .with_row_groups(vec![rg]);
@@ -671,12 +696,34 @@ async fn read_parquet_async(
             // when the probe above measured it worth doing, and only for a predicate proved to
             // carry the engine's own comparison semantics — unlike the pruning above, this
             // step *removes rows* rather than skipping provably-empty work.
-            if let (Some(pred), Some(cols)) = (bloom_pred.as_ref(), rf_cols.as_ref()) {
+            if let Some((late, true)) = late.as_ref() {
+                b = b.with_row_filter(late.row_filter(bloom_meta.parquet_schema()));
+            } else if late.as_ref().is_some_and(|(l, _)| l.deciding()) {
+                // Measuring the unfiltered side, which the native filter would turn into a third
+                // configuration. After `OFF` the read takes the native filter (`deciding`).
+            } else if let (Some(pred), Some(cols)) = (bloom_pred.as_ref(), rf_cols.as_ref()) {
                 b = b.with_row_filter(row_filter::build(pred, cols, bloom_meta.parquet_schema()));
             }
             let stream = b.build()?;
-            stream.try_collect::<Vec<RecordBatch>>().await
-        })
+            let mut out = stream.try_collect::<Vec<RecordBatch>>().await?;
+            if let Some(d) = dictionary.as_ref() {
+                out = out
+                    .into_iter()
+                    .map(|b| d.restore(b))
+                    .collect::<Result<_, _>>()?;
+            }
+            if let Some((late, installed)) = late.as_ref() {
+                let kept: usize = out.iter().map(RecordBatch::num_rows).sum();
+                let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                late.record(*installed, rg_rows, kept as u64, nanos);
+            }
+            Ok::<_, parquet::errors::ParquetError>(out)
+        };
+        if inline {
+            futures::future::Either::Left(async move { Ok(decode.await) })
+        } else {
+            futures::future::Either::Right(tokio::spawn(decode))
+        }
     });
 
     let per_rg_batches: Vec<Vec<RecordBatch>> = futures::stream::iter(per_rg)
@@ -748,46 +795,6 @@ fn coalesce_batches(
     }
     flush(&mut run, &mut out)?;
     Ok(out)
-}
-
-/// Reorder each batch's columns to the requested projection order (PyArrow parity).
-///
-/// The decoder emits columns in the file's schema order regardless of the order the
-/// caller asked for. When the requested names map one-to-one onto the batch's top-level
-/// fields, reorder to the requested order so the result is identical to PyArrow's
-/// `read_table(columns=[...])`. When they do not form a clean bijection (a nested/leaf
-/// projection, a duplicated or absent name), leave the batch untouched — the reorder is
-/// only defined for the flat top-level projections the engine actually issues, and
-/// touching the exotic cases would risk mangling them.
-fn reorder_to_projection(batches: &mut [RecordBatch], columns: &[String]) {
-    let Some(first) = batches.first() else {
-        return;
-    };
-    let schema = first.schema();
-    // A clean bijection: same count, and every requested name resolves to a distinct field.
-    if columns.len() != schema.fields().len() {
-        return;
-    }
-    let mut order = Vec::with_capacity(columns.len());
-    for name in columns {
-        match schema.index_of(name) {
-            Ok(idx) if !order.contains(&idx) => order.push(idx),
-            _ => return, // absent or duplicate name → not a clean reorder, leave as-is
-        }
-    }
-    if order.iter().enumerate().all(|(i, &idx)| i == idx) {
-        return; // already in requested order (the common case) — no work
-    }
-    for b in batches.iter_mut() {
-        let cols: Vec<_> = order.iter().map(|&i| b.column(i).clone()).collect();
-        let fields: Vec<_> = order.iter().map(|&i| b.schema().field(i).clone()).collect();
-        let new_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields));
-        // Reindexing existing columns of a valid batch cannot fail; keep the original on
-        // the impossible error rather than dropping data.
-        if let Ok(nb) = RecordBatch::try_new(new_schema, cols) {
-            *b = nb;
-        }
-    }
 }
 
 #[cfg(test)]

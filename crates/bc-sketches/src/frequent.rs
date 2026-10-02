@@ -1,8 +1,7 @@
 //! Misra-Gries — frequent-items (heavy-hitter *key*) enumeration.
 //!
-//! Where Count-Min answers "how often does *this* key occur?", Misra-Gries
-//! answers the question the optimizer actually asks before a shuffle: "*which*
-//! keys are hot?" It maintains a bounded summary of at most `capacity` monitored
+//! Misra-Gries answers the question the optimizer asks before a shuffle:
+//! "*which* keys are hot?" It maintains a bounded summary of at most `capacity` monitored
 //! `(key, counter)` pairs and, after a single pass, the monitored set is
 //! guaranteed to contain **every** key whose true frequency exceeds
 //! `N / (capacity + 1)`. Those are exactly the candidates worth *salting* (fanning
@@ -10,9 +9,7 @@
 //!
 //! The counters are *lower* bounds: the algorithm only ever decrements, so the
 //! stored count for a key undershoots its true frequency by at most
-//! `N / (capacity + 1)`. That one-sided error is the dual of Count-Min's one-sided
-//! over-estimate, and it's why the two sketches are used together — Count-Min to
-//! *size* a known hot key, Misra-Gries to *find* the unknown ones.
+//! `N / (capacity + 1)`.
 //!
 //! Mergeable: sum the counters of common keys, union the rest, then if the union
 //! exceeds `capacity` keys, subtract the `(capacity + 1)`-th largest count from
@@ -189,8 +186,7 @@ impl<K: Hash + Eq + Clone> FrequentItems<K> {
     /// at scale. Misra-Gries counters *underestimate* (they are decremented), so filtering on
     /// the raw counter drops exactly the borderline-heavy keys whose counters were decremented
     /// the most, which is the unsafe direction. Comparing the upper bound reports every key
-    /// that could be heavy and cannot miss one — the same safety choice Count-Min's `is_heavy`
-    /// and the join bloom make.
+    /// that could be heavy and cannot miss one — the same safety choice the join bloom makes.
     #[must_use]
     pub fn heavy_hitters(&self, fraction: f64) -> Vec<(K, u64)> {
         let threshold = fraction * self.total as f64;

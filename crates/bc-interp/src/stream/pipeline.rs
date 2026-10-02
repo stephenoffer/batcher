@@ -3,10 +3,14 @@
 //! Each is an `Iterator` over morsels that pulls exactly one morsel from its child, transforms
 //! it, and yields — so a chain of them holds one morsel per stage and nothing else.
 
-use arrow::array::RecordBatch;
+use arrow::array::{BooleanArray, RecordBatch};
+use arrow::compute::filter_record_batch;
+use bc_expr::{ConjunctOrder, Expr};
+use bc_ir::RelOp;
 
-use super::Morsels;
-use crate::InterpError;
+use super::builds::node_key;
+use super::{build_with, Ctx, Morsels};
+use crate::{ops, InterpError};
 
 /// Rows per morsel handed out by a scan.
 ///
@@ -15,6 +19,101 @@ use crate::InterpError;
 /// rather than a promise: the slices are zero-copy views, so this costs nothing and caps what a
 /// downstream filter or probe has to hold.
 const SCAN_MORSEL_ROWS: usize = bc_arrow::DEFAULT_MORSEL_ROWS;
+
+/// A Filter, or a run of Filters stacked directly on one another, as one per-morsel stage.
+///
+/// Filter and Project stay on the interpreter here, and that is a measured choice rather than
+/// an oversight: wiring the Tier-1 JIT into this path (compile once per operator on the first
+/// morsel, reuse across the rest) was tried and measured 1.01x over TPC-H in an interleaved
+/// A/B, with five queries slower. `par.rs` still compiles, where the fused shapes make it pay.
+///
+/// **A stacked run gathers once.** Each filter's own conjunct order is kept, and each one's
+/// mask is carried to the next, which ANDs its own onto it over the ungathered morsel
+/// (`ops::filter_mask_within`, which declines where that is not sound); the rows are gathered
+/// after the last. A filter over a filter is a shape the planner emits routinely -- the implied
+/// `x <= max` bound it derives from `x IN (...)`, or a pushed-down predicate it kept separate --
+/// and on a string-heavy morsel the intermediate gather was the larger cost (`memmove` plus
+/// `FilterBytes` ~49% of `l_shipmode IN (...) AND l_suppkey IN (...)`). Each filter's rows in
+/// and out are metered exactly as before. A filter a runtime join filter is attached to, or
+/// one already materialized, ends the run, so it keeps its own stream (`build_with`).
+pub(super) fn filter_stream<'a>(
+    input: &'a RelOp,
+    predicate: &'a Expr,
+    id: Option<u32>,
+    ctx: Ctx<'a>,
+) -> Result<Morsels<'a>, InterpError> {
+    // Innermost last while collecting, so `run` reads outermost first; reversed below.
+    let mut run: Vec<(Option<u32>, &Expr)> = vec![(id, predicate)];
+    let mut base = input;
+    while let RelOp::Filter { input, predicate } = base {
+        if !plain(base, ctx) {
+            break;
+        }
+        run.push((ctx.id(base), predicate));
+        base = input;
+    }
+    run.reverse();
+    let orders: Vec<Option<ConjunctOrder>> =
+        run.iter().map(|(_, p)| ConjunctOrder::new(p)).collect();
+    let child = build_with(base, ctx)?;
+    Ok(Box::new(child.map(move |b| {
+        let mut cur = b?;
+        // The keep mask of the filters run so far over `cur`, not yet applied to it.
+        let mut pending: Option<BooleanArray> = None;
+        for (k, (&(id, predicate), order)) in run.iter().zip(&orders).enumerate() {
+            let last = k + 1 == run.len();
+            let rows_in = pending
+                .as_ref()
+                .map_or(cur.num_rows(), BooleanArray::true_count) as u64;
+            let t = std::time::Instant::now();
+            let mask = match pending.take() {
+                Some(live) => {
+                    let within =
+                        ops::filter_mask_within(&cur, predicate, &None, order.as_ref(), &live)?;
+                    if within.is_none() {
+                        cur = filter_record_batch(&cur, &live)?;
+                    }
+                    within
+                }
+                None if !last => Some(ops::truthy(&ops::filter_mask_jit(
+                    &cur,
+                    predicate,
+                    &None,
+                    order.as_ref(),
+                )?)),
+                None => None,
+            };
+            match mask {
+                Some(mask) if !last => {
+                    let kept = mask.true_count() as u64;
+                    if let (Some(m), Some(id)) = (ctx.meter, id) {
+                        m.morsel_ungathered(id, rows_in, kept, &cur, t.elapsed().as_nanos() as u64);
+                    }
+                    pending = Some(mask);
+                }
+                Some(mask) => {
+                    cur = filter_record_batch(&cur, &mask)?;
+                    ctx.morsel(id, rows_in, &cur, t);
+                }
+                None => {
+                    cur = ops::filter_batch_jit(&cur, predicate, &None, order.as_ref())?;
+                    ctx.morsel(id, rows_in, &cur, t);
+                }
+            }
+        }
+        Ok(cur)
+    })))
+}
+
+/// Whether `node` is built as nothing more than its own operator: no runtime join filter is
+/// attached to it and it is not an already-materialized leaf -- see `build_with` and
+/// `build_node`, which would otherwise wrap or replace its stream.
+fn plain(node: &RelOp, ctx: Ctx<'_>) -> bool {
+    let key = node_key(node);
+    ctx.cache.filters_for(key).is_none()
+        && ctx.mats.and_then(|m| m.get(&key)).is_none()
+        && ctx.cache.probe_leaf(key).is_none()
+}
 
 /// Stream a source relation as zero-copy morsel-sized slices.
 pub(super) fn scan_stream(batches: &[RecordBatch]) -> Morsels<'_> {
@@ -29,6 +128,35 @@ pub(super) fn scan_stream(batches: &[RecordBatch]) -> Morsels<'_> {
             let len = SCAN_MORSEL_ROWS.min(rows - off);
             Ok(b.slice(off, len))
         }))
+    }))
+}
+
+/// Stream one unit of a lazily-read driving relation as morsel-sized slices, reading it only
+/// when the pipeline first pulls from it.
+///
+/// The owned counterpart of [`scan_stream`]: the unit's batches are decoded on the pulling
+/// worker and dropped once its morsels have passed through, so a worker holds one unit rather
+/// than its whole share of the relation. Zero-row batches are dropped — the caller keeps the
+/// schema carrier for a relation that turns out empty.
+pub(super) fn unit_stream<'a>(
+    src: &'a dyn super::chunked::units::UnitSource,
+    units: std::ops::Range<usize>,
+) -> Morsels<'a> {
+    Box::new(units.flat_map(move |unit| {
+        let decoded: Vec<Result<RecordBatch, InterpError>> = match src.read(unit) {
+            Ok(batches) => batches
+                .into_iter()
+                .flat_map(|b| {
+                    let rows = b.num_rows();
+                    (0..rows)
+                        .step_by(SCAN_MORSEL_ROWS)
+                        .map(move |off| Ok(b.slice(off, SCAN_MORSEL_ROWS.min(rows - off))))
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            Err(e) => vec![Err(e)],
+        };
+        decoded
     }))
 }
 

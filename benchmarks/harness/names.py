@@ -37,13 +37,35 @@ def canonical_column_name(name: str) -> str:
 
 
 def canonical_names(table: pa.Table) -> list[str]:
-    """`table`'s column names canonicalized, or merely lowercased if that would collide.
+    """`table`'s column names canonicalized, falling back step by step until they are unique.
 
-    Two columns of one result squeezing to the same name would silently drop one of them from
-    the comparison, which is the one outcome worse than the false failure this fixes. The
-    lowercased fallback is exactly the behaviour that preceded canonicalization.
+    Two columns of one result sharing a comparison name would silently drop one of them from
+    the comparison, because the rowset is built as a name-keyed mapping. That is the one
+    outcome worse than the false failure canonicalization fixes: with columns ``x`` and
+    ``X``, the lowercased fallback that used to stand here collided too, and changing ``X``
+    from 2 to 999 still passed. So the fallbacks are canonical, then lowercased, then the
+    names exactly as given, and finally the exact names with a positional suffix on any
+    repeat (Arrow permits duplicate names).
+
+    The squeeze drops only spaces, quotes and parentheses, and only when doing so leaves
+    every name in the result distinct, so two user aliases differing only in those
+    characters are never merged *within* one result. Across engines a squeezed match only
+    pairs the columns up; their values are still compared.
     """
-    canonical = [canonical_column_name(n) for n in table.column_names]
-    if len(set(canonical)) != len(canonical):
-        return [n.lower() for n in table.column_names]
-    return canonical
+    for candidate in (
+        [canonical_column_name(n) for n in table.column_names],
+        [n.lower() for n in table.column_names],
+        list(table.column_names),
+    ):
+        if len(set(candidate)) == len(candidate):
+            return candidate
+    used: set[str] = set()
+    unique = []
+    for name in table.column_names:
+        label, count = name, 0
+        while label in used:
+            count += 1
+            label = f"{name}#{count}"
+        used.add(label)
+        unique.append(label)
+    return unique

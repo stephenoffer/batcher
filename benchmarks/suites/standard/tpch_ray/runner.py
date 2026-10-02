@@ -71,6 +71,24 @@ def case_with_ray(name: str, query: str) -> Callable[[Context], EngineQueries]:
         native("ray", ray_impl(name))
         native("batcher", bt_impl)
         native("polars", pl_impl)
+        if pl_impl is not None and "polars" in ctx.names() and not ctx.tables and ctx.uris:
+            # Scan mode has no in-memory tables, but Polars' pipelines take LazyFrames, so a
+            # lazy `scan_parquet` per table serves them as-is. Without this, sf100 fell back to
+            # Polars' SQL frontend, which parses neither comma joins nor EXISTS, and 20 of 22
+            # queries reported PARTIAL: Polars was unmeasured at the scale that matters most.
+            fns["polars"] = lambda: pl_impl(_polars_scans(ctx))
         return fns
 
     return build
+
+
+def _polars_scans(ctx: Context) -> dict[str, Any]:
+    """A lazy, canonically-renamed `scan_parquet` per TPC-H table, rebuilt per call."""
+    import polars as pl
+
+    scans = {}
+    for table, uri in ctx.uris.items():
+        scan = pl.scan_parquet(uri)
+        cols = ctx.rename.get(table)
+        scans[table] = scan.rename(cols) if cols else scan
+    return scans

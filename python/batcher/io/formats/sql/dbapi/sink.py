@@ -44,7 +44,7 @@ A borrowed connection therefore writes into a table that already exists.
 from __future__ import annotations
 
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 import pyarrow as pa
@@ -54,9 +54,14 @@ from batcher._internal.logging import get_logger, log_kv
 from batcher.io.base._transient import with_retry
 from batcher.io.formats.base import SINKS
 from batcher.io.formats.sql._common import schema_probe
-from batcher.io.formats.sql.dbapi import _ddl, _statements
+from batcher.io.formats.sql.dbapi import _ddl, _staged, _statements
 from batcher.io.formats.sql.dbapi import source as _source
-from batcher.io.formats.sql.dbapi._bind import null_key_rows, parameter_chunks
+from batcher.io.formats.sql.dbapi._bind import (
+    duplicate_key_rows,
+    latest_per_key,
+    null_key_rows,
+    parameter_chunks,
+)
 from batcher.io.formats.sql.dbapi._statements import Statement
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.plan.types import logical_bytes
@@ -89,6 +94,13 @@ DEFAULT_ROWS_PER_STATEMENT = 1_000
 _LOGGER = get_logger("io.sql")
 
 
+def _as_columns(value: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    """One column name or several, as a tuple."""
+    if not value:
+        return ()
+    return (value,) if isinstance(value, str) else tuple(value)
+
+
 @SINKS.register("dbapi")
 @dataclass(frozen=True, slots=True)
 class DBAPISink:
@@ -119,6 +131,15 @@ class DBAPISink:
             `key_columns` as its primary key. A keyed mode against a table with no such
             key silently degrades to an append, so this is on by default. Ignored for a
             `connection` the caller supplied.
+        sequence_by: Columns ordering two rows that share a key, for the keyed modes.
+            When set, only the row with the greatest value per key is written, so a
+            repeated key's winner is a property of the data rather than of frame order,
+            which a distributed or streamed write does not fix. Without it a repeated key
+            is resolved by statement order, and the sink logs a warning saying so.
+        staged: Publish an ``append`` or ``overwrite`` atomically across every shard. Each
+            shard writes into its own staging table and `commit` copies them all into the
+            target in one transaction, so a failed distributed write changes nothing and a
+            distributed ``overwrite`` becomes possible. See `_staged`.
         rows_per_statement: Rows bound into one ``executemany`` call.
         retries: Extra attempts after a transient failure — a deadlock, a serialization
             failure, a dropped connection. `0` disables retrying.
@@ -144,6 +165,8 @@ class DBAPISink:
     paramstyle: str | None = None
     mode: str = "append"
     key_columns: tuple[str, ...] = ()
+    sequence_by: tuple[str, ...] = ()
+    staged: bool = False
     create_table: bool = True
     rows_per_statement: int = DEFAULT_ROWS_PER_STATEMENT
     retries: int = 3
@@ -152,6 +175,7 @@ class DBAPISink:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "key_columns", tuple(self.key_columns or ()))
+        object.__setattr__(self, "sequence_by", _as_columns(self.sequence_by))
         if self.mode not in WRITE_MODES:
             raise BackendError(
                 f"unknown SQL write mode {self.mode!r}; expected one of {list(WRITE_MODES)}."
@@ -160,6 +184,22 @@ class DBAPISink:
             raise BackendError(
                 f"mode={self.mode!r} needs key_columns= — the columns that identify a row "
                 "in the target table."
+            )
+        if self.sequence_by and self.mode not in _KEYED_MODES:
+            raise BackendError(
+                f"sequence_by= orders rows that share a key, so it needs a keyed mode "
+                f"({sorted(_KEYED_MODES)}); mode={self.mode!r} has no key."
+            )
+        if self.staged and self.mode not in _staged.STAGED_MODES:
+            raise BackendError(
+                f"staged=True publishes a whole-table write atomically, so it applies to "
+                f"{sorted(_staged.STAGED_MODES)}; mode={self.mode!r} is keyed, idempotent "
+                "per key, and made whole by re-running it."
+            )
+        if self.staged and self.connection is not None:
+            raise BackendError(
+                "staged=True needs a connection Batcher opens (uri= or module=): a "
+                "borrowed connection= is already one transaction you commit yourself."
             )
         if self.uri is not None and not self.module:
             self._resolve_uri()
@@ -271,12 +311,15 @@ class DBAPISink:
             A `WrittenFile` recording the rows applied, and the server's affected-row count
             under ``stats["affected_rows"]`` where the driver reports one.
         """
+        if self.staged:
+            return self._write_stage(table, path)
         if table.num_rows == 0 and self.mode != "overwrite":
             # An empty frame in a keyed mode is a no-op, and an empty `overwrite` is not:
             # it still means "leave the table holding exactly these rows", i.e. none.
             return WrittenFile(path=path, rows=0, bytes=0)
         if self.key_columns:
             self._warn_null_keys(table, path)
+            table = self._resolve_repeated_keys(table, path)
         affected = with_retry(
             lambda: self._apply(table, path),
             attempts=self.retries + 1,
@@ -298,6 +341,47 @@ class DBAPISink:
                 key_columns=list(self.key_columns),
                 rows=nulls,
             )
+
+    def _write_stage(self, table: pa.Table, path: str) -> WrittenFile:
+        """Write this shard into a fresh staging table; `commit` publishes it.
+
+        The shard write is an ordinary committed ``append`` into a table no reader knows
+        about, so it reuses the retry, chunking and table-creation logic unchanged.
+        """
+        if table.num_rows == 0:
+            return WrittenFile(path=path, rows=0, bytes=0)
+        stage = _staged.stage_name(path)
+        shard = replace(
+            self, mode="append", staged=False, key_columns=(), sequence_by=(), create_table=True
+        )
+        written = shard.write(table, stage)
+        stats = {**written.stats, "stage_table": stage, "stage_columns": list(table.schema.names)}
+        return replace(written, path=path, stats=stats)
+
+    def _resolve_repeated_keys(self, table: pa.Table, path: str) -> pa.Table:
+        """Collapse a repeated key by `sequence_by`, or say it will be resolved by order.
+
+        ``delete_insert`` is left alone: it inserts every row, so a repeated key is a
+        repeated row and the target's key constraint already refuses it by name.
+        """
+        if self.mode == "delete_insert" and not self.sequence_by:
+            return table
+        if self.sequence_by:
+            return latest_per_key(table, self.key_columns, self.sequence_by)
+        repeated = duplicate_key_rows(table, self.key_columns)
+        if repeated:
+            log_kv(
+                _LOGGER,
+                30,  # logging.WARNING
+                "sql write: rows share a key, so the last one in frame order wins; frame "
+                "order is not fixed across a distributed or streamed write. Pass "
+                "sequence_by= to choose the winner by value",
+                table=path,
+                mode=self.mode,
+                key_columns=list(self.key_columns),
+                rows=repeated,
+            )
+        return table
 
     def _apply(self, table: pa.Table, path: str) -> int | None:
         """Run the whole write on one connection, committing once or rolling back whole."""
@@ -507,7 +591,7 @@ class DBAPISink:
         Raises:
             BackendError: If a destructive `mode` meets a multi-shard write.
         """
-        if file_index > 0 and self.mode in _DESTRUCTIVE_MODES:
+        if file_index > 0 and self.mode in _DESTRUCTIVE_MODES and not self.staged:
             raise BackendError(
                 f"mode={self.mode!r} cannot be used for a distributed write to table "
                 f"{path!r}: every shard would apply it to the same table, so each one "
@@ -517,4 +601,40 @@ class DBAPISink:
         return [self.write(table, path)]
 
     def commit(self, manifest: WriteManifest, path: str) -> None:
-        """No-op: each shard commits its own transaction as it writes."""
+        """Publish a staged write in one transaction; otherwise a no-op.
+
+        Unstaged, each shard committed its own transaction as it wrote. Staged, this is the
+        write's single commit point: every staging table the manifest names is copied into
+        `path` together, after an ``overwrite`` has emptied it, and the staging tables are
+        dropped whether or not that succeeds.
+
+        Raises:
+            BackendError: If the publish fails. The target is left unchanged.
+        """
+        if not self.staged:
+            return
+        stages = [f.stats["stage_table"] for f in manifest.files if f.stats.get("stage_table")]
+        columns = next(
+            (f.stats["stage_columns"] for f in manifest.files if f.stats.get("stage_columns")),
+            None,
+        )
+        if columns is None and manifest.schema is not None:
+            columns = list(manifest.schema.names)
+        dialect = self._resolved_dialect()
+        conn = _source._connect(self.module, self.connect_kwargs)
+        try:
+            if columns is not None and self.create_table and manifest.schema is not None:
+                self._ensure_table(conn, manifest.schema, path)
+            _staged.publish_stages(
+                conn,
+                path,
+                stages,
+                columns or [],
+                overwrite=self.mode == "overwrite",
+                dialect=dialect,
+            )
+        finally:
+            try:
+                _staged.drop_stages(conn, stages, dialect=dialect)
+            finally:
+                conn.close()

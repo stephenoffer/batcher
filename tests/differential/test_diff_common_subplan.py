@@ -406,3 +406,109 @@ def test_narrowing_keeps_a_column_a_later_level_still_reads(duck):
     assert got.num_rows > finest.num_rows > 0, (
         f"levels went missing: {got.num_rows} rows against {finest.num_rows} for the finest"
     )
+
+
+def _sess_with_a_wide_payload():
+    """A keyed table carrying a wide text column, and a dimension that filters it."""
+    rng = np.random.default_rng(11)
+    n = 6000
+    sess = bt.Session()
+    sess.register(
+        "ps",
+        bt.from_arrow(
+            pa.table(
+                {
+                    "pk": rng.integers(0, 600, n),
+                    "sk": rng.integers(0, 50, n),
+                    "q": rng.integers(0, 1000, n),
+                    "comment": [f"payload-{i}-" + "x" * (i % 60) for i in range(n)],
+                }
+            )
+        ),
+    )
+    sess.register(
+        "p",
+        bt.from_arrow(
+            pa.table(
+                {
+                    "pk": np.arange(600),
+                    "name": [("f" if i % 3 else "g") + str(i) for i in range(600)],
+                }
+            )
+        ),
+    )
+    return sess
+
+
+_SHARED_UNDER_A_JOIN = (
+    "WITH s AS (SELECT * FROM ps WHERE pk IN (SELECT pk FROM p WHERE name LIKE 'f%')) "
+    "SELECT a.sk, a.q FROM s a JOIN (SELECT pk, max(q) AS mq FROM s GROUP BY pk) b "
+    "ON a.pk = b.pk AND a.q = b.mq"
+)
+
+
+def test_narrowing_sees_through_a_join_that_declares_an_unread_column(duck, cse_off):
+    """A join above an appearance names its whole output until pruning narrows it.
+
+    The plan *as written* therefore reports every column of the shared subtree as needed,
+    which is how TPC-H q20's `partsupp ⋈ part` came to be materialized with `ps_comment`:
+    80 M strings nothing reads, 3.2 s of a 7 s query at sf100. The need has to be the
+    pruned plan's, and the rewritten plan has to be pruned to match, or the narrower scan
+    does not validate.
+
+    Asserted both ways: the wide column is dropped, and the answer equals DuckDB's and the
+    unrewritten plan's -- dropping a column something still reads is a wrong answer.
+    """
+    from batcher import core
+    from batcher.api.subplan_reuse import reuse_common_subplans
+
+    sess = _sess_with_a_wide_payload()
+    q = sess.sql(_SHARED_UNDER_A_JOIN)
+    ctx = core.ExecutionContext(columns=q.columns, hub=core.default_hub())
+    _, sources = reuse_common_subplans(q._plan, list(q._sources), ctx)
+    assert len(sources) > len(q._sources), "no subplan was materialized"
+    kept = set(sources[len(q._sources) :][0].schema().names)
+    assert {"pk", "sk", "q"} <= kept, f"a needed column was dropped; kept {sorted(kept)}"
+    assert "comment" not in kept, f"the unread payload was materialized; kept {sorted(kept)}"
+
+    got = sess.sql(_SHARED_UNDER_A_JOIN).collect()
+    assert got.num_rows > 0
+    for name in ("ps", "p"):
+        duck.register(name, sess.sql(f"SELECT * FROM {name}").collect())
+    assert_same(got, duck.sql(_SHARED_UNDER_A_JOIN))
+    with cse_off():
+        assert _rows(sess.sql(_SHARED_UNDER_A_JOIN).collect()) == _rows(got)
+
+
+def test_a_failed_cluster_materialization_is_retried_on_the_driver(fact, monkeypatch):
+    """The distributed route must not decline reuse when the cluster run fails.
+
+    Declined, each appearance is recomputed across the cluster, and a float reduction can
+    come back with different last bits in each: TPC-H q15 (`sum = max(sum)`) returned no rows
+    at SF1 when a cold fleet timed the first materialization out. The retry on the driver is
+    what keeps the appearances reading one set of values.
+    """
+    from batcher import core
+    from batcher.api import subplan_reuse
+    from batcher.api.orchestration import run as orchestration_run
+    from batcher.api.subplan_reuse import reuse_common_subplans
+
+    real = orchestration_run.run_relational
+    routes = []
+
+    def cluster_down(plan, sources, ctx, *, distributed=False, **kw):
+        routes.append(distributed)
+        if distributed:
+            raise RuntimeError("no distributed worker became available within 60s")
+        return real(plan, sources, ctx, distributed=False, **kw)
+
+    monkeypatch.setattr(orchestration_run, "run_relational", cluster_down)
+    # Big enough that `auto` would send it to the cluster, whatever this machine is.
+    monkeypatch.setattr("batcher.api.terminal.routing.resolve_distributed", lambda *a: True)
+    q = _shared_agg_join(fact)
+    ctx = core.ExecutionContext(columns=q.columns, hub=core.default_hub())
+    subplan_reuse._VERDICTS.clear()
+    plan, sources = reuse_common_subplans(q._plan, q._sources, ctx, distributed=True)
+    assert routes[:2] == [True, False]
+    assert len(sources) > len(q._sources), "reuse was declined after the cluster run failed"
+    assert plan is not q._plan

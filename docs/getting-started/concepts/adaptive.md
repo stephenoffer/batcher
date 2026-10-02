@@ -22,7 +22,7 @@ A *pipeline breaker* is an operator that must finish before the next one starts,
 
 Suppose a filter is expected to keep most rows but actually keeps a handful. A plan built for the large estimate might size a hash join for millions of rows. Batcher runs the filter, sees that only a few rows survived, and re-plans the join before it starts, where it can choose a broadcast instead.
 
-This is stage-boundary re-optimization, the same mechanism and granularity as Spark's adaptive query execution. The difference is that Batcher does it on a single machine too, where AQE needs shuffle stages. Staging has a cost, so `collect(adaptive="auto")` turns the loop on only when all of the following hold:
+This is stage-boundary re-optimization, the same mechanism and granularity as Spark's adaptive query execution. AQE also runs on a single machine, in local mode. The difference is where the loop lives: Batcher runs it inside the Python process, not in a JVM beside it, and adds a cross-query loop that AQE doesn't have. Staging has a cost, so `collect(adaptive="auto")` turns the loop on only when all of the following hold:
 
 - The query has a join. A query with no join never qualifies.
 - The input clears 5,000,000 rows for each breaker the loop would cut at. That's about 10,000,000 rows for the simplest joined query.

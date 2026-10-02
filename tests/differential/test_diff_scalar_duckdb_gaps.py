@@ -1,11 +1,11 @@
 """Scalar functions DuckDB has and the engine did not — vs DuckDB.
 
-The differential function census (`docs/architecture/internals/competitor_parity_census.md`) sorted
-DuckDB's 478 scalar and aggregate builtins into supported, absent, and *wrong*. These are
-the absent ones this wave implemented: five math functions, one two-argument math
-function, and eleven string functions whose definition comes from an external
-specification (RFC 3986, POSIX paths, RE2's `QuoteMeta`) rather than from an operation on
-characters.
+The differential function census
+(`docs/architecture/internals/parity/competitor_parity_census.md`) sorted DuckDB's 478
+scalar and aggregate builtins into supported, absent, and *wrong*. These are the absent ones
+this wave implemented: five math functions, one two-argument math function, and eleven
+string functions whose definition comes from an external specification (RFC 3986, POSIX
+paths, RE2's `QuoteMeta`) rather than from an operation on characters.
 
 Arguments are **columns**, not literals, so constant folding cannot answer the query
 without the runtime kernel running.

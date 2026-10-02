@@ -50,7 +50,7 @@ __all__ = ["ONNX_TO_NUMPY", "OnnxSession", "onnx_predictor"]
 ONNX_TO_NUMPY: dict[str, str] = {
     "tensor(float)": "float32",
     "tensor(float16)": "float16",
-    "tensor(bfloat16)": "float32",  # NumPy has no bfloat16; the runtime casts on ingest
+    "tensor(bfloat16)": "float32",  # NumPy has no bfloat16; fed as a typed OrtValue
     "tensor(double)": "float64",
     "tensor(int64)": "int64",
     "tensor(int32)": "int32",
@@ -180,7 +180,7 @@ class OnnxSession:
 
     def close(self) -> None:
         """Drop the session so its device memory is released with the worker, not with the GC."""
-        self._session = None  # type: ignore[assignment]
+        self._session = None
 
     def _coerce(self, name: str, array: np.ndarray) -> np.ndarray:
         """One input array in the dtype and rank the graph declared for `name`."""
@@ -196,7 +196,7 @@ class OnnxSession:
         target = ONNX_TO_NUMPY.get(spec.type)
         out = np.asarray(array)
         if target is not None and out.dtype != np.dtype(target):
-            out = out.astype(target, copy=False)
+            out = _lossless_cast(name, out, np.dtype(target))
         rank = len(spec.shape or ())
         # An exported model whose feature axis is size 1 declares rank 2 while the column
         # arrives rank 1. Adding *one* trailing axis is unambiguous — there is exactly one
@@ -206,7 +206,68 @@ class OnnxSession:
         # report, where the message names the shapes.
         if rank and out.ndim == rank - 1:
             out = out[..., None]
-        return np.ascontiguousarray(out)
+        out = np.ascontiguousarray(out)
+        if spec.type == "tensor(bfloat16)":
+            return _bfloat16_value(out)
+        return out
+
+
+def _lossless_cast(name: str, array: np.ndarray, target: np.dtype) -> np.ndarray:
+    """`array` cast to the graph's declared `target`, refusing a cast that changes a value.
+
+    Narrowing a float to a lower float precision is what an fp16 export asks for and is
+    allowed. What is refused is a cast that rewrites values rather than rounding them: a
+    float column fed to an ``int64`` token-id input (a fractional value would be truncated,
+    and a NaN from a null becomes an arbitrary integer), or an integer outside the target's
+    range (which wraps). Both are almost always a wired-up-wrong column, so they fail by name
+    here instead of scoring garbage. Cast the column in the plan to make such a cast explicit.
+    """
+    import numpy as np
+
+    from batcher._internal.errors import PlanError
+
+    if target.kind in "iub" and array.size:
+        if array.dtype.kind == "f":
+            finite = np.isfinite(array)
+            if not finite.all() or not np.array_equal(array, np.round(array)):
+                raise PlanError(
+                    f"ONNX input {name!r} is declared {target} but received {array.dtype} "
+                    "values that are fractional, NaN or infinite; casting would change them. "
+                    f"Cast the column to {target} in the plan if that is intended."
+                )
+        if target.kind == "b" and array.dtype.kind != "b" and not np.isin(array, (0, 1)).all():
+            raise PlanError(
+                f"ONNX input {name!r} is declared bool but received values other than 0 and 1."
+            )
+        if target.kind in "iu" and array.dtype.kind in "iuf":
+            info = np.iinfo(target)
+            if array.min() < info.min or array.max() > info.max:
+                raise PlanError(
+                    f"ONNX input {name!r} is declared {target} but received values outside its "
+                    f"range [{info.min}, {info.max}]; casting would wrap them."
+                )
+    return array.astype(target, copy=False)
+
+
+def _bfloat16_value(array: np.ndarray) -> Any:
+    """A float32 array as a native ``bfloat16`` `OrtValue` for a graph that declares one.
+
+    NumPy has no bfloat16, and ONNX Runtime does **not** cast a float32 feed on ingest: it
+    rejects it with ``INVALID_ARGUMENT: Unexpected input data type``. So the bits are made
+    here, rounding float32 to nearest-even on the top 16 bits (NaN kept a quiet NaN, which the
+    rounding would otherwise carry into infinity), and handed over as a typed `OrtValue`.
+    """
+    import numpy as np
+    import onnxruntime as ort
+
+    bits = np.ascontiguousarray(array, dtype=np.float32).view(np.uint32)
+    rounded = ((bits + np.uint32(0x7FFF) + ((bits >> 16) & np.uint32(1))) >> 16).astype(np.uint16)
+    rounded[np.isnan(array)] = np.uint16(0x7FC0)
+    return ort.OrtValue.ortvalue_from_numpy_with_onnx_type(rounded, _ONNX_BFLOAT16)
+
+
+#: `onnx.TensorProto.BFLOAT16`, spelled out so the runtime path needs no `onnx` import.
+_ONNX_BFLOAT16 = 16
 
 
 def _session_options(

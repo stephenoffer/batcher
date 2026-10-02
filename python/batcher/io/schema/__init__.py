@@ -2,11 +2,11 @@
 
 A source is often many files written at different times, so their schemas drift:
 a column is added, a type widens, field order changes. `evolution` is where that
-drift is detected (`schema_drift` → `SchemaDrift`) and resolved into the one schema
-a scan must present (`unify_schemas`, `reconcile_batches`, `normalize_batch`) — so
-that every operator above sees a single stable schema and no format has to solve
-this for itself. `conform_batch` is the strict-mode counterpart: it does not
-reconcile, it *enforces* that every file matches the schema the source declared.
+drift is resolved into the one schema a scan must present (`unify_schemas`,
+`reconcile_batches`, `normalize_batch`) — so that every operator above sees a single
+stable schema and no format has to solve this for itself. `conform_batch` is the
+strict-mode counterpart: it does not reconcile, it *enforces* that every file matches the
+schema the source declared.
 
 Read-time only, and deliberately so: this reconciles what was *already written*.
 Deciding what a sink writes is the format's job, and the neutral type vocabulary the
@@ -16,19 +16,15 @@ unified schema is expressed in belongs to `plan.types`.
 from __future__ import annotations
 
 from batcher.io.schema.evolution import (
-    SchemaDrift,
     conform_batch,
     normalize_batch,
     reconcile_batches,
-    schema_drift,
     unify_schemas,
 )
 
 __all__ = [
-    "SchemaDrift",
     "conform_batch",
     "normalize_batch",
     "reconcile_batches",
-    "schema_drift",
     "unify_schemas",
 ]

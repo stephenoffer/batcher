@@ -12,8 +12,15 @@ of a too-large query is *slower*, not *dead*.
 :::{important}
 Spilling is a property of the runtime primitive, not a separate operator. There's no "spilling
 aggregate" node in the IR. The same `Aggregate` runs in memory or out of core depending on
-whether its reservation was granted, and the result is **bit-identical either way**. A query
-that spills is slower. It isn't different.
+whether its reservation was granted, and the result is **the same relation either way**: the
+same rows, column names and column types. A query that spills is slower. It isn't different.
+
+"The same" is exact for integer, string, and key-based results. Two things can legitimately
+move, and they are the same two the
+{doc}`mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>` allows between
+single-node and distributed. A floating-point `sum` or `mean` combines its partials in a
+different order when they come back from disk, so it can differ in the last bits. An unordered
+`array_agg` can list a group's elements in a different order.
 :::
 
 ## The admission decision
@@ -125,10 +132,17 @@ state. The table names the mechanism and the file that implements it:
 | Hash join | grace: co-partition both sides, join bucket-by-bucket | `bc-interp/src/join_par/mod.rs` |
 | ASOF join | partition by the `by` keys | `bc-interp/src/join_par/mod.rs` |
 | Window (PARTITION BY) | partition on the partition keys | `bc-interp/src/window_spill.rs` |
+| Window, one partition over budget | external sort, then the kernel per chunk with a carried correction | `bc-interp/src/ops/window_stream.rs` |
+| ASOF join without `by` | external sort of both sides, then a merge that keeps only candidate right rows | `bc-interp/src/join_par/asof_stream.rs` |
+| Range join, right side over budget | block-nested over left and right chunks, unmatched rows decided once | `bc-interp/src/join_par/range_blocked.rs` |
 | DISTINCT ON | grace, reduced to one row per key per morsel first | `bc-interp/src/distinct_on_spill.rs` |
 
 Top-N, a `Sort` carrying a `limit`, never spills. It runs a bounded heap, which is already
 memory-bounded.
+
+The three rows without a key to hash follow from what they compute. A window with no `PARTITION BY`, or a partition still over budget after every grace re-split, is sorted out of core by its partition keys, its order keys and each row's input position, which is the tie-break the in-memory kernel uses. The sorted stream is cut into chunks, and each chunk's `row_number`, `rank`, `dense_rank`, running `count` and frameless `first_value` are corrected by the counts carried from the rows before it. `lag` and `lead` run over the chunk plus the rows their offset reaches. Those corrections are integer arithmetic or copied values, so the result is identical to the kernel's. Every other window function in that shape, such as a running float `sum` whose re-association would move the low bits, is declined and still raises `MemoryBudgetExceededError`.
+
+A keyless ASOF join sorts both sides out of core by the join key. A left row can only be matched to the last right row at or before its key or the first at or after it, so of the right rows inside a left chunk's key range, only the first and last row between or at each of the chunk's distinct keys are kept for the kernel. A range join matches a pair on its two rows alone, so it is decomposed on both sides, with one mark per row deciding the unmatched rows an outer, semi or anti join emits.
 
 The **external sort** grows sorted runs to a quarter of the operator's budget, at least 1 MiB and at most 64 MiB (`DEFAULT_RUN_TARGET_BYTES`), rather than cutting one run per morsel. Fewer, larger runs mean fewer merge passes. It then merges with a bounded fan-in of `execution.sort_merge_fanin`, default 16, streaming the output back to disk between passes, so peak memory is O(fan-in batches) rather than O(input).
 
@@ -222,6 +236,12 @@ A missing spill file, such as on a spot node whose scratch disk was reclaimed, m
 retryable {py:exc}`ResourceError <batcher.ResourceError>`, so the distributed recovery loop recomputes the partition
 instead of crashing.
 
+### When the disk fills
+
+A spill write refused with `ENOSPC` or a quota's `EDQUOT` fails the query with a spill-out-of-space error that names the directory and the bytes already written, and suggests a larger `memory.spill_dir`, `memory.spill_remote_uri`, or a smaller `memory.max_memory_bytes` (`RuntimeError::SpillOutOfSpace` in `bc-runtime/src/error.rs`). The single-node engine does not retry it. The failing store's directory is removed by its `Drop` on that error path like any other. A file cut short by a full disk cannot turn into a wrong answer, because every read is checked against the row count taken when the file was written, and a shortfall fails with a truncation error.
+
+Nothing reserves disk across consumers. The Python tiered store, which the result cache's disk tier also writes through, clamps its local budget to 90% of the free space it measures when it is created (`carbonite/spill/disk.py::clamp_to_free_disk`). The engine's own grace and sort stores apply no free-space clamp. Two consumers sharing one volume can therefore each see room that the other then fills, and the second one gets the out-of-space error. Give the result cache's disk tier its own budget with `memory.result_cache_disk_max_bytes`, or point `memory.spill_dir` at a volume with room for both.
+
 ## Observing it
 
 `explain(analyze=True, format="json")` reports spill per operator and in total.
@@ -259,8 +279,12 @@ further.
 
 :::{warning}
 A key set so skewed that one group's state exceeds the budget on its own can't be partitioned
-out, because no hash split separates a single key from itself. That case degrades to running the
-bucket over budget rather than failing. The engine logs a warning when spill skew, the
+out, because no hash split separates a single key from itself. For an aggregate, the recursion
+stops at the depth cap and combines the bucket as it stands (`merge_partition` in
+`bc-runtime/src/agg/spill/mod.rs`). That is bounded for every constant-state aggregate, because a
+hot key contributes one partial row per morsel. `array_agg`, whose output is the list itself,
+runs the bucket over budget. A window partition in that position streams instead, as described
+above, when its functions allow it. The engine logs a warning when spill skew, the
 largest partition's bytes over the mean non-empty partition's, exceeds `SPILL_SKEW_WARN`
 of 3.0. If you see that warning, the fix is upstream of the aggregate, not in the spill
 configuration.
@@ -270,11 +294,19 @@ On the out-of-core spill path, `dist/spill/scratch.py::_fd_safe` caps the bucket
 1024 (`_FD_SAFE_PARTITIONS`) so a wide fan-out doesn't exhaust the process file-descriptor
 limit.
 
+The engine's own stores open one file per partition on its first write and close it when that
+partition is read back, or at once for an external sort's runs, which bounds a sort to one
+output file plus its merge fan-in. A grace store holds up to 256 writers open, and a re-split
+opens a child store while the parent's unread partitions keep theirs. So an adversarially skewed
+aggregate can hold on the order of 256 files per recursion level, up to its depth cap, and a
+grace join holds two such stores. There is no process-wide cap on the total. On a host with a
+low open-file limit, raise it before running deeply skewed spills.
+
 ## See also
 
 - {doc}`Architecture </architecture/index>`: why bounded memory is an operator property, not a mode.
 - {doc}`Carbonite </architecture/internals/carbonite>`: the resource manager whose reservation failure starts this.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the distributive equivalence grace rests on.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the distributive equivalence grace rests on.
 - {doc}`Performance </user-guide/operate/tuning/performance>`: the memory knobs, and when to raise them.
 - {doc}`Troubleshooting </user-guide/operate/running/troubleshooting>`: what to do when a query is spilling and you did not expect it.
 - {doc}`Scaling benchmarks </benchmarks/results/scaling>`: larger-than-memory queries, measured.

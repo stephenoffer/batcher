@@ -11,7 +11,7 @@ The following table summarizes the connector:
 | Extra | `pip install 'batcher-engine[databricks]'` |
 | Parallelism | Direct: Delta's splits, one per data file. Warehouse: a single split. |
 | Pushdown | Direct: predicates prune files, columns are pruned per file. Warehouse: predicates and projection fold into the SQL. |
-| Credentials | Direct: Unity vends storage credentials at plan time. Warehouse: an access token. |
+| Credentials | Direct: Unity vends storage credentials at plan time, and each split renews them on its worker before they expire. Warehouse: an access token. |
 
 The extra installs the Databricks SDK, for credential vending, and `databricks-sql-connector`, for the warehouse path.
 
@@ -27,7 +27,7 @@ from batcher import col
 orders = bt.read.databricks(
     "main.sales.orders",
     workspace="https://acme.cloud.databricks.com",
-    token="dapi...",
+    token="env:DATABRICKS_TOKEN",
 )
 big = orders.filter(col("amount") > 1_000).select("order_id", "customer_id", "amount")
 print(big.count())
@@ -82,7 +82,7 @@ There's no Databricks sink, and credential vending requests `READ` access only. 
 
 ## Requirements and limitations
 
-Vended credentials are short-lived. They're vended once at planning time and embedded in the splits sent to workers, and nothing refreshes them mid-query. A multi-hour read, or a job whose splits wait while a cluster autoscales, can start taking 403 errors from the object store partway through. Split a scan that long into several reads over partition ranges.
+Vended credentials are short-lived. They're vended once at planning time and embedded in the splits sent to workers. Each split also carries the table, the workspace and the token, and when the lease it was planned with is within five minutes of the expiry Unity reported, the worker vends a fresh one before reading, shared by every split of that table on the worker. A multi-hour read, or a job whose splits wait while a cluster autoscales, therefore keeps reading. The token travels with the splits to do this, so pass it as a secret reference such as `token="env:DATABRICKS_TOKEN"`, which each worker resolves for itself. A response with no expiry isn't renewed, because nothing says when to. A file already being read when its credentials lapse isn't restarted.
 
 The direct path reads Delta. For a table Unity fronts in another format, use the warehouse path.
 

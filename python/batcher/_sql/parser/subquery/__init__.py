@@ -9,7 +9,8 @@ optimizer and executor already understand:
   per-key `min`/`max` bound test (the TPC-H q21 shape).
 - `range` — an *inequality* correlation, which decorrelates to a range semi/anti join.
 - `quantified` — a pre-pass turning `= ANY` / `<> ALL` into the `IN` / `NOT IN` they are
-  defined as, so those inherit `core`'s decorrelation rather than needing their own.
+  defined as, so those inherit `core`'s decorrelation rather than needing their own, and
+  every other quantified comparison into its three-valued `CASE` over scalar aggregates.
 
 The public import path `batcher._sql.parser.subquery` is unchanged and so is what it means;
 the split is the sanctioned response to the parser directory reaching its file-count ceiling,

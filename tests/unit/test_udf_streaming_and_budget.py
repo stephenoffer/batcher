@@ -1,10 +1,7 @@
-"""Regression tests for the UDF execution path's memory bound and error budget.
+"""Regression tests for the UDF execution path: its routing, error budget, and cost probe.
 
 Each test here pins a behavior that used to be wrong in a way every gate passed:
 
-* `execute_with_udfs` called its result "streaming" while building a `list`, so peak memory
-  was the whole output. `stream_with_udfs` is the genuinely bounded form, and the test proves
-  the bound by counting how far the producer has run when the consumer takes its first batch.
 * `max_errored_rows` was rebuilt per call, so every partition, window, and execution path got
   its own full allowance and the real bound scaled with parallelism.
 * The per-row cost probe ran the user's `fn` up to four times on 65,536 rows before the query
@@ -79,89 +76,12 @@ def _identity(batch: pa.RecordBatch) -> pa.RecordBatch:
     return batch
 
 
-# ---------------------------------------------------------------------------
-# 1. Bounded memory: the streaming form must not run the producer to completion
-# ---------------------------------------------------------------------------
-
-
-def test_stream_with_udfs_is_bounded_not_fully_materialized():
-    """The consumer must see an early batch while most of the input is still unread.
-
-    This is the memory claim itself, not a proxy for it: if the producer has already run to
-    the end of a 200-batch source by the time the consumer takes batch 0, then every output
-    batch is resident at once and the "streaming" path is bounded by the whole output. The
-    ceiling below is the sum of the path's prefetch windows (source readahead, the per-stage
-    queue, and the in-flight GPU window), all small constants.
-    """
-    n = 200
-    src = _CountingSource(n)
-    plan = _gpu_chain(_identity)
-
-    it = udf_execute.stream_with_udfs(plan, [src])
-    first = next(it)
-    assert first.num_rows > 0
-    assert src.produced < n, "the whole source was consumed before the first output batch"
-    assert src.produced <= 32, f"look-ahead is not bounded: {src.produced} batches read"
-
-    # ...and draining it still yields every row, in order.
-    rest = list(it)
-    got = pa.Table.from_batches([first, *rest]).column("x").to_pylist()
-    assert got == list(range(n * 4))
-
-
-def test_execute_with_udfs_still_returns_the_whole_result():
-    """The listing entry point is unchanged — same rows, same order, for existing callers.
-
-    Also the control for the bound above: this one *does* drain the source before returning
-    anything, which is the property `stream_with_udfs` exists to avoid.
-    """
+def test_execute_with_udfs_returns_the_whole_result():
+    """The listing entry point returns every row in order, draining the source to do it."""
     src = _CountingSource(8)
     out = udf_execute.execute_with_udfs(_gpu_chain(_identity), [src])
     assert pa.Table.from_batches(out).column("x").to_pylist() == list(range(32))
     assert src.produced == 8
-
-
-def test_stream_with_udfs_falls_back_for_a_non_streaming_plan():
-    """A plan the streaming path can't take still produces identical rows via the fallback."""
-    scan = Scan(0, SchemaRef.from_arrow(_SCHEMA))
-    cpu_plan = MapBatches(input=scan, fn=_identity)  # no GPU stage -> not stream-eligible
-    src = _CountingSource(5)
-    got = list(udf_execute.stream_with_udfs(cpu_plan, [src]))
-    assert pa.Table.from_batches(got).column("x").to_pylist() == list(range(20))
-
-
-def test_reconcile_stream_widens_a_drifting_schema():
-    """A UDF whose output gains a column stays concatenable without buffering everything."""
-    batches = [
-        pa.record_batch({"x": [1, 2]}),
-        pa.record_batch({"x": [3, 4], "y": [5, 6]}),
-    ]
-    out = list(udf_stream.reconcile_stream(iter(batches)))
-    # The later, wider batch is normalized to the union; the earlier one keeps its own schema
-    # (it was already yielded), which is the documented weaker contract of the streaming form.
-    assert out[1].schema.names == ["x", "y"]
-    assert pa.Table.from_batches(out[1:]).column("y").to_pylist() == [5, 6]
-
-
-def test_reconcile_stream_backfills_a_column_a_later_batch_drops():
-    """After a widening, a batch that reverts to the narrow schema is backfilled to the union.
-
-    The running schema only grows, so once a field appears every later batch is normalized to
-    carry it (as a typed null when absent) — otherwise the stream would emit a batch narrower
-    than the ones before it and break the downstream concat the widening exists to enable.
-    """
-    batches = [
-        pa.record_batch({"x": [1]}),
-        pa.record_batch({"x": [2], "y": [9]}),  # widens the running schema to {x, y}
-        pa.record_batch({"x": [3]}),  # narrows again -> y must come back as a typed null
-    ]
-    out = list(udf_stream.reconcile_stream(iter(batches)))
-    assert out[2].schema.names == ["x", "y"]
-    assert out[2].column("y").to_pylist() == [None]
-
-
-def test_reconcile_stream_of_an_empty_source_yields_nothing():
-    assert list(udf_stream.reconcile_stream(iter([]))) == []
 
 
 # ---------------------------------------------------------------------------

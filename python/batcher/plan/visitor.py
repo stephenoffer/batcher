@@ -23,7 +23,6 @@ __all__ = [
     "children",
     "reparent_unvalidated",
     "scanned_source_ids",
-    "transform_down",
     "transform_up",
     "walk",
     "walk_with_base_names",
@@ -236,13 +235,6 @@ def transform_up(node: LogicalPlan, fn: Callable[[LogicalPlan], LogicalPlan]) ->
     return fn(rebuilt_node)
 
 
-def transform_down(node: LogicalPlan, fn: Callable[[LogicalPlan], LogicalPlan]) -> LogicalPlan:
-    """Top-down rewrite: apply `fn` to `node`, then recurse into the result's
-    children. Use when a rule reshapes a node before its children are visited."""
-    transformed = fn(node)
-    return with_children(transformed, [transform_down(c, fn) for c in children(transformed)])
-
-
 def walk(node: LogicalPlan):
     """Yield every node in the tree, pre-order (parents before children). For
     read-only analyses (counting ops, collecting scans, validation).
@@ -286,15 +278,33 @@ def walk_with_base_names(node: LogicalPlan) -> list[tuple[LogicalPlan, dict[str,
     them against each source's own schema by name — a name that belongs to neither side's
     source simply matches nothing.
 
+    Memoized on the node, like `to_ir`: a plan is immutable, so the walk is a pure function
+    of it, and one terminal op asks for it four times -- the column-bounds and the
+    distinct-count gates each run before the optimizer and again in the post-run learners.
+    The result is shared, so it is read-only: every caller iterates it and reads the maps
+    with `.get`, which is also what the maps inside it already required.
+
     Args:
         node: The plan to walk.
 
     Returns:
-        `(node, name → base name)` for every node, children before parents.
+        `(node, name → base name)` for every node, children before parents. Read-only.
     """
+    cache = getattr(node, "__dict__", None)
+    if cache is not None:
+        cached = cache.get(_BASE_NAMES_SLOT)
+        if cached is not None:
+            return cached
     pairs: list[tuple[LogicalPlan, dict[str, str]]] = []
     _base_names(node, pairs)
+    if cache is not None:
+        cache[_BASE_NAMES_SLOT] = pairs
     return pairs
+
+
+#: Instance-`__dict__` slot for `walk_with_base_names`, named like the `_memoize_noarg` slots
+#: (`_c_to_ir`, `_c_available_columns`) it sits beside.
+_BASE_NAMES_SLOT = "_c_walk_with_base_names"
 
 
 #: The map a leaf reports: a `Scan` reads its source's own column names, so every name it

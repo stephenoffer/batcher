@@ -83,19 +83,6 @@ def test_market_type_reads_each_provisioners_spelling(labels, expected):
     assert market_type(labels) == expected
 
 
-def test_is_preemptible_still_agrees_with_market_type():
-    """The boolean the shuffle's replica placement reads is now derived from the same scan.
-
-    A positive control on both sides: it has to move when the label does, or the derivation
-    could be a constant and this file would not notice.
-    """
-    from batcher.dist.executors.ray_runtime.fabric.topology import is_preemptible
-
-    assert is_preemptible({_RAY_KEY: "spot"}) is True
-    assert is_preemptible({_RAY_KEY: "on-demand"}) is False
-    assert is_preemptible({}) is False
-
-
 def test_census_carries_the_label_key_the_market_was_read_from():
     """A fleet labelled by Karpenter must be selected on Karpenter's key, not on Ray's.
 

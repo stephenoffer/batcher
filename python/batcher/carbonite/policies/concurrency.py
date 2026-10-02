@@ -287,10 +287,10 @@ class ConcurrencyLimiter:
     def release(self) -> None:
         """Give the slot back. Safe to call for a nested acquire, which held none.
 
-        A release with no matching acquire on this thread is ignored. It used to free a
-        slot anyway, so one unbalanced call (an `admit()` whose acquire raised, a caller
-        releasing twice) permanently inflated the pool: `_active` fell below the number of
-        queries actually running and the limiter admitted that many extra forever — the
+        A release with no matching acquire on this thread is ignored. Freeing a slot anyway
+        would let one unbalanced call (an `admit()` whose acquire raised, a caller releasing
+        twice) permanently inflate the pool: `_active` would fall below the number of queries
+        actually running and the limiter would admit that many extra forever — the
         oversubscription it exists to prevent, caused by the mechanism preventing it.
         """
         if self._slots <= 0:

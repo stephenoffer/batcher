@@ -172,14 +172,18 @@ def plan_write(
             "the table is not partitioned",
             hint="Pass partition_by=[...], or use mode='overwrite' to replace every row.",
         )
-    # One scoped overwrite per partition the rows cover. A Delta commit can only scope an
-    # overwrite to an AND of `partition == value`, so a reload of three days is three
-    # commits: each atomic, the set of them not. A reader between two sees some partitions
-    # reloaded and others not yet, never a partition half-written.
-    files = []
-    for term in _covered_partitions(aligned, columns):
-        files.extend(primitive(aligned.filter(term), "replace_where", term).files)
-    return WriteManifest(tuple(files))
+    # ONE scoped overwrite for every partition the rows cover, so a reader sees the old
+    # partitions or the new ones and never a mixture. It used to be one commit per
+    # partition, because a Delta overwrite filter is a single AND; the Delta sink now
+    # resolves an OR of partition equalities into explicit removals in one commit, and an
+    # Iceberg or in-memory table takes the disjunction directly.
+    terms = _covered_partitions(aligned, columns)
+    if not terms:
+        return WriteManifest()
+    scope = terms[0]
+    for term in terms[1:]:
+        scope = scope | term
+    return primitive(aligned, "replace_where", scope)
 
 
 def _check_creatable(

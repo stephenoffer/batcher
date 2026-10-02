@@ -67,12 +67,12 @@ _DECODE_WARN_LIMIT = 3
 def _rows(scanned: Iterable[tuple[Any, bytes]]) -> Iterable[tuple[Any, dict[str, Any]]]:
     """Decode a backend scan into `(key, row)` pairs, **skipping** what will not decode.
 
-    The isolation is per row, and that is the whole point. The view builders used to wrap their
-    entire loop in one `try`, so a single unparseable entry — a truncated write, a row from a
-    build with a different shape, a value another process was mid-write on — did not cost that
-    row, it cost *every row after it*. For the signed history that meant returning `[]`, i.e.
-    "this session has measured nothing", which silently disables cardinality correction and
-    cost calibration wholesale rather than degrading them by one observation.
+    The isolation is per row, and that is the whole point. With one `try` around the whole
+    loop, a single unparseable entry — a truncated write, a row from a build with a different
+    shape, a value another process was mid-write on — would cost *every row after it*, not just
+    itself. For the signed history that means returning `[]`, i.e. "this session has measured
+    nothing", which silently disables cardinality correction and cost calibration wholesale
+    rather than degrading them by one observation.
 
     A non-dict value is skipped too: JSON's scalars parse without error, and a bare `null` or
     `7` would otherwise reach `row.get` as an `AttributeError` deeper in the caller.
@@ -119,10 +119,9 @@ def build_views(
     """Both views from **one** pass over the backend scan.
 
     The two views are read together — Kyber calibrates cost from the by-kind buckets and
-    corrects cardinality from the signed history on the same optimize — but each used to load
-    itself, so the first query of a session scanned the `op_stats` table twice and ran
-    `json.loads` over every stored row twice. The parse is the expensive half (a persisted
-    store holds tens of thousands of rows), and it produces the same objects both times.
+    corrects cardinality from the signed history on the same optimize — so they share one scan
+    and one `json.loads` per stored row. The parse is the expensive half (a persisted store
+    holds tens of thousands of rows), and loading each view separately would do it twice.
 
     The two groupings differ, and the difference is load-bearing: the by-kind buckets are
     separated **per machine class**, because everything fitted from them is in machine units,

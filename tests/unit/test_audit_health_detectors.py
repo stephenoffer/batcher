@@ -172,3 +172,30 @@ class Derived(Base):
 '''
     )
     assert [f.category for f in silent.detect_stub(found)] == ["stub", "stub"]
+
+
+def _production_findings(src: str, rel: str) -> list[str]:
+    from tools.audit.production import _function_findings
+
+    fn = ast.parse(src).body[0]
+    return [f.message for f in _function_findings(fn, rel, "") if f.category == "production"]
+
+
+def test_a_print_in_library_code_is_still_reported() -> None:
+    src = "def load(path):\n    print(path)\n    return path\n"
+    assert _production_findings(src, "python/batcher/io/x.py")
+
+
+def test_a_cli_main_prints_by_contract() -> None:
+    src = "def main():\n    print('done')\n"
+    assert not _production_findings(src, "python/batcher/migrate/__main__.py")
+    # The same body anywhere but a `__main__.py` is still library code.
+    assert _production_findings(src, "python/batcher/migrate/cli.py")
+
+
+def test_the_print_or_return_convention_prints_by_contract() -> None:
+    src = (
+        "def tree_format(self, return_as_string=False):\n"
+        "    if return_as_string:\n        return 'x'\n    print('x')\n"
+    )
+    assert not _production_findings(src, "python/batcher/plan/expr_ir/namespaces/meta.py")

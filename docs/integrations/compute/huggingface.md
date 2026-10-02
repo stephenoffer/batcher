@@ -156,7 +156,9 @@ tokens = Tokenizer("text", hf_tok, output_column="input_ids").fit_transform(revi
 
 ## Requirements and limitations
 
-`load_dataset(..., streaming=True)` isn't a streaming source here. An `IterableDataset` has no materialized Arrow table, so the adapter iterates it into one, which materializes the whole dataset. Read the Parquet files instead.
+`load_dataset(..., streaming=True)` gives an `IterableDataset`, which `from_huggingface` reads as a streaming source. Each scan re-opens the stream and pulls Arrow batches of 16,384 rows, so `iter_batches` over a breaker-free pipeline holds one batch at a time. Building the `Dataset` pulls the first batch to read the schema. The stream is a single iterator, so it's read by one process and isn't split across workers. Land it as Parquet when a job needs parallel reads.
+
+A map-style view, the result of `select`, `filter`, `shuffle` or `train_test_split`, is an indices mapping over its parent's table. `from_huggingface` reads a view through that mapping, which copies the selected rows instead of sharing the parent's buffers.
 
 `Image` and `Audio` features are Arrow structs of paths or bytes, not decoded tensors, and they arrive as structs. Decoding is a `map_batches` stage, or {py:meth}`bt.read.images <batcher.api.io_namespace.reader.Reader.images>` if you have the paths. Nothing decodes implicitly. A `ClassLabel` arrives as its integer ids.
 

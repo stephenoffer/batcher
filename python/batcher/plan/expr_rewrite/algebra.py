@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Binary, Col, Expr, WindowExpr
 from batcher.plan.expr_rewrite.traverse import transform_expr_up
 
@@ -49,7 +50,7 @@ def combine_conjuncts(exprs: list[Expr]) -> Expr:
     preserves the predicate exactly (the conjuncts' left-to-right order is kept). Raises on
     an empty list (there is no neutral predicate to return without inventing a literal)."""
     if not exprs:
-        raise ValueError("combine_conjuncts requires at least one expression")
+        raise PlanError("combine_conjuncts requires at least one expression")
     while len(exprs) > 1:
         # Pairwise-fold one level at a time (a bottom-up balanced tree); an odd tail
         # carries forward. log2(n) passes ⇒ a tree of depth ceil(log2(n)).
@@ -84,7 +85,7 @@ def combine_disjuncts(exprs: list[Expr]) -> Expr:
 
     Raises on an empty list (no neutral disjunct exists without inventing a literal)."""
     if not exprs:
-        raise ValueError("combine_disjuncts requires at least one expression")
+        raise PlanError("combine_disjuncts requires at least one expression")
     while len(exprs) > 1:
         exprs = [
             Binary("or", exprs[i], exprs[i + 1]) if i + 1 < len(exprs) else exprs[i]

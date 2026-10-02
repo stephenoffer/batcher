@@ -43,9 +43,7 @@ __all__ = [
     "arrays_to_torch",
     "tf_dataset_from_arrays",
     "to_numpy_batches",
-    "to_tf",
     "to_tf_dataset",
-    "to_torch",
     "to_torch_dataloader",
     "to_torch_iterable",
 ]
@@ -243,51 +241,3 @@ def to_torch_dataloader(
         pin_memory=pin_memory,
         **dataloader_kwargs,
     )
-
-
-def to_torch(
-    batches: Iterable[pa.RecordBatch],
-    *,
-    columns: Sequence[str] | None = None,
-) -> Any:
-    """Alias of `to_torch_iterable` under the shorter ``to_torch`` name.
-
-    Args:
-        batches: an iterable of `pyarrow.RecordBatch`.
-        columns: optional subset of column names to keep (default: all).
-
-    Returns:
-        A `torch.utils.data.IterableDataset` yielding one tensor dict per batch.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt  # doctest: +SKIP
-            >>> from batcher.ml import to_torch  # doctest: +SKIP
-            >>> loader = to_torch(bt.from_pydict({"x": [1]}).iter_batches())  # doctest: +SKIP
-    """
-    return to_torch_iterable(batches, columns=columns)
-
-
-def to_tf(
-    batches: Iterable[pa.RecordBatch],
-    *,
-    columns: Sequence[str] | None = None,
-) -> Any:
-    """Alias of `to_tf_dataset` under the shorter ``to_tf`` name.
-
-    Args:
-        batches: an iterable of `pyarrow.RecordBatch`.
-        columns: optional subset of column names to keep (default: all).
-
-    Returns:
-        A ``tf.data.Dataset`` yielding one `{column: tensor}` dict per batch.
-
-    Examples:
-        .. doctest::
-
-            >>> import batcher as bt  # doctest: +SKIP
-            >>> from batcher.ml import to_tf  # doctest: +SKIP
-            >>> tf_ds = to_tf(bt.from_pydict({"x": [1]}).iter_batches())  # doctest: +SKIP
-    """
-    return to_tf_dataset(batches, columns=columns)

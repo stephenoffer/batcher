@@ -263,3 +263,37 @@ def test_an_arm_that_actually_changes_still_invalidates():
         bandit.record_join_strategy(hub, "sig", "broadcast", 500_000.0, 1e6)
     assert bandit.learned_join_strategy(hub, "sig") != "broadcast"
     assert learning.generation() != before, "a flipped arm served a stale plan"
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf, 0.0, -5.0])
+def test_a_non_finite_or_non_positive_reward_is_never_recorded(bad):
+    """NaN slipped past `reward_ms <= 0.0` and poisoned the arm's mean and spread for good.
+
+    A NaN lower-confidence bound never compares less than anything, so the arm could not be
+    chosen again, and the NaN reached every other arm's radius through the pooled spread.
+    """
+    from batcher.kyber.learned_tuning import learned_join_strategy, record_join_strategy
+    from batcher.kyber.learned_tuning.bandit import record_adaptive_route
+    from batcher.metadata import MetadataHub
+    from batcher.metadata.backends import InProcessBackend
+
+    hub = MetadataHub(InProcessBackend())
+    for _ in range(3):
+        record_join_strategy(hub, "sig", "hash", 10.0)
+    before = learned_join_strategy(hub, "sig")
+    record_join_strategy(hub, "sig", "hash", bad)
+    record_join_strategy(hub, "sig", "broadcast", bad)
+
+    from batcher.kyber.learned_tuning.bandit import _NS_ARM
+    from batcher.metadata.hardware_scope import scoped
+
+    stats = hub.get_keyed_param(scoped(_NS_ARM), "sig")
+    assert set(stats) == {"hash"}, stats
+    assert all(math.isfinite(v) for v in stats["hash"].values()), stats
+    assert learned_join_strategy(hub, "sig") == before
+
+    # The route bandit takes the same guard: a bad wall time is not even a cold sample.
+    record_adaptive_route(hub, "route-sig", "staged", bad)
+    from batcher.kyber.learned_tuning.bandit import _NS_ROUTE_COLD
+
+    assert not hub.get_keyed_param(scoped(_NS_ROUTE_COLD), "route-sig")

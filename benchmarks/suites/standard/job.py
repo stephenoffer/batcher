@@ -23,53 +23,15 @@ from __future__ import annotations
 import os
 
 from registry import suite
+from suites.standard._vendored import register_vendored
 
 job = suite("job", dataset="job")
 
 QUERY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "job_queries.sql")
 
-# The delimiter `tools/vendor_job_queries.py` writes before each statement.
-_MARKER = "-- @query "
 # JOB is 113 queries by definition; anything else means the vendored file is wrong.
 QUERY_COUNT = 113
 
-
-def load_queries(path: str = QUERY_FILE) -> dict[str, str]:
-    """Split the vendored ``.sql`` file into ``{case name -> statement}``.
-
-    Args:
-        path: The vendored query file.
-
-    Returns:
-        Each query's case name mapped to its SQL text, in file order.
-    """
-    queries: dict[str, str] = {}
-    name: str | None = None
-    lines: list[str] = []
-    with open(path) as fh:
-        text = fh.read()
-    for line in text.splitlines():
-        if line.startswith(_MARKER):
-            if name is not None:
-                queries[name] = "\n".join(lines).strip()
-            name = line[len(_MARKER) :].strip()
-            lines = []
-        elif name is not None:
-            lines.append(line)
-    if name is not None:
-        queries[name] = "\n".join(lines).strip()
-    return queries
-
-
-QUERIES = load_queries()
-
-# A truncated vendored file would otherwise shrink the benchmark silently: fewer cases
-# register, every gate stays green, and the suite quietly stops being JOB.
-if len(QUERIES) != QUERY_COUNT:
-    raise RuntimeError(
-        f"{QUERY_FILE} holds {len(QUERIES)} queries, expected {QUERY_COUNT} — "
-        f"re-run `python tools/vendor_job_queries.py`"
-    )
-
-for _name, _query in QUERIES.items():
-    job.sql(_name, _query)
+QUERIES = register_vendored(
+    job, QUERY_FILE, count=QUERY_COUNT, vendor_tool="tools/vendor_job_queries.py"
+)

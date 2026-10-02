@@ -36,16 +36,14 @@ near-leaves (nothing but `bc-arrow`, the DAG's root, below them), pulled in wher
                   which everything links, so a cloud SDK here would put tokio + a TLS
                   stack into builds that never resolve a secret. External key stores
                   are reached via `cmd:` or a host-registered backend.
-  bc-udf       → (nothing depends on it yet — the UDF/inference plane is not
-                  wired into bc-py; do not assume it is on a live path)
 ```
 
 Two things this picture gets right that the shorter `bc-arrow → bc-expr → bc-ir →
 {bc-runtime, bc-codegen} → …` chain got wrong, and that you should not "correct"
 back: **`bc-codegen` does not depend on `bc-ir`** — it compiles scalar `Expr`, so
 it sits beside `bc-ir`, both fed by `bc-expr`. And **`bc-py` is not merely
-downstream of `bc-interp`**: it depends directly on `bc-sketches`, `bc-transport`,
-`bc-io`, and `bc-resource` as well, which makes it a second assembly point, not a
+downstream of `bc-interp`**: it depends directly on `bc-runtime`, `bc-sketches`,
+`bc-transport`, `bc-io`, and `bc-resource` as well, which makes it a second assembly point, not a
 thin cap on the chain. `MAP.md` prints the live dependency list for every crate,
 read from the manifests — check there rather than trusting this diagram if the two
 ever disagree.
@@ -129,11 +127,11 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
 
 ## Sketches and transport
 
-- `bc-sketches` (HLL / KLL / Count-Min / ColumnStats) are all `Mergeable` with a fixed
+- `bc-sketches` (HLL / KLL / Bloom / ColumnStats) are all `Mergeable` with a fixed
   seed. Kyber consumes them for cardinality/quantile estimates. Keep them deterministic
   and mergeable — but **"merge identically" is only true of some of them**, and the line
-  runs where the algorithm does. HyperLogLog, Count-Min and Bloom fold by register-wise
-  max, cell-wise sum and bitwise OR, so any merge order reaches a bit-identical state, and
+  runs where the algorithm does. HyperLogLog and Bloom fold by register-wise
+  max and bitwise OR, so any merge order reaches a bit-identical state, and
   `ColumnStats`' min/max/count/ndv fold the same way. KLL and TDigest **do not**: their
   merge compacts and re-clusters, which is order-sensitive by construction, so a reduce
   that takes partials in a different order returns a different answer, as does
@@ -143,18 +141,9 @@ signatures, so SIMD/NUMA/spillable rewrites can land without touching callers.
   algorithm promises rather than a defect. Do not write a test asserting a quantile sketch
   merges to an identical state, and do not set out to "fix" the fact that it does not.
 
-  **Two things this entry got wrong, corrected 2026-09-13 by reading the test rather than
-  the comment above it.** `crates/bc-sketches/tests/merge_order.rs` has three test
-  functions, and they cover HLL/Count-Min/Bloom, `ColumnStats` scalars, and the two
-  quantile sketches. It loops `for seed in 1..12u64`, so **11 seeds** times three orders is
-  what is pinned; the "39 seeds" this entry used to cite appears only in a *comment*
-  describing an earlier sweep, and citing it as the committed measurement is the error this
-  file warns about elsewhere. And **`FrequentItems` is not tested by that file at all**, so
-  listing it as order-sensitive stated as fact something no test checks — while
-  `crates/bc-sketches/src/frequent.rs` argues at length for the opposite, that `merge` sums
-  counts and `heavy_hitters` sorts, making "the *algorithm* order-independent, which is a
-  stronger guarantee than a seed". One of those two files is wrong and the way to settle it
-  is a test, not an edit to either.
+  `crates/bc-sketches/tests/merge_order.rs` pins this over 11 seeds × 3 orders;
+  `FrequentItems` is not covered by it (`crates/bc-sketches/src/frequent.rs` argues its merge
+  is order-independent — settle that with a test, not an edit).
 - `bc-transport` is the Arrow Flight data-plane shuffle with **credit-based flow
   control** (Carbonite model: 1 credit = 1 batch slot; producer blocks at 0). The
   data plane bypasses the Ray object store entirely — do not route bulk batches

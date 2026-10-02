@@ -19,7 +19,7 @@ conventions:
 | Quaternion component order | `(x, y, z, w)`, scalar **last** |
 | Handedness | Right-handed |
 | What a rotation does | Moves the vector, not the axes |
-| Euler sequence | Intrinsic Z-Y-X: yaw about Z, pitch about Y, roll about X |
+| Euler sequence | Intrinsic Z-Y-X: yaw about Z, pitch about Y, roll about X. The `*_euler_seq*` functions below take any of the other 23 |
 | Pose layout | Translation `(tx, ty, tz)` first, then rotation `(qx, qy, qz, qw)` |
 | Pose application | Rotate, then translate |
 
@@ -140,6 +140,45 @@ row-major.
    quat_from_rotmat_x
    quat_from_rotmat_y
    quat_from_rotmat_z
+```
+
+## Other Euler sequences
+
+Euler angles in any of the 12 axis orders, intrinsic or extrinsic, named SciPy's way: an uppercase sequence such as `"ZXZ"` is intrinsic and a lowercase one such as `"xyz"` is extrinsic. The default, `"ZYX"`, is the convention of every other function on this page. The angles come back in sequence order, and at gimbal lock the third is zero.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   quat_from_euler_seq
+   quat_from_euler_seq_w
+   quat_from_euler_seq_x
+   quat_from_euler_seq_y
+   quat_from_euler_seq_z
+   quat_to_euler_seq
+   quat_to_euler_seq_first
+   quat_to_euler_seq_second
+   quat_to_euler_seq_third
+```
+
+## Checking and repairing a rotation
+
+{py:func}`quat_from_rotmat_x <batcher.quat_from_rotmat_x>` refuses a matrix more than `1e-4` from being a rotation. {py:func}`rotmat_orthogonality_error <batcher.rotmat_orthogonality_error>` and {py:func}`rotmat_determinant <batcher.rotmat_determinant>` report the two quantities it checks, and {py:func}`quat_from_rotmat_nearest <batcher.quat_from_rotmat_nearest>` returns the nearest rotation to a matrix that has drifted past it. {py:func}`quat_canonicalize <batcher.quat_canonicalize>` gives each rotation one sign, so grouping or joining on quaternion components treats `q` and `-q` as the one rotation they are.
+
+```{eval-rst}
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   quat_canonicalize
+   quat_from_rotmat_nearest
+   quat_from_rotmat_nearest_w
+   quat_from_rotmat_nearest_x
+   quat_from_rotmat_nearest_y
+   quat_from_rotmat_nearest_z
+   rotmat_determinant
+   rotmat_orthogonality_error
 ```
 
 ## Combining and interpolating rotations

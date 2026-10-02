@@ -88,7 +88,7 @@ def test_the_spill_device_splits_the_plan_cache_key():
     every scalar the key already carried, so two fleets identical in cores, RAM, cache, VRAM and
     worker count — one on local NVMe, one on a network volume — shared a key. Whichever planned
     first then decided for both whether an out-of-core plan was acceptable at all."""
-    from batcher.kyber.plan_cache import _hardware_key
+    from batcher.kyber.plan_cache.keys import _hardware_key
 
     common = {
         "cpu_cores": 64,
@@ -105,7 +105,7 @@ def test_the_device_model_and_machine_class_split_the_plan_cache_key():
     """`accelerator_type` steers the host-link and MIG decisions in `kyber.gpu.policy`, and
     `fingerprint` selects *which* learned coefficients and CPU shares the optimizer loaded —
     two fleets of the same shape and different silicon rank plans differently."""
-    from batcher.kyber.plan_cache import _hardware_key
+    from batcher.kyber.plan_cache.keys import _hardware_key
 
     common = {"cpu_cores": 64, "memory_bytes": 1 << 38, "worker_count": 8}
     keys = {
@@ -120,14 +120,14 @@ def test_the_device_model_and_machine_class_split_the_plan_cache_key():
 def test_the_key_stays_delimiter_free():
     """The whole cache key is recovered by a `|`-split, so a device model arriving from a node
     label nobody controls must not be able to make two profiles' keys ambiguous."""
-    from batcher.kyber.plan_cache import _hardware_key
+    from batcher.kyber.plan_cache.keys import _hardware_key
 
     hostile = HardwareProfile(cpu_cores=8, worker_count=1, accelerator_type="odd|model,name")
     assert "|" not in _hardware_key(hostile)
 
 
 def test_an_unchanged_machine_keeps_hitting_its_cached_plan():
-    from batcher.kyber.plan_cache import _hardware_key
+    from batcher.kyber.plan_cache.keys import _hardware_key
 
     spec = {"cpu_cores": 64, "memory_bytes": 1 << 38, "worker_count": 8, "storage_class": "nvme"}
     assert _hardware_key(HardwareProfile(**spec)) == _hardware_key(HardwareProfile(**spec))

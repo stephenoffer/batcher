@@ -30,22 +30,12 @@
 //! construction rather than by choice).
 
 use crate::Mergeable;
+use bc_arrow::hash::mix64;
 
 // Fixed seed → reproducible samples within and across processes, mirroring the
 // crate-wide determinism contract. Any odd, non-zero constant works for
 // xorshift64; this one is arbitrary.
 const RESERVOIR_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// SplitMix64 finalizer — avalanches a low-entropy seed (a partition index, a
-/// pair of small counts) into a well-distributed 64-bit value. xorshift64 warms up
-/// poorly from such seeds, so every seed this module derives goes through here.
-#[inline]
-fn mix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
 
 /// Minimal deterministic xorshift64 PRNG. Self-contained so sampling is
 /// reproducible without pulling in `rand` or touching system entropy.
@@ -222,8 +212,9 @@ impl<T: Clone> ReservoirSample<T> {
     }
 
     /// Total number of items ever offered via [`add`](ReservoirSample::add).
+    #[cfg(test)]
     #[must_use]
-    pub fn total_seen(&self) -> u64 {
+    pub(crate) fn total_seen(&self) -> u64 {
         self.seen
     }
 

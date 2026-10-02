@@ -160,6 +160,15 @@ def _channel_byte_budget(config: Config, channels: int | None = None) -> int:
     got more buffering than they asked for from the one function whose contract is that it
     only ever gives less.
 
+    **Every credited stream is a channel, however few peers there are.** A reducer's gather
+    runs `flow_control.gather_streams` concurrent streams (48 by default) split across its
+    peers, and when a peer holds fewer buckets than its share it *stripes* one bucket over
+    several shards (`bc_py::shuffle::gather::drive`, `ClientPool::fetch_secured_group_striped`).
+    Each shard is seeded with the full window, not a slice of it. So a two-worker shuffle
+    still has about `gather_streams` windows open at once, and dividing the transit share by
+    the two peers let it hold `gather_streams / 2` times that share in flight. The divisor is
+    therefore never below the gather's stream target.
+
     Args:
         config: The active config.
         channels: Channels actually fetching at once; `None` uses the configured fan-in cap.
@@ -172,7 +181,11 @@ def _channel_byte_budget(config: Config, channels: int | None = None) -> int:
     total = total_memory_bytes()
     if total <= 0:
         return configured
-    fan_in = max(1, channels if channels and channels > 0 else fc.shuffle_fetch_fan_in)
+    fan_in = max(
+        1,
+        channels if channels and channels > 0 else fc.shuffle_fetch_fan_in,
+        fc.gather_streams,
+    )
     headroom_per_channel = int(total * _SHUFFLE_BUFFER_FRACTION) // fan_in
     floor = min(configured, config.execution.morsel_bytes)
     return max(floor, min(configured, headroom_per_channel))

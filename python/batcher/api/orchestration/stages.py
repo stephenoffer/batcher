@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
 from batcher._internal.logging import note_suppressed
 from batcher.api.orchestration import phases
 from batcher.api.orchestration.sizing import (
@@ -24,15 +25,22 @@ from batcher.api.orchestration.sizing import (
     declared_row_count,
     partitions_from_physical,
 )
-from batcher.io.source import read_source
+from batcher.io.source import InMemorySource, read_source
 
 if TYPE_CHECKING:
     from batcher.core import ExecutionContext
     from batcher.io.source import Source
     from batcher.plan.logical import LogicalPlan
     from batcher.plan.physical import PhysicalPlan
+    from batcher.plan.profile.usage import UsageStopwatch
 
-__all__ = ["ResolvedSources", "execute_distributed", "resolve_sources", "spill_to_disk"]
+__all__ = [
+    "ResolvedSources",
+    "execute_distributed",
+    "measured_spill_collect",
+    "resolve_sources",
+    "spill_to_disk",
+]
 
 
 def execute_distributed(
@@ -95,16 +103,24 @@ def execute_distributed(
     mark = time.perf_counter()
     prof = ctx.profile
     worker_metrics: list = []
-    result = dist.execute_distributed(
-        logical_opt,
-        sources,
-        workers,
-        transport=ctx.transport,
-        envelope=envelope,
-        hub=ctx.hub,
-        materialize=materialize,
-        metrics_out=worker_metrics if prof is not None else None,
-    )
+    try:
+        result = dist.execute_distributed(
+            logical_opt,
+            sources,
+            workers,
+            transport=ctx.transport,
+            envelope=envelope,
+            hub=ctx.hub,
+            materialize=materialize,
+            metrics_out=worker_metrics if prof is not None else None,
+        )
+    except PlanError:
+        # Staging was skipped because the aligned executor claimed the plan, and it declined
+        # once it could see what planning cannot: the size of a broadcast result. The staged
+        # loop is the route this plan would have taken without it.
+        if not (materialize and _aligned_skipped_staging(plan, logical_opt, sources, ctx.hub)):
+            raise
+        result = _run_staged(plan, sources, ctx)
     phase("execute_distributed", time.perf_counter() - mark)
 
     phases.begin("collect_source_metadata")
@@ -124,6 +140,26 @@ def execute_distributed(
     )
     _record_distributed_cardinality(ctx.hub, plan, sources, result)
     return result
+
+
+def _aligned_skipped_staging(
+    plan: LogicalPlan, logical_opt: LogicalPlan, sources: list[Source], hub
+) -> bool:
+    """Whether staging was bypassed for this plan only because it looked aligned.
+
+    The same question the gate asked (`aligned_claims`, of `plan`), not a fresh one of
+    `logical_opt`: the two plans can differ, and a gate that said "aligned" followed by a
+    probe here that said "not aligned" re-raised the decline instead of staging.
+    """
+    from batcher.api.adaptive.gating import aligned_claims
+    from batcher.api.adaptive.staging import staged_depth_exhausted
+    from batcher.dist import requires_staging
+
+    return (
+        not staged_depth_exhausted()
+        and (requires_staging(plan) or requires_staging(logical_opt))
+        and aligned_claims(plan, sources, hub)
+    )
 
 
 def _stage_if_optimization_requires_it(
@@ -186,9 +222,19 @@ def _stage_if_optimization_requires_it(
     if not materialize or staged_depth_exhausted():
         return None
     from batcher.dist import requires_staging
+    from batcher.dist.executors.aligned import aligned_route
 
-    if not requires_staging(logical_opt):
+    # The aligned executor runs a breaker beneath a join whole, per key range, so a plan it
+    # takes needs no stage boundary -- and staging it would put an exchange back between
+    # tables whose layout already co-partitions them. `resolve_adaptive` asked this of the
+    # plan before eager aggregation; it has to be asked again of the plan after it.
+    if not requires_staging(logical_opt) or aligned_route(logical_opt, sources):
         return None
+    return _run_staged(plan, sources, ctx)
+
+
+def _run_staged(plan: LogicalPlan, sources: list[Source], ctx: ExecutionContext) -> pa.Table:
+    """Run `plan` through the staged loop because the one-shot route cannot run it."""
     from batcher.api.adaptive import execute_adaptive
 
     # Deliberately NOT recorded through `record_adaptive_route`. That feeds the bandit which
@@ -251,7 +297,7 @@ def _record_distributed_cardinality(hub, plan: LogicalPlan, sources: list[Source
         from batcher.api.orchestration.run import record_cardinality_outcome
 
         record_cardinality_outcome(hub, plan, sources, int(rows))
-    except Exception as exc:  # pragma: no cover - learning must never break a completed run
+    except Exception as exc:  # learning must never break a completed run
         note_suppressed("api", "record distributed cardinality", exc)
 
 
@@ -288,7 +334,6 @@ def spill_to_disk(
         The spilled result, or `None` when the plan has no out-of-core path.
     """
     from batcher.api.tuning import spill_compression_scope
-    from batcher.dist.spill import spill_collect
     from batcher.plan.profile.usage import UsageStopwatch
 
     partitions = (
@@ -314,9 +359,7 @@ def spill_to_disk(
     # Force the learned spill codec (large IO-bound state compresses; small state does not).
     # IPC self-describes its codec, so the un-spilled result is byte-identical either way.
     with spill_compression_scope(rm, opt):
-        spilled = spill_collect(logical_opt, sources, partitions)
-    if spilled is not None and ctx.profile is not None:
-        ctx.profile.record_usage(watch.finish())
+        spilled = measured_spill_collect(logical_opt, sources, partitions, ctx, watch)
     # Record the spill only once it has actually happened. `spill_collect` returns `None` for
     # a shape with no out-of-core path (a string-keyed sort, a filter/project with no state),
     # and the caller then falls through to the in-memory path — so recording *before* the
@@ -327,6 +370,41 @@ def spill_to_disk(
         from batcher.api.terminal.profile import record_spill
 
         record_spill(ctx.profile, partitions, rm.spill_reason(opt))
+    return spilled
+
+
+def measured_spill_collect(
+    logical_opt: LogicalPlan,
+    sources: list[Source],
+    partitions: int,
+    ctx: ExecutionContext,
+    watch: UsageStopwatch,
+) -> pa.Table | None:
+    """`spill_collect`, with what it cost and what it wrote to disk recorded into the profile.
+
+    Both readings are needed because this path runs no metered engine call: `watch` is the
+    whole-phase resource reading, and the spill meter is the only account of the buckets the
+    Python executors wrote, without which the profile reported `spilled: False` for a query
+    that went out of core. Nothing is recorded when the shape has no out-of-core path.
+
+    Args:
+        logical_opt: The optimized logical plan.
+        sources: The plan's bound sources.
+        partitions: The out-of-core bucket count.
+        ctx: The execution context, whose profile (if any) receives the readings.
+        watch: A stopwatch started where the phase's cost should begin.
+
+    Returns:
+        The out-of-core result, or `None` when the plan has no out-of-core path.
+    """
+    from batcher.dist.spill import spill_collect
+    from batcher.plan.profile.spill import spill_meter
+
+    with spill_meter() as meter:
+        spilled = spill_collect(logical_opt, sources, partitions)
+    if spilled is not None and ctx.profile is not None:
+        ctx.profile.record_usage(watch.finish())
+        ctx.profile.record_out_of_core_spill(meter)
     return spilled
 
 
@@ -345,6 +423,105 @@ class ResolvedSources:
     def __init__(self, batches: list, complete: list[bool]) -> None:
         self.batches = batches
         self.complete = complete
+
+
+def read_scanned(
+    sources: list[Source], opt: PhysicalPlan, ids: set[int] | frozenset[int]
+) -> dict[int, tuple[list[pa.RecordBatch], float]]:
+    """Read the sources in `ids` with the plan's pushdowns, concurrently: `{id: (batches, ms)}`.
+
+    One source after another used to be the rule, and on a join over several tables it put
+    every read in series although each spends its time in native code with the GIL released:
+    the reads of a TPC-H query's `orders`, `customer` and `nation` then cost their sum instead
+    of the longest. Each read keeps its own concurrency across its files, so this adds one
+    thread per source, not per file. `ms` is the read's own wall time — measured while the
+    others ran, which is the throughput the query actually got.
+
+    Args:
+        sources: The plan's bound sources.
+        opt: The optimized physical plan, carrying the pushed projections and predicates.
+        ids: The sources to read.
+
+    Returns:
+        Each read source's batches and its wall time in milliseconds.
+    """
+
+    groups = _shared_reads(sources, opt, sorted(i for i in ids if i < len(sources)))
+
+    def one(group: list[int]) -> tuple[list[pa.RecordBatch], float]:
+        started = time.perf_counter()
+        first = group[0]
+        if len(group) == 1:
+            projection = opt.source_projections.get(first)
+            predicate = opt.source_predicates.get(first)
+        else:
+            projection = _union_projection([opt.source_projections.get(i) for i in group])
+            predicates = [opt.source_predicates.get(i) for i in group]
+            predicate = predicates[0] if all(p == predicates[0] for p in predicates) else None
+        batches = read_source(
+            sources[first],
+            projection,
+            predicate,
+            opt.source_limits.get(first),
+            opt.source_orderings.get(first),
+        )
+        return batches, (time.perf_counter() - started) * 1000.0
+
+    # The pool buys overlap between reads that each spend their time in native code; a
+    # resident relation's "read" is a projection over batches already in memory, and a pool
+    # spun up and torn down around those cost more than the reads (~3% of a warm TPC-H sf1
+    # q8, sampled, in thread start/join alone). So it is used only when two or more groups
+    # actually read something.
+    if sum(not isinstance(sources[g[0]], InMemorySource) for g in groups) <= 1:
+        results = [one(g) for g in groups]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:
+            results = list(pool.map(one, groups))
+    out: dict[int, tuple[list[pa.RecordBatch], float]] = {}
+    for group, (batches, ms) in zip(groups, results, strict=True):
+        for i in group:
+            wanted = opt.source_projections.get(i)
+            out[i] = (batches if len(group) == 1 else _narrowed(batches, wanted), ms)
+    return out
+
+
+def _shared_reads(sources: list[Source], opt: PhysicalPlan, ids: list[int]) -> list[list[int]]:
+    """`ids` grouped so each group is read once: the bindings of one source object together.
+
+    A source bound twice — a self-join, or a correlated subquery decorrelated into a second
+    scan of the table it correlates with (TPC-H q17, q18, q20, q21) — was decoded once per
+    binding. One read of the union of their columns serves every binding, because what each
+    binding pushed is superset-safe: the engine keeps its `Filter`, so a binding handed rows its
+    predicate would have pruned still computes the same answer. Only bindings with no pushed row
+    cap and no pushed ordering share, since those change *which* rows a read returns.
+    """
+    groups: dict[int, list[int]] = {}
+    alone: list[list[int]] = []
+    for i in ids:
+        if opt.source_limits.get(i) is not None or opt.source_orderings.get(i):
+            alone.append([i])
+        else:
+            groups.setdefault(id(sources[i]), []).append(i)
+    return list(groups.values()) + alone
+
+
+def _union_projection(projections: list[list[str] | None]) -> list[str] | None:
+    """The columns every projection needs, first-seen order; None when any reads every column."""
+    columns: dict[str, None] = {}
+    for projection in projections:
+        if projection is None:
+            return None
+        columns.update(dict.fromkeys(projection))
+    return list(columns)
+
+
+def _narrowed(batches: list[pa.RecordBatch], columns: list[str] | None) -> list[pa.RecordBatch]:
+    """`batches` reduced to `columns` in that order (zero-copy), or unchanged for None."""
+    if columns is None:
+        return batches
+    return [b.select(columns) for b in batches]
 
 
 def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionContext):
@@ -376,6 +553,7 @@ def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionCont
     from batcher.metadata.io_stats import record_source_io, scanned_byte_count
 
     scanned_ids = opt.scanned_source_ids()
+    reads = read_scanned(sources, opt, scanned_ids)
     batches_per_source = []
     complete: list[bool] = []
     for i, src in enumerate(sources):
@@ -386,13 +564,9 @@ def resolve_sources(sources: list[Source], opt: PhysicalPlan, ctx: ExecutionCont
             batches_per_source.append([])
             complete.append(False)
             continue
-        read_started = time.perf_counter()
         predicate = opt.source_predicates.get(i)
         limit = opt.source_limits.get(i)
-        batches = read_source(
-            src, opt.source_projections.get(i), predicate, limit, opt.source_orderings.get(i)
-        )
-        elapsed_ms = (time.perf_counter() - read_started) * 1000.0
+        batches, elapsed_ms = reads[i]
 
         batches_per_source.append(batches)
         declared = declared_row_count(src)

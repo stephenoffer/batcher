@@ -28,9 +28,11 @@ import contextvars
 import logging
 import threading
 
-from batcher._internal.errors import ResourceError
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.dist.fleet.plan_id import active_query_scopes, adopt_plan_id, query_shuffle_scope
+from batcher.dist.fleet.spawn import (
+    _spawn_fleet_with_addrs,
+)
 
 __all__ = [
     "ShuffleFleet",
@@ -73,154 +75,6 @@ _QUERY_HOLD: contextvars.ContextVar[bool | None] = contextvars.ContextVar(
 )
 
 
-def _spawn_fleet_with_addrs(workers: int, credits: int, cfg_json: str, plan_id: int | None = None):
-    """Spawn the worker fleet and fetch their Flight addresses, releasing the gang on failure.
-
-    Returns ``(actors, placement_group, addrs)``. If anything between reserving the
-    placement group and collecting every worker's advertised address fails (an actor
-    that can't bind its Flight server, a node lost mid-spawn, an interrupt), the actors
-    are killed and the placement group released before the error propagates — otherwise
-    the reserved gang would leak (no `ShuffleFleet` is constructed, so its `cleanup`
-    never runs). The single guarded spawn point both `ShuffleFleet.spawn` and the
-    transient `acquire_fleet` path go through.
-    """
-    import ray
-
-    from batcher.config import active_config
-    from batcher.dist.executors.ray_runtime import release_placement
-    from batcher.dist.flight_worker import spawn_flight_workers
-
-    actors, pg = spawn_flight_workers(workers, credits, cfg_json, plan_id)
-    ok = False
-    try:
-        # Bounded wait for every worker to advertise its Flight address. An un-placeable
-        # actor (the request outran the schedulable node count) or one lost to a spot
-        # preemption mid-spawn would otherwise leave `ray.get` blocking FOREVER — the whole
-        # query hangs on fleet startup. Instead, wait up to the placement timeout and
-        # proceed with whichever workers came up, killing the stragglers: the mergeable
-        # shuffle algebra makes any (>=1) worker count result-identical, so a smaller fleet
-        # is a scheduling degradation, never a wrong answer.
-        addr_refs = [a.addr.remote() for a in actors]
-        timeout = max(1.0, active_config().distributed.placement_timeout_s)
-        ready, pending = ray.wait(addr_refs, num_returns=len(addr_refs), timeout=timeout)
-        if pending:
-            # A fleet asks for one worker per node holding that node's cores, i.e. the
-            # cluster's *whole* CPU capacity (`_even_cpu_share`). So it is placeable only
-            # when the cluster is genuinely idle — and the most common reason it isn't is
-            # a fleet that was torn down microseconds ago, whose actors Ray has not yet
-            # reaped. Degrading immediately turns that transient into a *cached* 1-2 worker
-            # fleet that then serves the rest of the session (measured: an 8-worker
-            # distributed join left running on 2 workers, 0.6 s -> 16 s). Give the
-            # reclamation one more placement window before accepting a smaller fleet.
-            ready, pending = ray.wait(addr_refs, num_returns=len(addr_refs), timeout=timeout)
-        if pending:
-            ready_set = set(ready)
-            for a, ref in zip(actors, addr_refs, strict=True):
-                if ref not in ready_set:
-                    with contextlib.suppress(Exception):
-                        ray.kill(a)  # a straggler that never came up — reclaim its slot
-            actors = [a for a, ref in zip(actors, addr_refs, strict=True) if ref in ready_set]
-            addr_refs = ready
-            _warn_degraded_fleet(len(actors), workers, timeout)
-        if not actors:  # nothing came up at all — a real, actionable failure, not a hang
-            raise ResourceError(
-                f"no distributed worker became available within {timeout:.0f}s: "
-                f"{_fleet_demand_reason() or 'the cluster is over-subscribed or unschedulable'}"
-                "; retry or reduce num_workers"
-            )
-        addrs = list(ray.get(addr_refs))
-        _tell_workers_about_node_peers(actors, addrs)
-        ok = True
-        return actors, pg, addrs
-    finally:
-        if not ok:
-            for a in actors:
-                with contextlib.suppress(Exception):
-                    ray.kill(a)
-            release_placement(pg)
-
-
-def _tell_workers_about_node_peers(actors, addrs) -> None:
-    """Tell each worker whether another worker landed on its node.
-
-    A shuffle address is `{node_ip}:{port}`, so two workers share a node exactly when their
-    addresses' hosts match — the fleet already has every address by this point, and nothing
-    else in the system does. The workers use it to skip mirroring buckets into shared memory
-    when no other process on the node could read one (`ShuffleSession._shm_mirror_ok`), which
-    is the ordinary shape of a fleet of small nodes: one worker per node, so every mirrored
-    file is written, never read, and unlinked.
-
-    Best-effort and one round-trip per fleet, not per query. A failure here leaves every
-    worker at its default of "assume a peer", which is exactly today's behaviour, so this can
-    only ever remove wasted work — never correctness, since a missing mirror already falls
-    back to Flight.
-    """
-    import ray
-
-    from batcher.carbonite.transfer.lifecycle import host_of
-
-    try:
-        seen: dict[str, int] = {}
-        hosts = [host_of(a) for a in addrs]
-        for h in hosts:
-            seen[h] = seen.get(h, 0) + 1
-        ray.get(
-            [
-                actor.set_shm_peers.remote(seen.get(host, 0) > 1)
-                for actor, host in zip(actors, hosts, strict=True)
-            ]
-        )
-    except Exception as exc:
-        note_suppressed("dist", "tell the fleet whether its workers share nodes", exc)
-
-
-def _fleet_demand_reason() -> str | None:
-    """Why the fleet's workers could not be placed, in the ask's own terms, or `None`.
-
-    "The cluster is over-subscribed or unschedulable" names both possibilities and
-    distinguishes neither, which is the wrong half of the answer to give someone whose query
-    just failed: the two have opposite fixes. Asking a worker for more cores than any node
-    has is settled by changing the grant; a cluster somebody else is holding is settled by
-    waiting or by looking at who. The topology already knows which one it is.
-    """
-    try:
-        from batcher.dist.executors.ray_runtime.capacity import Demand, describe_pending_demand
-        from batcher.dist.executors.ray_runtime.scheduling import current_envelope
-
-        return describe_pending_demand(Demand.from_envelope(current_envelope()))
-    except Exception as exc:  # pragma: no cover - a diagnosis never replaces the failure
-        note_suppressed("dist", "diagnose the unplaceable fleet", exc)
-        return None
-
-
-def _warn_degraded_fleet(placed: int, wanted: int, timeout: float) -> None:
-    """Say so when a fleet comes up narrower than it asked for.
-
-    This is the most expensive silent degradation on the distributed path and it left no
-    trace at all: the stragglers are killed, the survivors serve the query, and — on the
-    session-cached path — the rest of the session too. Measured on an 8-worker distributed
-    join that came up with 2: **0.6 s becomes 16 s**, with nothing anywhere to connect the
-    two. A query that runs at a quarter of its width should not have to be inferred from a
-    stopwatch.
-
-    Best-effort: reporting a degradation must not turn it into a failure.
-    """
-    if placed >= wanted:
-        return
-    try:
-        log_kv(
-            get_logger("dist"),
-            logging.WARNING,
-            "shuffle fleet came up narrower than requested; the query runs at reduced width",
-            placed=placed,
-            requested=wanted,
-            waited_s=round(timeout * 2, 1),
-            reason=_fleet_demand_reason() or "workers did not advertise in time",
-        )
-    except Exception as exc:  # pragma: no cover - observation must never fail a spawn
-        note_suppressed("dist", "report the degraded fleet", exc)
-
-
 class ShuffleFleet:
     """One placement group + `_FlightWorker` fleet reused across a query's stages.
 
@@ -230,7 +84,7 @@ class ShuffleFleet:
     teardown point — the adaptive loop calls it once, in its `finally`.
     """
 
-    __slots__ = ("actors", "addrs", "cfg_json", "credits", "num_cpus", "pg", "plan_id")
+    __slots__ = ("actors", "addrs", "cfg_json", "credits", "num_cpus", "pg", "plan_id", "session")
 
     def __init__(
         self,
@@ -241,6 +95,7 @@ class ShuffleFleet:
         cfg_json: str,
         plan_id: int,
         num_cpus: float = 0.0,
+        session: str | None = None,
     ) -> None:
         self.actors = actors
         self.pg = pg
@@ -255,6 +110,11 @@ class ShuffleFleet:
         # sixteen-core workers occupy the same cluster, and only the second can use it. See
         # `_fleet_is_too_thin`.
         self.num_cpus = num_cpus
+        # The Ray session the actors and placement group live in. A warm fleet outlives the
+        # query that spawned it, and so can outlive the *cluster*: after a reconnect its
+        # placement group names a reservation the new cluster never had, and a stage placed
+        # into it sits in Ray's infeasible queue forever. See `_from_this_session`.
+        self.session = session
 
     @property
     def workers(self) -> int:
@@ -267,15 +127,28 @@ class ShuffleFleet:
         from batcher.dist.flight_worker import new_plan_id
 
         plan_id = new_plan_id()
+        from batcher.dist.executors.ray_runtime.scheduling import ray_session_key
+
         actors, pg, addrs = _spawn_fleet_with_addrs(workers, credits, cfg_json, plan_id)
-        return cls(actors, pg, addrs, credits, cfg_json, plan_id, _wanted_grant())
+        return cls(
+            actors, pg, addrs, credits, cfg_json, plan_id, _wanted_grant(), ray_session_key()
+        )
 
     def cleanup(self) -> None:
-        """Kill the fleet's actors and release its placement group (idempotent)."""
+        """Kill the fleet's actors and release its placement group (idempotent).
+
+        A fleet from a Ray session this driver has left is only forgotten. Its handles name
+        the old cluster's actors and reservation, and acting on them after a reconnect sends
+        `kill`/`remove_placement_group` to the *new* cluster: the idle-release timer armed in
+        one session fires in the next, which is how a stale teardown landed on a live GCS.
+        """
         import ray
 
         from batcher.dist.executors.ray_runtime import release_placement
 
+        if not _from_this_session(self):
+            self.actors, self.pg = [], None
+            return
         for a in self.actors:
             with contextlib.suppress(Exception):
                 ray.kill(a)
@@ -348,6 +221,21 @@ def _fleet_is_too_thin(fleet: ShuffleFleet, wanted: float) -> bool:
     )
 
 
+def _from_this_session(fleet: ShuffleFleet) -> bool:
+    """Whether `fleet` was spawned in the Ray session this driver is attached to now.
+
+    `False` only on positive evidence of a different session. A fleet whose session could
+    not be read at spawn keeps the behaviour it had before the stamp existed, and the
+    liveness ping in `_acquire_session_fleet` still guards it.
+    """
+    stamp = getattr(fleet, "session", None)  # a handle-shaped stand-in carries no stamp
+    if stamp is None:
+        return True
+    from batcher.dist.executors.ray_runtime.scheduling import ray_session_key
+
+    return stamp == ray_session_key()
+
+
 def _session_fleet_alive(fleet: ShuffleFleet) -> bool:
     """Whether every actor in `fleet` is still reachable (cheap liveness ping)."""
     import ray
@@ -406,7 +294,7 @@ def _regrant_fleet(fleet: ShuffleFleet, credits: int, cfg_json: str) -> None:
     from batcher.dist.executors.ray_runtime import current_envelope
     from batcher.dist.flight_worker import _slot_engine_configs
 
-    cfgs = _slot_engine_configs(current_envelope(), len(fleet.actors), cfg_json, fleet.pg is not None)
+    cfgs = _slot_engine_configs(current_envelope(), len(fleet.actors), cfg_json, bool(fleet.pg))
     ray.get([a.set_grant.remote(credits, cfgs[i]) for i, a in enumerate(fleet.actors)])
     fleet.credits = credits
     fleet.cfg_json = cfg_json
@@ -473,6 +361,10 @@ def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> Shuffle
         if _SESSION_TIMER is not None:
             _SESSION_TIMER.cancel()
             _SESSION_TIMER = None
+        if _SESSION is not None and not _from_this_session(_SESSION):
+            # Spawned on a cluster this driver has since left. Dropped, not cleaned up: its
+            # actor handles and placement group belong to that cluster, not this one.
+            _SESSION = None
         if _SESSION is not None and not _session_fleet_alive(_SESSION):
             with contextlib.suppress(Exception):
                 _SESSION.cleanup()
@@ -507,6 +399,27 @@ def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> Shuffle
             _QUERY_HOLD.set(True)
             _SESSION_LEASES += 1
         return _SESSION
+
+
+def borrow_warm_session_fleet() -> list | None:
+    """The warm session fleet's actors, leased, or None when no fleet is warm; never spawns.
+
+    For work that runs *on* the fleet's actors without shuffling, which is only worth doing
+    when they already exist: the aligned executor's key-range units, which as plain tasks
+    waited ~0.5 s per query for a worker lease and forced the warm fleet down to find cores
+    (and the next shuffling query to pay a respawn). The lease is released with
+    `release_session_lease`, like any other borrow.
+    """
+    global _SESSION_LEASES, _SESSION_TIMER
+
+    with _SESSION_LOCK:
+        if _SESSION is None or not _from_this_session(_SESSION) or _FLEET.get() is not None:
+            return None
+        if _SESSION_TIMER is not None:
+            _SESSION_TIMER.cancel()
+            _SESSION_TIMER = None
+        _SESSION_LEASES += 1
+        return list(_SESSION.actors)
 
 
 def release_session_lease() -> None:
@@ -597,17 +510,28 @@ def release_session_fleet() -> None:
 
 
 def _free_cluster_cpus() -> float:
-    """CPUs the cluster can hand a task right now, or `inf` when it cannot be read.
+    """CPUs one node can hand a task right now, or `inf` when it cannot be read.
 
     Cores reserved inside a placement group count as *used* here even while the bundle sits
     idle, which is exactly the accounting `yield_session_fleet` needs: a warm fleet holding
     the whole cluster reads as zero free, because that is what a plain task sees.
+
+    The most free on any **one** node, not the cluster's sum: a task is placed on a single
+    node. A fleet holding 15 of each worker's 16 cores leaves eight free cores across eight
+    workers, which the sum called room for an 8-CPU task that no node could take. The task
+    then waited out the fleet's idle timer, 30 s on a query whose work took 0.3 s (TPC-H q10
+    at SF1, aligned units of 8 CPUs).
 
     `inf` on failure, so an unreadable cluster never causes a teardown.
     """
     import ray
 
     try:
+        from ray._private.state import available_resources_per_node
+
+        per_node = available_resources_per_node()
+        if per_node:
+            return max(float(r.get("CPU", 0.0)) for r in per_node.values())
         return float(ray.available_resources().get("CPU", 0.0))
     except Exception as exc:
         note_suppressed("dist", "read the cluster's free CPU", exc)
@@ -697,7 +621,9 @@ def held_placement_group():
         A Ray placement group, or None when no fleet is up.
     """
     fleet = _FLEET.get() or _SESSION
-    return getattr(fleet, "pg", None) if fleet is not None else None
+    if fleet is None or not _from_this_session(fleet):
+        return None
+    return getattr(fleet, "pg", None)
 
 
 def acquire_fleet(workers: int, credits: int, cfg_json: str):

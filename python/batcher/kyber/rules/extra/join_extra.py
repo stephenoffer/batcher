@@ -39,6 +39,7 @@ from batcher.plan.logical import (
     LogicalPlan,
     Project,
     Projection,
+    is_empty_relation,
 )
 
 __all__ = [
@@ -58,11 +59,6 @@ _PRESERVED_SIDES = {
     "right": frozenset({"right"}),
     "full": frozenset({"left", "right"}),
 }
-
-
-def _is_empty(node: LogicalPlan) -> bool:
-    """Whether `node` provably yields zero rows (the `Limit(_, 0)` empty marker)."""
-    return isinstance(node, Limit) and node.n == 0
 
 
 def _output_side(output: tuple[JoinOutputCol, ...]) -> str | None:
@@ -99,7 +95,7 @@ def semi_anti_join_empty_left(node: Join, _ctx: OptimizerContext) -> LogicalPlan
     exact result schema with zero rows. Returns None when the left is not provably
     empty; the rewritten node is a `Project`, so the rule fires at most once.
     """
-    if node.join_type not in ("semi", "anti") or not _is_empty(node.left):
+    if node.join_type not in ("semi", "anti") or not is_empty_relation(node.left):
         return None
     return _passthrough(node.left, node.output)
 
@@ -114,7 +110,7 @@ def semi_join_empty_right(node: Join, _ctx: OptimizerContext) -> LogicalPlan | N
     `Limit(Project(L, out), 0)`. Returns None when the right is not provably empty
     (and the `Limit`/`Project` result is not a `Join`, so it never re-fires).
     """
-    if node.join_type != "semi" or not _is_empty(node.right):
+    if node.join_type != "semi" or not is_empty_relation(node.right):
         return None
     projected = _passthrough(node.left, node.output)
     return None if projected is None else Limit(projected, 0)
@@ -130,7 +126,7 @@ def anti_join_empty_right(node: Join, _ctx: OptimizerContext) -> LogicalPlan | N
     output aliases. Returns None when the right is not provably empty. (Distinct from
     an empty *left*, which `semi_anti_join_empty_left` handles.)
     """
-    if node.join_type != "anti" or not _is_empty(node.right):
+    if node.join_type != "anti" or not is_empty_relation(node.right):
         return None
     return _passthrough(node.left, node.output)
 
@@ -175,7 +171,9 @@ def inner_join_empty_to_empty(node: Join, _ctx: OptimizerContext) -> LogicalPlan
     whose output still spans both sides is left untouched — the IR cannot fabricate a
     two-sided zero-row schema. Idempotent (the result is not a `Join`).
     """
-    if node.join_type != "inner" or not (_is_empty(node.left) or _is_empty(node.right)):
+    if node.join_type != "inner" or not (
+        is_empty_relation(node.left) or is_empty_relation(node.right)
+    ):
         return None
     side = _output_side(node.output)
     if side is None:
@@ -207,7 +205,7 @@ def preserving_join_empty_null_side(node: Join, _ctx: OptimizerContext) -> Logic
     if side is None or side not in preserved:
         return None
     other = node.right if side == "left" else node.left
-    if not _is_empty(other):
+    if not is_empty_relation(other):
         return None
     src = node.left if side == "left" else node.right
     return _passthrough(src, node.output)

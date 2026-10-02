@@ -30,9 +30,9 @@ The always-exact comparison flip (`lit OP col -> col flip(OP) lit`) carries no a
 and is applied unconditionally, canonicalizing the literal to the right so the raw-column
 passes and the rules above see a uniform shape.
 
-Each rewrite is a `plan_rule` in `Phase.NORMALIZE` (registered into `DEFAULT_REGISTRY`
-below), applied to every expression in the tree via `map_node_expressions` +
-`transform_expr_up`. Their pure functions stay importable for unit tests.
+Each rewrite is an expression leaf registered as a `node_rule` in `Phase.NORMALIZE` (into
+`DEFAULT_REGISTRY` below), applied to every expression of every node via
+`map_node_expressions` + `transform_expr_up`.
 """
 
 from __future__ import annotations
@@ -43,22 +43,14 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.leaf_rewrite import EXPR_NODES
+from batcher.kyber.rules.literals import in_int64
 from batcher.plan.expr_ir import Binary, Col, Expr, Lit
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.ir_tags import COMPARISON_FLIP
 from batcher.plan.logical import LogicalPlan
-from batcher.plan.visitor import transform_up
 
-__all__ = [
-    "flip_comparison_literal",
-    "sarg_add_const",
-    "sarg_mul_const",
-    "sarg_rsub_const",
-    "sarg_sub_const",
-    "sarg_xor_const",
-]
+__all__: list[str] = []
 
-_INT64_MIN, _INT64_MAX = -(2**63), 2**63 - 1
 # Comparisons that flip when the column moves from the right side to the left.
 # The additive/multiplicative strength reductions are exact *only* for these ops (a wrap of
 # the arithmetic would break an ordered comparison; equality's bijection is wrap-invariant).
@@ -70,22 +62,6 @@ ExprRule = Callable[[Expr], Expr]
 def _is_int(value: object) -> bool:
     """Whether `value` is a plain Python int (bool — an int subclass — excluded)."""
     return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _in_int64(value: int) -> bool:
-    """Whether a folded literal is representable as i64 (so the engine won't itself wrap it)."""
-    return _INT64_MIN <= value <= _INT64_MAX
-
-
-def _expr_pass(leaf: ExprRule) -> Callable[[LogicalPlan], LogicalPlan]:
-    """A whole-plan pass applying `leaf` bottom-up to every sub-expression of every node."""
-
-    def run(plan: LogicalPlan) -> LogicalPlan:
-        return transform_up(
-            plan, lambda node: map_node_expressions(node, lambda e: transform_expr_up(e, leaf))
-        )
-
-    return run
 
 
 def _arith_and_lit(expr: Binary) -> tuple[Binary, int] | None:
@@ -112,7 +88,7 @@ def _commutative_col_const(inner: Binary) -> tuple[Col, int] | None:
 # --- comparison flip (always exact, no arithmetic) --------------------------
 
 
-def flip_comparison_literal(plan: LogicalPlan) -> LogicalPlan:
+def _flip_leaf(expr: Expr) -> Expr:
     """Rewrite `literal OP col` to the canonical `col flip(OP) literal`.
 
     Flipping the operands of a comparison never changes its (three-valued) result, so this
@@ -122,10 +98,6 @@ def flip_comparison_literal(plan: LogicalPlan) -> LogicalPlan:
     zone-map pruning. Fires only for a bare `literal OP col`; a `col`-on-left comparison is
     already canonical (so the rule is idempotent).
     """
-    return _expr_pass(_flip_leaf)(plan)
-
-
-def _flip_leaf(expr: Expr) -> Expr:
     if (
         isinstance(expr, Binary)
         and expr.op in COMPARISON_FLIP
@@ -139,7 +111,7 @@ def _flip_leaf(expr: Expr) -> Expr:
 # --- additive strength reduction (eq/ne only, overflow-guarded) -------------
 
 
-def sarg_add_const(plan: LogicalPlan) -> LogicalPlan:
+def _add_leaf(expr: Expr) -> Expr:
     """Rewrite `col + k = lit` (or `k + col = lit`) to `col = lit - k`, and the `<>` form.
 
     Addition by a constant is a bijection of `Z/2^64`, so the equality holds for the same
@@ -148,25 +120,17 @@ def sarg_add_const(plan: LogicalPlan) -> LogicalPlan:
     fires only when `lit - k` stays within i64 (else the folded literal would itself wrap).
     Exposes the raw `col` for zone-map / bloom pruning.
     """
-    return _expr_pass(_add_leaf)(plan)
-
-
-def _add_leaf(expr: Expr) -> Expr:
     reduced = _reduce_additive(expr, "add", lambda lit, k: lit - k)
     return reduced if reduced is not None else expr
 
 
-def sarg_sub_const(plan: LogicalPlan) -> LogicalPlan:
+def _sub_leaf(expr: Expr) -> Expr:
     """Rewrite `col - k = lit` to `col = lit + k`, and the `<>` form (eq/ne only, i64-guarded).
 
     The subtractive twin of `sarg_add_const`: `col - k` is a bijection, so the equality is
     preserved for every column value under the engine's wrapping subtraction. Fires only
     when `lit + k` fits in i64.
     """
-    return _expr_pass(_sub_leaf)(plan)
-
-
-def _sub_leaf(expr: Expr) -> Expr:
     match = _arith_and_lit(expr) if isinstance(expr, Binary) and expr.op in _EQ_NE else None
     if match is None:
         return expr
@@ -176,12 +140,12 @@ def _sub_leaf(expr: Expr) -> Expr:
     if not _is_int(inner.right.value):
         return expr
     folded = lit + inner.right.value
-    if not _in_int64(folded):
+    if not in_int64(folded):
         return expr
     return Binary(expr.op, inner.left, Lit(folded))
 
 
-def sarg_rsub_const(plan: LogicalPlan) -> LogicalPlan:
+def _rsub_leaf(expr: Expr) -> Expr:
     """Rewrite `k - col = lit` to `col = k - lit`, and the `<>` form (eq/ne only, i64-guarded).
 
     Covers reverse subtraction and, as the `k = 0` case, unary minus (`-col`, which lowers to
@@ -189,10 +153,6 @@ def sarg_rsub_const(plan: LogicalPlan) -> LogicalPlan:
     every column value under wrapping subtraction. Fires only when `k - lit` fits in i64 (the
     guard that, for unary minus, declines to rewrite `-col = INT64_MIN`).
     """
-    return _expr_pass(_rsub_leaf)(plan)
-
-
-def _rsub_leaf(expr: Expr) -> Expr:
     match = _arith_and_lit(expr) if isinstance(expr, Binary) and expr.op in _EQ_NE else None
     if match is None:
         return expr
@@ -202,7 +162,7 @@ def _rsub_leaf(expr: Expr) -> Expr:
     if not _is_int(inner.left.value):
         return expr
     folded = inner.left.value - lit
-    if not _in_int64(folded):
+    if not in_int64(folded):
         return expr
     return Binary(expr.op, inner.right, Lit(folded))
 
@@ -223,7 +183,7 @@ def _reduce_additive(expr: Expr, op: str, fold: Callable[[int, int], int]) -> Bi
         return None
     col, k = col_const
     folded = fold(lit, k)
-    if not _in_int64(folded):
+    if not in_int64(folded):
         return None
     return Binary(expr.op, col, Lit(folded))
 
@@ -231,7 +191,7 @@ def _reduce_additive(expr: Expr, op: str, fold: Callable[[int, int], int]) -> Bi
 # --- multiplicative strength reduction (eq/ne, odd coefficient, exact divide) ---
 
 
-def sarg_mul_const(plan: LogicalPlan) -> LogicalPlan:
+def _mul_leaf(expr: Expr) -> Expr:
     """Rewrite `col * k = lit` to `col = lit / k`, and the `<>` form — only when it is exact.
 
     Multiplication is a bijection of `Z/2^64` iff `k` is **odd**; for an odd `k`, `col * k = lit`
@@ -241,10 +201,6 @@ def sarg_mul_const(plan: LogicalPlan) -> LogicalPlan:
     change results). The quotient always fits in i64 (`|lit / k| <= |lit|`). The sign of `k`
     needs no operator flip here because the rule is `=`/`<>` only.
     """
-    return _expr_pass(_mul_leaf)(plan)
-
-
-def _mul_leaf(expr: Expr) -> Expr:
     if not (isinstance(expr, Binary) and expr.op in _EQ_NE):
         return expr
     match = _arith_and_lit(expr)
@@ -267,7 +223,7 @@ def _mul_leaf(expr: Expr) -> Expr:
 # --- xor strength reduction (eq/ne; xor is its own inverse) ------------------
 
 
-def sarg_xor_const(plan: LogicalPlan) -> LogicalPlan:
+def _xor_leaf(expr: Expr) -> Expr:
     """Rewrite `col ^ k = lit` (or `k ^ col = lit`) to `col = lit ^ k`, and the `<>` form.
 
     Bitwise xor by a constant is an involution — its own inverse — so `col ^ k = lit <=>
@@ -275,10 +231,6 @@ def sarg_xor_const(plan: LogicalPlan) -> LogicalPlan:
     Restricted to `=`/`<>` (xor is not order-preserving) and integer operands. Exposes the
     raw `col` for bloom / point-lookup skipping.
     """
-    return _expr_pass(_xor_leaf)(plan)
-
-
-def _xor_leaf(expr: Expr) -> Expr:
     reduced = _reduce_bitxor(expr)
     return reduced if reduced is not None else expr
 
@@ -297,23 +249,17 @@ def _reduce_bitxor(expr: Expr) -> Binary | None:
         return None
     col, k = col_const
     folded = lit ^ k
-    if not _in_int64(folded):
+    if not in_int64(folded):
         return None
     return Binary(expr.op, col, Lit(folded))
 
 
 # --- registration -----------------------------------------------------------
 
-# Each of these walks the whole plan itself, and as a `plan_rule` it has no node type to be
-# indexed on -- so without an expression declaration it runs against every plan there is.
 # Every leaf gates on a `Binary` first: the five strength reductions need an `=`/`<>` (the
 # only comparisons whose bijection survives the arithmetic), and the flip needs any
-# comparison with the literal on the left.
-#: The node types that carry expressions. `map_node_expressions` -- which `_expr_pass` and
-#: the driver's fused chain both go through -- rewrites expressions on exactly these, and
-#: returns `Scan`, `Join`, `Distinct`, `Union`, `Limit`, and `MapBatches` untouched. So
-#: naming them here is not a narrowing: it is the same set the whole-plan pass already
-#: reached, stated explicitly.
+# comparison with the literal on the left — which is what `expr_ops` declares below.
+# `EXPR_NODES` are exactly the node types `map_node_expressions` rewrites.
 
 
 def _node_pass(leaf: ExprRule):
@@ -328,8 +274,7 @@ def _node_pass(leaf: ExprRule):
 
 # Registered as node rules rather than whole-plan ones so the driver runs all six inside the
 # single expression traversal it already makes per node, instead of each walking the entire
-# plan itself. The whole-plan `flip_comparison_literal`/`sarg_*_const` functions above stay
-# as they are: they are the standalone form the unit tests drive directly.
+# plan itself.
 for _name, _leaf, _ops in (
     ("sarg_flip_comparison", _flip_leaf, tuple(sorted(COMPARISON_FLIP))),
     ("sarg_add_const", _add_leaf, tuple(sorted(_EQ_NE))),

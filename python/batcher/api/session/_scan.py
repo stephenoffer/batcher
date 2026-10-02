@@ -17,11 +17,12 @@ from batcher.plan.schema import SchemaRef
 from batcher.plan.source_stats import stable_source_key
 
 
-def _scan(source: Source) -> Dataset:
+def _scan(source: Source, *, governed_as: str | None = None) -> Dataset:
     """Build the `Dataset` for `source`, governed by the active security policy.
 
     The single place a source becomes a plan, and therefore the single place governance
-    has to be applied for it to be unbypassable — see `api.security`.
+    has to be applied for it to be unbypassable — see `api.security`. `governed_as` is the
+    table name a caller declares for a source that names none of its own (a query read).
     """
     from batcher.api.security import govern_scan
 
@@ -35,7 +36,7 @@ def _scan(source: Source) -> Dataset:
         schema=SchemaRef.from_arrow(source.schema()),
         source_key=stable_source_key(source),
     )
-    return Dataset(govern_scan(plan, source), sources=[source])
+    return Dataset(govern_scan(plan, source, governed_as=governed_as), sources=[source])
 
 
 def _empty_batch(schema: pa.Schema) -> pa.RecordBatch:

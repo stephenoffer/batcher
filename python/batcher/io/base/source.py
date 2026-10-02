@@ -12,7 +12,6 @@ The `Source` protocol itself lives in `io.source`; this base structurally satisf
 from __future__ import annotations
 
 import hashlib
-import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator
 from typing import IO, Any, ClassVar, TypeVar
@@ -22,8 +21,14 @@ import pyarrow as pa
 from batcher._internal.errors import FormatError, IOError, SchemaError, unknown_value
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.logging import note_suppressed
-from batcher.io._backend import _has_wildcard, _scheme
-from batcher.io._concurrent import listed_sizes, read_each_file, total_file_bytes
+from batcher.config.env import env_float, env_int
+from batcher.io._backend import _has_wildcard
+from batcher.io._concurrent import (
+    is_local_path,
+    listed_sizes,
+    read_each_file,
+    total_file_bytes,
+)
 from batcher.io.base._options import BASE_SOURCE_ALIASES, BASE_SOURCE_OPTIONS
 from batcher.io.base._paths import normalize_source_path
 from batcher.io.base._readahead import ordered_readahead
@@ -54,15 +59,14 @@ _ITER_READAHEAD_FILES = 16
 # not the file count, is what bounds `iter_batches`: file count alone says nothing about
 # memory when one row can be a 200 MB video and another 4 KB of text. 512 MiB keeps a
 # streaming read comfortably inside a worker's envelope while still overlapping I/O.
-_ITER_READAHEAD_BYTES = max(1 << 20, int(os.environ.get("BATCHER_READAHEAD_BYTES", str(512 << 20))))
+_ITER_READAHEAD_BYTES = env_int("BATCHER_READAHEAD_BYTES", 512 << 20, floor=1 << 20)
 # How many files a **remote** (object-store) source reads concurrently, in `read` and as the
-# `iter_batches` read-ahead depth. Both used to be derived from `available_cpu_count()`, which
-# is the wrong ruler for a remote read: an S3 GET is ~tens of ms of *latency*, so throughput
-# tracks the number of requests in flight, not the number of cores available to decode them.
-# A 4-core worker therefore read 4 files at a time and sat idle waiting on the network. The
-# distributed scan already sizes its prefetch this way and measured it (`dist/executors/
-# scan_read.py::_SCAN_PREFETCH`: 8 -> 32 cut a TPC-H sf100 distributed agg ~53s -> ~31s, and
-# it plateaus past 32) — this is the same lever on the single-node path.
+# `iter_batches` read-ahead depth. The core count is the wrong ruler for a remote read: an S3
+# GET is ~tens of ms of *latency*, so throughput tracks the number of requests in flight, not
+# the number of cores available to decode them, and a 4-core worker sized by cores reads 4
+# files at a time and waits on the network. The distributed scan sizes its prefetch the same
+# way (`dist/executors/scan_read.py::_SCAN_PREFETCH`: 8 -> 32 cut a TPC-H sf100 distributed
+# agg ~53s -> ~31s, and it plateaus past 32); this is the same lever on the single-node path.
 #
 # Local files keep the core-count sizing: an NVMe read is bandwidth-bound, not latency-bound,
 # so oversubscribing it buys nothing and costs resident batches.
@@ -73,17 +77,17 @@ _ITER_READAHEAD_BYTES = max(1 << 20, int(os.environ.get("BATCHER_READAHEAD_BYTES
 # which a deeper window divides more finely rather than exceeding. `read` materializes the
 # whole source by definition, so extra concurrency there only widens the transient decode
 # working set.
-_REMOTE_READ_CONCURRENCY = max(2, int(os.environ.get("BATCHER_REMOTE_READ_CONCURRENCY", "32")))
+_REMOTE_READ_CONCURRENCY = env_int("BATCHER_REMOTE_READ_CONCURRENCY", 32, floor=2)
 # Attempts (including the first) for a read that fails *transiently* — an object-store
 # throttle, 5xx, or dropped connection. 3 absorbs the blips a cloud SDK would absorb on its
 # own without masking a real outage for long; 1 disables retrying. Non-transient failures
 # (404/403/malformed) never consume an attempt, so a genuine error still fails on the first
 # try. See `_transient.py` for why the classification, not the count, is the load-bearing part.
-_READ_RETRY_ATTEMPTS = max(1, int(os.environ.get("BATCHER_READ_RETRY_ATTEMPTS", "3")))
+_READ_RETRY_ATTEMPTS = env_int("BATCHER_READ_RETRY_ATTEMPTS", 3, floor=1)
 # First retry's backoff ceiling in seconds, doubling per round with equal jitter. Jitter
 # matters more than the base here: a wide scan retries hundreds of files at once, and
 # without decorrelation a single throttle turns into a synchronized stampede.
-_READ_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_READ_RETRY_BACKOFF_S", "0.5")))
+_READ_RETRY_BACKOFF_S = env_float("BATCHER_READ_RETRY_BACKOFF_S", 0.5, floor=0.0)
 # File count past which `splits()` stops reading a footer per file to plan sub-file splits.
 # The footer sweep is the driver's serial prologue to a distributed scan: it is worth ~100ms
 # of object-store latency per file (pooled, but still O(files) requests), which is a good
@@ -91,14 +95,26 @@ _READ_RETRY_BACKOFF_S = max(0.0, float(os.environ.get("BATCHER_READ_RETRY_BACKOF
 # while the driver GETs metadata it will only use to subdivide files that are already far
 # more numerous than the workers. Whole-file splits need no footer and give the same rows.
 # Env-overridable for a workload whose files are few but enormous.
-_MAX_FOOTER_PLAN_FILES = max(1, int(os.environ.get("BATCHER_MAX_FOOTER_PLAN_FILES", "10000")))
-# Rough bytes a whole-file split should cover when the caller names no target. One split
-# per file is the right unit until files outnumber workers by orders of magnitude; past
-# that, every split is a scheduled task and a pickled locator, so a million 4 KB objects
-# become a million tasks to move four gigabytes. 128 MiB is the figure Spark settled on for
-# the same job (`spark.sql.files.maxPartitionBytes`) and for the same reason. Files are only
-# ever *grouped*, never divided, so a dataset of large files packs one-per-split as before.
-_COALESCE_TARGET_BYTES = max(1, int(os.environ.get("BATCHER_SPLIT_TARGET_BYTES", str(128 << 20))))
+_MAX_FOOTER_PLAN_FILES = env_int("BATCHER_MAX_FOOTER_PLAN_FILES", 10000, floor=1)
+
+
+def _coalesce_target_bytes() -> int:
+    """Rough bytes a whole-file split should cover when the caller names no target.
+
+    One split per file is the right unit until files outnumber workers by orders of
+    magnitude; past that, every split is a scheduled task and a pickled locator, so a million
+    4 KB objects become a million tasks to move four gigabytes. The target is
+    `execution.split_bytes` (128 MiB, the figure Spark uses for
+    `spark.sql.files.maxPartitionBytes`), the same option the CSV, JSON and text readers
+    divide by, so one knob sizes every file split. `BATCHER_SPLIT_TARGET_BYTES` stays as an
+    operator override. Files are only ever *grouped*, never divided, so a dataset of large
+    files packs one per split.
+    """
+    from batcher.config import active_config
+
+    return env_int("BATCHER_SPLIT_TARGET_BYTES", active_config().execution.split_bytes, floor=1)
+
+
 # The fewest splits packing may leave when there are at least that many files. Grouping is
 # a throughput win and a parallelism risk in the same move: eight 10 MB files under a
 # 128 MiB target would coalesce to one task and idle every core but one. The driver cannot
@@ -281,14 +297,11 @@ class FileSource(ABC):
             self._expand_pinned(self._pinned) if self._pinned is not None else None
         )
         self._schema_cache: pa.Schema | None = None
-        # "strict" (default) keeps the historical behavior — file 0's schema is
-        # assumed for all. "union"/"latest" reconcile differing per-file schemas; each
-        # file's batches are normalized to the result. It is a per-read option
-        # (`read.parquet(path, schema_mode="union")`) and deliberately not a config
-        # setting: which files a *particular* source spans is a property of that read,
-        # not of the process. This comment used to cite `io.schema_evolution`, which has
-        # never existed — `Config` has no `io` section at all — so anyone following it
-        # went looking for a knob they could not find.
+        # "strict" (default) assumes file 0's schema for all files. "union"/"latest"
+        # reconcile differing per-file schemas; each file's batches are normalized to the
+        # result. It is a per-read option (`read.parquet(path, schema_mode="union")`) and
+        # deliberately not a config setting: which files a *particular* source spans is a
+        # property of that read, not of the process, so `Config` has no knob for it.
         self._schema_mode = schema_mode
         # `columns` (pandas `usecols`, Polars `columns`) and `n_rows` (pandas `nrows`,
         # Polars `n_rows`) are format-agnostic — they restrict *which* columns and *how
@@ -316,10 +329,10 @@ class FileSource(ABC):
 
         ``read.parquet([a, b])`` is the shape `pandas.concat` and ``spark.read.parquet(*p)``
         cover, and the entries are not always files: pointing it at two *output directories*
-        is the natural way to union two runs, and it used to fail with "path is a directory"
-        raised from inside the format's file reader — an error about the wrong thing, at the
-        wrong layer. Expanding here makes a list accept exactly the vocabulary one path
-        accepts.
+        is the natural way to union two runs. Left unexpanded, that fails with "path is a
+        directory" raised from inside the format's file reader — an error about the wrong
+        thing, at the wrong layer. Expanding here makes a list accept exactly the vocabulary
+        one path accepts.
 
         Only the entries that need it are listed. A path already ending in one of this
         format's suffixes is a file, so an explicit list of ten thousand Parquet files costs
@@ -393,7 +406,7 @@ class FileSource(ABC):
         sizes = listed_sizes(self._fs, files)
         if not sizes:
             return False
-        return max(sizes) <= (target_size or _COALESCE_TARGET_BYTES)
+        return max(sizes) <= (target_size or _coalesce_target_bytes())
 
     def _is_remote(self) -> bool:
         """Whether this source's files sit behind a network round trip.
@@ -403,7 +416,7 @@ class FileSource(ABC):
         and is therefore sized by in-flight requests rather than by cores. See
         `_REMOTE_READ_CONCURRENCY`.
         """
-        return _scheme(self._path) not in ("", "file")
+        return not is_local_path(self._path)
 
     @property
     def node_local(self) -> bool:
@@ -816,8 +829,8 @@ class FileSource(ABC):
 
         # Read the files concurrently: the decode runs in the C++ layer with the GIL
         # released, so a many-small-files read (thousands of Parquet parts — the shape
-        # every distributed producer and object-store dataset lands in) no longer opens
-        # and parses them one at a time. `read()` already materializes the whole source,
+        # every distributed producer and object-store dataset lands in) does not open
+        # and parse them one at a time. `read()` already materializes the whole source,
         # so holding all batches adds no memory beyond what it already returns. Order is
         # preserved so a downstream that assumes file order is unaffected.
         if len(files) <= 1:
@@ -999,10 +1012,10 @@ class FileSource(ABC):
         reconcile — see `io.schema.conform_batch` for the rules and why they match
         DuckDB's non-``union_by_name`` reader.
 
-        Strict mode used to pass batches through untouched, which left the declaration
-        unchecked: a file with an extra column had it silently dropped downstream, and a
-        file with a differing type failed at the final concat as a bare
-        `pyarrow.lib.ArrowInvalid` naming neither the file nor the fix.
+        Strict mode checks every batch rather than passing it through: unchecked, a file
+        with an extra column has it silently dropped downstream, and a file with a differing
+        type fails at the final concat as a bare `pyarrow.lib.ArrowInvalid` naming neither
+        the file nor the fix.
 
         `path` is required rather than defaulted, because it is the whole difference
         between an error a user can act on and one they cannot — and every read path here
@@ -1016,16 +1029,15 @@ class FileSource(ABC):
         `[]`. One source, two answers is exactly the divergence to avoid.
 
         It is also where an oversized batch is cut down. A reader that parses a whole file
-        into one Arrow chunk — numpy, XML, point clouds, several SQL drivers — emitted that
-        chunk as a *single* RecordBatch of however many rows the file held, and the engine's
+        into one Arrow chunk — numpy, XML, point clouds, several SQL drivers — emits that
+        chunk as a *single* RecordBatch of however many rows the file holds, and the engine's
         memory model budgets by batch: the read-ahead counts them, every operator holds one,
         and a spill is measured in them. A 100M-row file arriving as one batch defeats all
         three at once. `RecordBatch.slice` is zero-copy, so the cut is a view over the same
         buffers and costs nothing for a reader that already chunks (the loop runs once and
         yields the batch unchanged).
 
-        **The cut is bounded by bytes, not by the morsel row count, and that distinction is
-        worth a paragraph because it used to be the row count.** The engine re-morselizes
+        **The cut is bounded by bytes, not by the morsel row count.** The engine re-morselizes
         every source batch it is handed — `bc_interp::ops::morsel::morselize` splits on
         `execution.morsel_rows` *and* `execution.morsel_bytes`, zero-copy — so cutting to
         `morsel_rows` here does not reduce the work downstream by a row. What it does do is
@@ -1041,10 +1053,10 @@ class FileSource(ABC):
         buy is serial time — roughly 16 us each — rather than work.
 
         The native Parquet reader already returns 65,536-row batches sized to
-        `NATIVE_READ_TARGET_BYTES`; the old row cut shredded each of them into four and paid
-        the import four times. So the bound here is `execution.read_batch_bytes` measured
-        against the batch's own `nbytes` — the thing that actually costs memory — and it
-        never cuts below one morsel.
+        `NATIVE_READ_TARGET_BYTES`; a cut at the morsel row count would shred each of them
+        into four and pay the import four times. So the bound here is
+        `execution.read_batch_bytes` measured against the batch's own `nbytes` — the thing
+        that actually costs memory — and it never cuts below one morsel.
         """
         from batcher.config import active_config
         from batcher.io.schema import conform_batch, normalize_batch
@@ -1120,10 +1132,10 @@ class FileSource(ABC):
         # a page-cache syscall locally, and nothing at all once the footer cache holds it.
         # Whether to fan that out across threads is exactly the decision `read_each_file`
         # owns and has measured, so this asks it rather than opening a pool of its own.
-        # Opening one unconditionally is what this used to do, and on a local dataset it
-        # was a large *pessimization*: the per-file work is pure Python once the footer is
-        # cached, so N threads contend for the GIL instead of overlapping any I/O. Warm,
-        # over 4,096 local files, the 64-thread pool cost 374 ms against 64 ms serial.
+        # Opening one unconditionally is a large *pessimization* on a local dataset: the
+        # per-file work is pure Python once the footer is cached, so N threads contend for
+        # the GIL instead of overlapping any I/O. Warm, over 4,096 local files, a 64-thread
+        # pool costs 374 ms against 64 ms serial.
         counts = read_each_file(self._fs, files, lambda _fs, f: self._tolerant_file_row_count(f))
         if any(c is None for c in counts):
             self._row_count_cache = None
@@ -1411,12 +1423,11 @@ class FileSource(ABC):
             return [WholeSourceSplit(self)]
         files = self._files()
         # A schema-evolving read gets one normalized split PER FILE, each carrying the
-        # unified schema the driver already computed. It used to get a single
-        # `WholeSourceSplit`, on the correct reasoning that a plain `FileSplit` rebuilds a
-        # reader that knows nothing of the unification — but the price was that a
-        # schema-evolving dataset of any size ran as exactly one task on one worker.
+        # unified schema the driver already computed. A plain `FileSplit` would rebuild a
+        # reader that knows nothing of the unification, and a single `WholeSourceSplit`
+        # would run a schema-evolving dataset of any size as one task on one worker.
         # `NormalizedFileSplit` carries the target schema instead, so each worker reshapes
-        # its own file to it: same result, back to one task per file.
+        # its own file to it: same result, one task per file.
         if self._schema_mode != "strict":
             from batcher.io.splits import NormalizedFileSplit
 
@@ -1442,7 +1453,7 @@ class FileSource(ABC):
         # at that file count, so sub-file granularity buys nothing.
         # A `predicate` suspends this: footer statistics let `_file_splits` drop row-groups
         # (often whole files) at plan time, which is worth the sweep precisely because the
-        # dataset is large. `target_size` no longer does — `_whole_file_splits` honors it by
+        # dataset is large. `target_size` does not — `_whole_file_splits` honors it by
         # packing whole files to it, so a caller asking for sized splits gets them without
         # the sweep, which is what it wanted in the first place.
         if self._too_many_files_to_sweep() and predicate is None:
@@ -1522,7 +1533,7 @@ class FileSource(ABC):
         sizes = listed_sizes(self._fs, paths)
         if sizes is None:
             return planned
-        runs = pack_files(sizes, target_size or _COALESCE_TARGET_BYTES, _MIN_SPLITS)
+        runs = pack_files(sizes, target_size or _coalesce_target_bytes(), _MIN_SPLITS)
         if len(runs) == len(planned):
             return planned  # nothing grouped; keep the splits the format built
         kwargs = planned[0].kwargs  # type: ignore[attr-defined]
@@ -1561,7 +1572,7 @@ class FileSource(ABC):
         sizes = listed_sizes(self._fs, files)
         if sizes is None:
             return [FileSplit(self.format_name, f, kwargs) for f in files]
-        runs = pack_files(sizes, target_size or _COALESCE_TARGET_BYTES, _MIN_SPLITS)
+        runs = pack_files(sizes, target_size or _coalesce_target_bytes(), _MIN_SPLITS)
         return [
             FileSplit(self.format_name, files[start], kwargs)
             if stop - start == 1

@@ -285,7 +285,7 @@ def seed_topn_bound(plan: LogicalPlan, hub: MetadataHub | None) -> TopNSeed | No
             seeded_sort if plan is sort else Limit(seeded_sort, plan.n, plan.offset)
         )
         return TopNSeed(plan=seeded, k=k, signature=signature)
-    except Exception as exc:  # pragma: no cover - a hint must never break a query
+    except Exception as exc:  # a hint must never break a query
         note_suppressed("kyber", "seed top-n bound", exc)
         return None
 
@@ -329,5 +329,5 @@ def record_topn_bound(hub: MetadataHub | None, plan: LogicalPlan, table: Any) ->
         hub.put_keyed_param(
             _TOPN_NAMESPACE, _bound_key(sort, column, descending, k), _encode_bound(edge)
         )
-    except Exception as exc:  # pragma: no cover - recording must never break a query
+    except Exception as exc:  # recording must never break a query
         note_suppressed("kyber", "record top-n bound", exc)

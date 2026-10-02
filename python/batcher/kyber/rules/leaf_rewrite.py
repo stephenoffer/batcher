@@ -247,6 +247,12 @@ def node_expr_rule(leaf: Callable[[Expr], Expr]):
 def rewrite_node(node: LogicalPlan, leaf: Callable[[Expr], Expr]) -> LogicalPlan | None:
     """Apply a leaf `Expr -> Expr` rewrite to every expression `node` carries.
 
+    Identity first: `map_node_expressions` and `transform_expr_up` share structure, so an
+    untouched node comes back as the same object and "no change" costs O(1) — the answer for
+    almost every (rule, node) pair. The IR comparison runs only when the object did change,
+    because a rule may rebuild an equal-but-new tree, and treating that as a change would spin
+    the fixpoint forever.
+
     Args:
         node: The plan node whose expressions should be rewritten.
         leaf: The leaf rewrite, applied bottom-up to every sub-expression.

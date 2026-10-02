@@ -139,6 +139,12 @@ class StreamingQueryEngine:
         self._deltas_written = 0
         self._error: BaseException | None = None
         self._active = False
+        # Lifetime totals for this run. `_progress` is a bounded window, so a sum over it
+        # undercounts any query that has outlived `streaming.progress_history` batches.
+        self._total_input_rows = 0
+        self._total_output_rows = 0
+        self._total_late_rows = 0
+        self._listener_failures = 0
 
     # --- lifecycle --------------------------------------------------------
     def start(self) -> None:
@@ -169,7 +175,7 @@ class StreamingQueryEngine:
         # After the thread is running, so a listener that inspects the query sees a live
         # one. Before this existed the start of a query was the one event nothing could
         # observe: polling `recent_progress` can only ever see batches that already ran.
-        notify_query_started(self._name, time())
+        self._listener_failures += notify_query_started(self._name, time())
 
     def _recover(self) -> None:
         """Restore source position, batch counter, and running state from a checkpoint."""
@@ -203,22 +209,41 @@ class StreamingQueryEngine:
         if restore is not None:
             restore(plan.state)
 
-    def stop(self) -> None:
+    def stop(self, timeout: float | None = None) -> bool:
         """Signal the loop to halt at the next micro-batch boundary and join.
 
-        The join is unbounded on purpose — returning while the loop still writes to the sink
-        would be worse than waiting — but it is no longer *silent*. A stop is only observed
-        between micro-batches, so a source parked on a blocking read holds the join for as
-        long as that read takes, and with no output the caller cannot tell a slow drain from
-        a permanent hang. A periodic warning names the condition and what to check, the way
-        Carbonite's distributed barrier does.
+        By default the join is unbounded on purpose — returning while the loop still writes
+        to the sink would be worse than waiting — but it is not *silent*. A stop is only
+        observed between micro-batches, so a source parked on a blocking read holds the join
+        for as long as that read takes, and with no output the caller cannot tell a slow
+        drain from a permanent hang. A periodic warning names the condition and what to
+        check, the way Carbonite's distributed barrier does.
+
+        With `timeout`, the join gives up after that many seconds and returns ``False``. The
+        stop signal stays set, so the loop still halts at its next boundary; nothing is
+        interrupted mid-batch. That keeps the exactly-once order intact: the in-flight
+        micro-batch either finishes and commits, or — if the process exits first — was never
+        committed, and a restart from the checkpoint replays it.
+
+        Args:
+            timeout: Seconds to wait for the loop to finish, or None to wait for as long
+                as it takes.
+
+        Returns:
+            Whether the loop has stopped.
         """
         self._stop.set()
         if self._thread is None:
-            return
+            return True
+        deadline = None if timeout is None else perf_counter() + max(0.0, timeout)
         while self._thread.is_alive():
-            self._thread.join(_STOP_WARN_SECONDS)
-            if self._thread.is_alive():
+            wait = _STOP_WARN_SECONDS
+            if deadline is not None:
+                wait = min(wait, deadline - perf_counter())
+                if wait <= 0:
+                    return False
+            self._thread.join(wait)
+            if self._thread.is_alive() and wait >= _STOP_WARN_SECONDS:
                 from batcher._internal.logging import get_logger
 
                 get_logger("core").warning(
@@ -229,6 +254,7 @@ class StreamingQueryEngine:
                     self._name,
                     _STOP_WARN_SECONDS,
                 )
+        return True
 
     def await_termination(self, timeout: float | None = None) -> bool:
         """Block until the query stops (or `timeout` seconds); return whether it stopped."""
@@ -271,6 +297,10 @@ class StreamingQueryEngine:
             # From the last completed micro-batch, not re-measured: a `status()` call must
             # not touch the running fold from another thread.
             state_operators=self._progress[-1].state_operators if self._progress else (),
+            total_input_rows=self._total_input_rows,
+            total_output_rows=self._total_output_rows,
+            total_late_rows=self._total_late_rows,
+            listener_failures=self._listener_failures,
         )
 
     # --- the loop ---------------------------------------------------------
@@ -282,7 +312,7 @@ class StreamingQueryEngine:
             self._error = exc
         finally:
             self._active = False
-            notify_query_terminated(self._name, self._error)
+            self._listener_failures += notify_query_terminated(self._name, self._error)
             if self._sink is not None:
                 with contextlib.suppress(Exception):
                     self._sink.close()
@@ -475,7 +505,10 @@ class StreamingQueryEngine:
             duration_breakdown_ms=breakdown,
         )
         self._progress.append(progress)
-        notify_query_progress(self._name, progress)
+        self._total_input_rows += progress.num_input_rows
+        self._total_output_rows += progress.num_output_rows
+        self._total_late_rows += progress.num_late_rows
+        self._listener_failures += notify_query_progress(self._name, progress)
         self._apply_rate_limit(progress)
         self._batches += 1
         return True

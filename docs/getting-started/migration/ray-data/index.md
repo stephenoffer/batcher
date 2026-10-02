@@ -40,7 +40,7 @@ The following table lists the waves that hold Ray Data rows, in delivery order:
 |---|---|---|
 | WF | Foundations: output-name inference and aggregate broadcasting in `select`, `when` without `otherwise`, `over` on every expression, one explicit row-order policy, and the UDF verbs consolidated onto `Dataset` | 3 |
 | W0 | Silent mismatches: parameters that restore the other engine's semantics | 59 |
-| W2 | Missing parameters across all four engines | 36 |
+| W2 | Missing parameters across all four engines | 29 |
 | W3 | Scalar functions | 9 |
 | W4 | Maps, higher-order functions, and list reduction | 2 |
 | W5 | Window functions, including rolling and dynamic group-by | 1 |
@@ -61,7 +61,7 @@ The following table lists the pages in this section with the number of names eac
 | {doc}`dataset` | 117 | 12 | 20 | 59 | 10 | 16 |
 | {doc}`expressions` | 179 | 83 | 2 | 20 | 17 | 57 |
 | {doc}`io` | 96 | 19 | 11 | 33 | 21 | 12 |
-| {doc}`udfs-ai-multimodal` | 46 | 4 | 15 | 15 | 9 | 3 |
+| {doc}`udfs-ai-multimodal` | 46 | 11 | 8 | 15 | 9 | 3 |
 | {doc}`execution-context` | 92 | 0 | 15 | 3 | 2 | 72 |
 
 {doc}`leaving-batcher` maps the other way, from Batcher spellings back to Ray Data.

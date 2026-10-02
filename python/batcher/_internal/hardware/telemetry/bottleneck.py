@@ -33,7 +33,7 @@ mis-diagnose a GPU stage is to sample it at the moment it drained.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from batcher._internal.hardware.telemetry.sampler import MetricSummary
 
@@ -79,12 +79,19 @@ class Bottleneck:
             confidence on a real verdict means the device is close to a second limit and fixing
             the first will expose it, which is worth saying before someone spends a week on it.
         detail: A short phrase naming the specific measurement behind the verdict.
+        unmeasured: The signals this verdict was reached without, such as ``"occupancy"`` on a
+            host with no DCGM or ``"shared"`` across a PID namespace. A verdict is only as good
+            as what it could see: without occupancy, a kernel limited by its own shape reads as
+            `compute_bound`, and without process visibility a neighbour's load reads as this
+            workload's. Naming the gap next to the verdict is what keeps a confident reading
+            from being taken for a complete one.
     """
 
     index: int
     verdict: str = "unknown"
     confidence: float = 0.0
     detail: str = ""
+    unmeasured: tuple[str, ...] = ()
 
     @property
     def advice(self) -> str:
@@ -152,9 +159,20 @@ def classify_device(
     mem = memory.mean if memory and memory.samples else 0.0
     engine = codec.mean if codec and codec.samples else 0.0
     clamp = throttled.mean if throttled and throttled.samples else 0.0
-    return _external_limit(index, sm, bus, mem, engine, clamp, shared) or _sm_limit(
+    verdict = _external_limit(index, sm, bus, mem, engine, clamp, shared) or _sm_limit(
         index, sm, bus, mem, engine, occupancy
     )
+    signals = {
+        "memory": memory,
+        "pcie": pcie,
+        "throttled": throttled,
+        "codec": codec,
+        "occupancy": occupancy,
+    }
+    missing = [name for name, summary in signals.items() if not (summary and summary.samples)]
+    if shared is None:
+        missing.append("shared")
+    return replace(verdict, unmeasured=tuple(missing))
 
 
 def _external_limit(

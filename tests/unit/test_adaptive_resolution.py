@@ -47,8 +47,15 @@ def _fresh_hub():
 
 @pytest.fixture
 def any_size(monkeypatch):
-    """Lower the size gate so the *confidence* gate is what the test measures."""
+    """Lower the size gate so the *confidence* gate is what the test measures.
+
+    It also stands in a route bandit that takes staging whenever it is offered. The gates
+    decide whether staging is a candidate at all; the bandit then chooses between the
+    candidates, and cold it starts one-shot (see `test_a_cold_bandit_starts_one_shot`). With
+    it fixed, `resolve_adaptive` answers the question these tests ask: is staging offered?
+    """
     monkeypatch.setattr(adaptive_mod, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 1)
+    monkeypatch.setattr(adaptive_mod, "_learned_adaptive_route", lambda _plan, _hub: "staged")
 
 
 def _join_over_a_breaker():
@@ -165,10 +172,27 @@ def test_inaccurate_history_leaves_the_gate_on(any_size):
 
 
 def test_a_cold_hub_is_unchanged(any_size):
-    # No history is not evidence of accuracy. A fresh hub must behave exactly as the gate
-    # did before any of this existed, which is what keeps a first run's plan unchanged.
+    # No history is not evidence of accuracy. On a fresh hub the gate must offer staging
+    # exactly as it did before any history existed.
     joined = _join_over_a_breaker()
     assert resolve_adaptive("auto", joined._plan, joined._sources, _fresh_hub()) is True
+
+
+def test_a_cold_bandit_starts_one_shot(monkeypatch):
+    """Staging is offered, and a route bandit with no evidence still runs one-shot first.
+
+    The one-shot route converges in fewer runs: at TPC-H sf10 a staged start held q5 at
+    170-290 ms for five runs before it tried one-shot and settled at 101. The control is the
+    same plan once the bandit has a verdict for staging, which it then follows.
+    """
+    monkeypatch.setattr(adaptive_mod, "_ADAPTIVE_MIN_ROWS_PER_STAGE", 1)
+    joined = _join_over_a_breaker()
+    hub = _fresh_hub()
+    assert adaptive_mod._adaptive_would_help(joined._plan, joined._sources, hub) is True
+    assert resolve_adaptive("auto", joined._plan, joined._sources, hub) is False
+
+    monkeypatch.setattr(adaptive_mod, "_learned_adaptive_route", lambda _plan, _hub: "staged")
+    assert resolve_adaptive("auto", joined._plan, joined._sources, hub) is True
 
 
 def test_one_good_run_is_not_enough(any_size):
@@ -269,3 +293,27 @@ def test_staged_result_equals_one_shot_over_a_breaker_chain():
     assert norm(ds.collect(adaptive=True).to_pydict()) == norm(
         ds.collect(adaptive=False).to_pydict()
     )
+
+
+@pytest.mark.parametrize("how", ["anti", "semi", "inner"])
+def test_the_distributed_gate_answers_a_join_over_a_udf_operand(tmp_path, how):
+    # The distributed gate asks the aligned executor whether it claims the plan, and that
+    # question optimized the plan with its sources bound. Over a `map_batches` operand the
+    # self-join rules lowered the UDF to IR to compare the two sides, which raises, so
+    # `left.join(right.map_batches(f), how="anti").collect(distributed=True)` failed before
+    # any worker ran. The aligned executor cannot run a UDF plan, so the gate's answer is
+    # "not claimed", reached without optimizing. Ray-free: nothing here executes.
+    import pyarrow.parquet as pq
+
+    from batcher.api.adaptive.gating import aligned_claims
+
+    for side in ("left", "right"):
+        (tmp_path / side).mkdir()
+        for part in range(2):
+            keys = list(range(part, 40, 2))
+            pq.write_table(pa.table({"k": keys, "v": keys}), tmp_path / side / f"p{part}.parquet")
+    left = bt.read.parquet(str(tmp_path / "left"))
+    right = bt.read.parquet(str(tmp_path / "right"))
+    ds = left.join(right.map_batches(lambda b: b), on="k", how=how)
+    assert aligned_claims(ds._plan, ds._sources, _hub()) is False
+    resolve_adaptive("auto", ds._plan, ds._sources, _hub(), distributed=True)

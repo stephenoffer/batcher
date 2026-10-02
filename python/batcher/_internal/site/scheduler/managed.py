@@ -19,7 +19,7 @@ import json
 from batcher._internal.logging import note_suppressed
 from batcher._internal.site.scheduler.job import (
     SchedulerJob,
-    env_int,
+    env_count,
     env_str,
     first_env,
     launcher_ranks,
@@ -63,10 +63,10 @@ def aws_batch_job() -> SchedulerJob:
     return SchedulerJob(
         kind="aws_batch",
         job_id=env_str("AWS_BATCH_JOB_ID"),
-        num_nodes=env_int("AWS_BATCH_JOB_NUM_NODES"),
+        num_nodes=env_count("AWS_BATCH_JOB_NUM_NODES"),
         gpus_per_node=visible_device_count(),
-        tasks=env_int("AWS_BATCH_JOB_NUM_NODES") or ranks.tasks,
-        rank=env_int("AWS_BATCH_JOB_NODE_INDEX") or ranks.rank,
+        tasks=env_count("AWS_BATCH_JOB_NUM_NODES") or ranks.tasks,
+        rank=env_count("AWS_BATCH_JOB_NODE_INDEX") or ranks.rank,
         local_rank=ranks.local_rank,
         local_size=ranks.local_size,
         node_name=env_str("HOSTNAME"),
@@ -91,8 +91,8 @@ def sagemaker_job() -> SchedulerJob:
         kind="sagemaker",
         job_id=env_str("TRAINING_JOB_NAME"),
         nodes=nodes,
-        gpus_per_node=env_int("SM_NUM_GPUS") or visible_device_count(),
-        cpus_per_node=env_int("SM_NUM_CPUS"),
+        gpus_per_node=env_count("SM_NUM_GPUS") or visible_device_count(),
+        cpus_per_node=env_count("SM_NUM_CPUS"),
         tasks=len(nodes) or ranks.tasks,
         rank=nodes.index(current) if current in nodes else ranks.rank,
         local_rank=ranks.local_rank,
@@ -177,16 +177,16 @@ def skypilot_job() -> SchedulerJob:
     only one of them describes the job.
     """
     ips = tuple(ip.strip() for ip in env_str("SKYPILOT_NODE_IPS").split() if ip.strip())
-    rank = env_int("SKYPILOT_NODE_RANK")
-    gpus = env_int("SKYPILOT_NUM_GPUS_PER_NODE")
+    rank = env_count("SKYPILOT_NODE_RANK")
+    gpus = env_count("SKYPILOT_NUM_GPUS_PER_NODE")
     ranks = launcher_ranks()
     return SchedulerJob(
         kind="skypilot",
         job_id=first_env(("SKYPILOT_TASK_ID", "SKYPILOT_CLUSTER_NAME")),
         nodes=ips,
-        num_nodes=env_int("SKYPILOT_NUM_NODES"),
+        num_nodes=env_count("SKYPILOT_NUM_NODES"),
         gpus_per_node=gpus or visible_device_count(),
-        tasks=env_int("SKYPILOT_NUM_NODES") or ranks.tasks,
+        tasks=env_count("SKYPILOT_NUM_NODES") or ranks.tasks,
         rank=rank or ranks.rank,
         local_rank=ranks.local_rank,
         local_size=ranks.local_size,

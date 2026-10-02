@@ -12,8 +12,10 @@ bus:
 | Web dashboard | plans, per-operator timings, throughput, live logs | off ({py:func}`bt.start_ui() <batcher.start_ui>`) |
 | JSON event log | the durable per-query artifact, on disk | on |
 
-Because they share one source, they can't disagree. The timeline in the dashboard and the
+Because they share one source, they don't measure differently. The timeline in the dashboard and the
 profile in the on-disk event log are the same measurements, under the same query id.
+
+A shared source isn't a delivery guarantee, though. The bus is best-effort by contract: a sink that raises is skipped, and one that keeps raising is detached, after which it sees nothing more. A surface can also miss events simply because it was attached late. When two views disagree, one of them missed events. The measurement itself is the same.
 
 The event log takes one step more than the live surfaces. The per-query profile is assembled once, when the query finishes. Batcher publishes it onto the bus, which is how the dashboard gets it, and writes the same document to the event log. OpenTelemetry spans, when you turn them on, come from that same profile:
 

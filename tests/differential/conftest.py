@@ -6,35 +6,17 @@ interpreter is deterministic and built on arrow's typed kernels, so any
 divergence from DuckDB is a real bug — and once the JIT tiers land, each tier is
 checked against this same oracle.
 
-The comparison helpers themselves live in `tests/_harness.py` so that a test can
-import them by an unambiguous module name; they are re-exported here because this
-is where they are documented and where the `duck` fixture lives. Import them from
-`_harness` in new tests — a bare ``from conftest import ...`` resolves to whichever
-`conftest` pytest imported first, which breaks any run spanning two test directories.
+The comparison helpers live in `tests/_harness.py`; import them from `_harness`. A bare
+``from conftest import ...`` resolves to whichever `conftest` pytest imported first, which
+breaks any run spanning two test directories.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from _harness import (
-    assert_same,
-    assert_same_for_query,
-    assert_same_ordered,
-    assert_tables_equal,
-    duck_materialize,
-)
-
 duckdb = pytest.importorskip("duckdb")
 pytest.importorskip("batcher._native", reason="native engine not built")
-
-__all__ = [
-    "assert_same",
-    "assert_same_for_query",
-    "assert_same_ordered",
-    "assert_tables_equal",
-    "duck_materialize",
-]
 
 
 @pytest.fixture

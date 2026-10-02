@@ -69,6 +69,18 @@ for group in source.row_group_bounds(["a"]):
     print(group.num_rows, group.mins["a"], group.maxs["a"])
 ```
 
+Two more footer reads describe how a table is laid out.
+{py:meth}`ParquetSource.key_bounds <batcher.io.ParquetSource>` reports each file's minimum and maximum of one column. A table written in key order has disjoint ranges, and that is what lets a distributed join give each worker one range of every such table instead of shuffling them.
+{py:meth}`ParquetSource.column_byte_sizes <batcher.io.ParquetSource>` estimates the uncompressed bytes of each column, which is what a projection of that column costs to read.
+
+```python
+for part, start in enumerate((0, 100)):
+    pq.write_table(pa.table({"k": list(range(start, start + 100))}), f"{directory}/key-{part}.parquet")
+keyed = ParquetSource(f"{directory}/key-*.parquet")
+print([(b.lo, b.hi) for b in keyed.key_bounds("k")])
+print(keyed.column_byte_sizes()["k"] > 0)
+```
+
 Two more properties describe the source rather than its data.
 {py:obj}`FileSource.node_local <batcher.io.FileSource>` says whether the data is reachable
 only from the process that holds it, which is what stops the scheduler shipping a plan over

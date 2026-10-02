@@ -37,11 +37,12 @@ A query may use any of the following:
 - `SELECT` with column references, scalar expressions, and aggregates
 - `WHERE` filters, and `QUALIFY` to filter on a window function
 - `GROUP BY` with `HAVING`, plus `ROLLUP`, `CUBE`, and `GROUPING SETS`, with `GROUPING()` to tell a subtotal row from a real one
-- `ORDER BY` (including `ORDER BY ALL`), `LIMIT` / `OFFSET`, and the ANSI `FETCH FIRST n ROWS ONLY`
-- `INNER`, `LEFT`, `RIGHT`, `FULL`, and `CROSS JOIN` on equi-keys, where an extra non-equi `AND` condition is applied as a filter, plus `NATURAL JOIN` and `ASOF JOIN`
+- `ORDER BY` (including `ORDER BY ALL`), `LIMIT` / `OFFSET`, and the ANSI `FETCH FIRST n ROWS ONLY`, with `LIMIT n PERCENT` and `FETCH ... WITH TIES`
+- `INNER`, `LEFT`, `RIGHT`, `FULL`, and `CROSS JOIN` on equi-keys, where an extra non-equi `AND` condition is applied as a filter, plus `NATURAL JOIN` and `ASOF JOIN`, whose nearest-match key may be inclusive (`>=`, `<=`) or strict (`>`, `<`)
 - `UNION` / `INTERSECT` / `EXCEPT`, `WITH` (CTEs), and subqueries
 - Column alias lists on a table, subquery, or CTE, such as `FROM (SELECT ...) AS t(a, b)` and `WITH t(a, b) AS (...)`, which rename the relation's columns positionally
 - Window functions over any expression, including a computed `PARTITION BY` / `ORDER BY` key such as `date_trunc('month', ts)`, with explicit `ROWS` / `RANGE` / `GROUPS` frames. `RANGE BETWEEN INTERVAL '5' MINUTE PRECEDING` gives a time window
+- Frame `EXCLUDE CURRENT ROW` / `GROUP` / `TIES` for `sum`, `count`, `avg`, `min`, `max`, `bool_and` and `bool_or`, and `lag` / `lead` with `IGNORE NULLS`
 - `CASE` expressions, `CAST`, and `SIMILAR TO`
 - `INTERVAL` literals, including compound (`'1 day 3 hours'`), fractional (`'1.5 hours'`), clock (`'04:05:06'`) and abbreviated (`'1 mon'`) forms
 - `generate_series(a, b)` / `range(a, b)` in `FROM`, for a generated integer spine
@@ -106,6 +107,18 @@ print(out.to_pydict())
 ## Subqueries
 
 Scalar, `IN`, `NOT IN`, `EXISTS` and `NOT EXISTS` subqueries work in `WHERE`, and scalar and `EXISTS` subqueries work in the `SELECT` list. A *correlated* subquery, one that refers to a column of the outer query through an equality such as `o.cust = c.cust`, is rewritten into a join on that key, so it runs in parallel and on a cluster like any other join.
+
+Quantified comparisons work in any position. `= ANY` is `IN` and `<> ALL` is `NOT IN`. The other operators, such as `x > ALL (S)` and `x <= ANY (S)`, keep SQL's three-valued answer: an empty `S` makes `x > ALL (S)` TRUE, and a NULL in `S` makes it UNKNOWN unless some other element already refutes it. So `x > (SELECT max(c) FROM S)` is not the same predicate, because `max` skips NULLs and is NULL over an empty set:
+
+```python
+scores = bt.from_pydict({"id": [1, 2], "x": [5, 1]})
+bar = bt.from_pydict({"c": [2, None]})
+empty = bt.from_pydict({"c": [3]}).filter(bt.col("c") > 3)
+print(bt.sql("SELECT id, x > ALL (SELECT c FROM bar) AS a FROM scores ORDER BY id", scores=scores, bar=bar).to_pydict())
+print(bt.sql("SELECT id, x > ALL (SELECT c FROM bar) AS a FROM scores ORDER BY id", scores=scores, bar=empty).to_pydict())
+# {'id': [1, 2], 'a': [None, False]}
+# {'id': [1, 2], 'a': [True, True]}
+```
 
 The subquery's own clauses apply per key, the way SQL defines them. `ORDER BY ... LIMIT 1` picks one row for each outer row, an aggregate over no matching rows still has a value, and a `HAVING` inside `EXISTS` is tested for each key:
 
@@ -363,20 +376,19 @@ Constructs Batcher rejects rather than approximates. Each raises a clear error, 
 
 | Construct | Why, and what to write instead |
 |---|---|
-| `LIMIT n PERCENT`, `FETCH ... WITH TIES` | Both need a cardinality measured before the limit applies. Use a plain row count. |
 | `POSITIONAL JOIN` | Row position is not defined for a Batcher relation, which is morsel-parallel and may span nodes. Join on a key, or number both sides with `row_number() OVER (ORDER BY ...)` first. |
-| `ASOF JOIN` on a strict `>` or `<` | The nearest-match key is inclusive. Use `>=` or `<=`. |
-| A negative list-slice bound, `a[-2:]` | Counts back from the end in DuckDB, while the underlying slice clamps to the start. Index from the front, or reverse the list first. |
 | A correlated scalar or `IN` subquery whose correlation is an inequality, or goes through an expression such as `outer.c + 1` | An equality between two plain columns decorrelates to a join and is supported. `EXISTS` also takes an inequality correlation. Compute the expression as a column of the outer query first. |
 | A subquery correlated to a query two levels out | Only the immediately enclosing query can be referenced. Join the outer table into the middle query first. |
 | A correlated subquery in `ORDER BY`, `GROUP BY` or `JOIN ... ON` | Move it into the select list under an alias and order or join on the alias. |
 | `EXISTS` in the select list of an aggregating query | A per-row bit has no value per group. Compute it in a subquery and aggregate over that. |
 | `OFFSET` inside a correlated `EXISTS` over `DISTINCT` or `GROUP BY` | Count the groups in a scalar subquery and compare the count. |
-| Frame `EXCLUDE CURRENT ROW` / `GROUP` / `TIES` | Honouring the frame while dropping the exclusion would be a wrong answer. For a `sum` or `count`, subtract the current row from the window result. |
-| `lag` / `lead` with `IGNORE NULLS` | `first_value`, `last_value` and `nth_value` take `IGNORE NULLS` over any frame. |
+| Frame `EXCLUDE GROUP` / `TIES` under a `ROWS` frame with a bounded edge, any `EXCLUDE` under a `RANGE` frame with a value offset, and `EXCLUDE` on an aggregate other than `sum`, `count`, `avg`, `min`, `max`, `bool_and` or `bool_or` | An exclusion is answered by splitting the frame around what it excludes, and these frames have no exact split. Use a `GROUPS` frame for `GROUP` / `TIES`. Don't subtract the current row from the unexcluded result: that is wrong when the row is NULL, when the exclusion leaves the frame empty, and when a float is infinite. |
 | `STRING_AGG`, `ARRAY_AGG` or `LIST` with `OVER (...)` | The window engine has no list- or string-building aggregate. Aggregate with `GROUP BY` in a subquery and join the result back. |
 | `MERGE INTO` a catalog table | `DELETE` and `UPDATE` on a catalog table rewrite it in full. For an upsert, write the merged rows with `mode="overwrite"`, or keep the table in Delta and use `ds.write.delta(uri, merge_on=[...])`. |
-| An inequality quantified subquery, `x > ALL (...)` or `x >= ANY (...)` | Only the equality forms have a faithful rewrite: `= ANY` is `IN` and `<> ALL` is `NOT IN`, by definition. The tempting rewrite of `x > ALL (S)` as `x > (SELECT max(c) FROM S)` is wrong when `S` holds a NULL, because `max` skips it. The rewrite then answers TRUE where SQL says UNKNOWN, which is a silently wrong row rather than an error. Write the `max`/`min` form yourself, with `AND NOT EXISTS (SELECT 1 FROM S WHERE c IS NULL)` to keep the NULL case. |
+| A row-valued quantified subquery other than `= ANY` / `<> ALL`, such as `(a, b) > ALL (...)` | A row has no single extreme to compare against. Compare one column at a time. |
+| `INSERT ... ON CONFLICT`, `INSERT ... RETURNING`, `DELETE ... USING`, `DELETE ... RETURNING` | Each raises naming the clause. For an upsert, use `MERGE INTO` on a session table, or `ds.write.delta(uri, merge_on=[...])`. |
+| A per-row `ntile` bucket count or `nth_value` N, and per-row `regexp_replace` options | The window operator and the regex kernel fix these per query. A constant expression such as `ntile(2 * 2)` is folded and accepted. |
+| `array_sort` with a comparator lambda | The list kernels sort by value. Sort by a derived key: `list_select(l, list_grade_up(list_transform(l, x -> length(x))))`. |
 | `time_bucket` with a width that doesn't divide a day evenly | Buckets start from the Unix epoch and DuckDB starts them from 2000-01-03, so a width such as `INTERVAL 2 DAY` would put every boundary on a different instant. Use a width that divides a day, such as `1 DAY`, `6 HOUR`, or `15 MINUTE`, or `date_trunc` for calendar buckets. |
 | Two `UNNEST` calls in one `SELECT` list | SQL zips them into one relation. Unnest one list per query, or use `FROM t, UNNEST(...)` for each. |
 

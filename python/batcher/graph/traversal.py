@@ -14,6 +14,8 @@ computed from a sample of sources and labelled as estimates.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
@@ -114,9 +116,13 @@ def shortest_path_lengths(
     smallest of its current distance and the distance through any incoming edge. Converges
     once nothing improves.
 
-    **Negative edge weights are rejected.** With one, "shortest" has no meaning on a graph
-    containing a negative cycle, and the loop would drive distances to minus infinity
-    while looking like it was working.
+    **Negative edge weights are supported on a directed graph**, with Bellman-Ford's
+    negative-cycle check: a shortest path visits each node at most once, so on an
+    `n`-node graph the distances are final within `n` rounds, and a relaxation still
+    improving after that has found a negative cycle reachable from a source. That raises
+    rather than returning distances that would keep falling forever. A negative weight on
+    an undirected graph is refused up front, because walking the edge there and back is
+    already a negative cycle.
 
     Args:
         g: The graph. One built with `directed=False` is walked both ways.
@@ -129,8 +135,9 @@ def shortest_path_lengths(
         A dataset of `node` and `distance`, holding only the nodes actually reached.
 
     Raises:
-        PlanError: If any edge weight is negative, no source is in the graph, or a
-            `max_iterations` you set stops the relaxation before the distances are final.
+        PlanError: If an undirected graph has a negative edge weight, a negative cycle
+            is reachable from a source, no source is in the graph, or a `max_iterations`
+            you set stops the relaxation before the distances are final.
 
     Examples:
         .. doctest::
@@ -145,15 +152,16 @@ def shortest_path_lengths(
             >>> out.sort("node").to_pydict()
             {'node': [1, 2, 3], 'distance': [0.0, 1.0, 2.0]}
     """
+    negatives = g.edges.filter(bt.col(WEIGHT) < 0.0).count()
+    if negatives and not g.directed:
+        raise PlanError(
+            f"shortest_path_lengths(): {negatives} edge(s) of an undirected graph have a "
+            "negative weight. Walking such an edge there and back is a negative cycle, so "
+            "no shortest path is defined. Build the graph with directed=True if each edge "
+            "is meant to be walked one way."
+        )
     g = walked(g)
     rounds = fixpoint_rounds(max_iterations, g.num_nodes() if max_iterations is None else 0)
-    negatives = g.edges.filter(bt.col(WEIGHT) < 0.0).count()
-    if negatives:
-        raise PlanError(
-            f"shortest_path_lengths(): {negatives} edge(s) have a negative weight. "
-            "Shortest paths are undefined on a graph with a negative cycle, and the "
-            "relaxation would diverge rather than fail, so this is refused up front."
-        )
     frontier = _seed_frontier(g, sources, node)
     dist = checkpoint(frontier.select(**{NODE: bt.col(NODE), "distance": bt.lit(0.0)}))
     edges = g.edges.cache()
@@ -189,6 +197,13 @@ def shortest_path_lengths(
             if improved == 0:
                 return merged
         dist = merged
+    if negatives and max_iterations is None:
+        # `rounds` is one more than the node count, which a simple path cannot need.
+        raise PlanError(
+            "shortest_path_lengths(): the distances were still falling after "
+            f"{rounds} rounds, one more than the graph has nodes, so a negative cycle is "
+            "reachable from the sources and no shortest path is defined."
+        )
     require_fixpoint(False, "shortest_path_lengths", rounds)
     return dist
 
@@ -249,8 +264,55 @@ def reachable_from(
     return bfs(g, sources, node=node, max_depth=max_depth).select(NODE)
 
 
+def _seeded_levels(
+    g: Graph, sources: Dataset, node: str, max_depth: int | None, batch_size: int
+) -> Iterator[tuple[int, Dataset]]:
+    """Every (source, node) pair first reached at each depth, one source batch at a time.
+
+    One breadth-first search per source, run for a whole batch at once: the state carries
+    the source it started from, so a batch costs the search depth in queries rather than
+    sources times depth, and holds one row per (source, reached node) pair. The batch size
+    bounds that state, which is the memory each round passes through the driver.
+
+    Yields:
+        ``(depth, pairs)`` for each non-empty depth of each batch, where `pairs` has
+        `_seed` and `node`.
+    """
+    if max_depth is not None and max_depth < 0:
+        raise PlanError(f"max_depth must be non-negative, got {max_depth}")
+    if batch_size < 1:
+        raise PlanError(f"source_batch_size must be positive, got {batch_size}")
+    seeds = _seed_frontier(g, sources, node).to_pydict()[NODE]
+    edges = walked(g).edges.cache()
+    for start in range(0, len(seeds), batch_size):
+        batch = seeds[start : start + batch_size]
+        frontier = checkpoint(
+            bt.from_pydict({"_seed": batch}).select("_seed", **{NODE: bt.col("_seed")})
+        )
+        seen = frontier
+        depth = 0
+        while max_depth is None or depth < max_depth:
+            depth += 1
+            nxt = checkpoint(
+                edges.join(frontier.select("_seed", **{SRC: bt.col(NODE)}), on=SRC, how="inner")
+                .select("_seed", **{NODE: bt.col(DST)})
+                .distinct()
+                .join(seen, on=["_seed", NODE], how="anti")
+            )
+            if nxt.count() == 0:
+                break
+            yield depth, nxt
+            seen = checkpoint(seen.union(nxt))
+            frontier = nxt
+
+
 def harmonic_centrality(
-    g: Graph, sources: Dataset, *, node: str = "node", max_depth: int | None = None
+    g: Graph,
+    sources: Dataset,
+    *,
+    node: str = "node",
+    max_depth: int | None = None,
+    source_batch_size: int = 64,
 ) -> Dataset:
     """How close each node is to a sample of sources, as a sum of reciprocal distances.
 
@@ -263,10 +325,10 @@ def harmonic_centrality(
     node pairs, which is quadratic and does not fit. Sample the sources (`Dataset.sample`)
     and the ranking converges quickly even when the values do not.
 
-    Every source is searched at once, as one breadth-first search whose state carries the
-    source it started from, so the number of queries is the search depth rather than
+    Sources are searched in batches, each one breadth-first search whose state carries the
+    source it started from, so a batch costs the search depth in queries rather than
     sources times depth. The state is one row per (source, reached node) pair and passes
-    through the driver once per hop, which is what bounds the source count in practice.
+    through the driver once per hop; `source_batch_size` bounds it.
 
     Args:
         g: The graph. One built with `directed=False` is walked both ways.
@@ -274,9 +336,15 @@ def harmonic_centrality(
         node: The column in `sources` holding the node id.
         max_depth: A hop cap, or `None` (the default) for none; nodes beyond a cap
             contribute nothing.
+        source_batch_size: How many sources search together. A larger batch trades
+            memory for fewer rounds.
 
     Returns:
         A dataset of `node` and `harmonic_centrality`.
+
+    Raises:
+        PlanError: If `max_depth` is negative, `source_batch_size` is not positive, or
+            no source is in the graph.
 
     Examples:
         .. doctest::
@@ -289,33 +357,14 @@ def harmonic_centrality(
             >>> out.sort("node").to_pydict()["harmonic_centrality"]
             [0.3333333333333333, 1.5, 1.5, 0.3333333333333333]
     """
-    if max_depth is not None and max_depth < 0:
-        raise PlanError(f"max_depth must be non-negative, got {max_depth}")
-    seeds = _seed_frontier(g, sources, node)
-    edges = walked(g).edges.cache()
-    frontier = checkpoint(seeds.select(_seed=bt.col(NODE), **{NODE: bt.col(NODE)}))
-    seen = frontier
-    arms: list[Dataset] = []
-    depth = 0
-    while max_depth is None or depth < max_depth:
-        depth += 1
-        nxt = checkpoint(
-            edges.join(frontier.select("_seed", **{SRC: bt.col(NODE)}), on=SRC, how="inner")
-            .select("_seed", **{NODE: bt.col(DST)})
-            .distinct()
-            .join(seen, on=["_seed", NODE], how="anti")
-        )
-        if nxt.count() == 0:
-            break
-        arms.append(nxt.select(**{NODE: bt.col(NODE), "_s": bt.lit(1.0 / depth)}))
-        seen = checkpoint(seen.union(nxt))
-        frontier = nxt
-    if not arms:
+    summed: Dataset | None = None
+    for depth, pairs in _seeded_levels(g, sources, node, max_depth, source_batch_size):
+        arm = pairs.select(NODE, _s=bt.lit(1.0 / depth))
+        merged = arm if summed is None else summed.union(arm)
+        # Folded every level so the running total stays one row per node.
+        summed = checkpoint(merged.group_by(NODE).agg(_s=bt.sum("_s")))
+    if summed is None:
         return g.nodes().select(**{NODE: bt.col(NODE), "harmonic_centrality": bt.lit(0.0)})
-    reached = arms[0]
-    for arm in arms[1:]:
-        reached = reached.union(arm)
-    summed = reached.group_by(NODE).agg(_s=bt.sum("_s"))
     return (
         g.nodes()
         .join(summed, on=NODE, how="left")
@@ -329,14 +378,21 @@ def harmonic_centrality(
 
 
 def diameter_estimate(
-    g: Graph, sources: Dataset, *, node: str = "node", max_depth: int | None = None
+    g: Graph,
+    sources: Dataset,
+    *,
+    node: str = "node",
+    max_depth: int | None = None,
+    source_batch_size: int = 64,
 ) -> int:
     """The longest shortest path found from a sample of sources.
 
     A **lower bound** on the true diameter, and named for it: the real diameter is the
-    maximum over all pairs, and this searches from the sources you give it. Sampling a few
-    dozen high-degree nodes gets within a hop or two of the truth on most real graphs,
-    which is enough to size a `max_iterations` for the iterative algorithms.
+    maximum over all pairs, and this is the largest eccentricity among the sources you
+    give it. Each source is searched on its own, so adding a source can only raise the
+    estimate. Sampling a few dozen high-degree nodes gets within a hop or two of the truth
+    on most real graphs, which is enough to size a `max_iterations` for the iterative
+    algorithms.
 
     Args:
         g: The graph.
@@ -344,9 +400,14 @@ def diameter_estimate(
         node: The column in `sources` holding the node id.
         max_depth: A hop cap, or `None` (the default) for none. A result equal to a cap
             means the search was truncated and the true diameter may be larger.
+        source_batch_size: How many sources search together; see `harmonic_centrality`.
 
     Returns:
-        The largest depth reached, or 0 when nothing is reachable.
+        The largest depth reached from any one source, or 0 when nothing is reachable.
+
+    Raises:
+        PlanError: If `max_depth` is negative, `source_batch_size` is not positive, or
+            no source is in the graph.
 
     Examples:
         .. doctest::
@@ -357,8 +418,10 @@ def diameter_estimate(
             >>> diameter_estimate(Graph.from_edges(e), bt.from_pydict({"node": [1]}))
             3
     """
-    got = bfs(g, sources, node=node, max_depth=max_depth).agg(d=bt.max("depth")).to_pydict()["d"]
-    return int(got[0]) if got and got[0] is not None else 0
+    return max(
+        (depth for depth, _ in _seeded_levels(g, sources, node, max_depth, source_batch_size)),
+        default=0,
+    )
 
 
 def topological_order(g: Graph, *, max_iterations: int | None = None) -> Dataset:

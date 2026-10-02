@@ -30,7 +30,7 @@ __all__ = [
     "VISIBLE_DEVICE_COUNT_ENVS",
     "LauncherRanks",
     "SchedulerJob",
-    "env_int",
+    "env_count",
     "env_str",
     "first_env",
     "launcher_ranks",
@@ -89,8 +89,8 @@ def first_env(names: tuple[str, ...]) -> str:
     return ""
 
 
-def env_int(name: str, default: int = 0) -> int:
-    """An environment variable as an int, or `default` when absent or unparseable.
+def env_count(name: str, default: int = 0) -> int:
+    """A scheduler-published count as an int, or `default` when absent or unparseable.
 
     A leading-token parse, so Slurm's `SLURM_NTASKS_PER_NODE="8(x2)"` and PBS' decorated
     counts yield the number rather than the default. A value with no leading digits is
@@ -218,7 +218,7 @@ def _first_int(names: tuple[str, ...]) -> int:
     """The first parseable int among `names`, or `0`."""
     for name in names:
         if env_str(name):
-            return env_int(name)
+            return env_count(name)
     return 0
 
 

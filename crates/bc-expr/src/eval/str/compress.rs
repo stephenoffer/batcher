@@ -149,6 +149,34 @@ mod tests {
     const PAYLOAD: &[u8] =
         b"the quick brown fox jumps over the lazy dog, repeatedly and at some length";
 
+    /// The compressed bytes themselves are pinned, not only the round trip: a compressed
+    /// column is a stored value, so a codec crate bump that changes its encoder output would
+    /// change query results. `(codec, input index, length, xxhash64 of the frame)`.
+    #[test]
+    fn compressed_bytes_are_stable() {
+        let inputs: [&[u8]; 3] = [b"", PAYLOAD, &PAYLOAD.repeat(100)];
+        let pinned: [(&str, usize, usize, u64); 9] = [
+            ("zstd", 0, 9, 0x9fcc_d29d_986b_864f),
+            ("zstd", 1, 76, 0xaec9_2d5e_c73d_a2d6),
+            ("zstd", 2, 84, 0x3c43_a8cc_278f_1704),
+            ("brotli", 0, 3, 0xd3af_89fa_1474_46f4),
+            ("brotli", 1, 66, 0x1ae7_9a41_f389_a883),
+            ("brotli", 2, 75, 0x26f3_19a1_733d_02ec),
+            ("lz4", 0, 5, 0x00f4_f72f_b7a8_c648),
+            ("lz4", 1, 80, 0xe1da_9144_be10_c5eb),
+            ("lz4", 2, 118, 0xb971_6464_8cf8_05f7),
+        ];
+        for (codec, i, len, digest) in pinned {
+            let packed = compress(inputs[i], codec).unwrap().unwrap();
+            assert_eq!(packed.len(), len, "{codec} input {i}: frame length moved");
+            assert_eq!(
+                bc_arrow::xxhash64(&packed, 0),
+                digest,
+                "{codec} input {i}: frame bytes moved"
+            );
+        }
+    }
+
     #[test]
     fn every_codec_round_trips() {
         for codec in CODECS {

@@ -92,32 +92,51 @@ _CLICKBENCH_TIME_COLUMNS = ("EventTime", "ClientEventTime", "LocalEventTime")
 
 
 def _clickbench_select(con: duckdb.DuckDBPyConnection, uri: str) -> str:
-    """`SELECT` list that rebuilds ClickBench's DATE/TIMESTAMP columns, passing the rest."""
-    names = [r[0] for r in con.sql(f"DESCRIBE SELECT * FROM read_parquet('{uri}')").fetchall()]
+    """`SELECT` list that rebuilds ClickBench's DATE/TIMESTAMP and text columns.
+
+    The raw parquet stores every text column as an unannotated ``BYTE_ARRAY`` (``BLOB`` to
+    DuckDB, ``binary`` to Arrow). The loaded path casts them to ``utf8``
+    (`sources.tables._binary_to_utf8`); a scan hands each engine the file as written, so
+    without the same cast here ``LIKE``/``MIN``/``MAX`` on a blob fail and the scan run
+    measures a different benchmark. The timestamps are rebuilt as *naive* microsecond
+    stamps from the epoch second, matching the loaded path; ``TO_TIMESTAMP`` would return a
+    ``TIMESTAMPTZ`` whose cast depends on the session time zone.
+    """
+    described = con.sql(f"DESCRIBE SELECT * FROM read_parquet('{uri}')").fetchall()
     parts = []
-    for name in names:
+    for name, typ, *_ in described:
         if name in _CLICKBENCH_DATE_COLUMNS:
             days = f'CAST("{name}" AS INTEGER)'
             parts.append(f"CAST(DATE '1970-01-01' + INTERVAL ({days}) DAY AS DATE) AS \"{name}\"")
         elif name in _CLICKBENCH_TIME_COLUMNS:
-            secs = f'CAST("{name}" AS BIGINT)'
-            parts.append(f'CAST(TO_TIMESTAMP({secs}) AS TIMESTAMP) AS "{name}"')
+            micros = f'CAST("{name}" AS BIGINT) * 1000000'
+            parts.append(f'make_timestamp({micros}) AS "{name}"')
+        elif typ == "BLOB":
+            parts.append(f'CAST("{name}" AS VARCHAR) AS "{name}"')
         else:
             parts.append(f'"{name}"')
     return ", ".join(parts)
 
 
 def mirror_clickbench(con: duckdb.DuckDBPyConnection, parts: int, base: str, out: str) -> None:
-    dest = os.path.join(out, "clickbench", "hits", "part-0.parquet")
-    if os.path.exists(dest):
-        print("  clickbench/hits: exists, skipping")
-        return
-    uris = ", ".join(f"'{base}/hits_{i}.parquet'" for i in range(parts))
-    t0 = time.perf_counter()
+    """Mirror ``parts`` of the partitioned ``hits`` files, one normalized file per part.
+
+    One output file per source part keeps the published ``athena_partitioned`` layout (100
+    files of ~1 M rows), so every engine's scan sees the file-level parallelism the public
+    dataset has, and a mirror interrupted part-way resumes at the first missing part.
+    """
+    root = os.path.join(out, "clickbench", "hits")
     sel = _clickbench_select(con, f"{base}/hits_0.parquet")
-    _copy(con, f"SELECT {sel} FROM read_parquet([{uris}])", dest)
-    size = os.path.getsize(dest) / 1e9
-    print(f"  clickbench/hits: {size:.2f} GB in {time.perf_counter() - t0:.1f}s", flush=True)
+    t0 = time.perf_counter()
+    for i in range(parts):
+        dest = os.path.join(root, f"hits_{i:03d}.parquet")
+        if os.path.exists(dest):
+            continue
+        tmp = dest + ".tmp"
+        _copy(con, f"SELECT {sel} FROM read_parquet('{base}/hits_{i}.parquet')", tmp)
+        os.replace(tmp, dest)
+    size = sum(os.path.getsize(os.path.join(root, f)) for f in os.listdir(root)) / 1e9
+    print(f"  clickbench/hits: {parts} parts, {size:.2f} GB in {time.perf_counter() - t0:.1f}s")
 
 
 def main() -> int:

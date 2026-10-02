@@ -27,7 +27,7 @@
 //! | Quaternion component order | `(x, y, z, w)`, scalar **last** | ROS `geometry_msgs/Quaternion`, SciPy, Eigen's `coeffs()` |
 //! | Handedness | right-handed | everyone |
 //! | What a rotation does | **active**: it moves the vector, it does not relabel the axes | ROS `tf2`, SciPy |
-//! | Euler angle sequence | intrinsic **Z-Y-X** — yaw about Z, then pitch about Y, then roll about X | ROS, aerospace |
+//! | Euler angle sequence | intrinsic **Z-Y-X** — yaw about Z, then pitch about Y, then roll about X; the other eleven sequences, intrinsic or extrinsic, through `euler_seq` | ROS, aerospace |
 //! | Euler naming | roll about X, pitch about Y, yaw about Z | ROS, aerospace |
 //! | A pose | translation `(tx, ty, tz)` plus rotation quaternion, applied **rotate-then-translate** | ROS `geometry_msgs/Pose`, SE(3) convention |
 //!
@@ -48,10 +48,13 @@
 //! `None` for it — which the expression layer surfaces as a null, the same as any other
 //! undefined result.
 
+pub mod euler_seq;
 pub mod quat;
+pub mod repair;
 pub mod rigid;
 pub mod vec3;
 
+pub use euler_seq::EulerSeq;
 pub use quat::{Euler, Quat};
 pub use rigid::Pose;
 pub use vec3::Vec3;

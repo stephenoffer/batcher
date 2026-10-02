@@ -27,7 +27,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher.config import option_context
 from batcher.ml import metrics as M
 
@@ -41,11 +41,7 @@ FILES = 8
 WORKERS = 4
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(WORKERS)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(WORKERS)
 
 
 @pytest.fixture(scope="module")

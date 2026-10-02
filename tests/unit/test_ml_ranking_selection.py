@@ -405,10 +405,28 @@ def test_evaluate_multiclass_reports_the_averages() -> None:
     )
 
 
-def test_a_multiclass_average_cannot_be_grouped() -> None:
-    ds = bt.from_pydict({"g": ["x", "x"], "y": ["a", "b"], "p": ["a", "b"]})
-    with pytest.raises(PlanError, match="by="):
-        ds.ml.evaluate("y", y_pred="p", task="multiclass", by="g", metrics=["macro_f1"])
+@pytest.mark.parametrize("average", ["macro", "weighted"])
+@pytest.mark.parametrize("metric", ["precision", "recall", "f1"])
+def test_a_multiclass_average_by_group_matches_sklearn_per_group(average, metric) -> None:
+    # Group "y" never sees class "b" as a label or a prediction, so its macro average runs over
+    # {a, c} alone, which is what scoring that group by itself with scikit-learn gives.
+    groups = ["x", "x", "x", "x", "y", "y", "y", "z"]
+    true = ["a", "b", "c", "a", "a", "c", "c", "b"]
+    pred = ["a", "c", "c", "b", "c", "c", "a", "b"]
+    ds = bt.from_pydict({"g": groups, "y": true, "p": pred})
+    name = f"{average}_{metric}"
+    got = (
+        ds.ml.evaluate("y", y_pred="p", task="multiclass", by="g", metrics=[name])
+        .sort("g")
+        .to_pydict()
+    )
+    oracle = {"precision": skm.precision_score, "recall": skm.recall_score, "f1": skm.f1_score}
+    for index, key in enumerate(got["g"]):
+        rows = [i for i, g in enumerate(groups) if g == key]
+        expected = oracle[metric](
+            [true[i] for i in rows], [pred[i] for i in rows], average=average, zero_division=0
+        )
+        assert got[name][index] == pytest.approx(expected), key
 
 
 # --- lag and rolling features --------------------------------------------------------------

@@ -89,43 +89,6 @@ class VramPool:
     _peak: dict[int, int] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    @classmethod
-    def from_devices(
-        cls, capacities: dict[int, int], *, headroom: float = DEFAULT_HEADROOM, share: float = 1.0
-    ) -> VramPool:
-        """Build a pool over devices that are not all the same size.
-
-        The scalar `capacity_bytes` describes a node whose devices are interchangeable, which
-        is the node everyone develops on and not the node a fleet actually accumulates: a box
-        part-way through an upgrade, an L4 beside an A100, a partitioned device beside a whole
-        one. Governing those with one capacity is wrong in both directions at once — it strands
-        the large device and over-admits onto the small one, and the over-admission surfaces as
-        a job that fails only on certain nodes.
-
-        Args:
-            capacities: Total bytes per device index. Devices absent from it are not governed.
-            headroom: Fraction of each device held back from reservation.
-            share: Fraction of each device this pool may plan for.
-
-        Returns:
-            A pool whose per-device budgets follow each device's own capacity.
-
-        Examples:
-            .. doctest::
-
-                >>> from batcher.carbonite.accel import VramPool
-                >>> pool = VramPool.from_devices({0: 80 << 30, 1: 24 << 30})
-                >>> pool.usable_bytes(0) > pool.usable_bytes(1)
-                True
-        """
-        return cls(
-            capacity_bytes=min(capacities.values()) if capacities else 0,
-            device_count=max(1, len(capacities)),
-            headroom=headroom,
-            share=share,
-            capacities=dict(capacities),
-        )
-
     def governed_devices(self) -> tuple[int, ...]:
         """The device indices this pool accounts for, ascending.
 

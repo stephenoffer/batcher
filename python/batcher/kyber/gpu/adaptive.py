@@ -208,12 +208,6 @@ def learned_device_throughput(hub: MetadataHub | None, accelerator_type: str | N
     return float(s.get("rows", 0.0)) / seconds
 
 
-# `(intercept_ms, slope_ms_per_row)` for a backend, or None when the samples are too few or
-# too clustered to identify a line. Shared with the broadcast/sort-merge crossovers, which
-# fold the same statistics — the two copies of this fit had already diverged once.
-_fit = fit_ols
-
-
 def learned_gpu_min_rows(
     hub: MetadataHub | None, accelerator_type: str | None = None, shape: str | None = None
 ) -> int | None:
@@ -238,17 +232,17 @@ def learned_gpu_min_rows(
     try:
         gpu = cpu = None
         if shape:
-            gpu = _fit(
+            gpu = fit_ols(
                 hub.get_keyed_param(scoped(_NS), _bucket("gpu", accelerator_type, shape)) or {}
             )
-            cpu = _fit(hub.get_keyed_param(scoped(_NS), _bucket("cpu", None, shape)) or {})
+            cpu = fit_ols(hub.get_keyed_param(scoped(_NS), _bucket("cpu", None, shape)) or {})
             if gpu is None or cpu is None:
                 gpu = cpu = None
         if gpu is None:
-            gpu = _fit(hub.get_keyed_param(scoped(_NS), _bucket("gpu", accelerator_type)) or {})
+            gpu = fit_ols(hub.get_keyed_param(scoped(_NS), _bucket("gpu", accelerator_type)) or {})
             if gpu is None and accelerator_type:
-                gpu = _fit(hub.get_keyed_param(scoped(_NS), "gpu") or {})
-            cpu = _fit(hub.get_keyed_param(scoped(_NS), "cpu") or {})
+                gpu = fit_ols(hub.get_keyed_param(scoped(_NS), "gpu") or {})
+            cpu = fit_ols(hub.get_keyed_param(scoped(_NS), "cpu") or {})
     except Exception as exc:  # pragma: no cover
         note_suppressed("kyber", "fit gpu crossover", exc)
         return None

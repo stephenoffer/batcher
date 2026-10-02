@@ -1,10 +1,11 @@
 """SQL names the function census reported missing, and what closing each one costs.
 
-The DuckDB, Spark and Daft censuses (`docs/architecture/internals/competitor_parity_census.md`)
-re-run here reported 104 names the engine could not reach. Most needed a kernel; this file
-covers the ones that needed only a *composition* of kernels the engine already had, which
-is the cheapest class to close and the easiest to close wrongly — a plausible composition
-that disagrees with the reference on one input is worse than the clear refusal it replaced.
+The DuckDB, Spark and Daft censuses
+(`docs/architecture/internals/parity/competitor_parity_census.md`) re-run here reported 104
+names the engine could not reach. Most needed a kernel; this file covers the ones that
+needed only a *composition* of kernels the engine already had, which is the cheapest class
+to close and the easiest to close wrongly — a plausible composition that disagrees with the
+reference on one input is worse than the clear refusal it replaced.
 
 So every case runs the argument as a **column**, not a literal, so constant folding cannot
 answer it without the kernel; and the inputs are chosen for the edge each composition can

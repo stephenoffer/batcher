@@ -12,37 +12,10 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow_pyarrow::PyArrowType;
+use bc_runtime::shuffle::{is_temporal_key, temporal_to_i64};
 use bc_sketches::{FrequentItems, Mergeable};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-
-/// Temporal types whose order the integer backing (days / ticks) preserves — the ones a
-/// range/quantile pass can treat numerically. Excludes `Interval` (not a totally-ordered
-/// scalar). Mirrors `bc_runtime::shuffle::is_temporal_key` so the sort *sample* here and the
-/// range *partition* there agree on which keys are numeric-backed.
-fn is_temporal_key(dt: &DataType) -> bool {
-    matches!(
-        dt,
-        DataType::Date32
-            | DataType::Date64
-            | DataType::Time32(_)
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _)
-            | DataType::Duration(_)
-    )
-}
-
-/// Cast a temporal column to `Int64` via its order-preserving backing (`Date32`/`Time32`
-/// are `i32`-backed, so route through `Int32`). Same representation the range partition
-/// uses, so quantile boundaries sampled here route rows there identically.
-fn temporal_to_i64(col: &ArrayRef) -> Option<ArrayRef> {
-    match cast(col, &DataType::Int64) {
-        Ok(a) => Some(a),
-        Err(_) => cast(col, &DataType::Int32)
-            .and_then(|a| cast(&a, &DataType::Int64))
-            .ok(),
-    }
-}
 
 /// Replace each requested *temporal* column with its `Int64` backing, so the KLL quantile
 /// sketch (numeric-only) can summarize a `Date`/`Timestamp` sort key. Non-temporal columns
@@ -63,7 +36,7 @@ fn temporal_cols_as_i64(
             for (i, f) in b.schema().fields().iter().enumerate() {
                 let c = b.column(i);
                 if targets.contains(f.name().as_str()) && is_temporal_key(c.data_type()) {
-                    if let Some(i64c) = temporal_to_i64(c) {
+                    if let Ok(i64c) = temporal_to_i64(c) {
                         fields.push(Arc::new(Field::new(
                             f.name(),
                             DataType::Int64,

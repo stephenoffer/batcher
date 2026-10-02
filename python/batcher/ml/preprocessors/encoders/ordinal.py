@@ -23,8 +23,11 @@ from batcher.ml.preprocessors.base import (
     column_arg,
     columns_arg,
     distinct_values,
+    output_columns_arg,
+    output_pairs,
 )
 from batcher.plan.expr_ir import Expr, col, lit, when
+from batcher.plan.functions.collection import element
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -34,11 +37,16 @@ if TYPE_CHECKING:
 __all__ = ["LabelEncoder", "OrdinalEncoder"]
 
 
-def ordinal_expr(column: str, categories: list[Any], unknown_value: int) -> Expr:
-    """A CASE expression mapping each category to its index, else `unknown_value`."""
+def ordinal_expr(subject: str | Expr, categories: list[Any], unknown_value: int) -> Expr:
+    """A CASE expression mapping each category to its index, else `unknown_value`.
+
+    `subject` is a column name, or an expression such as `element()` when the codes are
+    computed per list element.
+    """
+    value = col(subject) if isinstance(subject, str) else subject
     builder = None
     for idx, cat in enumerate(categories):
-        cond = col(column) == cat
+        cond = value == cat
         builder = when(cond).then(idx) if builder is None else builder.when(cond).then(idx)
     if builder is None:
         # No categories were learned (an all-null column, or an empty fit set): every row
@@ -47,6 +55,17 @@ def ordinal_expr(column: str, categories: list[Any], unknown_value: int) -> Expr
         # (`Null * Int64` / `Utf8 * Int64`), crashing the documented all-unknown result.
         return lit(unknown_value)
     return builder.otherwise(unknown_value)
+
+
+def _is_list_column(ds: Dataset, column: str) -> bool:
+    """Whether `column` is a list column, read from the schema without a scan."""
+    import pyarrow as pa
+
+    schema = ds.schema
+    if column not in schema.names:
+        return False
+    dtype = schema.field(column).type
+    return pa.types.is_list(dtype) or pa.types.is_large_list(dtype)
 
 
 class OrdinalEncoder(Preprocessor):
@@ -61,15 +80,33 @@ class OrdinalEncoder(Preprocessor):
             >>> OrdinalEncoder(["c"]).fit_transform(ds).to_pydict()
             {'c': [1, 0, 2, 0]}
 
+            >>> tags = bt.from_pydict({"t": [["b", "a"], ["c"], []]})
+            >>> OrdinalEncoder("t", output_columns="t_codes").fit_transform(tags).to_pydict()
+            {'t': [['b', 'a'], ['c'], []], 't_codes': [[1, 0], [2], []]}
+
     Args:
         columns: the categorical columns to encode in place.
         unknown_value: the code for values unseen at fit time (and nulls).
         max_categories: the ceiling on each column's fitted cardinality. Each category
             becomes one CASE arm, so this bounds both the plan size and the category set
             read back to the driver.
+        encode_lists: encode each element of a list column, learning the categories from
+            the elements (Ray Data's default). ``False`` would treat each whole list as one
+            category, which needs list literals the expression layer does not have, so it
+            raises on a list column. A scalar column ignores this.
+        output_columns: write each code column to this name instead of over its input,
+            one name per column in order, keeping the inputs (Ray Data's
+            ``output_columns``). ``None`` (the default) encodes in place.
     """
 
-    __slots__ = ("categories_", "columns", "max_categories", "unknown_value")
+    __slots__ = (
+        "categories_",
+        "columns",
+        "encode_lists",
+        "max_categories",
+        "output_columns",
+        "unknown_value",
+    )
 
     def __init__(
         self,
@@ -77,19 +114,25 @@ class OrdinalEncoder(Preprocessor):
         *,
         unknown_value: int = -1,
         max_categories: int = MAX_CATEGORIES,
+        encode_lists: bool = True,
+        output_columns: str | Sequence[str] | None = None,
     ) -> None:
         self.columns = columns_arg(columns, what="OrdinalEncoder")
         if not self.columns:
             raise PlanError("OrdinalEncoder requires at least one column")
         self.unknown_value = unknown_value
         self.max_categories = max_categories
+        self.encode_lists = encode_lists
+        self.output_columns = output_columns_arg(
+            self.columns, output_columns, what="OrdinalEncoder"
+        )
         self.categories_: dict[str, list[Any]] = {}
 
     def fit(self, ds: Dataset) -> OrdinalEncoder:
         """Learn each column's sorted distinct categories from `ds`.
 
         Stored in `categories_[c]`; the code assigned to a value at transform time is
-        its index into that sorted list.
+        its index into that sorted list. A list column learns from its elements.
 
         Examples:
             .. doctest::
@@ -110,16 +153,31 @@ class OrdinalEncoder(Preprocessor):
             PlanError: If a column has more than `max_categories` distinct values.
         """
         for c in self.columns:
+            source = ds
+            if _is_list_column(ds, c):
+                self._require_element_encoding(c)
+                source = ds.select(c).explode(c)
             self.categories_[c] = distinct_values(
-                ds, c, what="OrdinalEncoder", max_categories=self.max_categories
+                source, c, what="OrdinalEncoder", max_categories=self.max_categories
             )
         self._fitted = True
         return self
 
+    def _require_element_encoding(self, column: str) -> None:
+        """Refuse ``encode_lists=False`` on a list column, naming what it would need."""
+        if not self.encode_lists:
+            raise PlanError(
+                f"OrdinalEncoder(encode_lists=False): column {column!r} is a list column, and "
+                "encoding each whole list as one category needs list literals, which the "
+                "expression layer does not support. Use encode_lists=True to encode each "
+                "element, or turn the list into a string first (col(...).list.join(','))."
+            )
+
     def transform(self, ds: Dataset) -> Dataset:
         """Replace each fitted column with its integer category code.
 
-        Values unseen at fit time (and nulls) map to `unknown_value`.
+        Values unseen at fit time (and nulls) map to `unknown_value`. A list column is
+        encoded element by element, and a null list stays null.
 
         Examples:
             .. doctest::
@@ -137,7 +195,14 @@ class OrdinalEncoder(Preprocessor):
             A new lazy `Dataset` with each fitted column replaced by its codes.
         """
         self._require_fitted()
-        new = {c: ordinal_expr(c, self.categories_[c], self.unknown_value) for c in self.columns}
+        new = {}
+        for c, out in output_pairs(self.columns, self.output_columns):
+            if _is_list_column(ds, c):
+                self._require_element_encoding(c)
+                codes = ordinal_expr(element(), self.categories_[c], self.unknown_value)
+                new[out] = col(c).list.transform(codes)
+            else:
+                new[out] = ordinal_expr(c, self.categories_[c], self.unknown_value)
         return ds.with_columns(**new)
 
 
@@ -155,13 +220,18 @@ class LabelEncoder(Preprocessor):
             >>> LabelEncoder("y").fit_transform(ds).to_pydict()
             {'y': [0, 1, 0]}
 
+            >>> LabelEncoder("y", output_column="y_code").fit_transform(ds).to_pydict()
+            {'y': ['cat', 'dog', 'cat'], 'y_code': [0, 1, 0]}
+
     Args:
         column: the single label column to encode in place.
         unknown_value: the code for labels unseen at fit time (and nulls).
         max_categories: the ceiling on the fitted class count (one CASE arm each).
+        output_column: write the codes to this column and keep the labels (Ray Data's
+            ``output_column``). ``None`` (the default) encodes in place.
     """
 
-    __slots__ = ("classes_", "column", "max_categories", "unknown_value")
+    __slots__ = ("classes_", "column", "max_categories", "output_column", "unknown_value")
 
     def __init__(
         self,
@@ -169,8 +239,14 @@ class LabelEncoder(Preprocessor):
         *,
         unknown_value: int = -1,
         max_categories: int = MAX_CATEGORIES,
+        output_column: str | None = None,
     ) -> None:
         self.column = column_arg(column, what="LabelEncoder")
+        if output_column is not None and not isinstance(output_column, str):
+            raise PlanError(
+                f"LabelEncoder: output_column must be a single column name, got {output_column!r}"
+            )
+        self.output_column = output_column
         self.unknown_value = unknown_value
         self.max_categories = max_categories
         self.classes_: list[Any] = []
@@ -223,4 +299,4 @@ class LabelEncoder(Preprocessor):
         """
         self._require_fitted()
         expr = ordinal_expr(self.column, self.classes_, self.unknown_value)
-        return ds.with_columns(**{self.column: expr})
+        return ds.with_columns(**{self.output_column or self.column: expr})

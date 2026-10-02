@@ -21,6 +21,7 @@ import re
 import shutil
 import socket
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -141,8 +142,8 @@ def _docs_run_like_a_reader(request, monkeypatch):
     a reason that has nothing to do with the page.
 
     Scoped by path here rather than in a `tests/docs/conftest.py`, because a second
-    top-level module named `conftest` shadows `tests/differential/conftest.py` — and 174
-    differential tests import `assert_same` from it by bare name.
+    top-level module named `conftest` can shadow `tests/differential/conftest.py` for any
+    code that imports it by bare name.
     """
     if _DOCS_TESTS not in request.path.parents:
         return
@@ -429,7 +430,17 @@ def cluster_scratch(cluster_tmp_dir):
     def make(name: str) -> Path:
         scratch = cluster_tmp_dir / _safe_dirname(name)
         shutil.rmtree(scratch, ignore_errors=True)
-        scratch.mkdir(parents=True)
+        try:
+            scratch.mkdir(parents=True)
+        except FileExistsError:
+            # The old directory could not be emptied. On the NFS mounts these tests use, a
+            # file some process still holds open -- a long-lived Ray worker, or this driver,
+            # that read the previous corpus -- is renamed to `.nfsXXXX` instead of unlinked,
+            # and `rmtree` cannot remove the directory around it until that handle closes.
+            # Asking for the same name twice in one session (two tests sharing a `_write`
+            # helper) raised here. A fresh sibling is just as empty and leaves the held files
+            # alone; the session teardown, or a later run's `_prune_dead_owners`, removes both.
+            scratch = Path(tempfile.mkdtemp(prefix=f"{scratch.name}-", dir=cluster_tmp_dir))
         return scratch
 
     return make

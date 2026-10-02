@@ -126,9 +126,7 @@ def variance_ddof(column: Expr, ddof: int, *, sqrt: bool) -> AggExpr | Expr:
         n = column.count().cast("float64")
         variance = (
             when(column.count() > lit(ddof))
-            .then(  # type: ignore[arg-type]
-                population * n / (n - lit(float(ddof)))
-            )
+            .then(population * n / (n - lit(float(ddof))))
             .otherwise(lit(None))
         )
     return MathExpr("sqrt", variance) if sqrt else variance  # type: ignore[arg-type]

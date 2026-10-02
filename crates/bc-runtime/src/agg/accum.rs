@@ -46,6 +46,10 @@ pub(super) fn accumulate_call(
             group_ids,
             num_groups,
         ),
+        // An `Int64` `SUM` partial is its exact 128-bit total (`agg::int_sum` says why here).
+        AggFunc::Sum if super::int_sum::takes(call) => {
+            super::int_sum::call_state(call, group_ids, num_groups)
+        }
         _ => accumulate(call.func, call.values.as_ref(), group_ids, num_groups),
     }
 }
@@ -237,8 +241,9 @@ pub(crate) fn sum_acc(
         }
         // Decimal sums accumulate in i128 (scale preserved). `checked_add` so a sum past
         // i128's range errors instead of silently wrapping to a negative value, mirroring
-        // the i64 SUM path (DuckDB raises on decimal overflow).
-        DataType::Decimal128(p, s) => {
+        // the i64 SUM path (DuckDB raises on decimal overflow). State and result are
+        // `Decimal128(38, s)`, never the input's precision (`DECIMAL_SUM_PRECISION`).
+        DataType::Decimal128(_, s) => {
             let arr = values.as_primitive::<Decimal128Type>();
             let mut sums = vec![0i128; num_groups];
             // **No no-null arm here, and that is a measurement rather than an omission.** The
@@ -260,7 +265,7 @@ pub(crate) fn sum_acc(
                     valid[g as usize] = true;
                 }
             }
-            Ok(masked_decimal(sums, valid, *p, *s)?)
+            masked_decimal(sums, valid, super::DECIMAL_SUM_PRECISION, *s)
         }
         other => Err(RuntimeError::UnsupportedAggregate {
             func: func.name().to_string(),

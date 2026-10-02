@@ -35,6 +35,34 @@ print(mats.select(w=bt.quat_from_rotmat_w(*names)).to_pydict())
 # {'w': [1.0, None, None]}
 ```
 
+A matrix that has been through a few thousand multiplications, or was written out to four digits, drifts past that `1e-4` while still plainly meaning a rotation. Choose the tolerance yourself instead. {py:func}`rotmat_orthogonality_error <batcher.rotmat_orthogonality_error>` is the largest entry of `M * M^T - I` and {py:func}`rotmat_determinant <batcher.rotmat_determinant>` is the determinant, which are exactly the two quantities the strict reader holds to `1e-4`. {py:func}`quat_from_rotmat_nearest <batcher.quat_from_rotmat_nearest>` then returns the rotation nearest the matrix, the one an SVD-based repair such as SciPy's `Rotation.from_matrix` gives, and still refuses a reflection:
+
+```python
+drift = bt.from_pydict({n: [1.001, 0.97] if n in diagonal else [0.0, 0.0] for n in names})
+checked = drift.select(
+    err=bt.rotmat_orthogonality_error(names).round(4),
+    det=bt.rotmat_determinant(names).round(4),
+    strict=bt.quat_from_rotmat_w(*names),
+    **bt.quat_from_rotmat_nearest(names),
+)
+print(checked.to_pydict())
+# {'err': [0.002, 0.0591], 'det': [1.003, 0.9127], 'strict': [None, None], 'qx': [0.0, 0.0], 'qy': [0.0, 0.0], 'qz': [0.0, 0.0], 'qw': [1.0, 1.0]}
+```
+
+Filter on `err` before repairing when a large error means a broken calibration rather than rounding.
+
+Euler angles in another axis order, such as the proper Euler angles Z-X-Z of orbital mechanics or the Y-X-Z of biomechanics, go through {py:func}`quat_from_euler_seq <batcher.quat_from_euler_seq>` and {py:func}`quat_to_euler_seq <batcher.quat_to_euler_seq>`. The sequence is named SciPy's way: uppercase letters are intrinsic, each turn about the axes the previous turns left, and lowercase letters are extrinsic, each turn about the fixed axes. The angles come back in sequence order:
+
+```python
+imu = bt.from_pydict({"a": [0.3], "b": [1.1], "c": [-0.4]})
+q = imu.select(**bt.quat_from_euler_seq(("a", "b", "c"), sequence="ZXZ"))
+angles = bt.quat_to_euler_seq(("qx", "qy", "qz", "qw"), sequence="ZXZ")
+print(q.select(**{k: v.round(4) for k, v in angles.items()}).to_pydict())
+# {'angle_1': [0.3], 'angle_2': [1.1], 'angle_3': [-0.4]}
+```
+
+Like the rest of the family, each of these whole-rotation helpers is built from one function per output, for a filter or a join key that needs a single number: {py:func}`quat_from_euler_seq_x <batcher.quat_from_euler_seq_x>`, {py:func}`quat_from_euler_seq_y <batcher.quat_from_euler_seq_y>`, {py:func}`quat_from_euler_seq_z <batcher.quat_from_euler_seq_z>`, {py:func}`quat_from_euler_seq_w <batcher.quat_from_euler_seq_w>` build a rotation from any sequence, {py:func}`quat_to_euler_seq_first <batcher.quat_to_euler_seq_first>`, {py:func}`quat_to_euler_seq_second <batcher.quat_to_euler_seq_second>`, {py:func}`quat_to_euler_seq_third <batcher.quat_to_euler_seq_third>` read one back, and {py:func}`quat_from_rotmat_nearest_x <batcher.quat_from_rotmat_nearest_x>`, {py:func}`quat_from_rotmat_nearest_y <batcher.quat_from_rotmat_nearest_y>`, {py:func}`quat_from_rotmat_nearest_z <batcher.quat_from_rotmat_nearest_z>`, {py:func}`quat_from_rotmat_nearest_w <batcher.quat_from_rotmat_nearest_w>` repair a matrix. The component functions take the sequence as a trailing argument, so SQL spells it as a string literal: `quat_to_euler_seq_first(qx, qy, qz, qw, 'ZXZ')`.
+
 ## Moving a point between frames
 
 {py:func}`se3_transform <batcher.se3_transform>` takes a pose and a point and returns three named columns, so a whole transform is one call:
@@ -261,6 +289,17 @@ print(err.to_pydict())
 
 Aggregate it like any other column to get a per-log or per-scenario score.
 
+The same sign ambiguity breaks a `group_by`, a `distinct` or an equality join on the components, which treat `q` and `-q` as two rotations. {py:func}`quat_canonicalize <batcher.quat_canonicalize>` normalizes each quaternion and gives it a non-negative `w`, with ties broken the way SciPy's canonical form breaks them, so each rotation has one spelling:
+
+```python
+logged = bt.from_pydict({"qx": [0.0, -0.0], "qy": [0.0, -0.0], "qz": [0.6, -0.6], "qw": [0.8, -0.8]})
+canon = logged.select(**bt.quat_canonicalize(("qx", "qy", "qz", "qw")))
+print(canon.distinct().to_pydict())
+# {'qx': [0.0], 'qy': [0.0], 'qz': [0.6], 'qw': [0.8]}
+```
+
+Canonicalize before comparing components, not before interpolating: {py:func}`quat_slerp <batcher.quat_slerp>` already takes the short way round from either sign.
+
 ## Where this runs
 
 Every function on this page is a `Float64` expression over `Float64` columns. Nothing here introduces a composite type, which has three consequences worth stating:
@@ -269,7 +308,7 @@ Every function on this page is a `Float64` expression over `Float64` columns. No
 - It spills and shuffles like arithmetic, so a transform over a cluster-scale log needs no special handling and produces the same rows single-node or distributed.
 - It streams. A transform in an {py:meth}`iter_batches <batcher.Dataset.iter_batches>` pipeline never materializes the sweep.
 
-The arithmetic itself runs in Rust, in the `bc-spatial` crate. The JIT declines this family and falls back to the interpreter, which is deliberate: the kernels call transcendental functions whose bit-for-bit agreement across two tiers is a claim nothing currently proves, and the interpreter's loop is already tight.
+The arithmetic itself runs in Rust, in the `bc-spatial` crate. The JIT declines this family and falls back to the interpreter, which is deliberate: the kernels call transcendental functions whose bit-for-bit agreement across two tiers is a claim nothing proves, and the interpreter's loop is already tight.
 
 ### On a cluster
 
@@ -277,9 +316,9 @@ Because every function here is a row-wise expression, a distributed query comput
 
 ## Requirements and limitations
 
-- Euler angles use the intrinsic Z-Y-X sequence, with roll about X, pitch about Y and yaw about Z. There is no way to select a different sequence.
-- {py:func}`quat_to_euler <batcher.quat_to_euler>` reports roll as zero at gimbal lock and folds the whole rotation into yaw. That keeps the function single-valued. It does not make the decomposition unique, because nothing can.
-- {py:func}`quat_from_rotmat_x <batcher.quat_from_rotmat_x>` returns null for a matrix more than `1e-4` from orthonormal with determinant 1. It does not re-orthonormalize a drifted matrix beyond that, and the quaternion it returns is normalized.
+- The roll, pitch and yaw functions use the intrinsic Z-Y-X sequence, with roll about X, pitch about Y and yaw about Z. The `*_euler_seq*` functions take any of the 12 axis orders, intrinsic or extrinsic.
+- {py:func}`quat_to_euler <batcher.quat_to_euler>` and {py:func}`quat_to_euler_seq <batcher.quat_to_euler_seq>` report the third angle as zero at gimbal lock and fold the whole rotation into the first. That keeps each function single-valued. It does not make the decomposition unique, because nothing can, and it does not make it continuous: a rotation passing through the lock moves the reported first and third angles abruptly while the rotation itself changes smoothly. Interpolate, average, difference and learn on quaternions, and convert to angles only to report.
+- {py:func}`quat_from_rotmat_x <batcher.quat_from_rotmat_x>` returns null for a matrix more than `1e-4` from orthonormal with determinant 1. {py:func}`quat_from_rotmat_nearest <batcher.quat_from_rotmat_nearest>` repairs a drifted matrix instead, and refuses only a non-finite entry or a determinant that is not positive.
 - These are Cartesian and answer in the coordinates' own units. A `lat`/`lon` column wants {doc}`/user-guide/analyze/domains/geospatial` instead.
 
 ## See also

@@ -89,7 +89,7 @@ The Storage Read API is metered per project, on read throughput and concurrent s
 
 Read sessions expire. Batcher creates the session at planning time, so a scan whose splits wait behind a long queue, on a busy cluster or an autoscaler still warming up, can find its streams gone. A stream that fails mid-read is re-read from its start by the retry, not resumed at the offset it reached.
 
-There's no BigQuery sink. A {py:exc}`BackendError <batcher.BackendError>` at construction means the client libraries are missing, or that neither `query` nor `table` was supplied. A governance policy matches a `table=` read by its table name. A query read has no table name to match.
+There's no BigQuery sink. A {py:exc}`BackendError <batcher.BackendError>` at construction means the client libraries are missing, or that neither `query` nor `table` was supplied. A governance policy matches a `table=` read by its table name. A query read has no table name to match, so declare one with `governed_as="<project.dataset.table>"`. Inside a {py:obj}`bt.security() <batcher.security>` block, an undeclared query that names a governed table is refused. See {doc}`How a table is named </user-guide/trust/table-names>`.
 
 ## See also
 

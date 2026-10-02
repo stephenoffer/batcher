@@ -59,9 +59,20 @@ def _selectivity_of(row: dict) -> float | None:
     """The selectivity one feedback row contributes, or `None` if it contributes nothing.
 
     Only a filter measures a selectivity, and a ratio outside [0, 1] is not one.
+
+    Nor is the ratio of a filter whose input a runtime join filter reduced. It is the
+    predicate's selectivity *given* the join filter, and the estimator applies a learned
+    selectivity to the unreduced input. The two are furthest apart exactly where it matters:
+    a sideways-derived key range (`movie_id BETWEEN lo AND hi`) is implied by the join filter
+    on that key, so it measures 1.0 on the reduced rows while keeping a few percent of the
+    table. Learned as selectivities, ratios like this put a JOB q27c join at 849M estimated
+    rows from the third run on, and admission sent a ~35 ms query out-of-core for 1.3-6.5 s
+    on every run after that.
     """
     sel = row.get("selectivity")
     if row.get("kind") != "filter" or not isinstance(sel, (int, float)):
+        return None
+    if row.get("runtime_filtered"):
         return None
     ratio = float(sel)
     return ratio if 0.0 <= ratio <= 1.0 else None

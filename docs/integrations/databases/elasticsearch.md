@@ -153,7 +153,7 @@ The key column stays in the document body. It is used as the `_id` *and* written
 
 The Arrow response for ES|QL, `format="arrow"`, needs Elasticsearch 8.18 or later. Against an older cluster the ES|QL call fails rather than degrading, so drop `esql=` and take the scroll path there.
 
-The scroll path infers its schema from the first hit's `_source`. Heterogeneous documents, from a mapping that changed mid-index or an `object` field that is sometimes a scalar, produce a schema that does not describe the rest of the index. Constrain the shape with `esql=... | KEEP ...` or a projection so you read known columns.
+The scroll path infers its schema from the `_source` of the first 100 hits, unioned column by column, so a field only some documents carry still appears. It's a sample, not the mapping, so a field no sampled document holds is still missing. A field whose values no single Arrow type holds, such as an `object` field that is sometimes a scalar, raises {py:exc}`FormatError <batcher.FormatError>` naming the field rather than returning a schema that doesn't describe the index. Pass `schema=` with a `pyarrow.Schema` to declare the columns and skip inference, or constrain the shape with `esql=... | KEEP ...`.
 
 Scroll contexts are a cluster resource. Every slice holds one open for a 2-minute window, refreshed as the engine drains it. Batcher clears them on the way out, best-effort, but a job killed mid-read leaves them to expire. Many concurrent sliced reads against a busy cluster can hurt production search latency.
 

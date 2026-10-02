@@ -15,16 +15,30 @@ import sys
 
 from .compare import CompareResult, EngineResult
 
-
 # Reporting
 # --------------------------------------------------------------------------- #
-def _fmt_ms(er: EngineResult) -> str:
+#: Error-text markers of an allocation failure. An out-of-memory engine and a query an
+#: engine cannot express are different findings, and one ``ERR`` for both hid which it was.
+_OOM_MARKERS = ("MemoryError", "out of memory", "OutOfMemory", "ResourceExhausted", "OOM")
+
+
+def cell_status(er: EngineResult) -> str:
+    """The code a missing timing cell prints, so the reason for the gap travels with it.
+
+    ``n/a`` the engine has no form of this query, ``OOM`` it ran out of memory, ``ERR`` it
+    raised, ``-`` it was not measured. None of these is a wrong answer; a wrong answer keeps
+    its timing and loses its ratio (``n/c``).
+    """
     if er.error == "n/a":
         return "n/a"
     if er.error:
-        return "ERR"
-    if er.ms is None:
-        return "-"
+        return "OOM" if any(m in er.error for m in _OOM_MARKERS) else "ERR"
+    return "-"
+
+
+def _fmt_ms(er: EngineResult) -> str:
+    if er.error or er.ms is None:
+        return cell_status(er)
     return f"{er.ms:.1f}"
 
 
@@ -112,6 +126,8 @@ def print_table(results: list[CompareResult], engines: list[str]) -> None:
 
     # Say what the refusal means, but only when one is on screen — an unexplained `n/c`
     # reads as a missing timing, which is the one thing it is not.
+    print_distribution(results, engines)
+
     if any(NOT_COMPARABLE in row for row in rows):
         print()
         print(
@@ -120,6 +136,33 @@ def print_table(results: list[CompareResult], engines: list[str]) -> None:
             "      semantic difference, DEGENERATE an agreement between results carrying no "
             "information (the engines agree; nothing was compared)."
         )
+
+
+def print_distribution(results: list[CompareResult], engines: list[str]) -> None:
+    """Print first-call, median, p95 and in-process CPU per engine beside the best-of-N.
+
+    The main table is best-of-N, the optimistic tail. This one is what a reader needs to
+    judge it: the cold first call (the only run that meets empty caches and no learned
+    state), the median and 95th percentile of the timed runs, and the CPU time the best run
+    used in this process — a wall-clock win bought with more cores shows up here.
+    """
+    rows = []
+    for r in results:
+        for e in engines:
+            er = r.engines.get(e)
+            if er is None or not er.samples_ms:
+                continue
+            cells = [er.first_ms, er.ms, er.median_ms, er.p95_ms, er.cpu_ms]
+            rows.append([r.name, e, *("-" if v is None else f"{v:.1f}" for v in cells)])
+    if not rows:
+        return
+    headers = ["query", "engine", "first_ms", "best_ms", "median_ms", "p95_ms", "cpu_ms"]
+    widths = [max(len(h), *(len(row[i]) for row in rows)) for i, h in enumerate(headers)]
+    print()
+    print("timing distribution (cpu_ms is in-process only; out-of-process engines under-report):")
+    for row in [headers, *rows]:
+        cells = zip(row, widths, strict=True)
+        print("  ".join(c.ljust(w) if i < 2 else c.rjust(w) for i, (c, w) in enumerate(cells)))
 
 
 # --------------------------------------------------------------------------- #
@@ -166,7 +209,14 @@ def emit_result(result: CompareResult) -> None:
         "status": result.status,
         "note": result.note,
         "engines": {
-            name: {"ms": er.ms, "error": er.error, "correct": er.correct}
+            name: {
+                "ms": er.ms,
+                "error": er.error,
+                "correct": er.correct,
+                "first_ms": er.first_ms,
+                "samples_ms": er.samples_ms,
+                "cpu_ms": er.cpu_ms,
+            }
             for name, er in result.engines.items()
         },
     }
@@ -181,7 +231,12 @@ def _parse_result(line: str) -> CompareResult:
     )
     for name, er in payload.get("engines", {}).items():
         result.engines[name] = EngineResult(
-            ms=er.get("ms"), error=er.get("error"), correct=er.get("correct")
+            ms=er.get("ms"),
+            error=er.get("error"),
+            correct=er.get("correct"),
+            first_ms=er.get("first_ms"),
+            samples_ms=list(er.get("samples_ms") or []),
+            cpu_ms=er.get("cpu_ms"),
         )
     return result
 

@@ -75,8 +75,8 @@ def supports_spilling_join(join: _Joinish) -> bool:
     """Whether this join can grace-partition out-of-core.
 
     Each side must name one source: a side spanning two sources — a join whose operand is
-    itself a join, i.e. any 3+-table query — cannot, and this path used to assert on it rather
-    than decline. Sort and Window already gate this way.
+    itself a join, i.e. any 3+-table query — cannot, so this declines it rather than
+    asserting. Sort and Window gate the same way.
 
     An ASOF join additionally needs `by` keys, which are the only thing it can hash on; a
     keyless one is refused here and reaches the cluster by a different decomposition entirely

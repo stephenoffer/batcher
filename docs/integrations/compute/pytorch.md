@@ -232,8 +232,8 @@ Sharing it would be faster and is undefined behavior per torch, since a training
 batches in place and the Arrow buffer is immutable. For read-only inference you can opt into `zero_copy=True` on `iter_torch_batches`, which hands the buffer over through DLPack and saves a copy. Don't set it for training.
 
 Apple MPS has no 64-bit dtypes. `device="auto"` downcasts float64/int64 to 32-bit when it
-targets MPS, so a dev box works. Nothing downcasts on CUDA, so a float64 feature column will move 8
-bytes per value to the GPU forever. Cast in the plan.
+targets MPS, so a dev box works, and only where no value changes beyond precision. An int64 column with a value outside the int32 range, such as an id or a nanosecond timestamp, raises a `PlanError` naming the column instead of wrapping. So does a float64 column with a finite value beyond float32's range, which would become infinity. A float64 column that fits still loses precision, and the loader issues a `UserWarning` that it's moving it as float32. So `device="auto"` can change a model's numbers between an MPS dev box and a CUDA cluster. Nothing downcasts on CUDA, so a float64 feature column will move 8
+bytes per value to the GPU forever. Cast in the plan, which makes the choice explicit on every device.
 
 A `map_batches` retry re-runs your `fn`. Under `distributed=True`, a preempted worker's
 partition is recomputed. Side effects (writing to a feature store, POSTing to a service) can happen

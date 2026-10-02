@@ -150,6 +150,54 @@ def classification_report(
     return bt.from_pydict(rows).sort("support", descending=True)
 
 
+def _grouped_multiclass_averages(
+    ds: Dataset, y_true: str, y_pred: str, groups: list[str], names: list[str], max_classes: int
+) -> Dataset:
+    """The macro and weighted per-class averages in `names`, one row per group of `groups`.
+
+    The same per-class counts `classification_report` takes, computed as `count_if` terms of
+    one grouped aggregate, so they merge across partitions like any other count and a grouped
+    report is one pass. The averages are then plain expressions over those counts. Within a
+    group, a class counts toward the macro average only when it occurs there as a label or a
+    prediction, which is the class set scoring that group on its own would see.
+    """
+    classes = _label_set(ds, y_true, y_pred, max_classes)
+    counts: dict[str, Any] = {}
+    for index, label in enumerate(classes):
+        actual = col(y_true) == lit(label)
+        predicted = col(y_pred) == lit(label)
+        counts[f"__bt_tp_{index}"] = count_if(actual & predicted)
+        counts[f"__bt_fp_{index}"] = count_if(~actual & predicted)
+        counts[f"__bt_fn_{index}"] = count_if(actual & ~predicted)
+    reduced = ds.group_by(*groups).agg(**counts)
+
+    def ratio(numerator: Any, denominator: Any, empty: float = 0.0) -> Any:
+        return (
+            when(denominator > lit(0))
+            .then(numerator.cast("float64") / denominator.cast("float64"))
+            .otherwise(lit(empty))
+        )
+
+    per_class: dict[str, list[Any]] = {"precision": [], "recall": [], "f1": []}
+    supports: list[Any] = []
+    present: list[Any] = []
+    for index in range(len(classes)):
+        tp, fp, fn = (col(f"__bt_{kind}_{index}") for kind in ("tp", "fp", "fn"))
+        per_class["precision"].append(ratio(tp, tp + fp))
+        per_class["recall"].append(ratio(tp, tp + fn))
+        per_class["f1"].append(ratio(lit(2) * tp, lit(2) * tp + fp + fn))
+        supports.append((tp + fn).cast("float64"))
+        present.append((tp + fp + fn > lit(0)).cast("float64"))
+    averages: dict[str, Any] = {}
+    for metric, values in per_class.items():
+        macro = sum(p * v for p, v in zip(present, values, strict=True))
+        weighted = sum(w * v for w, v in zip(supports, values, strict=True))
+        # NaN for a group with nothing to average, as the ungrouped report answers.
+        averages[f"macro_{metric}"] = ratio(macro, sum(present), float("nan"))
+        averages[f"weighted_{metric}"] = ratio(weighted, sum(supports), float("nan"))
+    return reduced.with_columns(**{n: averages[n] for n in names}).select(*groups, *names)
+
+
 def _ratio(numerator: float, denominator: float) -> float:
     """``numerator / denominator``, or 0.0 when the denominator vanishes.
 

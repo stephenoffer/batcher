@@ -36,6 +36,7 @@ from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, RuleCategory, plan_rule
 from batcher.kyber.rules.joins.order_budget import search_pair_budget
+from batcher.kyber.rules.joins.order_goo import rebuild_goo
 from batcher.kyber.rules.joins.order_residual import (
     bind_residuals,
     hoistable_filter,
@@ -135,9 +136,33 @@ def _try_reorder(top: Join, ctx: OptimizerContext, visit) -> LogicalPlan | None:
     # milliseconds), while the same shape over a volume that justifies it still reaches the
     # same ceiling it could reach before. The budget takes search away from queries that
     # cannot repay it; it takes none from a query that can.
-    budget = search_pair_budget(top, ctx)
+    #
+    # The region is priced by the best of the two cheap orders, not as written. Written
+    # order is what the SQL frontend happened to produce, and for a comma join that is a
+    # cross product under a filter until this rule runs, so pricing it granted every such
+    # query the ceiling. JOB q29c (17 leaves over IMDB) spent 45 s of a 45 s query evaluating
+    # 200,000 pairs, hit the ceiling, and returned the greedy order anyway, where execution
+    # took 22 ms. What a search can win is bounded by the best order already in hand, so that
+    # is the cost a share of it is taken from. Both cheap builders run anyway whenever the DP
+    # bails, so building them first adds an O(n^2) pass, not a second search.
+    cost = ctx.costs()
+    built = [
+        plan
+        for plan in (
+            _rebuild_greedy(leaves, edges, required, ctx, residuals),
+            rebuild_goo(leaves, edges, required, ctx, residuals),
+        )
+        if plan is not None
+    ]
+    cheapest = min(built, key=lambda plan: cost.cost(plan).total()) if built else None
+    budget = search_pair_budget(cheapest if cheapest is not None else top, ctx)
     dp = _rebuild_dphyp(leaves, edges, required, ctx, residuals, budget)
-    return dp if dp is not None else _rebuild_greedy(leaves, edges, required, ctx, residuals)
+    if dp is not None:
+        return dp
+    # Past the budget, the cheaper of the two cheap builders by the same cost model: the
+    # left-deep greedy is at the mercy of which leaf is smallest, and GOO keeps a forest so a
+    # second fact table's selective side can be built before the two meet (`order_goo`).
+    return cheapest
 
 
 def _is_transparent(node: LogicalPlan) -> bool:

@@ -406,7 +406,11 @@ def main() -> int:
     # threads than at 1 under load 25, which is not a fact about DuckDB, and several deltas
     # in BENCHMARK_RESULTS.md are explicitly disavowed for it. A benchmark that cannot
     # refuse an unusable environment reports the neighbour's load as an engine difference.
-    require_quiet_box(allow_busy=args.allow_busy_box)
+    # Not in an `--isolate` child: the parent checked before its first case, and the load a
+    # child sees is the parent's *previous case*, whose one-minute average outlives it. At
+    # sf100 every child after q1 refused on that and the suite recorded 21 KILLED rows.
+    if args.isolate_case is None:
+        require_quiet_box(allow_busy=args.allow_busy_box)
 
     datasets = ALL_DATASETS if args.benchmark == "all" else (args.benchmark,)
     names = [e.name for e in engines]

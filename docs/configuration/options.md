@@ -201,8 +201,6 @@ nests three sub-sections: `cardinality`, `cost_coeffs`, and `cost_weights`.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
-| `join_dp_max_tables` | `12` | **No effect.** Declared and validated, but no rule reads it, so setting it changes nothing. Join ordering sizes its own search per query; see {doc}`/architecture/deep-dives/adaptive/cost-model`. |
-| `greedy_max_tables` | `25` | **No effect.** Declared and validated, and read by nothing, as with `join_dp_max_tables`. |
 | `reoptimize_error` | `2.0` | Re-optimize when `abs(actual - estimate) / estimate` exceeds this. |
 | `target_rows_per_task` | `4000000` | Target rows per distributed task; worker fan-out tracks data size, not CPU count. |
 | `fixpoint_iterations` | `8` | Maximum rewrite-phase iterations before bailing. |
@@ -217,6 +215,7 @@ nests three sub-sections: `cardinality`, `cost_coeffs`, and `cost_weights`.
 | `locality_max_bytes` | `4194304` (4 MiB) | Shuffle volume below which co-locating a small shuffle's workers beats spreading them. A network decision, kept separate from the cache-sized `broadcast_max_bytes`. |
 | `plan_cache_entries` | `256` | Optimized plans memoized in a bounded LRU, so an identical query skips re-planning. `0` disables the cache. |
 | `common_subplan_max_bytes` | `268435456` (256 MiB) | Largest result held so a subplan appearing more than once in a query runs once. `0` turns the rewrite off. |
+| `common_subplan_memory_fraction` | `0.0625` | Share of the hard memory budget the common-subplan budget rises to when that is larger than `common_subplan_max_bytes`, so the budget scales with the machine. `0` keeps it fixed. |
 | `filter_split_materialize_cost` | `1.0` | Cost, in `cost_coeffs` work units, of the extra compacted batch paid when a cheap selective predicate is split out ahead of an expensive one. |
 | `filter_split_min_gain` | `1.25` | Cost ratio a filter split must beat before it is taken, so marginal rewrites are left alone. |
 | `cardinality_correction_min_samples` | `2` | Observations an operator signature needs before its learned cardinality correction is trusted. |
@@ -318,7 +317,7 @@ Where learned statistics (the MetadataHub) live and how fast confidence decays.
 |-------|---------|---------|
 | `backend` | `"in_process"` | Storage backend: `"in_process"`, `"sqlite"`, `"rocksdb"`, `"redis"`, `"object_storage"`, or `"layered"`. `"sqlite"` is the durable single-node default; `"rocksdb"` is the embedded alternative for a write-heavy loop, where an LSM tree absorbs many small writes that a B-tree would pay a journal write for; `"redis"` and `"object_storage"` share statistics across a cluster, and `"layered"` caches one of those behind a local dict. |
 | `uri` | `None` | Connection or path for a non-in-process backend. |
-| `decay_per_day` | `0.1` | **No effect.** Nothing expires: there is no TTL or aging on any backend. Recency comes from smoothing instead; see {doc}`/architecture/deep-dives/adaptive/learned-metadata`. |
+| `require_durable` | `False` | Raise a `ConfigError` when the configured backend can't be built, instead of degrading to `"in_process"` with a warning. Set it where cross-run learning is expected, so a misconfigured store fails the first query rather than silently learning nothing across runs. |
 
 These fields are the {py:class}`MetadataConfig <batcher.MetadataConfig>` dataclass
 (the full field list is in the API reference). Construct one and swap it onto
@@ -360,8 +359,8 @@ process-global caches and learned statistics by accident.
 | Field | Default | Meaning |
 |-------|---------|---------|
 | `tenant_id` | `""` | Names the tenant. Empty means no tenancy: everything behaves as before. |
-| `cache_share` | `0.0` | Share of the result-cache budget this tenant may hold. 0 is unbounded. |
-| `max_concurrent_queries` | `0` | Concurrency cap for this tenant. 0 is unbounded. |
+| `cache_share` | `0.0` | Not implemented. Any value but `0.0` raises `ConfigError`. |
+| `max_concurrent_queries` | `0` | Not implemented. Any value but `0` raises `ConfigError`. Use `execution.max_concurrent_queries` for a process-wide cap. |
 
 These fields are the {py:class}`TenantConfig <batcher.TenantConfig>` dataclass. Set them
 with the {py:func}`bt.tenant <batcher.tenant>` scope, not by replacing the section:
@@ -369,7 +368,7 @@ with the {py:func}`bt.tenant <batcher.tenant>` scope, not by replacing the secti
 ```python
 import batcher as bt
 
-with bt.tenant("analytics", max_concurrent_queries=4):
+with bt.tenant("analytics"):
     print(bt.active_config().tenant.tenant_id)
 # analytics
 ```

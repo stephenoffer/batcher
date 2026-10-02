@@ -14,6 +14,7 @@ from typing import Any
 
 from batcher.plan.feedback import cpu_utilization
 from batcher.plan.physical import PhysicalOp
+from batcher.plan.profile.spill import SpillMeter
 from batcher.plan.profile.stages import StageRecorder
 from batcher.plan.profile.types import Decision, OpProfile, QueryProfile, QueryUsage
 
@@ -33,6 +34,11 @@ class ProfileCollector:
 
     optimized_ir: dict[str, Any] | None = None
     logical_ir: dict[str, Any] | None = None
+    # The two IRs above as JSON text, when the recorder already had it serialized (the
+    # logical plan's `ir_json`, the physical plan's memoized `to_json`). The event log splices
+    # these in rather than re-encoding ~50 KB of IR per query; `None` means "encode it".
+    optimized_ir_json: str | None = None
+    logical_ir_json: str | None = None
     physical_ops: tuple[PhysicalOp, ...] = ()
     metric_ops: list[dict[str, Any]] = field(default_factory=list)
     decisions: list[Decision] = field(default_factory=list)
@@ -63,6 +69,19 @@ class ProfileCollector:
     # `source_pushdown` is: rendering an IR node lives in `observe`, which this layer may
     # not import.
     node_details: dict[int, str] = field(default_factory=dict)
+    # What the Python out-of-core executors wrote to disk (`plan.profile.spill`), summed over
+    # every out-of-core phase of the run. The engine's own spills arrive in `metric_ops`.
+    out_of_core_spilled: bool = False
+    out_of_core_spill_bytes: int = 0
+
+    def record_out_of_core_spill(self, meter: SpillMeter) -> None:
+        """Fold one out-of-core phase's measured spill into the run's.
+
+        Args:
+            meter: The meter that was open around the phase.
+        """
+        self.out_of_core_spilled = self.out_of_core_spilled or meter.spilled
+        self.out_of_core_spill_bytes += meter.bytes_written
 
     def record_usage(self, doc: dict[str, Any] | None) -> None:
         """Fold one `ExecMetrics.query` block in, summing with anything already recorded.
@@ -112,6 +131,8 @@ class ProfileCollector:
             memory_budget_bytes=memory_budget_bytes,
             worker_ops=worker_ops,
             usage=usage,
+            out_of_core_spilled=self.out_of_core_spilled,
+            out_of_core_spill_bytes=self.out_of_core_spill_bytes,
         )
 
 

@@ -6,6 +6,7 @@
 import atexit
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -28,6 +29,39 @@ try:
 except PackageNotFoundError:
     release = "0.1.0"
 version = release
+
+
+def _source_revision() -> str | None:
+    """The commit these pages were built from: CI's ``GITHUB_SHA``, else the local checkout."""
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        return sha
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return out.stdout.strip() or None
+
+
+# Every page carries the package version and commit it documents. The site deploys from
+# `main` (.github/workflows/docs.yml), not from a release tag, so a reader holding an
+# installed wheel needs to see which revision the prose describes.
+_REVISION = _source_revision()
+_REPO_URL = "https://github.com/stephenoffer/batcher"
+if _REVISION:
+    _ANNOUNCEMENT = (
+        f"These pages document batcher-engine {release} as built from commit "
+        f'<a href="{_REPO_URL}/commit/{_REVISION}"><code>{_REVISION[:10]}</code></a> '
+        "on the main branch. A released wheel can predate what they describe."
+    )
+else:
+    _ANNOUNCEMENT = f"These pages document batcher-engine {release}."
 
 # -- General configuration ---------------------------------------------------
 
@@ -127,14 +161,13 @@ exclude_patterns = [
     ".DS_Store",
     "requirements.txt",
     "Makefile",
-    # The contributor working records, grouped by kind. These are measured ledgers, audits,
-    # program logs and RFCs: each carries an explicit "what this did not do" or "still
+    # The contributor working records, grouped by kind. These are measured ledgers, audits
+    # and RFCs: each carries an explicit "what this did not do" or "still
     # unmeasured" register, which is exactly what a published page must not carry. They are
     # excluded by directory rather than one line per file, so adding a record does not mean
     # remembering to exclude it.
     "architecture/internals/parity/*",
     "architecture/internals/audits/*",
-    "architecture/internals/programs/*",
     "architecture/internals/rfcs/*",
     # Standalone formal paper, rendered to PDF by internals/generate_pdf.py rather
     # than as a site page. It carries its own internal cross-reference scheme.
@@ -195,6 +228,7 @@ html_theme_options = {
     "sidebar_hide_name": False,
     "navigation_with_keys": True,
     "top_of_page_button": "edit",
+    "announcement": _ANNOUNCEMENT,
     "light_css_variables": {
         "color-brand-primary": _BRAND,
         "color-brand-content": _BRAND,

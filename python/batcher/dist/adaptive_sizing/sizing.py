@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 from batcher.metadata.hardware_scope import scoped
+from batcher.metadata.smoothed import blend
 from batcher.plan.feedback import oversubscribed
 
 if TYPE_CHECKING:
@@ -92,7 +93,7 @@ def _ema(hub: MetadataHub, namespace: str, key: str, value: float) -> None:
         s = hub.get_keyed_param(scoped(namespace), key) or {}
         prior = s.get("ema")
         a = _alpha()
-        ema = float(value) if prior is None else a * float(value) + (1.0 - a) * float(prior)
+        ema = float(value) if prior is None else blend(float(prior), float(value), a)
         hub.put_keyed_param(scoped(namespace), key, {"ema": ema, "n": int(s.get("n", 0)) + 1})
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("dist", "fold sizing ema", exc)
@@ -202,7 +203,7 @@ def _family_oversubscribed(hub: MetadataHub | None, family: str) -> bool:
         return False
     try:
         return oversubscribed(hub.op_stats_by_kind().get(family, []))
-    except Exception as exc:  # pragma: no cover - a learned read must never break a query
+    except Exception as exc:  # a learned read must never break a query
         note_suppressed("dist", "read family contention", exc)
         return False
 
@@ -406,7 +407,7 @@ def _sizing_rows(node, sources) -> float | None:
     if rows is None or rows <= 0:
         try:
             rows = _estimated_rows(node, sources)
-        except Exception as exc:  # pragma: no cover - the estimator guards itself too
+        except Exception as exc:  # the estimator guards itself too
             note_suppressed("dist", "estimate reducer count", exc)
             rows = None
     return rows if rows is not None and rows > 0 else None

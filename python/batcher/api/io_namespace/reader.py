@@ -1300,7 +1300,8 @@ class Reader:
             connection: An already-open PEP 249 connection or SQLAlchemy handle.
                 Mutually exclusive with `uri`.
             opts: Further options — ``table=``, ``password=``, the partitioning
-                keywords above, or any driver-specific keyword.
+                keywords above, ``governed_as=`` (the table a governance policy is
+                matched against for a query read), or any driver-specific keyword.
 
         Returns:
             A lazy `Dataset` over the query or table result.
@@ -1372,8 +1373,9 @@ class Reader:
 
         Args:
             query: SQL text to execute against Snowflake.
-            opts: ``connection_kwargs=`` (``account``, ``user``, ``warehouse``, ...) plus
-                any other source options.
+            opts: ``connection_kwargs=`` (``account``, ``user``, ``warehouse``, ...),
+                ``governed_as=`` (the table a governance policy is matched against, since
+                a query names none), plus any other source options.
 
         Returns:
             A lazy `Dataset` over the Snowflake query result.
@@ -1416,7 +1418,8 @@ class Reader:
 
         Args:
             query: SQL text to execute, or ``None`` when reading via ``table=``.
-            opts: Project, credentials, and ``table=`` options passed as keywords.
+            opts: Project, credentials, and ``table=`` options passed as keywords, plus
+                ``governed_as=`` to name the table a policy governs a query read by.
 
         Returns:
             A lazy `Dataset` over the BigQuery query or table result.

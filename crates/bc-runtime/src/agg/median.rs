@@ -15,13 +15,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, Float64Builder, Int64Array, Int64Builder, UInt32Array,
+    Array, ArrayRef, AsArray, Float64Builder, Int64Array, Int64Builder, ListArray, PrimitiveArray,
+    UInt32Array,
 };
+use arrow::buffer::OffsetBuffer;
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Float64Type, Int64Type};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Float64Type, Int64Type};
 use arrow::row::{RowConverter, SortField};
 
-use super::{bucket_values_into_list, flatten_list_state, QuantileInterpolation};
+use super::{bucket_values_into_list, QuantileInterpolation};
 use crate::error::RuntimeError;
 
 /// Partial state for MEDIAN: each group's non-null values as one `List` column.
@@ -117,15 +119,89 @@ pub(crate) fn finalize_list_agg(state: &ArrayRef) -> Result<ArrayRef, RuntimeErr
     Ok(Arc::new(rebuilt))
 }
 
-/// Merge per-group value lists across partitions (flatten to `(group, value)`,
-/// re-bucket — no dedup, unlike COUNT(DISTINCT)).
+/// Merge per-group value lists across partitions: each merged group's list is the
+/// concatenation of its partial rows' lists, in row order — no dedup, unlike COUNT(DISTINCT).
+///
+/// This used to flatten the state to one `(group, value)` pair per **element** and re-bucket
+/// every element through a per-group cursor, so a merge moved each value three times (the
+/// group-id fill, the scatter, and the flatten's copy) whatever the shape. A partial's list is
+/// already contiguous per group, so the merge only has to decide the order of the *rows*:
+/// a counting sort of the row ids by merged group, then one slice copy per row. A grouped
+/// `MEDIAN` over TPC-H `lineitem` (7 groups, 6 M values, ~400 partials) has ~2,800 rows to
+/// order and 6 M values to copy once.
+///
+/// The result is element-for-element the flatten-and-bucket one: a group's values come from its
+/// rows in ascending row order and each row's values in their own order — which is exactly the
+/// order the element scatter visited them in. `ListAggOrdered` merges its two aligned lists
+/// through here and relies on that determinism to keep them aligned.
 pub(crate) fn merge_median(
     state: &ArrayRef,
     group_ids: &[u32],
     num_groups: usize,
 ) -> Result<ArrayRef, RuntimeError> {
-    let (elem_groups, values) = flatten_list_state(state, group_ids)?;
-    bucket_values_into_list(&elem_groups, &values, num_groups)
+    let list = state.as_list::<i32>();
+    let offs = list.value_offsets();
+    let child = list.values();
+    debug_assert_eq!(
+        group_ids.len(),
+        list.len(),
+        "one merged group id per partial row"
+    );
+    let group_ids = &group_ids[..list.len()];
+    // Each merged group's row count and element count, then the rows sorted by group, stably.
+    let mut row_start = vec![0usize; num_groups + 1];
+    let mut out_offsets = vec![0i32; num_groups + 1];
+    for (row, &g) in group_ids.iter().enumerate() {
+        row_start[g as usize + 1] += 1;
+        out_offsets[g as usize + 1] += offs[row + 1] - offs[row];
+    }
+    for g in 0..num_groups {
+        row_start[g + 1] += row_start[g];
+        out_offsets[g + 1] += out_offsets[g];
+    }
+    let mut cursor = row_start[..num_groups].to_vec();
+    let mut rows = vec![0u32; group_ids.len()];
+    for (row, &g) in group_ids.iter().enumerate() {
+        rows[cursor[g as usize]] = row as u32;
+        cursor[g as usize] += 1;
+    }
+    let total = out_offsets[num_groups] as usize;
+    let field = Arc::new(Field::new("item", child.data_type().clone(), true));
+    let ordered = match child.data_type() {
+        DataType::Float64 if child.null_count() == 0 => {
+            copy_row_slices::<Float64Type>(child, offs, &rows, total)
+        }
+        DataType::Int64 if child.null_count() == 0 => {
+            copy_row_slices::<Int64Type>(child, offs, &rows, total)
+        }
+        // Any other child (or one carrying nulls, which `array_agg` keeps): gather it through
+        // the element indices in the same order, so nulls and types carry through `take`.
+        _ => {
+            let mut idx: Vec<u32> = Vec::with_capacity(total);
+            for &row in &rows {
+                idx.extend(offs[row as usize] as u32..offs[row as usize + 1] as u32);
+            }
+            take(child.as_ref(), &UInt32Array::from(idx), None)?
+        }
+    };
+    let list = ListArray::try_new(field, OffsetBuffer::new(out_offsets.into()), ordered, None)?;
+    Ok(Arc::new(list))
+}
+
+/// The child values of `rows`' lists, row after row, as one flat array of `total` values.
+fn copy_row_slices<T: ArrowPrimitiveType>(
+    child: &ArrayRef,
+    offs: &[i32],
+    rows: &[u32],
+    total: usize,
+) -> ArrayRef {
+    let src = child.as_primitive::<T>().values();
+    let mut out: Vec<T::Native> = Vec::with_capacity(total);
+    for &row in rows {
+        let (s, e) = (offs[row as usize] as usize, offs[row as usize + 1] as usize);
+        out.extend_from_slice(&src[s..e]);
+    }
+    Arc::new(PrimitiveArray::<T>::new(out.into(), None))
 }
 /// Median per group: the middle value (averaging the two middle for an even count).
 /// Always yields Float64; empty groups → null. (Median is the `q=0.5` quantile.)
@@ -614,6 +690,60 @@ pub(crate) fn finalize_contiguity(
 mod tests {
     use super::*;
     use arrow::array::Float64Array;
+
+    /// The merge as it was before the row-slice copy: flatten to one `(group, value)` pair per
+    /// element, then bucket every element. The oracle the new merge must reproduce exactly.
+    fn merge_by_flatten(state: &ArrayRef, group_ids: &[u32], num_groups: usize) -> ArrayRef {
+        let (elem_groups, values) =
+            super::super::distinct::flatten_list_state(state, group_ids).unwrap();
+        bucket_values_into_list(&elem_groups, &values, num_groups).unwrap()
+    }
+
+    /// `merge_median` is element-for-element the flatten-and-bucket merge, on the shapes where
+    /// a row-slice copy could go wrong: groups interleaved across rows, a merged group with no
+    /// rows, empty lists, a sliced (non-contiguous) list state, null children (kept by
+    /// `array_agg`), and every child type the copy and the `take` fallback each handle.
+    #[test]
+    fn the_row_slice_merge_equals_the_flatten_merge() {
+        use arrow::array::{Int64Array, StringArray};
+        let lens = [3usize, 0, 2, 1, 4, 0, 2, 5];
+        let groups = [2u32, 0, 2, 3, 0, 2, 3, 0]; // group 1 receives no rows
+        let n: usize = lens.iter().sum();
+        let children: Vec<ArrayRef> = vec![
+            Arc::new(Float64Array::from_iter_values(
+                (0..n).map(|i| i as f64 * 1.5),
+            )),
+            Arc::new(Int64Array::from_iter_values(
+                (0..n as i64).map(|i| i * 7 - 20),
+            )),
+            Arc::new(Int64Array::from_iter(
+                (0..n as i64).map(|i| (i % 4 != 1).then_some(i)),
+            )),
+            Arc::new(StringArray::from_iter_values(
+                (0..n).map(|i| format!("v{i}")),
+            )),
+        ];
+        for child in children {
+            let mut offsets = vec![0i32];
+            for &l in &lens {
+                offsets.push(offsets.last().unwrap() + l as i32);
+            }
+            let field = Arc::new(Field::new("item", child.data_type().clone(), true));
+            let whole: ArrayRef = Arc::new(
+                ListArray::try_new(field, OffsetBuffer::new(offsets.into()), child, None).unwrap(),
+            );
+            assert_eq!(
+                merge_median(&whole, &groups, 4).unwrap().as_ref(),
+                merge_by_flatten(&whole, &groups, 4).as_ref(),
+            );
+            // A slice: its offsets no longer start at zero or end at the child's length.
+            let part = whole.slice(2, 5);
+            assert_eq!(
+                merge_median(&part, &groups[2..7], 4).unwrap().as_ref(),
+                merge_by_flatten(&part, &groups[2..7], 4).as_ref(),
+            );
+        }
+    }
 
     /// `histogram` over a Float64 group must fold `-0.0`/`0.0` (and every NaN) into ONE key
     /// with the summed count. Before the fix `[0.0, -0.0]` produced two keys of count 1

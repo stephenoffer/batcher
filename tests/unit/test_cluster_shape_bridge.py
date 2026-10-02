@@ -209,11 +209,6 @@ def test_quarantined_devices_reach_the_shape(fake_ray, monkeypatch):
         _node("well", 96.0, gpus=8.0, accel="H100"),
     ]
     monkeypatch.setattr(
-        shape_mod,
-        "_node_records",
-        lambda: fake_ray.records,
-    )
-    monkeypatch.setattr(
         hp,
         "sampled_device_health",
         lambda: ({"node_id": "sick", "quarantined": ["GPU-a", "GPU-b"], "degraded": ["GPU-b"]},),
@@ -235,7 +230,6 @@ def test_quarantined_devices_reach_the_shape(fake_ray, monkeypatch):
 def test_a_stale_health_record_cannot_drive_healthy_devices_negative(fake_ray, monkeypatch):
     """A record naming devices a resized node no longer has must be capped, not trusted."""
     fake_ray.records = [_node("shrunk", 32.0, gpus=2.0, accel="H100")]
-    monkeypatch.setattr(shape_mod, "_node_records", lambda: fake_ray.records)
     monkeypatch.setattr(
         hp,
         "sampled_device_health",
@@ -250,7 +244,6 @@ def test_planning_never_triggers_a_fleet_wide_health_probe(fake_ray, monkeypatch
     """Probing from the planner would put a round trip to every accelerator node on every
     optimize. Absence of a sample reads as "assume healthy", which is what held before."""
     fake_ray.records = [_node("a", 32.0, gpus=4.0, accel="H100")]
-    monkeypatch.setattr(shape_mod, "_node_records", lambda: fake_ray.records)
 
     def explode():  # pragma: no cover - the point is that it is never called
         raise AssertionError("cluster_shape() probed the fleet's device health")

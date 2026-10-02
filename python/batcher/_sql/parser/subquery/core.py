@@ -24,7 +24,7 @@ from batcher._sql.parser.subquery.correlation import (
 )
 from batcher._sql.parser.subquery.in_set import in_marker as _in_marker
 from batcher._sql.parser.subquery.in_set import not_in_antijoin as _not_in_antijoin
-from batcher._sql.parser.subquery.scalar_sub import decorrelate_scalar_subqueries
+from batcher._sql.parser.subquery.scalar_sub import decorrelate_scalar_subqueries, equality_join
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import col, lit
 
@@ -217,6 +217,9 @@ def _apply_single_predicate(tr, ds: Dataset, pred):
             "in a way that cannot become a join is not supported"
         )
 
+    joined = equality_join(tr, ds, pred)
+    if joined is not None:
+        return joined, None
     return ds, pred
 
 

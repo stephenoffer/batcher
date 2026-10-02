@@ -83,6 +83,15 @@ _GET_RECORDS_MAX_LIMIT = 10_000
 _MAX_FETCH_THREADS = 16
 
 
+#: Options passed through to ``boto3.client("kinesis", ...)`` when set.
+_CLIENT_OPTIONS = (
+    "endpoint_url",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+)
+
+
 @SOURCES.register("kinesis")
 class KinesisSource(BrokerSource):
     """An unbounded Kinesis stream, consumed via ``boto3``.
@@ -153,7 +162,18 @@ class KinesisSource(BrokerSource):
     def _client(self) -> Any:
         if self._client_obj is None:
             boto3 = _import_boto3()
-            self._client_obj = boto3.client("kinesis", region_name=self._options["region"])
+            from batcher.io.credentials import resolve_client_secrets
+            from batcher.io.formats.streaming.broker.schema import _BROKER_SECRET_HINTS
+
+            # An endpoint override reaches LocalStack, a VPC endpoint, or a Kinesis-compatible
+            # service; explicit keys (as secret references, resolved here on the worker) reach
+            # an account the ambient boto3 chain does not. Absent, boto3's defaults apply.
+            extra = {k: self._options[k] for k in _CLIENT_OPTIONS if self._options.get(k)}
+            self._client_obj = boto3.client(
+                "kinesis",
+                region_name=self._options["region"],
+                **resolve_client_secrets(extra, what="kinesis", hints=_BROKER_SECRET_HINTS),
+            )
         return self._client_obj
 
     def _shards(self) -> list[dict[str, Any]]:
@@ -397,7 +417,7 @@ class KinesisSource(BrokerSource):
         """
         client = self._client()
         try:
-            return client.get_records(  # type: ignore[no-any-return]
+            return client.get_records(
                 ShardIterator=self._iterator(shard_id, shard_number),
                 Limit=min(self.poll_size, _GET_RECORDS_MAX_LIMIT),
             )

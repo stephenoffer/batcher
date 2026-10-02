@@ -19,6 +19,7 @@ use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 use std::sync::Arc;
 
+use super::short_key::pack_short_bytes;
 use crate::error::RuntimeError;
 use crate::keys::canon_f64;
 
@@ -214,6 +215,20 @@ pub(crate) fn assign_groups(
             return assign_groups_packed_wide(group_keys, &layout, total, num_rows);
         }
         return assign_groups_multi_raw(group_keys, num_rows);
+    }
+    // Nullable composite `Int64` / string key: every raw fast path above is gated on null-free
+    // columns, so one NULL anywhere in `i_brand` sent TPC-DS q47's six-column GROUP BY (and the
+    // window partitioned on the same keys) down the row encoder below, which was the query's
+    // single hottest kernel. `nullable_codes` rewrites each nullable column as integers that
+    // keep NULL its own value, so the integer grouper handles it exactly as a null-free key.
+    if group_keys.len() >= 2 {
+        if let Some(coded) = nullable_codes(group_keys, num_rows) {
+            let cols: Vec<&Int64Array> = coded
+                .iter()
+                .map(|a| a.as_primitive::<Int64Type>())
+                .collect();
+            return assign_groups_int64_multi(&cols, group_keys, num_rows);
+        }
     }
     // The general (row-encoded) path. Canonicalize float keys FIRST: arrow's row encoding is
     // NOT canonical for floats — it maps `-0.0` and `0.0` to different bytes — so without this
@@ -514,9 +529,9 @@ where
                 .zip(&a.values()[..num_rows])
                 .enumerate()
             {
-                // `to_isize` succeeded for min and max above, so it succeeds for every
-                // value between them.
-                let slot = &mut map[(v.to_isize().unwrap_or(lo) - lo) as usize];
+                // Wrapping arithmetic on the bit pattern: every value lies in `[min, max]`, so
+                // `v - min` is in `[0, span)` modulo 2^64, for signed and unsigned keys alike.
+                let slot = &mut map[v.as_usize().wrapping_sub(lo as usize)];
                 if *slot == u32::MAX {
                     *slot = reps.len() as u32;
                     reps.push(i as u32);
@@ -555,6 +570,17 @@ where
     // path's — so a table sized for the final group count scatters every probe from row zero,
     // where doubling into it keeps the live set compact for most of the pass. See
     // `competitor_technique_review.md` item 26.
+    //
+    // **A run of equal keys is looked up once.** The row before is the one group id this loop
+    // can know without a probe, and a clustered key — a fact table in its surrogate-key order,
+    // `lineitem` by `l_orderkey`, the output of a stable hash shuffle of such a table — repeats
+    // it for most rows: TPC-H `GROUP BY l_orderkey` averages four rows per order, so three
+    // probes in four were a hash, a random load into a 15M-group table and a compare, to learn
+    // the id the previous row already had. The reuse is exact (the id of an equal key *is*
+    // that id, and first-seen order is unchanged because the run's first row assigned it), and
+    // on an unclustered key it costs one compare against a register per row, a branch that
+    // predicts "different" every time.
+    let mut prev: Option<(T::Native, u32)> = None;
     for i in 0..num_rows {
         if a.is_null(i) {
             let gid = *null_gid.get_or_insert_with(|| {
@@ -563,9 +589,16 @@ where
                 g
             });
             group_ids.push(gid);
+            prev = None;
             continue;
         }
         let v = a.value(i);
+        if let Some((pv, pg)) = prev {
+            if pv == v {
+                group_ids.push(pg);
+                continue;
+            }
+        }
         let hash = state.hash_one(v);
         let gid = match table.entry(hash, |&(k, _)| k == v, |&(k, _)| state.hash_one(k)) {
             Entry::Occupied(e) => e.get().1,
@@ -577,6 +610,7 @@ where
             }
         };
         group_ids.push(gid);
+        prev = Some((v, gid));
     }
     (group_ids, reps)
 }
@@ -686,8 +720,7 @@ where
         // routing a low-cardinality key to `int_group_ids`' dense direct-map instead of hashing
         // byte slices. Distinct `(len, bytes)` → distinct `u64`, so the groups are identical.
         if let Some(packed) = pack_short_bytes::<T>(a, num_rows) {
-            let keys = arrow::array::UInt64Array::from(packed);
-            let (group_ids, reps) = int_group_ids::<UInt64Type>(&keys, num_rows);
+            let (group_ids, reps) = super::short_key::short_group_ids(&packed);
             let num_groups = reps.len();
             let group_columns = group_columns(std::slice::from_ref(arr), reps, num_rows)?;
             return Ok((group_ids, num_groups, group_columns));
@@ -787,14 +820,17 @@ where
     let bytes = &a.value_data()[base..base + num_rows];
     let mut slot = [u32::MAX; 256];
     let mut reps: Vec<u32> = Vec::new();
-    let mut group_ids = Vec::with_capacity(num_rows);
-    for (i, &b) in bytes.iter().enumerate() {
+    // Written into a pre-sized buffer rather than `push`ed: a `push` re-checks capacity and
+    // bumps a length on every row of the loop the engine's flag-keyed aggregates spend a third
+    // of their time in, and zipping two equal-length slices proves every index for free.
+    let mut group_ids = vec![0u32; num_rows];
+    for (i, (out, &b)) in group_ids.iter_mut().zip(bytes).enumerate() {
         let s = &mut slot[b as usize];
         if *s == u32::MAX {
             *s = reps.len() as u32;
             reps.push(i as u32);
         }
-        group_ids.push(*s);
+        *out = *s;
     }
     Some((group_ids, reps))
 }
@@ -831,15 +867,15 @@ fn bytes1_multi_group_ids(cols: &[ArrayRef], num_rows: usize) -> Option<(Vec<u32
     if let [c0, c1] = byte_cols[..] {
         let mut slot = vec![u32::MAX; 1 << 16];
         let mut reps: Vec<u32> = Vec::new();
-        let mut group_ids = Vec::with_capacity(num_rows);
-        for i in 0..num_rows {
-            let idx = (c0[i] as usize) | ((c1[i] as usize) << 8);
-            let s = &mut slot[idx];
+        // Pre-sized and zipped for the reason `byte1_group_ids` gives.
+        let mut group_ids = vec![0u32; num_rows];
+        for (i, ((out, &b0), &b1)) in group_ids.iter_mut().zip(c0).zip(c1).enumerate() {
+            let s = &mut slot[(b0 as usize) | ((b1 as usize) << 8)];
             if *s == u32::MAX {
                 *s = reps.len() as u32;
                 reps.push(i as u32);
             }
-            group_ids.push(*s);
+            *out = *s;
         }
         return Some((group_ids, reps));
     }
@@ -874,65 +910,6 @@ where
         return None;
     }
     Some((&a.value_data()[base..base + num_rows], true))
-}
-
-/// Pack each null-free byte-string ≤ 7 bytes into a `u64` group key, or `None` if any value
-/// exceeds 7 bytes (in which case the caller keeps the byte-slice hash path).
-///
-/// The key is `(len << 56) | little_endian(bytes)`: the length occupies the high byte and the
-/// ≤ 7 payload bytes the low 56 bits, so two values collide iff they have the same length and
-/// the same bytes — i.e. iff the strings are equal. That injectivity is what lets the integer
-/// grouping produce the exact same groups as hashing the slices directly. One linear pass over
-/// the offsets bails out the moment a value is too long, so a long-string column pays only a
-/// cheap scan before falling back.
-///
-/// ## Seven bytes, and why widening it to fifteen does not pay
-///
-/// Seven is a low ceiling for a categorical key — an ISO code, a SKU, a `YYYY-MM-DD`, most real
-/// identifiers are wider — and the byte-slice hash path beyond it is the engine's worst measured
-/// group-by shape. On the H2O db-benchmark's group-by table at its 1e7-row tier, over 100,000
-/// groups and the identical `sum(v1)`:
-///
-/// | key | bytes | Batcher | DuckDB |
-/// |---|---|---:|---:|
-/// | `id6` (`int32`) | — | 26.0 ms | 31.6 ms |
-/// | `id3` (`'id0000039083'`) | 12 | 54.5 ms | 32.0 ms |
-///
-/// Same cardinality, same aggregate: the string key costs **2.1x** what the integer one does,
-/// while DuckDB pays the same either way. So the obvious move is to pack 8-15 bytes into an
-/// `i128` and route it through [`int_group_ids`] exactly as this does for `u64`.
-///
-/// **It was built and measured, and it is 1.13x *slower*** (`id3` 49.7/53.0 ms -> 57.6/59.2 ms
-/// over two interleaved rounds, same tree, two `.so`s differing only in this). Two costs swamp
-/// the saving, and both are properties of the wide key rather than of the implementation: the
-/// packing is a second full pass that materializes a 160 MB `Vec<i128>` the hash path never
-/// allocates, and `int_group_ids`' inline-key table becomes 20 bytes a slot against the byte
-/// path's 4, so it loses far more to cache misses on a 100,000-group probe than it gains by
-/// comparing registers instead of slices. The byte path is not naive: it already keeps each
-/// group's representative *slice* beside its id, so its comparison costs no indirection either.
-///
-/// The gap is real and still open; a wider pack of the same shape is not the way to close it.
-/// What the measurement points at is the representation, not the key width — a `StringView`
-/// leaf with an inline prefix, so the comparison never leaves the array that was scanned
-/// (`competitor_technique_review.md` item 2).
-fn pack_short_bytes<T>(a: &GenericByteArray<T>, num_rows: usize) -> Option<Vec<u64>>
-where
-    T: arrow::array::types::ByteArrayType,
-{
-    let mut out = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
-        let v: &[u8] = a.value(i).as_ref();
-        let len = v.len();
-        if len > 7 {
-            return None;
-        }
-        let mut key = (len as u64) << 56;
-        for (j, &b) in v.iter().enumerate() {
-            key |= u64::from(b) << (8 * j);
-        }
-        out.push(key);
-    }
-    Some(out)
 }
 
 /// `(len, bytes)` packed into a `u128` per row, or `None` when some value exceeds 15 bytes.
@@ -1115,9 +1092,8 @@ fn combine_hash(a: u64, b: u64) -> u64 {
 
 /// Per-row hashes of a null-free composite `Int64` key, one **column at a time**.
 ///
-/// The probe loop this feeds used to hash row-major: construct an `ahash` hasher, walk the
-/// column list writing each value into it, finish it — per row. This does the same work
-/// column-major instead, one tight pass per column over a contiguous `&[i64]`. It is the
+/// The row-major alternative constructs an `ahash` hasher, walks the column list writing each
+/// value into it, and finishes it — per row. This does the same work column-major instead, one tight pass per column over a contiguous `&[i64]`. It is the
 /// shape DuckDB (`TightLoopCombineHash`) and Polars (`vec_hash_combine`) both use, and each
 /// pass streams two slices with no hasher state to spill, no bounds check, and no indirect
 /// call through a column list — the column count is loop-invariant rather than re-walked per
@@ -1130,8 +1106,7 @@ fn combine_hash(a: u64, b: u64) -> u64 {
 ///
 /// The `8 x num_rows` this costs is deliberate and is less than the neighbouring paths already
 /// spend — `assign_groups_packed` materializes a `u128` per row, and the `RowConverter` path a
-/// whole encoded row. Storing the hash in the table entry instead was **built and measured**,
-/// and it loses: it removes the array but quadruples the entry (4 bytes to 16), and past a few
+/// whole encoded row. Storing the hash in the table entry instead **measures worse**: it removes the array but quadruples the entry (4 bytes to 16), and past a few
 /// hundred thousand groups the wider table costs more cache than the free rehash saves. See
 /// `competitor_technique_review.md` item 26.
 fn hash_columns_i64(values: &[&[i64]], num_rows: usize) -> Vec<u64> {
@@ -1163,8 +1138,8 @@ fn assign_groups_int64_multi(
         }
     }
 
-    // **Tried and reverted: delegating a two-column key to `assign_groups_packed`.** The loop
-    // below verifies a probe with `eq_rows(reps[g], i)`, reading the rep row in *every* key
+    // **A two-column key is not delegated to `assign_groups_packed`.** The loop below verifies a
+    // probe with `eq_rows(reps[g], i)`, reading the rep row in *every* key
     // column — one random access per column into an array of `8 × num_rows` bytes, on the
     // critical path of each probe. That is the defect [`int_group_ids`] carried, multiplied by
     // the column count, and it costs **362.7 ns/row** at 1.7 M groups and **469.6 ns/row** at
@@ -1175,12 +1150,9 @@ fn assign_groups_int64_multi(
     // *every* row, which is pure overhead once the table is small enough to stay in L1 — the
     // low-cardinality composite key (`GROUP BY <region>, <status>`) measured **21.4 ns/row
     // against 12.3**, a 1.7x regression on the commoner shape. Two cached loads beat building
-    // a key. Restoring the delegation needs a cardinality signal to gate it on, which is not
-    // available here before the probe loop has run.
-    //
-    // Those figures predate the hash now stored in the entry, which removes most of what the
-    // packing was for: the rep-row read still happens, but only once a full 64-bit hash has
-    // matched, rather than on every tag collision. Re-measure before reviving the idea.
+    // a key. Delegating needs a cardinality signal to gate it on, which is not available here
+    // before the probe loop has run. The probe loop has changed since these figures were
+    // taken, so re-measure before reviving the idea.
 
     // Raw value slices for the equality check. `Int64Array::value(i)` re-reads the array's
     // offset and re-checks its bounds on every access, and a probe makes `cols.len()` of them
@@ -1188,12 +1160,10 @@ fn assign_groups_int64_multi(
     let values: Vec<&[i64]> = cols.iter().map(|c| &c.values()[..num_rows]).collect();
     let eq_rows = |a: usize, b: usize| -> bool { values.iter().all(|v| v[a] == v[b]) };
 
-    // The entry carries the row's hash beside its group id, which pays for itself twice. The
-    // table's rehash closure — which fires on every growth step, and which previously had to
-    // re-read the representative row out of *every* key column, one random access each into
-    // `8 x num_rows` bytes — becomes the identity. And a probe compares the full 64-bit hash
-    // before `eq_rows`, so the scattered per-column reads happen only on a real candidate
-    // rather than on `hashbrown`'s 1-in-128 tag collisions.
+    // The per-row hashes stay live beside the table (see `hash_columns_i64`), so the table's
+    // rehash closure — which fires on every growth step — is one array read rather than a
+    // re-read of the representative row out of *every* key column, one random access each into
+    // `8 x num_rows` bytes.
     let hashes = hash_columns_i64(&values, num_rows);
     let mut table: HashTable<u32> = HashTable::with_capacity(group_table_capacity(num_rows));
     let mut reps: Vec<u32> = Vec::new(); // group_id -> first-seen row index
@@ -1290,6 +1260,11 @@ where
     if a.null_count() != 0 {
         return None;
     }
+    // Short values rank as packed registers: no slice hash, no `memcmp` per row.
+    if let Some(packed) = pack_short_bytes::<T>(a, num_rows) {
+        let codes = super::short_key::rank_short(&packed, RANK_MAX_DISTINCT)?;
+        return Some(Arc::new(Int64Array::from(codes)) as ArrayRef);
+    }
     let mut ids: ahash::AHashMap<&[u8], i64> = ahash::AHashMap::new();
     let mut codes: Vec<i64> = Vec::with_capacity(num_rows);
     for i in 0..num_rows {
@@ -1301,6 +1276,78 @@ where
                 return None; // too many distinct values for ranking to pay
             }
             let code = ids.len() as i64;
+            ids.insert(value, code);
+            code
+        };
+        codes.push(code);
+    }
+    Some(Arc::new(Int64Array::from(codes)) as ArrayRef)
+}
+
+/// A composite key with NULLs, as null-free `Int64` columns that group exactly as it does,
+/// or `None` when some column is neither `Int64` nor a byte type, when no column holds a NULL
+/// (the null-free paths already cover that), or when a nullable byte column passes
+/// [`RANK_MAX_DISTINCT`].
+///
+/// SQL groups every NULL of a column together and apart from every value, so a NULL needs a
+/// code of its own. A nullable byte column is ranked with NULL as code 0 and its values from
+/// 1 in first-seen order; a nullable `Int64` column becomes two columns, a null flag and the
+/// value with NULLs zeroed, because no `i64` is free to stand for NULL. Both maps are
+/// injective, so two rows share a code tuple exactly when they share a key under SQL's
+/// grouping, and the ids and first-seen representatives match the row-encoded oracle's.
+fn nullable_codes(cols: &[ArrayRef], num_rows: usize) -> Option<Vec<ArrayRef>> {
+    use arrow::datatypes::DataType::{Binary, Int64, LargeBinary, LargeUtf8, Utf8};
+
+    if cols.iter().all(|a| a.null_count() == 0) {
+        return None;
+    }
+    let mut out: Vec<ArrayRef> = Vec::with_capacity(cols.len() + 1);
+    for a in cols {
+        match a.data_type() {
+            Int64 if a.null_count() == 0 => out.push(Arc::clone(a)),
+            Int64 => {
+                let v = a.as_primitive::<Int64Type>();
+                let flags: Int64Array = (0..num_rows)
+                    .map(|i| Some(i64::from(v.is_null(i))))
+                    .collect();
+                let values: Int64Array = (0..num_rows)
+                    .map(|i| Some(if v.is_null(i) { 0 } else { v.value(i) }))
+                    .collect();
+                out.push(Arc::new(flags) as ArrayRef);
+                out.push(Arc::new(values) as ArrayRef);
+            }
+            Utf8 => out.push(rank_nullable_bytes::<Utf8Type>(a, num_rows)?),
+            LargeUtf8 => out.push(rank_nullable_bytes::<LargeUtf8Type>(a, num_rows)?),
+            Binary => out.push(rank_nullable_bytes::<BinaryType>(a, num_rows)?),
+            LargeBinary => out.push(rank_nullable_bytes::<LargeBinaryType>(a, num_rows)?),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// One byte column's values as dense `Int64` codes, NULL as 0 and values from 1 in
+/// first-seen order, or `None` past [`RANK_MAX_DISTINCT`].
+fn rank_nullable_bytes<T>(arr: &ArrayRef, num_rows: usize) -> Option<ArrayRef>
+where
+    T: arrow::array::types::ByteArrayType,
+{
+    let a = arr.as_bytes::<T>();
+    let mut ids: ahash::AHashMap<&[u8], i64> = ahash::AHashMap::new();
+    let mut codes: Vec<i64> = Vec::with_capacity(num_rows);
+    for i in 0..num_rows {
+        if a.is_null(i) {
+            codes.push(0);
+            continue;
+        }
+        let value: &[u8] = a.value(i).as_ref();
+        let code = if let Some(&code) = ids.get(value) {
+            code
+        } else {
+            if ids.len() == RANK_MAX_DISTINCT {
+                return None;
+            }
+            let code = ids.len() as i64 + 1;
             ids.insert(value, code);
             code
         };
@@ -2019,6 +2066,35 @@ mod tests {
         check_i64(vals);
     }
 
+    /// Runs of equal keys on the hash path reuse the previous row's id; the reuse must give the
+    /// reference's ids exactly, across a null breaking a run, a key recurring after its run
+    /// ended, and runs of one.
+    #[test]
+    fn clustered_sparse_keys_reuse_the_run_and_match_reference() {
+        let vals: Vec<Option<i64>> = (0..2000)
+            .map(|i: i64| match i % 37 {
+                5 | 6 => None,
+                // Runs of 1..4 rows over a sparse key, a key revisited every 300 rows.
+                _ => Some((i / ((i % 4) + 1)) % 300 * 1_000_003 - 7),
+            })
+            .collect();
+        check_i64(vals.clone());
+        // A pure run structure: every key repeated 4 times, consecutively.
+        let runs: Vec<Option<i64>> = (0..4000).map(|i: i64| Some((i / 4) * 999_983)).collect();
+        check_i64(runs);
+        // A key equal to the previous one only across a null — must not merge with the null.
+        let across: Vec<Option<i64>> = (0..900)
+            .map(|i: i64| {
+                if i % 3 == 1 {
+                    None
+                } else {
+                    Some((i / 3) * 1_000_003)
+                }
+            })
+            .collect();
+        check_i64(across);
+    }
+
     /// Two far-apart values: span is huge but only 2 groups — must NOT build a giant map.
     #[test]
     fn two_distant_values_fall_back_and_match_reference() {
@@ -2183,6 +2259,27 @@ mod tests {
     #[test]
     fn short_strings_mixed_lengths_stay_distinct() {
         check_str(vec!["", "a", "aa", "a", "aaa", "", "aa", "b", "ab", "ba"]);
+    }
+
+    /// The packing loads 8 bytes per value and masks to its length, so the bytes *after* a
+    /// value — the next value's — must never reach its key. Values that are prefixes of their
+    /// successors (`"ab"` then `"abc"`), every length 0..=7, and the last values of the buffer
+    /// (where the load would overrun and the byte loop takes over), over a fresh array and a
+    /// slice of one whose offsets do not start at zero.
+    #[test]
+    fn short_strings_load_past_their_end_and_mask_it() {
+        let alphabet = [
+            "", "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "b", "ba",
+        ];
+        let vals: Vec<&str> = (0..300)
+            .map(|i| alphabet[(i * 7) % alphabet.len()])
+            .collect();
+        check_str(vals.clone());
+        let arr: ArrayRef = Arc::new(StringArray::from(vals.clone()));
+        let sliced = arr.slice(37, 200);
+        let (ids, n, _) = assign_groups(&[sliced], 200).unwrap();
+        let (want_ids, want_n, _) = reference_str(&vals[37..237]);
+        assert_eq!((ids, n), (want_ids, want_n));
     }
 
     /// A key longer than 7 bytes forces the fallback hash path — which must still be correct.
@@ -2665,5 +2762,83 @@ mod tests {
                 "projected capacity must not exceed the input"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod nullable_composite_tests {
+    use super::*;
+    use arrow::array::StringArray;
+
+    /// Naive first-seen grouping over `Option` tuples: SQL's NULL-groups-together semantics.
+    fn reference(rows: &[(Option<&str>, Option<i64>, Option<&str>)]) -> (Vec<u32>, Vec<u32>) {
+        let mut seen: Vec<(Option<&str>, Option<i64>, Option<&str>)> = Vec::new();
+        let mut reps = Vec::new();
+        let ids = rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| match seen.iter().position(|s| s == r) {
+                Some(g) => g as u32,
+                None => {
+                    seen.push(*r);
+                    reps.push(i as u32);
+                    (seen.len() - 1) as u32
+                }
+            })
+            .collect();
+        (ids, reps)
+    }
+
+    #[test]
+    fn a_nullable_composite_key_groups_like_sql_and_avoids_the_row_encoder() {
+        let mut rows = Vec::new();
+        for i in 0..3_000_i64 {
+            let a = if i % 7 == 0 {
+                None
+            } else {
+                Some(["x", "y", "", "zz"][(i % 4) as usize])
+            };
+            let b = if i % 11 == 0 { None } else { Some(i % 5 - 2) };
+            let c = if i % 13 == 0 {
+                None
+            } else {
+                Some(["p", "q"][(i % 2) as usize])
+            };
+            rows.push((a, b, c));
+        }
+        let keys: Vec<ArrayRef> = vec![
+            Arc::new(rows.iter().map(|r| r.0).collect::<StringArray>()),
+            Arc::new(rows.iter().map(|r| r.1).collect::<Int64Array>()),
+            Arc::new(rows.iter().map(|r| r.2).collect::<StringArray>()),
+        ];
+        // The fast path must actually engage for this shape.
+        assert!(nullable_codes(&keys, rows.len()).is_some());
+        let (ids, n, cols) = assign_groups(&keys, rows.len()).unwrap();
+        let (want_ids, want_reps) = reference(&rows);
+        assert_eq!(ids, want_ids);
+        assert_eq!(n, want_reps.len());
+        let want_first =
+            arrow::compute::take(&keys[1], &UInt32Array::from(want_reps), None).unwrap();
+        assert_eq!(cols[1].as_ref(), want_first.as_ref());
+    }
+
+    #[test]
+    fn an_empty_string_is_not_null() {
+        let keys: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![Some(""), None, Some(""), None])),
+            Arc::new(Int64Array::from(vec![1, 1, 1, 1])),
+        ];
+        let (ids, n, _) = assign_groups(&keys, 4).unwrap();
+        assert_eq!((ids, n), (vec![0, 1, 0, 1], 2));
+    }
+
+    #[test]
+    fn a_null_int_is_not_zero() {
+        let keys: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![Some(0), None, Some(0), None])),
+            Arc::new(StringArray::from(vec!["a", "a", "a", "a"])),
+        ];
+        let (ids, n, _) = assign_groups(&keys, 4).unwrap();
+        assert_eq!((ids, n), (vec![0, 1, 0, 1], 2));
     }
 }

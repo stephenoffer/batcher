@@ -170,7 +170,7 @@ def link_gauges() -> list[str]:
         from batcher._internal.hardware.telemetry.throughput import device_throughput
 
         return _emit("device", _LINK_GAUGES, device_throughput())
-    except Exception as exc:  # pragma: no cover - a scrape must never fail a process
+    except Exception as exc:  # a scrape must never fail a process
         note_suppressed("observe", "read the node's link throughput", exc)
         return []
 

@@ -24,7 +24,7 @@ _DEFAULT_BUDGET = int(MemoryConfig().default_total_bytes * MemoryConfig().hard_l
 
 def test_pid_defaults_are_canonical_gains():
     """Regression for the ki/kd transposition: the only PID controller that exists
-    (bc-udf BatchSizeController / ml.inference._LatencyController) uses
+    (ml.inference._LatencyController) uses
     kp=0.4, ki=0.05, kd=0.1. Config must match — not the old swapped 0.4/0.1/0.05."""
     pid = Config().pid
     assert (pid.kp, pid.ki, pid.kd) == (0.4, 0.05, 0.1)
@@ -69,6 +69,7 @@ def test_engine_config_json_shape_and_defaults():
         "morsel_bytes": 1 << 20,
         "parallelism": 0,
         "memory_budget_bytes": _DEFAULT_BUDGET,
+        "memory_soft_fraction": 0.85,
         "spill_dir": None,
         "spill_compression": "auto",
         "fuse_linear": True,
@@ -86,6 +87,7 @@ def test_engine_config_json_shape_and_defaults():
         "morsel_bytes": 1 << 15,
         "parallelism": 3,
         "memory_budget_bytes": _DEFAULT_BUDGET,
+        "memory_soft_fraction": 0.85,
         "spill_dir": None,
         "spill_compression": "auto",
         "fuse_linear": True,
@@ -136,6 +138,16 @@ def test_engine_config_ships_spill_budget_when_capped():
     payload = json.loads(scoped.engine_config_json())
     assert payload["memory_budget_bytes"] == 900_000
     assert payload["spill_dir"] == "/scratch"
+
+
+def test_engine_config_ships_the_soft_line_the_pressure_monitor_reads():
+    """The engine pool's soft line is `memory.soft_limit`, pulled down to `hard_limit` the
+    way `PressureMonitor._classify` pulls it, so the pool's reported ELEVATED and the
+    monitor's SPILL reading of that pool begin at the same fraction (F066)."""
+    payload = json.loads(Config().replace(memory=MemoryConfig(soft_limit=0.7)).engine_config_json())
+    assert payload["memory_soft_fraction"] == 0.7
+    inverted = Config().replace(memory=MemoryConfig(soft_limit=0.95, hard_limit=0.9))
+    assert json.loads(inverted.engine_config_json())["memory_soft_fraction"] == 0.9
 
 
 def test_from_env_overlays_nested_sections():
@@ -236,16 +248,12 @@ def test_validate_covers_every_section():
         "target_bytes_per_task": Config().replace(
             optimizer=OptimizerConfig(target_bytes_per_task=0)
         ),
-        "join thresholds": Config().replace(
-            optimizer=OptimizerConfig(join_dp_max_tables=20, greedy_max_tables=10)
-        ),
         "eq_selectivity": Config().replace(
             optimizer=OptimizerConfig(cardinality=CardinalityConfig(eq_selectivity=5.0))
         ),
         "pid gains": Config().replace(pid=PIDConfig(kp=-1.0)),
         "max_step_fraction": Config().replace(pid=PIDConfig(max_step_fraction=1.5)),
         "metadata.backend": Config().replace(metadata=MetadataConfig(backend="postgres")),
-        "decay_per_day": Config().replace(metadata=MetadataConfig(decay_per_day=2.0)),
         "log_level": Config().replace(observability=ObservabilityConfig(log_level="LOUD")),
         "log_format": Config().replace(observability=ObservabilityConfig(log_format="xml")),
     }

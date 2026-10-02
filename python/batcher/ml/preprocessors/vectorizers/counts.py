@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.ml.preprocessors.base import Preprocessor, column_arg
-from batcher.ml.preprocessors.vectorizers.assemble import bag_of_words, set_columns
+from batcher.ml.preprocessors.vectorizers.assemble import (
+    bag_of_words,
+    null_document_policy,
+    set_columns,
+)
 from batcher.ml.preprocessors.vectorizers.tokens import (
     DEFAULT_TOKEN_PATTERN,
     resolve_stop_words,
@@ -106,6 +110,10 @@ class CountVectorizer(Preprocessor):
         binary: Record presence as ``1.0`` rather than the count.
         dense: Emit one fixed-width list column instead of the index/value pair.
         max_vocabulary: The ceiling on the learned vocabulary size.
+        null_documents: ``"empty"`` (the default) reads a null document as one with no
+            terms: it counts toward the fitted document count and gets an empty row.
+            ``"null"`` keeps it missing: it is left out of the fit and every output column
+            is null for it, so missing text stays distinguishable from empty text.
     """
 
     __slots__ = (
@@ -120,6 +128,7 @@ class CountVectorizer(Preprocessor):
         "max_vocabulary",
         "min_df",
         "ngram_range",
+        "null_documents",
         "output_column",
         "stop_words",
         "token_pattern",
@@ -141,9 +150,11 @@ class CountVectorizer(Preprocessor):
         binary: bool = False,
         dense: bool = False,
         max_vocabulary: int = MAX_VOCABULARY,
+        null_documents: str = "empty",
     ) -> None:
         what = type(self).__name__
         self.column = column_arg(column, what=what)
+        self.null_documents = null_document_policy(null_documents, what=what)
         self.output_column = output_column
         self.lowercase = lowercase
         self.token_pattern = token_pattern
@@ -242,6 +253,8 @@ class CountVectorizer(Preprocessor):
             PlanError: If the vocabulary exceeds `max_vocabulary`, or the document-frequency
                 bounds admit nothing.
         """
+        if self.null_documents == "null":
+            ds = ds.filter(col(self.column).is_not_null())
         n_documents = ds.count()
         lower, upper = self._bounds(n_documents)
         stats = _document_stats(ds, self._terms()).filter(
@@ -319,9 +332,16 @@ class CountVectorizer(Preprocessor):
         binary, dense = self.binary, self.dense
         indices_column, values_column = self.indices_column, self.values_column
         term_column = "__bt_terms"
-        keep = self._output_columns(ds)
+        final = self._output_columns(ds)
+        keep_nulls = self.null_documents == "null"
+        text_column = self.column
 
         def _udf(batch: Any) -> Any:
+            null_rows = (
+                batch.column(text_column).is_null().to_numpy(zero_copy_only=False)
+                if keep_nulls
+                else None
+            )
             built = bag_of_words(
                 batch.column(term_column),
                 vocabulary=vocabulary,
@@ -331,11 +351,12 @@ class CountVectorizer(Preprocessor):
                 weights=weights,
                 norm=norm,
                 dense=dense,
+                null_rows=null_rows,
             )
             written = {values_column: built["values"]}
             if not dense:
                 written[indices_column] = built["indices"]
-            return set_columns(batch, written).select(keep)
+            return set_columns(batch, written).select(final)
 
         staged = ds.with_columns(**{term_column: self._terms()})
-        return staged.map_batches(_udf, output_columns=keep)
+        return staged.map_batches(_udf, output_columns=final)

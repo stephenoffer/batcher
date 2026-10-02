@@ -99,6 +99,17 @@ _SHAPES = {
     "computed_window_key_and_a_projection_above": lambda ds: ds.window(
         partition_by=[bt.col("a") % 4], order_by=["b"], functions={"r": "row_number"}
     ).select("rid", "a", "r"),
+    # A *global* window is cut on its leading ORDER BY key instead, by the same range
+    # partitioner the sort uses, so a computed order key needs the same hoist (F092).
+    "computed_global_window_order_key": lambda ds: ds.window(
+        order_by=[bt.col("a") * 2 + bt.col("b")], functions={"r": "rank"}
+    ),
+    # A window over another window: the outer one's input is a breaker, so no bounded route
+    # takes it and it materializes. The hoist used to be kept anyway, and the materializing
+    # fallback returned the hidden `__win_key_0` column from `iter_batches()`.
+    "computed_window_key_over_another_window": lambda ds: ds.window(
+        partition_by=[bt.col("a") % 5], order_by=["rid"], functions={"s": "row_number"}
+    ).window(partition_by=[bt.col("b") % 3], order_by=["rid"], functions={"r": "row_number"}),
 }
 
 

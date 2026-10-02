@@ -102,12 +102,29 @@ Reach for `spectral_rolloff` first on an unknown corpus. It says where a recordi
 
 All four average over frames and skip frames with no energy. Counting a silent frame as "0 Hz" would drag the average toward DC and make a mostly quiet recording look band-limited, which is the exact confusion these measures exist to resolve.
 
+## Refusing clips that didn't decode
+
+An undecodable clip becomes null instead of failing the scan, so a corpus that is mostly MP3 can pass through every method above and come out mostly null. `decode()` is null exactly when a clip's bytes are present and unreadable, so it's the check that makes decoding strict. Declare it as a data-quality constraint. `validate()` counts the rejected rows, `fail()` stops the pipeline on the first one, and `quarantine()` routes them aside:
+
+```python
+from batcher import col
+
+mixed = bt.from_pydict({"bytes": [clip, b"ID3\x03 an MP3 header", None]})
+decodable = mixed.dq.check(
+    col("bytes").is_null() | col("bytes").audio.decode().is_not_null(), name="decodable"
+)
+print(str(decodable.validate()))
+# ValidationReport(violations: decodable=1)
+```
+
+The null clip passes, since missing input isn't a decode failure. Add `not_null("bytes")` to refuse that too. `decode()` also reports each clip's original `channels`, which is the one place that count survives the downmix described below.
+
 ## Requirements and limitations
 
-- Native decode covers WAV/PCM and FLAC, the `symphonia` codecs the engine is built with. Bytes in any other container decode to null rather than raising, so a corpus of MP3 or Ogg needs a conversion pass before these methods see it.
+- Native decode covers WAV/PCM and FLAC, the `symphonia` codecs the engine is built with. Bytes in any other container decode to null rather than raising, so a corpus of MP3 or Ogg needs a conversion pass before these methods see it. Make the decode strict with the check above.
 - The level and hygiene measures, `trim_silence`, `peak_normalize`, `rms_normalize` and `pre_emphasis` need no sample rate, so they take a waveform column as readily as encoded bytes and chain without re-decoding. `encode_wav` also takes a waveform, provided you pass `rate`. The methods defined against a rate, meaning `resample`, `slice`, `pad_or_trim` and the spectral front ends, need encoded bytes. Handed a waveform, they name the method and say what to do instead.
 - The waveform methods return a variable-length `list<float32>` column. That includes `pad_or_trim`, whose rows all share one length but whose type stays `list<float32>`, so the declared schema matches the column.
-- Multi-channel audio is averaged to mono at decode.
+- Multi-channel audio is averaged to mono at decode, so channel and spatial information is gone from every waveform and feature. There is no channel-preserving mode. Split channels before the bytes reach Batcher when a model needs them.
 
 ## See also
 

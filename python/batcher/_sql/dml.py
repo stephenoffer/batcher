@@ -23,33 +23,24 @@ from batcher._sql import translate_ast
 from batcher._sql.parser.translator import _Translator
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import Expr, col, lit, nullif, when
+from batcher.plan.expr_ir.constructors import null_of_type
+from batcher.plan.types import dtype_name
 
 __all__ = ["align_insert", "apply_dml"]
 
 _Registry = dict[str, Dataset]
 
 
-def _cast_name(dtype: pa.DataType) -> str | None:
-    """The engine cast target for an Arrow type, or None to leave a value as-is."""
-    if pa.types.is_integer(dtype):
-        return "int64"
-    if pa.types.is_floating(dtype) or pa.types.is_decimal(dtype):
-        return "float64"
-    if pa.types.is_string(dtype) or pa.types.is_large_string(dtype):
-        return "string"
-    if pa.types.is_boolean(dtype):
-        return "bool"
-    if pa.types.is_date(dtype):
-        return "date"
-    if pa.types.is_timestamp(dtype):
-        return "timestamp"
-    return None
+def _typed_null(dtype: pa.DataType) -> Expr:
+    """A NULL of the column's exact type, or the untyped (Int64) NULL for a nested one."""
+    typed = null_of_type(dtype)
+    return typed if typed is not None else nullif(lit(0), lit(0))
 
 
-def _typed_null(cast_name: str | None) -> Expr:
-    """A NULL literal typed to `cast_name` (`lit(None)` has no wire type)."""
-    n = nullif(lit(0), lit(0))
-    return n.cast(cast_name) if cast_name is not None else n
+def _cast_to(value: Expr, dtype: pa.DataType) -> Expr:
+    """`value` cast to the column's exact type, or as-is for one the engine cannot cast to."""
+    name = None if pa.types.is_null(dtype) else dtype_name(dtype)
+    return value.cast(name) if name is not None else value
 
 
 def _target_name(table_node: Any) -> str:
@@ -131,14 +122,11 @@ def align_insert(
 
     projections: dict[str, Expr] = {}
     for c in target_cols:
-        cast_name = _cast_name(target_types[c])
-        if c in provided:
-            value: Expr = col(provided[c])
-            if cast_name is not None:
-                value = value.cast(cast_name)
-        else:
-            value = _typed_null(cast_name)
-        projections[c] = value
+        projections[c] = (
+            _cast_to(col(provided[c]), target_types[c])
+            if c in provided
+            else _typed_null(target_types[c])
+        )
     return new_rows.select(**projections)
 
 
@@ -181,10 +169,7 @@ def _update(node: Any, registry: _Registry, functions: dict[str, Any]) -> tuple[
         if c not in assignments:
             projections[c] = col(c)
             continue
-        value = assignments[c]
-        cast_name = _cast_name(target_types[c])
-        if cast_name is not None:
-            value = value.cast(cast_name)
+        value = _cast_to(assignments[c], target_types[c])
         # A predicate restricts the update to the rows it selects; a NULL predicate
         # leaves the row unchanged (the CASE falls through to the old value).
         projections[c] = when(pred).then(value).otherwise(col(c)) if pred is not None else value

@@ -1,8 +1,7 @@
 """Differential tests for numeric edge cases fixed in the bug-hunt sweep.
 
 Each test pins a specific defect: the query returned the wrong answer (or crashed)
-before the fix and matches DuckDB after it. See docs/architecture/internals/bug_hunt_ledger.md
-(B4-B14).
+before the fix and matches DuckDB after it.
 """
 
 from __future__ import annotations

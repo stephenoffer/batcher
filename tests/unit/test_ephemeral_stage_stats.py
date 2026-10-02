@@ -19,6 +19,10 @@ Recording them anyway cost three separate things, and the third is the expensive
 The same argument disqualifies the plan cache from storing a plan built over such a source:
 the entry could never be read again, it evicts one that would have hit, and `store` pins
 the source tuple alive — so the stage's whole materialized intermediate stays resident.
+The exception is a stage source named by its *derivation* (`plan.source_stats.derivation_key`
+of the stage's subplan over its inputs' keys): the next run of the query derives the same
+relation and asks for the same key, so the plan over it is cached, and `store` does not pin it.
+It is still skipped by every statistics writer, on `ephemeral` alone.
 
 These tests pin the marker, the two writers that must honor it, and — because a learner that
 learns nothing is a different bug — that an ordinary registered relation still gets measured.
@@ -166,3 +170,58 @@ def test_one_ephemeral_source_disqualifies_a_mixed_plan() -> None:
     key = plan_cache.cache_key("plan-fingerprint", [ordinary, stage], active_config(), hub)
 
     assert key is None
+
+
+def test_a_stage_named_by_its_derivation_is_cached_and_not_pinned() -> None:
+    """A derived stage source recurs by name, so the plan over it can be read back."""
+    hub = MetadataHub(InProcessBackend())
+    from batcher.config import active_config
+    from batcher.kyber.plan_cache import memo
+
+    keys = []
+    for _ in range(2):
+        stage, _schema = _stage_source(_table(), "the-same-derivation")
+        keys.append(plan_cache.cache_key("plan-fingerprint", [stage], active_config(), hub))
+    assert keys[0] is not None
+    assert keys[0] == keys[1], "two runs deriving the same stage must ask for the same plan"
+
+    memo.store(keys[0], "a-plan", [stage], max_entries=8)
+    try:
+        exact, _ = memo._split(keys[0])
+        assert memo._CACHE[exact][1] == (), "a derived intermediate was pinned by the cache"
+        assert plan_cache.lookup(keys[1]) == "a-plan"
+    finally:
+        plan_cache.clear()
+
+
+def test_a_staged_query_replans_no_stage_once_warm(monkeypatch) -> None:
+    """End to end: every stage's optimize hits the plan cache on a repeated staged query.
+
+    The control is the first run, which must miss for every stage; without it a plan cache
+    disabled by configuration would pass the warm half by never being asked.
+    """
+    from batcher.api.adaptive import staging
+    from batcher.kyber.optimizer import facade
+
+    plan_cache.clear()
+    outcomes: list[bool] = []
+    real_lookup = facade.plan_cache.lookup
+
+    def spy(key, holds=None):
+        hit = real_lookup(key, holds)
+        outcomes.append(hit is not None)
+        return hit
+
+    monkeypatch.setattr(facade.plan_cache, "lookup", spy)
+    monkeypatch.setattr(staging, "_worth_staging", lambda *_: lambda _node: True)
+    fact = bt.from_pydict({"k": [i % 50 for i in range(5_000)], "v": list(range(5_000))})
+    dim = bt.from_pydict({"k": list(range(50)), "w": [i * 3 for i in range(50)]})
+    query = fact.group_by("k").agg(s=col("v").sum()).join(dim, on="k")
+    runs = []
+    for _ in range(6):
+        outcomes.clear()
+        rows = query.collect(adaptive=True).sort_by("k").to_pydict()
+        runs.append(list(outcomes))
+    assert rows["s"][:2] == [sum(range(0, 5_000, 50)), sum(range(1, 5_000, 50))]
+    assert len(runs[0]) >= 2 and not any(runs[0]), f"the first run must plan every stage: {runs}"
+    assert runs[-1] and all(runs[-1]), f"a warm staged query re-planned a stage: {runs}"

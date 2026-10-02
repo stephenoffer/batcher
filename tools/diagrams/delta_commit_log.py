@@ -52,20 +52,20 @@ body: list[str] = [
     band(20, 90, 940, 292, "ONE TABLE, FOUR COMMITS, FIVE DATA FILES", "blue"),
 ]
 
-for name, x in zip(FILES, COL_X):
+for name, x in zip(FILES, COL_X, strict=True):
     body.append(
         f'<text x="{x + COL_W / 2}" y="146" text-anchor="middle" font-family="{FONT}" '
         f'font-size="12.5" font-weight="700" class="t-arrow">{name}</text>'
     )
 body.append(note(824, 146, "data files on storage", anchor="start"))
 
-for (version, op, actions, live), y in zip(VERSIONS, ROW_Y):
+for (version, op, actions, live), y in zip(VERSIONS, ROW_Y, strict=True):
     body += [
         label(40, y + 22, version),
         note(76, y + 22, op),
         note(40, y + 39, actions),
     ]
-    for name, x in zip(FILES, COL_X):
+    for name, x in zip(FILES, COL_X, strict=True):
         if name in live:
             body.append(
                 f'<rect x="{x}" y="{y}" width="{COL_W}" height="{ROW_H}" rx="7" '
@@ -89,7 +89,7 @@ body += [
 ]
 
 # The columns vacuum would reclaim: every file the bottom row does not mark.
-for name, x in zip(FILES, COL_X):
+for name, x in zip(FILES, COL_X, strict=True):
     if name in VERSIONS[-1][3]:
         continue
     body += [

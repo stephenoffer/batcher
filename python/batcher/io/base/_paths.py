@@ -25,6 +25,7 @@ import os
 from typing import Any
 
 from batcher._internal.errors import IOError as _IOError
+from batcher.io._backend import _scheme
 
 __all__ = ["hive_segment", "normalize_path", "normalize_source_path"]
 
@@ -58,11 +59,6 @@ def hive_segment(name: str) -> tuple[str, str] | None:
         return None
     col, _, val = base.partition("=")
     return (col, val) if col else None
-
-
-def _scheme_of(path: str) -> str:
-    idx = path.find("://")
-    return path[:idx].lower() if idx > 0 else ""
 
 
 def normalize_path(path: Any, *, what: str = "path") -> str:
@@ -112,7 +108,7 @@ def normalize_path(path: Any, *, what: str = "path") -> str:
         )
     # `~` is a legal character in an object-store key, so expand it only where it is a
     # shell shorthand: a local path with no URI scheme.
-    if text.startswith("~") and not _scheme_of(text):
+    if text.startswith("~") and not _scheme(text):
         text = os.path.expanduser(text)
     return text
 
@@ -163,9 +159,9 @@ def _common_root(files: list[str]) -> str:
     is what is actually read — so an imprecise root costs nothing but a nicer plan label.
     """
     dirs = [f.rsplit("/", 1)[0] if "/" in f else "" for f in files]
-    if len({_scheme_of(f) for f in files}) > 1:
+    if len({_scheme(f) for f in files}) > 1:
         return dirs[0]
-    common = os.path.commonpath(dirs) if all(not _scheme_of(f) for f in files) else None
+    common = os.path.commonpath(dirs) if all(not _scheme(f) for f in files) else None
     if common:
         return common
     first = dirs[0]

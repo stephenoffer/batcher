@@ -67,6 +67,14 @@ class TrailingValues:
             for r in range(1, self.distance + 1)
         ]
 
+    def values(self) -> list:
+        """The held tail, oldest first -- at most `distance` values, fewer at the start.
+
+        Returns:
+            A copy, so a reader cannot shorten the tail the next bucket reads.
+        """
+        return list(self._values)
+
     def absorb(self, values: list) -> None:
         """Take this bucket's input values, in the window's order, and keep the last `k`.
 

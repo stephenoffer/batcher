@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::RecordBatch;
+use arrow::array::{BooleanArray, RecordBatch};
+use arrow::compute::filter_record_batch;
 use bc_ir::{AggFunc, AggregateItem, EngineConfig, ProjectionItem, RelOp};
 use bc_resource::{CancelToken, MemoryPool, MemoryReservation};
 use bc_runtime::agg::spill::{combine_finalize_spilling, DiskSpillStore, SpillCodec, SpillStore};
@@ -101,6 +102,11 @@ pub struct ExecOptions {
     /// number of rayon dispatches change. Off by default — opt-in until it has cleared
     /// a full differential + seq==par==JIT + benchmark cycle as the default.
     pub fuse_linear: bool,
+    /// Kyber's verdict that some join's build side reads far more rows than its probe side can
+    /// match (`EngineConfig::prefer_sideways`). The streaming executor then evaluates such a
+    /// join's probe side before its build side and restricts the build side's source to the
+    /// probe keys (`stream::builds`), which the materializing executor does unconditionally.
+    pub prefer_sideways: bool,
     /// Performance-threshold knobs (bloom, radix/window parallel thresholds, sort
     /// fan-in, skew) the control plane may tune per query. Default equals
     /// `RuntimeTuning::default()`, i.e. the historical consts — so absent any
@@ -121,6 +127,7 @@ impl Default for ExecOptions {
             morsel_bytes: DEFAULT_TARGET_MORSEL_BYTES,
             parallelism: 0,
             fuse_linear: false,
+            prefer_sideways: false,
             tuning: bc_arrow::RuntimeTuning::default(),
         }
     }
@@ -159,6 +166,7 @@ impl ExecOptions {
         };
         self.parallelism = cfg.parallelism;
         self.fuse_linear = cfg.fuse_linear;
+        self.prefer_sideways = cfg.prefer_sideways;
         self.tuning = cfg.runtime_tuning();
         if cfg.memory_budget_bytes > 0 {
             self.agg_spill = Some(SpillOptions {
@@ -277,6 +285,22 @@ fn admit(opts: &ExecOptions, op_id: u32, estimate_bytes: usize) -> Admit {
         // impl on the operators that own in-progress state (the aggregate's hash table, the
         // sort's runs), which is harder than it looks — the pool may call `spill` from
         // another thread, mid-`par_iter`, on state the owning operator is actively reading.
+        //
+        // The pool is *process-wide* and its limit only grows (`bc_py::process`), so it is a
+        // ceiling on the process, not on this query. The query's own envelope — the user's
+        // `memory.max_memory_bytes`, shipped as `memory_budget_bytes` — is checked first:
+        // after any earlier query ran under the auto-sensed envelope, the pool admitted 24 MB
+        // of aggregate state against an explicit 7.2 MB cap, so the cap held only for the
+        // first query in the process. This is the global envelope, never the per-op
+        // estimate, so it cannot reintroduce the spurious spill the note above describes.
+        Some(_)
+            if opts
+                .agg_spill
+                .as_ref()
+                .is_some_and(|sp| estimate_bytes > sp.memory_budget_bytes) =>
+        {
+            Admit::Spill
+        }
         Some(pool) => match pool.try_reserve_cooperative(estimate_bytes) {
             Ok(reservation) => Admit::InMemory(Some(reservation)),
             // Pool full (and, once consumers register, still full after they spilled):
@@ -1335,9 +1359,40 @@ fn exec(
                     )?;
                     (out, true, vol)
                 }
-                // No PARTITION BY: the kernel needs the whole relation at once and
-                // cannot grace-partition, so spilling can't bound it. Fail with a
-                // typed, catchable error rather than letting the process OOM.
+                // No PARTITION BY: the relation is one partition, so grace cannot split it.
+                // The functions with an exact carried-state form stream over an
+                // out-of-core sort instead (`ops::window_stream`).
+                Admit::Spill
+                    if ops::window_streamable(
+                        &parts,
+                        partition_keys,
+                        order_keys,
+                        functions,
+                        *rank_limit,
+                    )? =>
+                {
+                    let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
+                    let budget = opts.op_budget(op_id).unwrap_or(global.memory_budget_bytes);
+                    let spill = ops::StreamSpill {
+                        chunk_bytes: (budget / 4).max(ops::MIN_CHUNK_BYTES),
+                        dir: &global.dir,
+                        fanin: opts.tuning.sort_merge_fanin,
+                        run_target_bytes: ((budget / 4) as u64)
+                            .clamp(1 << 20, ops::DEFAULT_RUN_TARGET_BYTES),
+                        codec: global.codec,
+                        cancel: opts.cancel.as_ref(),
+                    };
+                    let (out, vol) = ops::window_streaming(
+                        ops::remorselize(parts, opts.morsel_target()),
+                        partition_keys,
+                        order_keys,
+                        functions,
+                        &spill,
+                    )?;
+                    (out, true, vol)
+                }
+                // Anything else needs the whole relation at once. Fail with a typed,
+                // catchable error rather than letting the process OOM.
                 Admit::Spill => {
                     return Err(InterpError::MemoryBudgetExceeded {
                         needed: bytes as usize,
@@ -1421,6 +1476,55 @@ fn exec(
                 // not fit answers the question too late to matter.
                 let bytes = (batch_bytes(&left_batches) + batch_bytes(&right_batches)) as usize;
                 if let Some(budget) = opts.op_budget(op_id) {
+                    // Over the envelope, merge two out-of-core sorted streams instead
+                    // (`join_par::asof_stream`), when the key types allow it.
+                    let spec = crate::join_par::asof_stream::AsofSpec {
+                        left_on,
+                        right_on,
+                        direction: *direction,
+                        tolerance: *tolerance,
+                        allow_exact_matches: *allow_exact_matches,
+                        output,
+                    };
+                    let global = opts.agg_spill.as_ref();
+                    if let Some(global) = global.filter(|_| {
+                        bytes > budget
+                            && crate::join_par::asof_stream::streamable(
+                                &left_batches,
+                                &right_batches,
+                                &spec,
+                            )
+                    }) {
+                        let spill = crate::join_par::asof_stream::AsofSpill {
+                            chunk_bytes: (budget / 4)
+                                .max(crate::join_par::asof_stream::MIN_CHUNK_BYTES),
+                            dir: &global.dir,
+                            fanin: opts.tuning.sort_merge_fanin,
+                            run_target_bytes: ((budget / 4) as u64)
+                                .clamp(1 << 20, ops::DEFAULT_RUN_TARGET_BYTES),
+                            codec: global.codec,
+                            cancel: opts.cancel.as_ref(),
+                        };
+                        let (out, _) = crate::join_par::asof_stream::asof_streaming(
+                            ops::remorselize(left_batches, opts.morsel_target()),
+                            ops::remorselize(right_batches, opts.morsel_target()),
+                            &spec,
+                            &spill,
+                        )?;
+                        push_breaker(
+                            m,
+                            op_id,
+                            "asof_join",
+                            rows_in,
+                            rows_build,
+                            in_bytes,
+                            &out,
+                            t0,
+                            true,
+                            "interp",
+                        );
+                        return Ok(out);
+                    }
                     if bytes > budget {
                         return Err(InterpError::MemoryBudgetExceeded {
                             needed: bytes,
@@ -1533,10 +1637,9 @@ fn exec(
             // same batch, same cost. Only a left side that genuinely exceeds the envelope pays
             // for extra passes over the right side, which is the trade that buys the bound.
             //
-            // The right side is *not* decomposable this way (its sort order is global), so it
-            // is still held whole. When even that will not fit, the join fails with a typed,
-            // catchable error rather than the process being killed — the same contract the
-            // keyless ASOF join and the un-partitioned window already state.
+            // A right side that does not fit is decomposed too: a pair matches on its two rows
+            // alone, so the join is the union over (left chunk, right chunk) pairs, with each
+            // side's unmatched remainder decided once (`join_par::range_blocked`).
             let left_batches = exec(left, sources, opts, m, ids)?;
             let right_batches = exec(right, sources, opts, m, ids)?;
             let rows_in = count_rows(&left_batches);
@@ -1545,14 +1648,42 @@ fn exec(
             let t0 = Stopwatch::start();
             let right_bytes = batch_bytes(&right_batches) as usize;
             let budget = opts.op_budget(op_id);
-            if let Some(budget) = budget {
-                if right_bytes > budget {
-                    return Err(InterpError::MemoryBudgetExceeded {
-                        needed: right_bytes,
-                        budget,
-                        reason: "range join needs one global order over its right side",
-                    });
+            if let Some(budget) = budget.filter(|&b| right_bytes > b) {
+                let mut out = crate::join_par::range_blocked::range_join_blocked(
+                    &left_batches,
+                    &right_batches,
+                    conditions,
+                    *join_type,
+                    output,
+                    budget,
+                )?;
+                if out.is_empty() {
+                    let schema = |b: &[RecordBatch]| b.first().map(RecordBatch::schema);
+                    let (Some(ls), Some(rs)) = (schema(&left_batches), schema(&right_batches))
+                    else {
+                        return Err(InterpError::EmptyJoinInput);
+                    };
+                    out.push(ops::range_join_batches(
+                        &RecordBatch::new_empty(ls),
+                        &RecordBatch::new_empty(rs),
+                        conditions,
+                        *join_type,
+                        output,
+                    )?);
                 }
+                push_breaker(
+                    m,
+                    op_id,
+                    "range_join",
+                    rows_in,
+                    rows_build,
+                    in_bytes,
+                    &out,
+                    t0,
+                    false,
+                    "interp",
+                );
+                return Ok(out);
             }
             let right = ops::materialize(&right_batches)?;
             let stream = ProbeStream {
@@ -1609,7 +1740,23 @@ fn exec(
             strategy,
         } => {
             let left_batches = exec(left, sources, opts, m, ids)?;
-            let right_batches = exec(right, sources, opts, m, ids)?;
+            // A build-side aggregate restricted to the probe's keys (`join_par::sideways`). Its
+            // operators run over a filtered source, so their row counts describe this query's
+            // restriction rather than the subplan: they go to a scratch collector and are not
+            // reported, or Kyber would learn a cardinality the subplan does not have.
+            let right_batches = match crate::join_par::sideways::restrict_right_sources(
+                *join_type,
+                left_keys,
+                right_keys,
+                &left_batches,
+                right,
+                sources,
+            )? {
+                Some(restricted) => {
+                    exec(right, &restricted, opts, &mut ExecMetrics::default(), ids)?
+                }
+                None => exec(right, sources, opts, m, ids)?,
+            };
 
             // ── Runtime build-side correction ────────────────────────────────────────
             // The planner chose which side to build from *estimated* cardinalities. Both
@@ -2593,16 +2740,7 @@ fn exec_fused(
     let n = stages.len();
     let results: Vec<(RecordBatch, Vec<u64>)> = base_morsels
         .par_iter()
-        .map(|b| {
-            opts.check_cancelled()?;
-            let mut cur = b.clone();
-            let mut stage_rows = Vec::with_capacity(n);
-            for stage in &stages {
-                cur = stage.apply(&cur)?;
-                stage_rows.push(cur.num_rows() as u64);
-            }
-            Ok((cur, stage_rows))
-        })
+        .map(|b| run_chain(&stages, b, opts))
         .collect::<Result<Vec<_>, InterpError>>()?;
 
     // Single-threaded reduce after the join (keeps the `&mut ExecMetrics` race-free):
@@ -2826,7 +2964,7 @@ fn try_fused_join_aggregate(
     // Combine the partials — the same in-memory / grace-spill path as the unfused aggregate.
     let funcs = ops::agg_funcs(aggregates);
     let state_bytes = partial_state_bytes(&partials);
-    let (group_columns, agg_cols) = match admit(opts, op_id, state_bytes) {
+    let (group_columns, agg_cols, spilled, spill_vol) = match admit(opts, op_id, state_bytes) {
         Admit::Spill => {
             let global = opts.agg_spill.as_ref().expect("spill implies an envelope");
             let sp =
@@ -2836,13 +2974,19 @@ fn try_fused_join_aggregate(
                 DiskSpillStore::with_codec(sp.dir.join(format!("agg-{p}p")), p, sp.codec)?;
             let res =
                 combine_finalize_spilling(partials, &funcs, &mut store, sp.memory_budget_bytes)?;
-            (res.group_columns, res.agg_columns)
+            warn_if_skewed(op_id, "aggregate", &store);
+            (
+                res.group_columns,
+                res.agg_columns,
+                true,
+                store.spilled_bytes(),
+            )
         }
         Admit::InMemory(_reservation) => {
             let merged =
                 agg::combine_with(&partials, &funcs, opts.tuning.radix_parallel_threshold)?;
             let agg_cols = agg::finalize(&funcs, &merged)?;
-            (merged.group_columns, agg_cols)
+            (merged.group_columns, agg_cols, false, 0)
         }
     };
     let out = vec![ops::build_agg_batch(
@@ -2851,7 +2995,10 @@ fn try_fused_join_aggregate(
         &group_columns,
         &agg_cols,
     )?];
-    push_breaker(
+    // The spill is reported as it happened. This passed a literal `false`, so a fused
+    // join-aggregate that went through `combine_finalize_spilling` -- 116 MiB written for a
+    // 1M-group aggregate under an 8 MB cap -- read `spilled: false` in `explain(analyze=True)`.
+    push_breaker_spilled(
         m,
         op_id,
         "aggregate",
@@ -2861,7 +3008,8 @@ fn try_fused_join_aggregate(
             + bc_runtime::join::estimate_build_bytes(build.num_rows()) as u64,
         &out,
         t0,
-        false,
+        spilled,
+        spill_vol,
         "fused-join-agg",
     );
     let _ = (join_id, join_type);
@@ -2870,6 +3018,13 @@ fn try_fused_join_aggregate(
 
 /// Run the fused linear chain over one morsel, returning the chained batch and the row count
 /// after each stage (which is what gives the fused ops exact selectivity metrics).
+///
+/// A Filter directly under another Filter does not gather its rows: its mask is carried to
+/// the next one, which ANDs its own onto it (`ops::filter_mask_within`), and the rows are
+/// gathered once, after the last filter of the run. Each stage's row count is still its own
+/// mask's population, so the metrics are unchanged. Where the outer filter cannot be
+/// evaluated against the ungathered rows, the carried mask is applied first and the stage
+/// runs exactly as before.
 fn run_chain(
     stages: &[FusedStage],
     b: &RecordBatch,
@@ -2878,9 +3033,57 @@ fn run_chain(
     opts.check_cancelled()?;
     let mut cur = b.clone();
     let mut stage_rows = Vec::with_capacity(stages.len());
-    for stage in stages {
-        cur = stage.apply(&cur)?;
-        stage_rows.push(cur.num_rows() as u64);
+    // The keep mask of the filters run so far over `cur`, not yet applied to it.
+    let mut pending: Option<BooleanArray> = None;
+    for (i, stage) in stages.iter().enumerate() {
+        let next_is_filter = matches!(stages.get(i + 1), Some(FusedStage::Filter { .. }));
+        let FusedStage::Filter {
+            predicate,
+            jit,
+            order,
+            ..
+        } = stage
+        else {
+            if let Some(live) = pending.take() {
+                cur = filter_record_batch(&cur, &live)?;
+            }
+            cur = stage.apply(&cur)?;
+            stage_rows.push(cur.num_rows() as u64);
+            continue;
+        };
+        let mask = match pending.take() {
+            Some(live) => {
+                let within = ops::filter_mask_within(&cur, predicate, jit, order.as_ref(), &live)?;
+                if within.is_none() {
+                    cur = filter_record_batch(&cur, &live)?;
+                }
+                within
+            }
+            None if next_is_filter => Some(ops::truthy(&ops::filter_mask_jit(
+                &cur,
+                predicate,
+                jit,
+                order.as_ref(),
+            )?)),
+            None => None,
+        };
+        match mask {
+            Some(mask) if next_is_filter => {
+                stage_rows.push(mask.true_count() as u64);
+                pending = Some(mask);
+            }
+            Some(mask) => {
+                cur = filter_record_batch(&cur, &mask)?;
+                stage_rows.push(cur.num_rows() as u64);
+            }
+            None => {
+                cur = stage.apply(&cur)?;
+                stage_rows.push(cur.num_rows() as u64);
+            }
+        }
+    }
+    if let Some(live) = pending {
+        cur = filter_record_batch(&cur, &live)?;
     }
     Ok((cur, stage_rows))
 }
@@ -3681,6 +3884,122 @@ mod tests {
             fired,
             "the fused join-aggregate path never fired — the test proved nothing"
         );
+    }
+
+    /// The query's own envelope binds even when the process-wide pool is far larger.
+    ///
+    /// `bc_py::process::shared_memory_pool` only ever grows its limit, so after one query ran
+    /// under the auto-sensed envelope every later query shared a pool sized for that one. A
+    /// small explicit cap then never spilled anything: the pool admitted the state and the
+    /// cap was decorative. The fused join-aggregate is the shape this was measured on, and it
+    /// is also the one that reported `spilled: false` after spilling, so both are pinned here:
+    /// it must spill against the tiny cap, say so in its metrics, and still match the oracle.
+    #[test]
+    fn a_query_cap_binds_below_a_larger_shared_pool() {
+        use bc_expr::Expr;
+        let pair = |a: &str, b: &str, n: i64| {
+            RecordBatch::try_from_iter(vec![
+                (
+                    a,
+                    Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())) as ArrayRef,
+                ),
+                (
+                    b,
+                    Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())) as ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let plan = RelOp::Aggregate {
+            input: Box::new(RelOp::HashJoin {
+                left: Box::new(RelOp::Scan { source_id: 0 }),
+                right: Box::new(RelOp::Scan { source_id: 1 }),
+                left_keys: vec!["pk".into()],
+                right_keys: vec!["bk".into()],
+                join_type: bc_ir::JoinType::Inner,
+                output: vec![
+                    bc_ir::JoinOutputCol {
+                        side: bc_ir::JoinSide::Left,
+                        name: "v".into(),
+                        alias: "v".into(),
+                    },
+                    bc_ir::JoinOutputCol {
+                        side: bc_ir::JoinSide::Right,
+                        name: "g".into(),
+                        alias: "g".into(),
+                    },
+                ],
+                strategy: bc_ir::JoinStrategy::Hash,
+            }),
+            group_keys: vec![ProjectionItem {
+                expr: Expr::Col { name: "g".into() },
+                alias: "g".into(),
+            }],
+            aggregates: vec![AggregateItem {
+                func: AggFunc::Sum,
+                input: Some(Expr::Col { name: "v".into() }),
+                input2: None,
+                order_by: Vec::new(),
+                alias: "s".into(),
+                param: None,
+                interpolation: None,
+            }],
+        };
+        let n = 4_000;
+        let sources = vec![vec![pair("pk", "v", n)], vec![pair("bk", "g", n)]];
+        let oracle = execute(&plan, &sources).unwrap();
+        let groups = |bs: &[RecordBatch]| -> Vec<(i64, i64)> {
+            let mut out = Vec::new();
+            for b in bs {
+                let g = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+                let s = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                out.extend((0..b.num_rows()).map(|i| (g.value(i), s.value(i))));
+            }
+            out.sort_unstable();
+            out
+        };
+        let run = |budget: usize| {
+            // A pool a previous, uncapped query left behind: 1 GiB of headroom.
+            let pool = MemoryPool::new(1 << 30);
+            let dir =
+                std::env::temp_dir().join(format!("bc_query_cap_{budget}_{}", std::process::id()));
+            let opts = ExecOptions {
+                fuse_linear: true,
+                morsel_rows: 256,
+                agg_spill: Some(SpillOptions {
+                    memory_budget_bytes: budget,
+                    dir,
+                    codec: SpillCodec::None,
+                }),
+                pool: Some(Arc::clone(&pool)),
+                ..ExecOptions::default()
+            };
+            let (out, m) = execute_parallel_with_metrics(&plan, &sources, &opts).unwrap();
+            assert_eq!(pool.used(), 0, "every reservation is released");
+            let agg = m
+                .ops
+                .iter()
+                .find(|o| o.kind == "aggregate")
+                .unwrap()
+                .clone();
+            (out, agg)
+        };
+
+        let (capped, agg) = run(1_024);
+        assert_eq!(
+            agg.backend, "fused-join-agg",
+            "the fused path must be the one tested"
+        );
+        assert!(agg.spilled, "4,000 groups against a 1 KiB cap must spill");
+        assert!(agg.spill_bytes > 0, "a spill reports the volume it wrote");
+        assert_eq!(groups(&capped), groups(&oracle));
+
+        // Control: the same plan under an ample cap stays resident, so the spill above is the
+        // cap's doing and not something the shape does regardless.
+        let (ample, agg) = run(1 << 30);
+        assert_eq!(agg.backend, "fused-join-agg");
+        assert!(!agg.spilled, "an ample cap must not spill");
+        assert_eq!(groups(&ample), groups(&oracle));
     }
 
     /// A byte-heavy source (few rows, large blobs) must lift the worker cap: counting
@@ -5928,36 +6247,38 @@ mod tests {
         }
     }
 
-    /// A range join whose *right* side exceeds the envelope fails with a typed error.
-    ///
-    /// The right side carries a global sort order, so it cannot be decomposed the way the
-    /// left one is. Before, there was no check at all and the process was simply killed;
-    /// a catchable error is what lets a caller retry with a larger envelope or a different
-    /// plan. Same contract as the keyless ASOF join and the un-partitioned window.
+    /// A range join whose *right* side exceeds the envelope is decomposed on both sides
+    /// (`join_par::range_blocked`) and still equals the sequential oracle. It used to fail
+    /// with `MemoryBudgetExceeded` here, because only the left side was chunked.
     #[test]
-    fn a_range_join_over_its_envelope_errors_rather_than_ooming() {
-        let plan = range_plan(bc_ir::RangeOp::Lt, bc_ir::JoinType::Inner);
-        let left = vec![batch(&[1, 2, 3], &[10, 20, 30])];
-        let right = vec![batch(&[1, 2, 3], &[5, 15, 25])];
-        let opts = ExecOptions {
-            agg_spill: Some(SpillOptions {
-                memory_budget_bytes: 1,
-                dir: std::env::temp_dir().join(format!("bc_range_env_{}", std::process::id())),
-                codec: SpillCodec::None,
-            }),
-            ..ExecOptions::default()
-        };
-        let err = execute_parallel_with(&plan, &[left, right], &opts).unwrap_err();
-        assert!(
-            matches!(err, InterpError::MemoryBudgetExceeded { .. }),
-            "expected a typed envelope error, got {err:?}"
-        );
+    fn a_range_join_over_its_envelope_is_blocked_on_both_sides() {
+        for jt in [bc_ir::JoinType::Inner, bc_ir::JoinType::Full] {
+            let plan = range_plan(bc_ir::RangeOp::Lt, jt);
+            let sources = || {
+                vec![
+                    vec![batch(&[1, 2, 3], &[10, 20, 30])],
+                    vec![batch(&[1, 2, 3], &[5, 15, 25])],
+                ]
+            };
+            let opts = ExecOptions {
+                agg_spill: Some(SpillOptions {
+                    memory_budget_bytes: 1,
+                    dir: std::env::temp_dir().join(format!("bc_range_env_{}", std::process::id())),
+                    codec: SpillCodec::None,
+                }),
+                ..ExecOptions::default()
+            };
+            let got = execute_parallel_with(&plan, &sources(), &opts).unwrap();
+            let oracle = crate::execute(&plan, &sources()).unwrap();
+            assert_eq!(rows(&got), rows(&oracle), "{jt:?}");
+        }
     }
 
-    /// A keyless ASOF over a configured envelope it exceeds fails loudly with a typed
-    /// error (it cannot grace-partition), instead of risking an OOM.
+    /// A keyless ASOF over a configured envelope it exceeds merges two out-of-core sorted
+    /// streams (`join_par::asof_stream`) and equals the sequential oracle. It used to fail
+    /// with `MemoryBudgetExceeded`, because there is no key to grace-partition on.
     #[test]
-    fn keyless_asof_over_budget_errors() {
+    fn keyless_asof_over_budget_streams() {
         use bc_ir::{JoinOutputCol, JoinSide};
 
         let plan = RelOp::AsofJoin {
@@ -5976,21 +6297,23 @@ mod tests {
                 alias: "lv".into(),
             }],
         };
-        let left = vec![batch(&[1, 2, 3], &[10, 20, 30])];
-        let right = vec![batch(&[1, 2, 3], &[5, 15, 25])];
+        let sources = || {
+            vec![
+                vec![batch(&[1, 2, 3], &[10, 20, 30])],
+                vec![batch(&[1, 2, 3], &[5, 15, 25])],
+            ]
+        };
         let opts = ExecOptions {
             agg_spill: Some(SpillOptions {
                 memory_budget_bytes: 1, // any real input exceeds this
-                dir: std::env::temp_dir(),
+                dir: std::env::temp_dir().join(format!("bc_asof_env_{}", std::process::id())),
                 codec: SpillCodec::None,
             }),
             ..ExecOptions::default()
         };
-        let err = execute_parallel_with(&plan, &[left, right], &opts).unwrap_err();
-        assert!(
-            matches!(err, InterpError::MemoryBudgetExceeded { .. }),
-            "expected MemoryBudgetExceeded, got {err:?}"
-        );
+        let got = execute_parallel_with(&plan, &sources(), &opts).unwrap();
+        let oracle = crate::execute(&plan, &sources()).unwrap();
+        assert_eq!(rows(&got), rows(&oracle));
     }
 
     /// External merge sort (tiny budget + tiny morsels → many spilled runs, then a

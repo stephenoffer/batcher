@@ -32,11 +32,11 @@ That is why performance work here doesn't accumulate risk. The compiled subset c
 
 This is the differentiator most often overstated, so here it is at full precision.
 
-![A capability matrix comparing DuckDB, Spark AQE, and Batcher on three properties: re-planning inside one query, running on a single node, and carrying what was learned into the next run. DuckDB optimizes once and keeps no cross-run state. Spark AQE re-plans at stage boundaries but needs shuffle stages and keeps no cross-run state. Batcher re-plans at the same stage-boundary granularity, runs the same loop on a single node, and carries sketches, calibrated costs, and a bandit into the next run.](/_static/diagrams/adaptive_positioning.svg)
+![A capability matrix comparing DuckDB, Spark AQE, and Batcher on three properties: re-planning inside one query, running inside the Python process, and carrying what was learned into the next run. DuckDB runs embedded in-process but optimizes once and keeps no cross-run state. Spark AQE, on by default since Spark 3.2, re-plans at stage boundaries, but from a JVM beside Python, and keeps no cross-run state. Batcher re-plans at the same stage-boundary granularity, runs the loop inside the Python process, and carries sketches, calibrated costs, and a bandit into the next run.](/_static/diagrams/adaptive_positioning.svg)
 
 Batcher re-optimizes during a query at pipeline breakers, using cardinalities it has *measured* rather than estimated. When an estimate was wrong by more than `optimizer.reoptimize_error` (2.0 by default), Kyber re-plans the rest of the query on the real numbers. That is stage-boundary re-optimization, the same granularity Spark AQE works at.
 
-Two things about it are different. First, it runs on a single node. AQE is a cluster mechanism built around shuffle stages, and DuckDB optimizes once, before execution, with no way to revise the plan.
+Two things about it are different. First, it runs inside the Python process. Spark AQE is on by default since Spark 3.2 and re-plans at shuffle-exchange query stages in local mode (`local[*]`) too, so it also runs on one machine, but it plans in a JVM beside Python. DuckDB optimizes once, before execution, with no way to revise the plan.
 
 Second, what it measured survives the query. Core records actual cardinalities, operator times, and peak memory into the `MetadataHub`, and the next run of that plan shape reads them. That covers sketch-backed cardinality (HyperLogLog for distinct counts, KLL for quantiles), cost coefficients calibrated from measured operator times rather than fixed constants, and a UCB1 bandit over equivalent join strategies. A query gets a better plan the more often it runs, and neither DuckDB nor Spark keeps anything comparable between runs.
 

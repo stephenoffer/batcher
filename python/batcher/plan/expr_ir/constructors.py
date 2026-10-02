@@ -29,6 +29,7 @@ from batcher.plan.expr_ir.nodes import (
     Least,
     NullIf,
 )
+from batcher.plan.types.registry import dtype_name
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -104,7 +105,7 @@ def array(*elements: IntoExpr) -> Array:
     if len(elements) == 1 and isinstance(elements[0], (list, tuple)):
         elements = tuple(elements[0])
     if not elements:
-        raise ValueError("array() requires at least one element")
+        raise PlanError("array() requires at least one element")
     return Array([_wrap(e) for e in elements])
 
 
@@ -133,7 +134,7 @@ def coalesce(*exprs: IntoExpr) -> Coalesce:
             {'c': [1, 20, 3]}
     """
     if not exprs:
-        raise ValueError("coalesce() requires at least one argument")
+        raise PlanError("coalesce() requires at least one argument")
     return Coalesce([_col_or_expr(e) for e in exprs])
 
 
@@ -258,7 +259,7 @@ def greatest(*exprs: IntoExpr) -> Greatest:
             {'hi': [4, 9]}
     """
     if not exprs:
-        raise ValueError("greatest() requires at least one argument")
+        raise PlanError("greatest() requires at least one argument")
     return Greatest([_col_or_expr(e) for e in exprs])
 
 
@@ -286,7 +287,7 @@ def least(*exprs: IntoExpr) -> Least:
             {'lo': [1, 2]}
     """
     if not exprs:
-        raise ValueError("least() requires at least one argument")
+        raise PlanError("least() requires at least one argument")
     return Least([_col_or_expr(e) for e in exprs])
 
 
@@ -485,3 +486,27 @@ def null(dtype: str | None = None) -> Expr:
     one = Lit(1)
     untyped: Expr = NullIf(one, one)
     return untyped if dtype in (None, "int64") else untyped._cast(dtype, try_cast=False)
+
+
+def null_of_type(dtype: pa.DataType) -> Expr | None:
+    """A NULL of exactly `dtype`, or ``None`` when the cast vocabulary cannot name it.
+
+    `null` takes a *name* from a short list; this takes the Arrow *type* a caller read off
+    a schema, and names it through `dtype_name`, whose round trip is exact. So a column a
+    rewrite has to fill with nulls (a diagonal concat's missing column, an INSERT's unlisted
+    one) keeps its precision, scale, unit and time zone instead of being retyped to the
+    nearest short name.
+
+    Args:
+        dtype: The Arrow type the null must have.
+
+    Returns:
+        An expression that is NULL on every row, typed as `dtype`, or ``None`` for a
+        nested or extension type the cast grammar does not spell, and for the Arrow
+        ``null`` type, which the engine cannot cast to.
+    """
+    name = dtype_name(dtype)
+    if name is None or name == "null":
+        return None
+    one = Lit(1)
+    return NullIf(one, one)._cast(name, try_cast=False)

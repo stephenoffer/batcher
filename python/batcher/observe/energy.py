@@ -220,7 +220,7 @@ def _device_conditions():
             {f.index: f for f in device_faults() if f.readable},
             dict(enumerate(device_pcie_links())),
         )
-    except Exception:  # pragma: no cover - a status table must never fail a run
+    except Exception:  # a status table must never fail a run
         return ({}, {})
 
 

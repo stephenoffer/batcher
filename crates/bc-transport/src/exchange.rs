@@ -54,6 +54,38 @@ fn is_retryable_status(s: &tonic::Status) -> bool {
         // "transport error" message. That is exactly the worker-loss case the recovery
         // loop must retry (recompute + re-fetch), not a fatal protocol error.
         || (s.code() == tonic::Code::Unknown && s.message().contains("transport error"))
+        // A peer that dies *mid-stream* arrives as `Unknown` with an HTTP/2 message ("h2
+        // protocol error: error reading a body from connection") whose source chain ends in
+        // an I/O connection loss. Measured on a 3-node cluster, where a killed worker's
+        // reducers failed with a FatalShuffleError and recovery never ran; on one host the
+        // kill usually lands before the connection, which is why no local test saw it.
+        // Keyed on the I/O kind in the source chain, not on message text, so a genuine
+        // protocol or decode error -- which carries no such source -- stays fatal.
+        || (s.code() == tonic::Code::Unknown && lost_connection(s))
+}
+
+/// Whether `err`'s source chain contains an I/O error meaning the peer's connection is gone.
+fn lost_connection(err: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind;
+    let mut next = Some(err);
+    while let Some(e) = next {
+        let io = e
+            .downcast_ref::<std::io::Error>()
+            .or_else(|| e.downcast_ref::<h2::Error>().and_then(h2::Error::get_io));
+        if let Some(io) = io {
+            if matches!(
+                io.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            ) {
+                return true;
+            }
+        }
+        next = e.source();
+    }
+    false
 }
 
 /// gRPC status codes that mean "the peer/connection is transiently gone".
@@ -603,6 +635,71 @@ mod tests {
         );
     }
 
+    /// A peer whose connection resets mid-stream is retryable, measured end to end.
+    ///
+    /// A TCP proxy forwards a large `DoGet` until ~2 MiB has passed, then drops the client
+    /// socket with `SO_LINGER=0`, which sends a real RST. The client's error is therefore the
+    /// genuine tonic -> hyper -> h2 -> io chain a killed worker produces, not a hand-built
+    /// status: on a 3-node cluster it read "h2 protocol error: error reading a body from
+    /// connection" and was classified fatal, so recovery never ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_reset_mid_stream_is_retryable() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(Int64Array::from_iter_values(
+                0..131_072,
+            ))],
+        )
+        .unwrap();
+        let server = crate::FlightServer::new();
+        server.register("big", vec![batch; 64]).await;
+        let (upstream, _handle) = server.serve_ephemeral().await.unwrap();
+
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut client, _) = proxy.accept().await.unwrap();
+            client.set_zero_linger().unwrap();
+            let mut up = TcpStream::connect(upstream).await.unwrap();
+            let (mut cbuf, mut ubuf) = (vec![0u8; 16 << 10], vec![0u8; 64 << 10]);
+            let mut forwarded = 0usize;
+            loop {
+                tokio::select! {
+                    n = client.read(&mut cbuf) => {
+                        let n = n.unwrap_or(0);
+                        if n == 0 { break; }
+                        up.write_all(&cbuf[..n]).await.unwrap();
+                    }
+                    n = up.read(&mut ubuf) => {
+                        let n = n.unwrap_or(0);
+                        if n == 0 { break; }
+                        client.write_all(&ubuf[..n]).await.unwrap();
+                        forwarded += n;
+                        if forwarded > (2 << 20) { break; }
+                    }
+                }
+            }
+            drop(client); // zero linger: RST, not FIN
+        });
+
+        let mut client = crate::FlightClient::connect(proxy_addr.to_string())
+            .await
+            .unwrap();
+        let err = client.fetch("big").await.unwrap_err();
+        assert_eq!(
+            classify(&err),
+            FetchFault::Retryable,
+            "a mid-stream reset was fatal: {err:?}"
+        );
+    }
+
     #[test]
     fn classify_separates_retryable_from_fatal() {
         // A hung/idle peer and an unavailable/cancelled server are retryable: the
@@ -644,6 +741,23 @@ mod tests {
         // NotFound (an unpublished empty bucket) is not a fault to retry here.
         assert_eq!(
             classify(&TransportError::from(tonic::Status::not_found("no ticket"))),
+            FetchFault::Fatal
+        );
+        // A peer killed mid-stream: `Unknown` from h2, sourced in a connection reset.
+        let mut reset =
+            tonic::Status::unknown("h2 protocol error: error reading a body from connection");
+        reset.set_source(std::sync::Arc::new(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        )));
+        assert_eq!(
+            classify(&TransportError::from(reset)),
+            FetchFault::Retryable
+        );
+        // The same message with no connection loss behind it is a protocol error: fatal.
+        assert_eq!(
+            classify(&TransportError::from(tonic::Status::unknown(
+                "h2 protocol error: error reading a body from connection"
+            ))),
             FetchFault::Fatal
         );
         // A non-transport `Unknown` (a genuine server-side error) stays fatal.

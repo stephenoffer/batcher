@@ -25,13 +25,9 @@ def main() -> None:
     lineitem = tpch("lineitem")
 
     # Two shapes with different coordination costs.
-    low_cardinality = (
-        lineitem.group_by("l_returnflag").agg(n=bt.count()).sort("l_returnflag")
-    )
+    low_cardinality = lineitem.group_by("l_returnflag").agg(n=bt.count()).sort("l_returnflag")
     high_cardinality = (
-        lineitem.group_by("l_orderkey")
-        .agg(revenue=col("l_extendedprice").sum())
-        .sort("l_orderkey")
+        lineitem.group_by("l_orderkey").agg(revenue=col("l_extendedprice").sum()).sort("l_orderkey")
     )
 
     for name, query in (("few groups", low_cardinality), ("many groups", high_cardinality)):
@@ -40,9 +36,7 @@ def main() -> None:
 
         for partitions in (1, 4, 16):
             started = time.perf_counter()
-            result = query.collect(
-                distributed=distributed, num_partitions=partitions
-            ).to_pydict()
+            result = query.collect(distributed=distributed, num_partitions=partitions).to_pydict()
             elapsed = (time.perf_counter() - started) * 1000
             print(f"    {partitions:>3} partitions  {elapsed:7.1f} ms")
 
@@ -58,10 +52,7 @@ def main() -> None:
     # The two shapes differ in how much has to move, which is the thing that decides how
     # the curve looks.
     assert high_cardinality.count() > low_cardinality.count()
-    print(
-        f"{high_cardinality.count()} groups shuffle far more than "
-        f"{low_cardinality.count()}"
-    )
+    print(f"{high_cardinality.count()} groups shuffle far more than {low_cardinality.count()}")
 
 
 if __name__ == "__main__":

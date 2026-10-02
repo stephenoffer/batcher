@@ -177,7 +177,7 @@ def fold_leading_scan(plan: LogicalPlan, workers: int) -> bool:
         from batcher.dist.executors.ray_runtime.scaling import cpu_only_can_host
 
         return not cpu_only_can_host(max(1, workers), active_config().execution.cpu_share_io)
-    except Exception as exc:  # pragma: no cover - a placement courtesy, never a failure
+    except Exception as exc:  # a placement courtesy, never a failure
         note_suppressed("dist", "read the fleet shape before splitting the leading scan", exc)
         return True
 

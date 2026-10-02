@@ -12,6 +12,7 @@ import pytest
 
 import batcher as bt
 import batcher.graph as bg
+from batcher import PlanError
 
 pytestmark = pytest.mark.unit
 
@@ -220,10 +221,19 @@ def test_weighted_distance_finds_the_cheap_detour_not_the_short_hop():
     assert got.to_pydict()["distance"] == [0.0, 1.0, 2.0]
 
 
-def test_a_negative_weight_is_refused_rather_than_diverging():
-    e = bt.from_pydict({"src": [1], "dst": [2], "w": [-1.0]})
+def test_a_negative_cycle_is_refused_rather_than_diverging():
+    # A lone negative edge is a valid directed graph (see the differential suite); a cycle
+    # whose weights sum below zero has no shortest path, so it must raise, not loop.
+    e = bt.from_pydict({"src": [1, 2, 3], "dst": [2, 3, 2], "w": [1.0, -2.0, 1.0]})
     g = bg.Graph.from_edges(e, weight="w")
-    with pytest.raises(Exception, match="negative"):
+    with pytest.raises(PlanError, match="negative cycle"):
+        bg.shortest_path_lengths(g, bt.from_pydict({"node": [1]}))
+
+
+def test_a_negative_weight_on_an_undirected_graph_is_refused():
+    e = bt.from_pydict({"src": [1], "dst": [2], "w": [-1.0]})
+    g = bg.Graph.from_edges(e, weight="w", directed=False)
+    with pytest.raises(PlanError, match="negative"):
         bg.shortest_path_lengths(g, bt.from_pydict({"node": [1]}))
 
 

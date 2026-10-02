@@ -15,6 +15,18 @@ from batcher._internal.humanize import byte_size
 from batcher._internal.mathx import safe_div
 from batcher.plan.feedback import CONTENDED_PREEMPTIONS_PER_CORE_SECOND, preemption_rate
 
+#: `QueryProfile.machine`'s rendering, with the profile object it rendered. The hardware
+#: profile is assembled once per process and replaced (never mutated) by a probe reset, so the
+#: same object always renders the same name -- and every profiled query renders it once, for
+#: the event-log document, hashing the fingerprint and formatting the label each time.
+_MACHINE_NAME: tuple[object, str] | None = None
+
+
+def _remember_machine_name(profile: object, name: str) -> None:
+    global _MACHINE_NAME
+    _MACHINE_NAME = (profile, name)
+
+
 __all__ = ["Decision", "OpProfile", "QueryProfile", "QueryUsage"]
 
 
@@ -350,6 +362,11 @@ class QueryProfile:
     # per operator — the only such measurement that is sound on the streaming tier, which is
     # where most queries run. Summed across workers on a distributed run.
     usage: QueryUsage = field(default_factory=QueryUsage)
+    # What the Python out-of-core executors (`dist.spill`, `dist.spill_breakers`) wrote to
+    # disk, measured at their scratch store (`plan.profile.spill`). Held apart from `ops`
+    # because that path runs no metered engine call, so no operator carries the reading.
+    out_of_core_spilled: bool = False
+    out_of_core_spill_bytes: int = 0
 
     @property
     def machine(self) -> str:
@@ -366,17 +383,35 @@ class QueryProfile:
         read as facts about this box.
         """
         profile = hardware_profile()
-        return f"{profile.label()} [{profile.fingerprint()}]"
+        memo = _MACHINE_NAME
+        if memo is not None and memo[0] is profile:
+            return memo[1]
+        name = f"{profile.label()} [{profile.fingerprint()}]"
+        _remember_machine_name(profile, name)
+        return name
 
     @property
     def spilled(self) -> bool:
-        """Whether any operator spilled to disk during the run."""
-        return any(o.spilled for o in self.ops)
+        """Whether the run spilled to disk on any path.
+
+        An engine operator (driver or distributed worker) that reported a spill, or the
+        Python out-of-core executors having written buckets. Reading the operators alone
+        answered `False` for every query Carbonite routed out of core.
+        """
+        return (
+            self.out_of_core_spilled
+            or any(o.spilled for o in self.ops)
+            or any(o.spilled for o in self.worker_ops)
+        )
 
     @property
     def total_spill_bytes(self) -> int:
-        """Total logical bytes spilled to disk across every operator this run."""
-        return sum(o.spill_bytes for o in self.ops)
+        """Total bytes spilled to disk this run, across every operator and spill path."""
+        return (
+            self.out_of_core_spill_bytes
+            + sum(o.spill_bytes for o in self.ops)
+            + sum(o.spill_bytes for o in self.worker_ops)
+        )
 
     @property
     def peak_rss_bytes(self) -> int:

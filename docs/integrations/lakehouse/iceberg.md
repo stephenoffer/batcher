@@ -124,8 +124,7 @@ under the catalog warehouse and returns only the file locator; the driver regist
 file with `add_files` in one snapshot. The files are referenced in place, never re-read or rewritten by the driver.
 
 :::{important}
-The staging directory under `<warehouse>/<table>/_batcher_staging/` is not scratch. Those Parquet files *are* the table's data
-files. Do not sweep the directory.
+The files land in `<warehouse>/<table>/data/`, and they *are* the table's data files. Tables written by older Batcher releases keep theirs under `<warehouse>/<table>/_batcher_staging/`, which is not scratch either. Every snapshot names its files by full path, so deleting from either directory destroys data that snapshots still reference.
 :::
 
 Staged names carry a per-write token, so a later write can't clobber a file an earlier snapshot still references, while a preempted and rerun shard overwrites its own file and stays idempotent.

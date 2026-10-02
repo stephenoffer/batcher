@@ -10,6 +10,9 @@ whether a global window has a distributed path -- needs this half and never the 
 
 from __future__ import annotations
 
+import pyarrow as pa
+
+from batcher.dist.global_window.frames import is_rows_running_frame, trailing_rows_distance
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import Window
 
@@ -134,8 +137,37 @@ def _is_running_first_value(fn) -> bool:
 
 
 def _running_frame_ok(fn) -> bool:
-    """Whether `fn`'s explicit frame is one of the running frames this algebra carries."""
-    return is_running_last_value(fn) or is_running_nth_value(fn) or _is_running_first_value(fn)
+    """Whether `fn`'s explicit frame is one of the frames this algebra carries.
+
+    The three positional running frames above, plus the two ``ROWS`` frames `frames`
+    corrects: the running one `cum_sum` builds and the trailing one `rolling_sum` builds.
+    """
+    return (
+        is_running_last_value(fn)
+        or is_running_nth_value(fn)
+        or _is_running_first_value(fn)
+        or is_rows_running_frame(fn)
+        or trailing_rows_distance(fn) is not None
+    )
+
+
+def _trailing_input_ok(window: Window, fn) -> bool:
+    """Whether a trailing-framed `fn`'s input is a type `frames.TrailingFrame` folds exactly.
+
+    The tail fold runs in `int64` or `float64`, so a `sum`/`min`/`max`/`avg` over any other
+    type (a decimal, a string, a date) is declined rather than folded through a cast that
+    could round or reorder it. `count` reads only nullness and takes any type.
+    """
+    if trailing_rows_distance(fn) is None or fn.func == "count":
+        return True
+    schema = window.input.available_schema()
+    if schema is None:
+        return False
+    index = schema.arrow.get_field_index(fn.input.name)
+    if index < 0:
+        return False
+    dtype = schema.arrow.field(index).type
+    return pa.types.is_integer(dtype) or pa.types.is_floating(dtype)
 
 
 #: Window functions whose global value is recovered from the within-bucket value plus a
@@ -168,8 +200,9 @@ def supports_ordered_bucket_offsets(window: Window, *, assembled: bool = False) 
 
     Requires: no partition keys (global); a **leading** order key that is a plain column (the
     column the range partitioner cuts on) *of a type that partitioner can cut*; every function
-    offsettable or `first_value`, with no explicit frame; and aggregate/`first_value` inputs
-    are plain columns.
+    offsettable or `first_value`, with no explicit frame other than the running positional
+    frames and the two ``ROWS`` frames `frames` corrects (a trailing one only over a numeric
+    input); and aggregate/`first_value` inputs are plain columns.
 
     `assembled` says the caller will hold every bucket's corrected rows before it returns any
     of them, and will call `OrderedBucketOffsets.finalize` on the assembly. That admits the
@@ -230,6 +263,8 @@ def supports_ordered_bucket_offsets(window: Window, *, assembled: bool = False) 
             return False
         if fn.func in _NEEDS_COL_INPUT and not isinstance(fn.input, Col):
             return False
+        if not _trailing_input_ok(window, fn):
+            return False
     return True
 
 
@@ -237,10 +272,9 @@ def unoffsettable_functions(window: Window, *, assembled: bool = False) -> list[
     """The functions in `window` this algebra has no offset for, for an error message.
 
     `supports_ordered_bucket_offsets` answers *whether*; this answers *which*, from the same
-    tables, so a refusal names the function at fault rather than every function present. The
-    message that used to be built at the call site listed them all — a `row_number` beside a
-    `lag` was reported as equally unsupported, which sends the reader to rewrite the wrong half
-    of their query.
+    tables, so a refusal names the function at fault rather than every function present.
+    Listing them all would report a `row_number` beside a `lag` as equally unsupported, which
+    sends the reader to rewrite the wrong half of their query.
 
     Args:
         window: The global window that found no distributed route.
@@ -286,7 +320,7 @@ def _key_type_partitionable(window: Window) -> bool:
 
     Imported inside the function on purpose: this module is the one part of
     `dist.global_window` that `dist.executor` imports eagerly (see the package docstring on
-    the 0.44 s `import ray` that eager submodule loading used to cost), and
+    the 0.44 s `import ray` that eager submodule loading would cost), and
     `executors.partition_io` is not on that budget.
     """
     from batcher.dist.executors.partition_io import range_partitionable

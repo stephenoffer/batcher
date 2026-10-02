@@ -11,6 +11,7 @@ import pyarrow as pa
 from batcher._internal.errors import FormatError
 from batcher._internal.hardware import available_cpu_count
 from batcher.config import active_config
+from batcher.config.env import env_int
 from batcher.io.base import FileSink, FileSource
 from batcher.io.base._bad_rows import bad_row_handler
 from batcher.io.base._options import BASE_SOURCE_OPTIONS, OptionSpec
@@ -79,7 +80,7 @@ _JSON_COUNTER = 0
 # reader (no `open_json` counterpart to `open_csv`), so streaming means cutting the file at
 # newline boundaries and decoding one cut at a time. 8 MiB keeps peak memory at a window
 # rather than a file while still amortizing the parse.
-_JSON_STREAM_CHUNK_BYTES = max(1 << 16, int(os.environ.get("BATCHER_JSON_CHUNK_BYTES", 8 << 20)))
+_JSON_STREAM_CHUNK_BYTES = env_int("BATCHER_JSON_CHUNK_BYTES", 8 << 20, floor=1 << 16)
 
 
 def _newline_chunks(fh: IO[Any], size: int) -> Iterator[bytes]:
@@ -389,7 +390,7 @@ class JSONSink(FileSink):
                 _disable_json_proc()  # a broken pool must not poison later writes
         self._write_serial(table, fh)
 
-    def _write_parts(self, table, directory, file_index, resume, max_rows_per_file):  # type: ignore[override]
+    def _write_parts(self, table, directory, file_index, resume, max_rows_per_file):
         """Write a directory's part files across PROCESSES (pandas' JSON encoder holds the
         GIL, so the base's thread-per-part write serializes). Each worker encodes and writes
         one part from its IPC chunk — no result IPC, no concat — which is the difference
@@ -419,7 +420,7 @@ class JSONSink(FileSink):
             return base(table, directory, file_index, resume, max_rows_per_file)
         return [WrittenFile(path=p, rows=r, bytes=b) for p, r, b in parts]
 
-    def write_stream(self, batches, path, *, schema=None, resume=False):  # type: ignore[override]
+    def write_stream(self, batches, path, *, schema=None, resume=False):
         """Stream NDJSON to one file, encoding one batch at a time (bounded memory).
 
         The base `write_stream` buffers the whole result into one table before encoding

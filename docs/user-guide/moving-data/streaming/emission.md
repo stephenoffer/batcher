@@ -34,7 +34,7 @@ stops. That is the right answer for a source that ends, including an unbounded-b
 source that drains, such as an incremental file read under
 {py:meth}`Trigger.available_now() <batcher.Trigger.available_now>`. Over a source that
 genuinely never ends, such as a Kafka topic, "at end of input" never arrives and the query
-consumes without emitting.
+consumes without emitting. `iter_batches()` warns with a `PerformanceWarning` before its first read when an unbounded source feeds one of these three shapes, and names the ways to get output while rows arrive.
 
 Put one shape from each row of the table side by side on the same four triggers and the difference is entirely one of timing:
 
@@ -89,6 +89,15 @@ The answer matches the batch plan, because a row-wise operator's output for a ro
 on that row alone, so applying it to the running result is what applying it to the whole
 input computes. This holds on a cluster as well: the driver applies the same operators to
 the combined result, so `distributed=True` returns what one machine returns.
+
+A `filter` above the aggregate can drop a group it kept on an earlier trigger, for example
+when a running `sum` falls back below a threshold. What the sink then holds depends on the
+output mode. In `"complete"` mode each snapshot replaces the sink's contents, including a
+snapshot with no rows left, so the sink ends on the batch answer. In `"update"` mode Batcher
+emits only rows that are present and changed. A group that leaves the filter's set produces no
+row at all, and there is no deletion or tombstone record, so an upsert sink keeps that group's
+last emitted row. When a group can cross a `HAVING` threshold in both directions, use
+`"complete"`, or apply the threshold downstream of an `"update"` sink.
 
 ```python
 import pyarrow as pa

@@ -14,6 +14,7 @@ from batcher._internal.errors import PlanError
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.api._join_helpers import _empty_result_schema
 from batcher.api.orchestration import phases
+from batcher.api.orchestration.chunked import run_chunked
 from batcher.api.orchestration.sizing import (
     DEFAULT_PARTITIONS,
     carried_columns,
@@ -21,10 +22,16 @@ from batcher.api.orchestration.sizing import (
     partitions_from_physical,
     projected_input_bytes,
     proven_empty_table,
+    resident_input_bytes,
 )
-from batcher.api.orchestration.stages import execute_distributed, resolve_sources, spill_to_disk
+from batcher.api.orchestration.stages import (
+    execute_distributed,
+    measured_spill_collect,
+    resolve_sources,
+    spill_to_disk,
+)
 from batcher.api.orchestration.topn_seeding import run_seeded_topn
-from batcher.api.source_stats import collect_source_stats, column_bounds_needed
+from batcher.api.source_stats import planning_source_stats
 from batcher.config import active_config, config_context
 from batcher.core.runtime import query_scope
 from batcher.metadata.hardware_scope import planning_for
@@ -223,11 +230,7 @@ def _optimize(plan, sources, ctx, *, hardware=None):
     # Reuse the conductor's already-collected stats when present: the metadata-answer
     # attempt for a missed count()/is_empty() collected them, so a terminal op reads each
     # source's footer once across both passes.
-    source_stats = (
-        ctx.source_stats
-        if ctx.source_stats is not None
-        else collect_source_stats(sources, ctx.hub, need_columns=column_bounds_needed(plan))
-    )
+    source_stats = planning_source_stats(sources, ctx.hub, plan, ctx.source_stats)
     phases.record("collect_source_stats", time.perf_counter() - mark)
 
     phases.begin("kyber.optimize_full")
@@ -560,9 +563,20 @@ def _run_relational_scoped(
     # query, because the in-memory path resolves every source to Arrow *before* the engine
     # runs — a 600M-row scan is resident in full even when the query returns four rows.
     input_bytes = projected_input_bytes(sources, opt.source_projections, opt.scanned_source_ids())
-    # `resident_total_exceeds_budget` subsumes the input-only check: the input and the
-    # plan's peak state are concurrent on this path, so what matters is their sum.
-    if must_spill or rm.should_spill(opt) or rm.resident_total_exceeds_budget(input_bytes, opt):
+    # `resident_total_exceeds_budget` subsumes the input-only check: the input and the plan's
+    # peak state are concurrent here, less what the process already holds (`resident_input_bytes`).
+    held = resident_input_bytes(sources, opt.source_projections, opt.scanned_source_ids())
+    over = rm.resident_total_exceeds_budget(input_bytes, opt, held_bytes=held)
+    spill = must_spill or rm.should_spill(opt) or over
+    # Before either path reads the whole input, stream the largest source into the engine when
+    # the plan's shape allows it (`orchestration.chunked`).
+    streamed = run_chunked(plan, opt, ctx, sources, input_bytes=input_bytes, spill=spill)
+    if streamed is not None:
+        _close_resident_free_loops(
+            plan, logical_opt, ctx, rm, sources, streamed.num_rows, decisions, started=started
+        )
+        return streamed, decisions
+    if spill:
         phases.begin("core.execute.spilled")
         mark = time.perf_counter()
         spilled = spill_to_disk(logical_opt, sources, ctx, rm, opt, verdict)
@@ -591,29 +605,20 @@ def _run_relational_scoped(
     # is only real if a `False` actually changes behavior.
     with rm.reserve(rm.estimated_bytes(opt)) as granted:
         if not granted:
-            from batcher.dist.spill import spill_collect
             from batcher.plan.profile.usage import UsageStopwatch
 
             parts = partitions_from_physical(opt) or DEFAULT_PARTITIONS
             # As in `spill_to_disk`: this path runs unmetered engine dispatches, so the
-            # whole-phase reading is the only account of what it cost.
+            # whole-phase reading and the spill meter are the only account of what it did.
             watch = UsageStopwatch()
             phases.begin("core.execute.spilled")
             mark = time.perf_counter()
-            spilled = spill_collect(logical_opt, sources, parts)
+            spilled = measured_spill_collect(logical_opt, sources, parts, ctx, watch)
             phases.record("core.execute.spilled", time.perf_counter() - mark)
             if spilled is not None:
-                if ctx.profile is not None:
-                    ctx.profile.record_usage(watch.finish())
+                rows = spilled.num_rows
                 _close_resident_free_loops(
-                    plan,
-                    logical_opt,
-                    ctx,
-                    rm,
-                    sources,
-                    spilled.num_rows,
-                    decisions,
-                    started=started,
+                    plan, logical_opt, ctx, rm, sources, rows, decisions, started=started
                 )
                 return spilled, decisions
         # The phase a reader came for. Everything recorded above it is *planning*, so the
@@ -622,7 +627,8 @@ def _run_relational_scoped(
         phases.begin("core.execute")
         mark = time.perf_counter()
         table = _execute_in_memory(logical_opt, plan, opt, ctx, resolved)
-        phases.record("core.execute", time.perf_counter() - mark)
+        phases.record("core.execute", elapsed := time.perf_counter() - mark)
+        kyber.plan_cache.record_outcome(opt, elapsed * 1e3)  # the memo's regret guard
 
     _close_learning_loops(
         plan, logical_opt, ctx, rm, sources, resolved, table, decisions, started=started
@@ -643,7 +649,7 @@ def _publish_resource_gauges(rm: object) -> None:
     """Publish Carbonite's reading to the event bus. Best-effort; never breaks a query."""
     try:
         rm.publish_stats()  # type: ignore[attr-defined]
-    except Exception as exc:  # pragma: no cover - telemetry must never fail a run
+    except Exception as exc:  # telemetry must never fail a run
         note_suppressed("api", "publish Carbonite resource gauges", exc)
 
 
@@ -659,7 +665,7 @@ def _record_flap_rate(hub: object, rm: object) -> None:
         rate = rm.flap_rate()  # type: ignore[attr-defined]
         if rate is not None:
             record_flap_rate(hub, rate)  # type: ignore[arg-type]
-    except Exception as exc:  # pragma: no cover - a learned write must never fail a run
+    except Exception as exc:  # a learned write must never fail a run
         # Noted, not swallowed, and this is the write where the distinction matters most.
         # It is the producer half of a loop that has already been permanently inert once
         # (`PressureMonitor.flap_rate` records why), and a silent failure here reproduces

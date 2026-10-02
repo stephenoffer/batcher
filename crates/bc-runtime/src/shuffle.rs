@@ -137,10 +137,84 @@ pub fn bucket_of_rows_salted(
     // groups where the single-node oracle returns one (invariant #7). See `crate::keys`.
     let canon = crate::keys::canonicalize_float_keys(keys);
     let keys: &[ArrayRef] = canon.as_deref().unwrap_or(keys);
+    if let [only] = keys {
+        if only.null_count() == 0 {
+            if let Some(col) = int_col(only) {
+                return Ok(int_key_buckets(&col, rows, num_partitions, salt));
+            }
+        }
+    }
     let hasher = KeyHash::build(keys)?;
     Ok(map_rows(rows, |i| {
         bucket_of_salted(hasher.hash(i), num_partitions, salt)
     }))
+}
+
+/// [`bucket_of_rows_salted`] for one null-free integer key: the same bucket for every row, from
+/// a loop specialized to the column's width, that hashes a run of equal keys once.
+///
+/// The general loop pays, per row, a dispatch on the hasher's shape, a null test, a walk over a
+/// one-element column list and a dispatch on the column's type before it reaches the hash. On
+/// a single integer key — the shape of nearly every join and `GROUP BY` on a surrogate key —
+/// that bookkeeping costs as much as the hash. And a clustered key repeats: `lineitem` in
+/// `l_orderkey` order carries four rows per order, so three hashes in four recomputed the
+/// bucket of the row before. Both are removed here and nothing else changes: the hash is
+/// [`IntCol::write`] into a fresh [`SEED`] hasher, exactly as [`KeyHash::hash`] computes it, so a
+/// key lands in the same bucket on either path and co-partitioning (invariant #7) is untouched.
+fn int_key_buckets(col: &IntCol<'_>, rows: usize, num_partitions: usize, salt: u64) -> Vec<u32> {
+    /// Rows one parallel task buckets; each task keeps its own run cache.
+    const CHUNK: usize = 1 << 14;
+    fn run<T: Copy + PartialEq + Sync>(
+        vals: &[T],
+        bucket: impl Fn(usize) -> u32 + Sync,
+        out: &mut [u32],
+        base: usize,
+    ) {
+        let mut prev: Option<(T, u32)> = None;
+        for (j, slot) in out.iter_mut().enumerate() {
+            let i = base + j;
+            let v = vals[i];
+            *slot = match prev {
+                Some((pv, pb)) if pv == v => pb,
+                _ => {
+                    let b = bucket(i);
+                    prev = Some((v, b));
+                    b
+                }
+            };
+        }
+    }
+    fn go<T: Copy + PartialEq + Sync>(
+        vals: &[T],
+        rows: usize,
+        bucket: impl Fn(usize) -> u32 + Sync,
+    ) -> Vec<u32> {
+        let mut out = vec![0u32; rows];
+        if rows >= PAR_HASH_MIN_ROWS {
+            out.par_chunks_mut(CHUNK)
+                .enumerate()
+                .for_each(|(c, chunk)| run(vals, &bucket, chunk, c * CHUNK));
+        } else {
+            run(vals, &bucket, &mut out, 0);
+        }
+        out
+    }
+    let bucket = |i: usize| {
+        use std::hash::Hasher;
+        let mut h = SEED.build_hasher();
+        col.write(&mut h, i);
+        bucket_of_salted(h.finish(), num_partitions, salt)
+    };
+    match col {
+        IntCol::I8(v) => go(v, rows, bucket),
+        IntCol::I16(v) => go(v, rows, bucket),
+        IntCol::I32(v) => go(v, rows, bucket),
+        IntCol::I64(v) => go(v, rows, bucket),
+        IntCol::U8(v) => go(v, rows, bucket),
+        IntCol::U16(v) => go(v, rows, bucket),
+        IntCol::U32(v) => go(v, rows, bucket),
+        IntCol::U64(v) => go(v, rows, bucket),
+    }
 }
 
 /// Compute a per-row bucket id across every core on a large input.
@@ -356,15 +430,6 @@ fn scatter_into_buckets(
         .collect()
 }
 
-/// Range-partition `batch` into `n_buckets` globally-ordered buckets by the leading
-/// sort key at `key_index` and the ascending `boundaries`. Bucket `b` receives rows
-/// whose key falls in the `b`-th open interval of the boundaries
-/// (`searchsorted(boundaries, key, side="right")`), so equal keys never span a
-/// boundary and a concatenation of the per-bucket sorts is globally ordered. Nulls go
-/// to the front or back bucket to match single-node null ordering: `front` is the
-/// bucket the driver concatenates first (`n_buckets-1` for a descending sort, else
-/// `0`), and nulls land there when `nulls_first`, else at the opposite end.
-///
 /// Whether `dt` is a temporal type with a total order that its integer backing
 /// (days / millis / micros / nanos) preserves — so range-partitioning on the backing
 /// gives the same order as the single-node temporal sort. Excludes `Interval`
@@ -395,6 +460,15 @@ pub fn temporal_to_i64(col: &ArrayRef) -> Result<ArrayRef, RuntimeError> {
     }
 }
 
+/// Range-partition `batch` into `n_buckets` globally-ordered buckets by the leading
+/// sort key at `key_index` and the ascending `boundaries`. Bucket `b` receives rows
+/// whose key falls in the `b`-th open interval of the boundaries
+/// (`searchsorted(boundaries, key, side="right")`), so equal keys never span a
+/// boundary and a concatenation of the per-bucket sorts is globally ordered. Nulls go
+/// to the front or back bucket to match single-node null ordering: `front` is the
+/// bucket the driver concatenates first (`n_buckets-1` for a descending sort, else
+/// `0`), and nulls land there when `nulls_first`, else at the opposite end.
+///
 /// This is the Rust counterpart of the hash [`partition_by_keys`] for the
 /// distributed-sort path. The key is compared as `f64` — bit-identical to the
 /// previous NumPy `searchsorted` over `to_numpy()` keys (the boundaries are
@@ -531,39 +605,12 @@ pub fn range_part_of_f64(
     }))
 }
 
-/// Like [`range_partition_by_key_array`], but for an **integer** leading key compared
-/// **exactly** as `i64` (boundaries are `i64` quantiles) — no `f64` cast, so a key beyond
-/// `2^53` is routed without precision loss. Any signed/unsigned integer width is widened
-/// to `i64` (order-preserving). The single-node parallel sample-sort uses this for an
-/// integer `ORDER BY` leading key; floats keep [`range_partition_by_key_array`].
-pub fn range_partition_by_i64_key(
-    batch: &RecordBatch,
-    key_col: &ArrayRef,
-    boundaries: &[i64],
-    n_buckets: usize,
-    nulls_first: bool,
-    descending: bool,
-) -> Result<Vec<RecordBatch>, RuntimeError> {
-    assert!(n_buckets >= 1);
-    if n_buckets == 1 {
-        return Ok(vec![batch.clone()]);
-    }
-    let mut part_of = range_part_of_i64(key_col, boundaries, n_buckets, nulls_first, descending)?;
-    // More split points than `n_buckets-1` (boundaries sized for `workers` but fewer buckets
-    // requested) would let `partition_point` return an id == `n_buckets` and index
-    // `scatter_into_buckets` out of bounds — a panic on a data path. Clamp so an over-long
-    // boundary list degrades to fewer non-empty buckets, every row preserved and equal keys
-    // still co-located (the clamp is monotonic) — the same guard the f64
-    // [`range_partition_by_key_array`] applies.
-    let last = (n_buckets - 1) as u32;
-    for b in &mut part_of {
-        *b = (*b).min(last);
-    }
-    scatter_into_buckets(batch, &part_of, n_buckets)
-}
-
-/// The per-row bucket id [`range_partition_by_i64_key`] would scatter by — the routing
-/// without the gather, for callers that permute the rows themselves.
+/// Per-row range bucket ids for an **integer** leading key compared **exactly** as `i64`
+/// (boundaries are `i64` quantiles) — no `f64` cast, so a key beyond `2^53` is routed without
+/// precision loss. Any signed/unsigned integer width is widened to `i64` (order-preserving).
+/// The single-node parallel sample-sort routes an integer `ORDER BY` leading key with this;
+/// floats keep [`range_part_of_f64`]. Returns the routing without the gather, for callers
+/// that permute the rows themselves.
 pub fn range_part_of_i64(
     key_col: &ArrayRef,
     boundaries: &[i64],
@@ -681,7 +728,7 @@ fn int_buckets(key_col: &ArrayRef, boundaries: &[i64], null_bucket: u32) -> Vec<
     }
 }
 
-/// Like [`range_partition_by_i64_key`], but for a **byte-lexicographic** leading key —
+/// Range-partition a batch by a **byte-lexicographic** leading key —
 /// `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` or `FixedSizeBinary` — compared by its bytes.
 ///
 /// That is exactly the ordering arrow's `sort_to_indices` gives those columns, so the
@@ -715,30 +762,6 @@ pub fn range_partition_by_byte_key(
         *b = (*b).min(last);
     }
     scatter_into_buckets(batch, &part_of, n_buckets)
-}
-
-/// [`range_partition_by_byte_key`] for the `Utf8`/`LargeUtf8` spelling of the same key, whose
-/// boundaries cross the FFI as `String`.
-///
-/// A wrapper rather than a second implementation: a `String` boundary *is* its bytes
-/// (`String: AsRef<[u8]>`), and UTF-8 compares byte-lexicographically, so there is exactly one
-/// routing here and both key families take it.
-pub fn range_partition_by_str_key(
-    batch: &RecordBatch,
-    key_col: &ArrayRef,
-    boundaries: &[String],
-    n_buckets: usize,
-    nulls_first: bool,
-    descending: bool,
-) -> Result<Vec<RecordBatch>, RuntimeError> {
-    range_partition_by_byte_key(
-        batch,
-        key_col,
-        boundaries,
-        n_buckets,
-        nulls_first,
-        descending,
-    )
 }
 
 /// Cap on the values a single [`byte_quantiles`] call sorts. Boundaries only need to
@@ -838,17 +861,6 @@ pub fn range_part_of_bytes(
         boundaries,
         null_bucket_of(n_buckets, nulls_first, descending),
     )
-}
-
-/// [`range_part_of_bytes`] for `String` boundaries — see [`range_partition_by_str_key`].
-pub fn range_part_of_str(
-    key_col: &ArrayRef,
-    boundaries: &[String],
-    n_buckets: usize,
-    nulls_first: bool,
-    descending: bool,
-) -> Result<Vec<u32>, RuntimeError> {
-    range_part_of_bytes(key_col, boundaries, n_buckets, nulls_first, descending)
 }
 
 /// Route every row of a byte-key column against ascending `boundaries`.
@@ -1324,6 +1336,54 @@ mod tests {
     use arrow::array::Int64Array;
     use std::sync::Arc;
 
+    /// The single-integer-key fast path must bucket every row exactly as the general
+    /// [`KeyHash`] loop does — that agreement *is* co-partitioning — on clustered and scattered
+    /// keys, every native width, a salt, both bucket-mapping arms, and both sides of the
+    /// parallel threshold (where each chunk keeps its own run cache).
+    #[test]
+    fn single_int_key_fast_path_matches_the_general_hash() {
+        use arrow::array::{Int32Array, Int8Array, UInt64Array};
+        let general = |keys: &[ArrayRef], parts: usize, salt: u64| -> Vec<u32> {
+            let h = KeyHash::build(keys).unwrap();
+            (0..keys[0].len())
+                .map(|i| bucket_of_salted(h.hash(i), parts, salt))
+                .collect()
+        };
+        for n in [0usize, 1, 7, 1000, PAR_HASH_MIN_ROWS + 12_345] {
+            let clustered: Vec<i64> = (0..n as i64).map(|i| (i / 4) * 7 - 3).collect();
+            let scattered: Vec<i64> = (0..n as i64)
+                .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64))
+                .collect();
+            let cols: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(clustered.clone())),
+                Arc::new(Int64Array::from(scattered)),
+                Arc::new(Int32Array::from_iter_values(
+                    clustered.iter().map(|&v| v as i32),
+                )),
+                Arc::new(Int8Array::from_iter_values(
+                    clustered.iter().map(|&v| v as i8),
+                )),
+                Arc::new(UInt64Array::from_iter_values(
+                    clustered.iter().map(|&v| v as u64),
+                )),
+            ];
+            for col in &cols {
+                let keys = std::slice::from_ref(col);
+                for parts in [7usize, 64] {
+                    for salt in [0u64, 11] {
+                        let fast = bucket_of_rows_salted(keys, n, parts, salt).unwrap();
+                        assert_eq!(
+                            fast,
+                            general(keys, parts, salt),
+                            "n={n} type={} parts={parts} salt={salt}",
+                            col.data_type()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn partitions_are_disjoint_and_complete() {
         let batch = RecordBatch::try_from_iter(vec![(
@@ -1783,26 +1843,7 @@ mod tests {
         );
     }
 
-    /// Regression: the **i64** range partitioner must degrade gracefully — not panic — when
-    /// handed more split points than `n_buckets-1` (boundaries sized for `workers` but only
-    /// `n_buckets` requested), exactly like the f64 sibling. Before the clamp,
-    /// `range_part_of_i64` returned an id == `n_buckets` and indexed `scatter_into_buckets`
-    /// out of bounds. Every row must still be preserved (no loss, no dup).
-    #[test]
-    fn range_i64_more_boundaries_than_buckets_does_not_panic() {
-        let keys: Vec<i64> = vec![1, 3, 5, 7, 9];
-        let col = Arc::new(Int64Array::from(keys.clone())) as ArrayRef;
-        let batch = RecordBatch::try_from_iter(vec![("k", col.clone())]).unwrap();
-        // 3 buckets but 6 boundaries — the over-long-boundaries repro shape.
-        let parts = range_partition_by_i64_key(&batch, &col, &[2, 3, 4, 5, 6, 7], 3, true, false)
-            .expect("must not error");
-        assert_eq!(parts.len(), 3);
-        let total: usize = parts.iter().map(|p| p.num_rows()).sum();
-        assert_eq!(total, keys.len(), "no row may be lost or duplicated");
-    }
-
-    /// Regression: the **string** range partitioner had the same missing clamp as the i64
-    /// one — more boundaries than `n_buckets-1` panicked `scatter_into_buckets`. Degrade to
+    /// Regression: the **byte-key** range partitioner once lacked the clamp — more boundaries than `n_buckets-1` panicked `scatter_into_buckets`. Degrade to
     /// fewer non-empty buckets instead, preserving every row.
     #[test]
     fn range_str_more_boundaries_than_buckets_does_not_panic() {
@@ -1814,7 +1855,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let parts =
-            range_partition_by_str_key(&batch, &col, &b, 3, true, false).expect("must not error");
+            range_partition_by_byte_key(&batch, &col, &b, 3, true, false).expect("must not error");
         assert_eq!(parts.len(), 3);
         let total: usize = parts.iter().map(|p| p.num_rows()).sum();
         assert_eq!(total, 5, "no row may be lost or duplicated");
@@ -1972,7 +2013,7 @@ mod tests {
             let probs: Vec<f64> = (1..buckets).map(|i| i as f64 / buckets as f64).collect();
             let mut bounds = string_quantiles(&key, &probs).unwrap();
             bounds.dedup();
-            let part_of = range_part_of_str(&key, &bounds, buckets, false, false).unwrap();
+            let part_of = range_part_of_bytes(&key, &bounds, buckets, false, false).unwrap();
             // Concatenate the buckets in order, sorting within each, and compare against
             // one global sort of the whole column.
             let mut concat: Vec<&String> = Vec::new();
@@ -2088,7 +2129,7 @@ mod tests {
         let words: Vec<String> = (0..300).map(|i| format!("v{}", i % 5)).collect();
         let key: ArrayRef = Arc::new(StringArray::from(words.clone()));
         let bounds = string_quantiles(&key, &[0.25, 0.5, 0.75]).unwrap();
-        let part_of = range_part_of_str(&key, &bounds, 4, false, false).unwrap();
+        let part_of = range_part_of_bytes(&key, &bounds, 4, false, false).unwrap();
         let mut of_word = std::collections::HashMap::new();
         for (w, b) in words.iter().zip(&part_of) {
             assert_eq!(
@@ -2158,11 +2199,11 @@ mod tests {
         assert!(string_quantiles(&all_null, &[0.5]).unwrap().is_empty());
         let bounds = vec!["b".to_string()];
         assert_eq!(
-            range_part_of_str(&key, &bounds, 4, true, false).unwrap()[1],
+            range_part_of_bytes(&key, &bounds, 4, true, false).unwrap()[1],
             0
         );
         assert_eq!(
-            range_part_of_str(&key, &bounds, 4, false, false).unwrap()[1],
+            range_part_of_bytes(&key, &bounds, 4, false, false).unwrap()[1],
             3
         );
     }

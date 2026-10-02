@@ -99,13 +99,13 @@ def _crossover_step(
     """
     try:
         fits = {
-            name: _fit(
+            name: fit_ols(
                 (candidate if name == bucket else hub.get_keyed_param(scoped(namespace), name))
                 or {}
             )
             for name in (below, above)
         }
-    except Exception as exc:  # pragma: no cover - a decision test must never break a query
+    except Exception as exc:  # a decision test must never break a query
         # Best-effort, but not invisible. A store that has started refusing reads makes
         # every plan silently fall back to its shipped default, and the two look identical
         # from outside: plans that used to improve across runs quietly stop, with nothing
@@ -117,9 +117,6 @@ def _crossover_step(
     if xover is None or xover <= 0.0:
         return None
     return math.floor(math.log(xover) / math.log(1.0 + _XOVER_STEP))
-
-
-_fit = fit_ols
 
 
 def _solve_crossover(
@@ -138,9 +135,12 @@ def _solve_crossover(
     if hub is None:
         return None
     try:
-        below = _fit(hub.get_keyed_param(scoped(namespace), cheap_below) or {})
-        above = _fit(hub.get_keyed_param(scoped(namespace), cheap_above) or {})
-    except Exception:  # pragma: no cover
+        below = fit_ols(hub.get_keyed_param(scoped(namespace), cheap_below) or {})
+        above = fit_ols(hub.get_keyed_param(scoped(namespace), cheap_above) or {})
+    except Exception as exc:  # pragma: no cover - a learned threshold must never break a query
+        # Traced for the reason `_crossover_step` gives: a store refusing reads would otherwise
+        # pin every threshold to its default with nothing saying why.
+        note_suppressed("kyber", "read the learned crossover buckets", exc)
         return None
     return _crossover_of(below, above, default)
 
@@ -193,7 +193,7 @@ def record_broadcast_timing(
             below="broadcast",
             above="shuffle",
         )
-    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+    except Exception as exc:  # a learned write must never break a query
         # Noted, not swallowed. This recorder had *no caller at all* until recently, so
         # `learned_broadcast_max_bytes` returned `None` forever and the threshold never moved
         # off its static default — with nothing in the log to say so. A silent failure here
@@ -230,7 +230,7 @@ def record_sort_merge_timing(
             below="hash",
             above="sort_merge",
         )
-    except Exception as exc:  # pragma: no cover - a learned write must never break a query
+    except Exception as exc:  # a learned write must never break a query
         note_suppressed("kyber", "record a hash-vs-sort-merge timing", exc)
 
 

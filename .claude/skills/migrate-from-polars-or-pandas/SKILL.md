@@ -163,7 +163,7 @@ engine, and asserting on order will produce spurious failures (and, worse, an
 order-*independent* comparison cannot see a real sort bug, so sorted queries must be
 compared *in order*).
 
-The in-repo pattern is `tests/differential/conftest.py::assert_same`: coerce to
+The in-repo pattern is `tests/_harness.py::assert_same`: coerce to
 pyarrow, normalize rows to tuples, sort by a total order, compare multisets with
 int↔float and float-rounding tolerance. Reuse it rather than hand-rolling:
 

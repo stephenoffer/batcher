@@ -30,6 +30,7 @@ from batcher.kyber.rules.joins import order as _join_order  # noqa: F401  (regis
 from batcher.kyber.rules.joins import projection as _join_projection  # noqa: F401  (registers rules)
 from batcher.kyber.rules import joins as _joins  # noqa: F401  (registers the rewrites family)
 from batcher.kyber.rules.joins import agg_semijoin as _agg_semijoin  # noqa: F401  (registers rules)
+from batcher.kyber.rules.joins import outer_float as outer_float  # registers rules
 
 # isort: on
 from batcher.kyber.rules import (

@@ -149,7 +149,10 @@ mod tests {
 
     #[test]
     fn a_first_seen_aggregate_is_order_sensitive() {
-        assert!(aggregates_ignore_order(&[agg(AggFunc::CountStar), agg(AggFunc::Sum)]));
+        assert!(aggregates_ignore_order(&[
+            agg(AggFunc::CountStar),
+            agg(AggFunc::Sum)
+        ]));
         for f in [
             AggFunc::ListAgg,
             AggFunc::ArgMin,
@@ -157,7 +160,10 @@ mod tests {
             AggFunc::ApproxQuantile,
             AggFunc::Product,
         ] {
-            assert!(!aggregates_ignore_order(&[agg(AggFunc::Count), agg(f)]), "{f:?}");
+            assert!(
+                !aggregates_ignore_order(&[agg(AggFunc::Count), agg(f)]),
+                "{f:?}"
+            );
         }
     }
 
@@ -199,7 +205,10 @@ mod tests {
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(keys))]).unwrap()
         };
         let left: Vec<i64> = (0..60_000).filter(|k| k % 3 == 0).collect();
-        let right: Vec<i64> = (0..60_000).filter(|k| k % 2 == 0).map(|k| k % 40_000).collect();
+        let right: Vec<i64> = (0..60_000)
+            .filter(|k| k % 2 == 0)
+            .map(|k| k % 40_000)
+            .collect();
         let sources = vec![vec![side("l", left)], vec![side("r", right)]];
         let join = RelOp::HashJoin {
             left: Box::new(RelOp::Scan { source_id: 0 }),
@@ -208,8 +217,16 @@ mod tests {
             right_keys: vec!["r".into()],
             join_type: JoinType::Full,
             output: vec![
-                JoinOutputCol { side: JoinSide::Left, name: "l".into(), alias: "l".into() },
-                JoinOutputCol { side: JoinSide::Right, name: "r".into(), alias: "r".into() },
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "l".into(),
+                    alias: "l".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "r".into(),
+                    alias: "r".into(),
+                },
             ],
             strategy: JoinStrategy::Hash,
         };
@@ -234,7 +251,10 @@ mod tests {
         let sorted = RelOp::Sort {
             input: Box::new(RelOp::Aggregate {
                 input: Box::new(join),
-                group_keys: vec![ProjectionItem { expr: col("r"), alias: "r".into() }],
+                group_keys: vec![ProjectionItem {
+                    expr: col("r"),
+                    alias: "r".into(),
+                }],
                 aggregates: vec![count(AggFunc::CountStar, None, "n")],
             }),
             keys: by(&["r"]),
@@ -242,13 +262,16 @@ mod tests {
         };
         for plan in [global, sorted] {
             let oracle = crate::execute(&plan, &sources).unwrap();
-            let got = super::super::execute_streaming_parallel(&plan, &sources, 8, 0, None).unwrap();
+            let got =
+                super::super::execute_streaming_parallel(&plan, &sources, 8, 0, None).unwrap();
             let rows = |b: &[RecordBatch]| {
                 let t = crate::ops::materialize(b).unwrap();
                 (0..t.num_columns())
                     .map(|c| {
                         let a = t.column(c).as_any().downcast_ref::<Int64Array>().unwrap();
-                        (0..a.len()).map(|i| a.is_valid(i).then(|| a.value(i))).collect()
+                        (0..a.len())
+                            .map(|i| a.is_valid(i).then(|| a.value(i)))
+                            .collect()
                     })
                     .collect::<Vec<Vec<Option<i64>>>>()
             };

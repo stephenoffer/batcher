@@ -129,5 +129,5 @@ class FanoutTrace:
                 steps=steps,
             )
             events.publish(events.DECISION, **self.to_decision().to_dict())
-        except Exception as exc:  # pragma: no cover - observation must never fail a query
+        except Exception as exc:  # observation must never fail a query
             note_suppressed("dist", "report the fan-out trace", exc)

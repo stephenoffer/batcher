@@ -18,6 +18,9 @@ pub(crate) fn eval_case(
     otherwise: &Expr,
     batch: &RecordBatch,
 ) -> Result<ArrayRef, ExprError> {
+    if let Some((value, fallback)) = coalesce_shape(branches, otherwise) {
+        return super::coalesce::coalesce_of(&[value, fallback], batch);
+    }
     let n = batch.num_rows();
 
     // Pass one: the conditions, folded into **disjoint** selections. `unclaimed` is the
@@ -67,6 +70,33 @@ pub(crate) fn eval_case(
         acc = zip(selection, &value.as_ref(), &acc_c.as_ref())?;
     }
     Ok(acc)
+}
+
+/// `(e, o)` when this `CASE` is `CASE WHEN e IS NOT NULL THEN e ELSE o END` — which is
+/// `COALESCE(e, o)`, and is what the SQL front end lowers `COALESCE` to.
+///
+/// Evaluated as written it computes `e` twice (once for the condition, once for the body over
+/// the rows it selects), gathers and scatters for the body, and `zip`s the two arms; on
+/// `SUM(COALESCE(NULLIF(l_discount, 0.00), 1.00))` that was over half the query. `COALESCE`
+/// computes `e` once and evaluates `o` only over the rows where `e` is null — exactly the rows
+/// `CASE` hands its `ELSE` — with the same numeric coercion between the two, so the answer, its
+/// type and which rows can raise are all unchanged.
+///
+/// The two `e`s are matched on their derived `Debug` rendering, which is structural: equal
+/// renderings are the same expression, and anything it fails to match keeps the general path.
+/// The shape test runs first, so a `CASE` of any other form never formats anything.
+fn coalesce_shape<'a>(
+    branches: &'a [CaseBranch],
+    otherwise: &'a Expr,
+) -> Option<(&'a Expr, &'a Expr)> {
+    let [CaseBranch {
+        when: Expr::IsNotNull { input },
+        then,
+    }] = branches
+    else {
+        return None;
+    };
+    (format!("{input:?}") == format!("{then:?}")).then_some((input.as_ref(), otherwise))
 }
 
 #[cfg(test)]
@@ -124,6 +154,65 @@ mod tests {
         (0..a.len())
             .map(|i| (!a.is_null(i)).then(|| a.value(i)))
             .collect()
+    }
+
+    /// `CASE WHEN e IS NOT NULL THEN e ELSE o END` answers through `COALESCE(e, o)`; it must
+    /// give the general path's array and type. The general path is reached by spelling the
+    /// condition `NOT (e IS NULL)`, which means the same and is not the shape.
+    #[test]
+    fn a_coalesce_shaped_case_matches_the_general_path() {
+        let batch = sample();
+        let nullif_f = Expr::NullIf {
+            left: Box::new(col("f")),
+            right: Box::new(Expr::Lit {
+                value: Literal::Float(3.5),
+            }),
+        };
+        for (e, o) in [
+            (
+                nullif_f.clone(),
+                Expr::Lit {
+                    value: Literal::Float(-0.0),
+                },
+            ),
+            (col("f"), col("i")),
+            (
+                col("i"),
+                Expr::Lit {
+                    value: Literal::Float(0.5),
+                },
+            ),
+            (col("i"), lit_int(9)),
+        ] {
+            let shaped = [CaseBranch {
+                when: Expr::IsNotNull {
+                    input: Box::new(e.clone()),
+                },
+                then: e.clone(),
+            }];
+            assert!(coalesce_shape(&shaped, &o).is_some());
+            let general = [CaseBranch {
+                when: Expr::Not {
+                    input: Box::new(Expr::IsNull {
+                        input: Box::new(e.clone()),
+                    }),
+                },
+                then: e.clone(),
+            }];
+            assert!(coalesce_shape(&general, &o).is_none());
+            let got = eval_case(&shaped, &o, &batch).expect("coalesce shape");
+            let want = eval_case(&general, &o, &batch).expect("general");
+            assert_eq!(got.data_type(), want.data_type(), "{e:?} / {o:?}");
+            assert_eq!(&got, &want, "{e:?} / {o:?}");
+        }
+        // A body that is not the condition's operand is not the shape.
+        let other = [CaseBranch {
+            when: Expr::IsNotNull {
+                input: Box::new(col("f")),
+            },
+            then: col("i"),
+        }];
+        assert!(coalesce_shape(&other, &lit_int(0)).is_none());
     }
 
     /// A branch no row selects is not evaluated, so a body that would fail on the rows it
@@ -283,5 +372,109 @@ mod tests {
                 Some(0.0)
             ]
         );
+    }
+
+    /// A `CASE` over nested branch values with no `ELSE`, as the control plane lowers it:
+    /// the missing arm is `nullif(v, v)`, a NULL typed like `v`. It used to fail with
+    /// "Nested comparison: List(Int64) == List(Int64)" because that typed NULL went
+    /// through the flat equality kernel. The masks select values; nothing compares them.
+    fn nested_case(value: ArrayRef, cond: Vec<Option<bool>>) -> ArrayRef {
+        use arrow::array::BooleanArray;
+        let schema = Schema::new(vec![
+            Field::new("c", DataType::Boolean, true),
+            Field::new("v", value.data_type().clone(), true),
+        ]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![std::sync::Arc::new(BooleanArray::from(cond)), value],
+        )
+        .expect("nested batch");
+        let typed_null = Expr::NullIf {
+            left: Box::new(col("v")),
+            right: Box::new(col("v")),
+        };
+        let branches = vec![CaseBranch {
+            when: col("c"),
+            then: col("v"),
+        }];
+        let out = eval_case(&branches, &typed_null, &batch).expect("nested case");
+        assert_eq!(out.data_type(), batch.column(1).data_type());
+        out
+    }
+
+    fn nulls(arr: &ArrayRef) -> Vec<bool> {
+        (0..arr.len()).map(|i| arr.is_null(i)).collect()
+    }
+
+    fn int_list(rows: Vec<Option<Vec<Option<i64>>>>) -> ArrayRef {
+        use arrow::array::ListArray;
+        use arrow::datatypes::Int64Type;
+        std::sync::Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(rows))
+    }
+
+    #[test]
+    fn a_list_case_without_else_selects_by_mask() {
+        let v = int_list(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![None]),
+            None,
+            Some(vec![]),
+        ]);
+        let out = nested_case(v.clone(), vec![Some(true), Some(true), Some(true), None]);
+        assert_eq!(nulls(&out), vec![false, false, true, true]);
+        assert_eq!(out.slice(0, 2).to_data(), v.slice(0, 2).to_data());
+    }
+
+    #[test]
+    fn a_large_list_case_without_else_selects_by_mask() {
+        use arrow::array::LargeListArray;
+        use arrow::datatypes::Int64Type;
+        let v: ArrayRef =
+            std::sync::Arc::new(LargeListArray::from_iter_primitive::<Int64Type, _, _>(
+                vec![Some(vec![Some(1)]), Some(vec![Some(2)])],
+            ));
+        let out = nested_case(v, vec![Some(false), Some(true)]);
+        assert_eq!(nulls(&out), vec![true, false]);
+    }
+
+    #[test]
+    fn a_struct_case_without_else_selects_by_mask() {
+        use arrow::array::StructArray;
+        let x: ArrayRef = std::sync::Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let v: ArrayRef = std::sync::Arc::new(StructArray::from(vec![(
+            std::sync::Arc::new(Field::new("x", DataType::Int64, true)),
+            x,
+        )]));
+        let out = nested_case(v, vec![Some(true), Some(true), Some(false)]);
+        assert_eq!(nulls(&out), vec![false, false, true]);
+    }
+
+    #[test]
+    fn a_map_case_without_else_selects_by_mask() {
+        use arrow::array::{Int64Builder, MapBuilder};
+        let mut b = MapBuilder::new(None, Int64Builder::new(), Int64Builder::new());
+        b.keys().append_value(1);
+        b.values().append_value(10);
+        b.append(true).expect("map row");
+        b.append(true).expect("empty map row");
+        let v: ArrayRef = std::sync::Arc::new(b.finish());
+        let out = nested_case(v, vec![Some(false), Some(true)]);
+        assert_eq!(nulls(&out), vec![true, false]);
+    }
+
+    /// No row selected, and every row selected: the two ends of the mask.
+    #[test]
+    fn a_nested_case_under_an_all_false_or_all_true_mask() {
+        let v = int_list(vec![Some(vec![Some(1)]), None, Some(vec![Some(2)])]);
+        let none = nested_case(v.clone(), vec![None, Some(false), None]);
+        assert_eq!(nulls(&none), vec![true; 3]);
+        let all = nested_case(v.clone(), vec![Some(true); 3]);
+        assert_eq!(all.to_data(), v.to_data());
+    }
+
+    #[test]
+    fn a_nested_case_over_an_empty_batch() {
+        let out = nested_case(int_list(vec![]), vec![]);
+        assert_eq!(out.len(), 0);
     }
 }

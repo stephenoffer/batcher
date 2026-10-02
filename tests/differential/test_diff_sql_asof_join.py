@@ -119,11 +119,29 @@ def test_asof_never_emits_more_rows_than_the_left_side(duck):
         assert bt.sql(query, **tables).collect().num_rows <= _left().num_rows
 
 
-def test_strict_inequality_is_rejected_not_approximated(duck):
-    """`>` has no inclusive-node representation, so it must raise rather than answer."""
+@pytest.mark.parametrize(
+    "on",
+    [
+        "t.id > u.id",
+        "t.id < u.id",
+        "u.id < t.id",
+        "t.id > u.id AND t.g = u.g",
+    ],
+)
+@pytest.mark.parametrize("how", ["", "LEFT "])
+def test_strict_inequality_excludes_the_equal_key_like_duckdb(duck, on, how):
+    """`>` / `<` take the nearest right row strictly before / after, never an equal key.
+
+    Carried to the engine as `allow_exact_matches=False`; a post-filter on the inclusive
+    match would drop the row instead of moving to the next valid one. The keys 1..3 are
+    equal on both sides here, so an inclusive answer differs on those rows.
+    """
     tables = _both(duck)
-    with pytest.raises(Exception, match="strict inequality"):
-        bt.sql("SELECT t.id, u.v FROM t ASOF JOIN u ON t.id > u.id", **tables).collect()
+    query = f"SELECT t.id, u.v FROM t ASOF {how}JOIN u ON {on} ORDER BY t.id"
+    got = [tuple(r.values()) for r in bt.sql(query, **tables).collect().to_pylist()]
+    assert got == duck.sql(query).fetchall()
+    inclusive = query.replace(" > ", " >= ").replace(" < ", " <= ")
+    assert got != duck.sql(inclusive).fetchall(), "positive control: strictness must matter"
 
 
 def test_asof_without_an_inequality_is_rejected(duck):

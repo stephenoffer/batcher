@@ -25,6 +25,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import SchemaError
 from batcher.config import active_config
+from batcher.config.env import env_int
 from batcher.io.base import FileSink, FileSource
 from batcher.io.formats.base import SINKS, SOURCES
 
@@ -36,9 +37,7 @@ __all__ = ["WebDatasetSink", "WebDatasetSource"]
 # and bounds nothing that matters. This is the same reasoning `base/source.py` applies to its
 # read-ahead window ("one row can itself be a 200 MB video") and `binary.py` to its file
 # batches — a count-only ceiling does not bound memory when rows are not narrow.
-_BATCH_PAYLOAD_BYTES = max(
-    1 << 20, int(os.environ.get("BATCHER_WEBDATASET_BATCH_BYTES", str(64 << 20)))
-)
+_BATCH_PAYLOAD_BYTES = env_int("BATCHER_WEBDATASET_BATCH_BYTES", 64 << 20, floor=1 << 20)
 
 
 def _split_key_ext(member_name: str) -> tuple[str, str]:

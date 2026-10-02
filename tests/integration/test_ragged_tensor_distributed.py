@@ -17,18 +17,14 @@ import numpy as np
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher.io.formats.ml.ragged import is_ragged_tensor_column, ragged_to_numpy
 
 pytest.importorskip("ray", reason="ray not installed")
 pytest.importorskip("batcher._native", reason="native engine not built")
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(2)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(2)
 
 
 def _images(n: int) -> list[np.ndarray]:

@@ -1,16 +1,16 @@
 """Per-signature learned scalars — the priors that seed sizing and pre-aggregation.
 
 Where `bandit` picks between algorithms and `crossover` learns a threshold, this module learns a
-*number* per plan signature from what actually happened: how big each join side was, how many rows
-a breaker shuffled, how far an aggregate collapsed its input. Each is folded into O(1)
-sufficient statistics by a `record_*` function and read back by a `learned_*` one.
+*number* per plan signature from what actually happened: how many rows a breaker shuffled and
+how far an aggregate collapsed its input. Each is folded into O(1) sufficient statistics by a
+`record_*` function and read back by a `learned_*` one.
 
 Whether to re-optimize *between* stages is not here: it is a two-sided cost question, so it
 lives with the other regret-minimizing choices in `bandit.learned_adaptive_route`.
 
-Every one of them steers sizing, sharding or planning effort only — a build orientation, a
-partition count, whether to pre-aggregate — so a wrong learned value costs
-throughput and never correctness. The family contract is in the package docstring.
+Every one of them steers sizing, sharding or planning effort only — a partition count, whether to
+pre-aggregate — so a wrong learned value costs throughput and never correctness. The family
+contract is in the package docstring.
 """
 
 from __future__ import annotations
@@ -19,23 +19,20 @@ import math
 from typing import TYPE_CHECKING
 
 from batcher._internal.logging import note_suppressed
-from batcher.config import active_config
 from batcher.kyber import plan_cache
+from batcher.metadata.smoothed import convergent_blend
 
 if TYPE_CHECKING:
     from batcher.metadata import MetadataHub
 
 __all__ = [
-    "learned_build_sides",
     "learned_partial_agg",
     "learned_partition_count",
     "learned_signature_rows",
     "record_group_reduction",
-    "record_join_sides",
     "record_partition_rows",
 ]
 
-_NS_SIDES = "tuning.join_sides"  # per-signature measured (left_rows, right_rows)
 _NS_PART = "tuning.partition_rows"  # per-signature measured shuffle rows
 _NS_GROUP = "tuning.group_reduction"  # per-signature measured groups / input rows
 
@@ -45,101 +42,36 @@ _NS_GROUP = "tuning.group_reduction"  # per-signature measured groups / input ro
 # machine-unit measurement (nanoseconds, bytes of RAM, a batch size chosen against them), and
 # never scope a statement about data, because "scoping those would fragment the statistics that
 # took the most work to collect, turning a well-calibrated fleet into N poorly-calibrated ones
-# for no gain." All three values here are on the data side of that line and nothing else: a
-# join's two input row counts, a breaker's shuffled row count, and an aggregate's
-# `groups / input_rows` ratio. A relation has the same number of rows whichever machine counts
-# them.
+# for no gain." Both values here are on the data side of that line and nothing else: a breaker's
+# shuffled row count and an aggregate's `groups / input_rows` ratio. A relation has the same
+# number of rows whichever machine counts them.
 #
-# They were scoped, and the cost was exactly what the rule predicts. Every one is recorded on
-# the *driver* from the whole query's figures (`api.tuning.decisions`), never per shard — so
-# the same query planned single-node and then distributed wrote two separate entries for
-# identical data, and neither run could ever inform the other. An autoscaling fleet split them
-# again on every instance type it moved through. Unscoping costs one run of re-learning per
-# signature, which is what `hardware_scope` says a namespace change costs, and it is paid once.
+# Both are recorded on the *driver* from the whole query's figures (`api.tuning.decisions`),
+# never per shard. Scoped, the same query planned single-node and then distributed would
+# write two entries for identical data, neither run informing the other, and an autoscaling
+# fleet would split them again on every instance type it moved through.
 
 
-# Decision family — per-signature priors (build sides, partitions, pre-aggregation).
-def _smooth(prior: float, observed: float, n_obs: int) -> float:
-    """A running mean while evidence is thin, decaying into an EWMA.
-
-    Step `max(OptimizerConfig.learned_scalar_alpha_floor, 1/(n_obs+1))`. The floor is *not*
-    the static blend weight used elsewhere: at that 0.5 the newest run always carried half the
-    weight, giving these priors a ~2-observation memory one anomalous run swung by half.
-    """
-    floor = active_config().optimizer.learned_scalar_alpha_floor
-    alpha = max(floor, 1.0 / (n_obs + 1))
-    return alpha * observed + (1.0 - alpha) * prior
-
-
+# Decision family — per-signature priors (partitions, pre-aggregation).
 def _record_scalar(
     hub: MetadataHub | None, namespace: str, key: str, field: str, value: float
 ) -> None:
-    if hub is None or value < 0.0:
+    # Non-finite observations are dropped: smoothing folds a NaN or an infinity into the stored
+    # prior and from there into every later update, poisoning the entry for the life of the
+    # store (`metadata.smoothed.record_smoothed_scalar` spells out the same argument).
+    if hub is None or not math.isfinite(value) or value < 0.0:
         return
     try:
         entry = dict(hub.get_keyed_param(namespace, key) or {})
         n = int(entry.get("n_obs", 0))
         prior = entry.get(field)
-        entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
+        entry[field] = (
+            float(value) if prior is None else convergent_blend(float(prior), float(value), n)
+        )
         entry["n_obs"] = n + 1
         plan_cache.record_write(hub, namespace, key, entry)
     except Exception as exc:  # pragma: no cover - best-effort learned prior
         note_suppressed("kyber", "record scalar prior", exc)
-
-
-def record_join_sides(
-    hub: MetadataHub | None, signature: str, left_rows: float, right_rows: float
-) -> None:
-    """Record a join's measured left/right input sizes, keyed by signature.
-
-    Written **without** advancing the learned generation, which is the same exemption
-    `bandit.record_arm` documents as `invalidates_plans=False` and for the same reason: a
-    memoized plan can only be stale with respect to a value some plan *reads*, and nothing
-    reads this one. `learned_build_sides` has no caller in the optimizer — only tests — so
-    every write here was flushing the whole plan cache to record a number no rewrite consults.
-
-    That was not a small leak. These are smoothed measurements of the same two row counts, so
-    they drift a few percent on every run and never converge; `is_material_change` therefore
-    fired forever. Measured on TPC-H at scale 1, this write alone kept **six of the twenty-two
-    queries from ever hitting the plan cache** (q4, q12, q13, q14, q19, q22), which is why q19
-    spent 73% of its wall clock re-optimizing a plan it had already optimized four times.
-
-    If a rule is ever written that reads `learned_build_sides`, this must go back to
-    `plan_cache.record_write`: at that point a moved measurement really can leave a memoized
-    plan building the wrong side.
-    """
-    if hub is None:
-        return
-    try:
-        entry = dict(hub.get_keyed_param(_NS_SIDES, signature) or {})
-        n = int(entry.get("n_obs", 0))
-        for field, value in (("left", left_rows), ("right", right_rows)):
-            prior = entry.get(field)
-            entry[field] = float(value) if prior is None else _smooth(float(prior), float(value), n)
-        entry["n_obs"] = n + 1
-        hub.put_keyed_param(_NS_SIDES, signature, entry)
-    except Exception as exc:  # pragma: no cover - best-effort learned prior
-        note_suppressed("kyber", "record join sides", exc)
-
-
-def learned_build_sides(hub: MetadataHub | None, signature: str) -> tuple[float, float] | None:
-    """The measured `(left_rows, right_rows)` for this join, or `None` cold.
-
-    Seeds build-side selection from what the two sides *actually* were last time, so a join whose
-    estimate is wrong (correlated predicates, skew) still builds the truly-smaller side. Only the
-    build orientation changes — the relation does not.
-    """
-    if hub is None:
-        return None
-    try:
-        entry = hub.get_keyed_param(_NS_SIDES, signature) or {}
-        left, right = entry.get("left"), entry.get("right")
-        if left is None or right is None:
-            return None
-        return float(left), float(right)
-    except Exception as exc:  # pragma: no cover - best-effort learned prior
-        note_suppressed("kyber", "read join sides", exc)
-        return None
 
 
 def record_partition_rows(hub: MetadataHub | None, signature: str, rows: float) -> None:

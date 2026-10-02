@@ -207,6 +207,12 @@ pub fn finalize(funcs: &[AggFunc], p: &Partial) -> Result<Vec<ArrayRef>, Runtime
             AggFunc::KurtosisPop => finalize_kurtosis_pop(state)?,
             // The compensation is added back exactly once, at the end.
             AggFunc::KahanSum => finalize_kahan(&state[0], &state[1])?.remove(0),
+            // An `Int64` `SUM` is range-checked here, on the true total, and nowhere earlier.
+            // Recognized by its state's marker field, never by a decimal type a user's
+            // `DECIMAL(38, 0)` sum shares (`agg::int_sum`).
+            AggFunc::Sum if super::int_sum::is_state(state[0].data_type()) => {
+                super::int_sum::finalize(&state[0])?
+            }
             // These functions' state IS their output — a scalar accumulator folded by the
             // same associative op the partial used, so `finalize` is the identity.
             //

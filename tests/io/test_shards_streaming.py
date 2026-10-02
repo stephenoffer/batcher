@@ -39,7 +39,10 @@ def test_writer_publishes_shards_before_consuming_the_whole_input(tmp_path):
             if i == 100:  # halfway through the source
                 shards_seen_midway.append(len(list(tmp_path.glob("shard-*.arrow"))))
 
-    index = write_shards(_batches(), str(tmp_path), rows_per_shard=8)
+    # One writer, so backpressure bounds the shards still in flight at the midpoint to one:
+    # with the default pool, how many of the 13 submitted shards have *landed* there depends
+    # on thread scheduling, and a loaded box read 9.
+    index = write_shards(_batches(), str(tmp_path), rows_per_shard=8, write_concurrency=1)
     assert index.total_rows == 200
     assert index.shard_rows == tuple([8] * 25)
     assert shards_seen_midway[0] >= 10, (

@@ -138,11 +138,20 @@ enum FusedAcc<'a> {
 /// `start..end` with the concrete array type in hand. Writing the loop inside every arm by
 /// hand would be the same code twelve times, and the twelfth would eventually differ from the
 /// first.
+///
+/// The bracketed names are the arm's state `Vec`s, rebound as `&mut` slices before the loop.
+/// Indexed through the `&mut Vec` instead, every store may alias the `Vec`'s own header (its
+/// pointer and length are machine words like the state), so LLVM reloads both on every row;
+/// a `&mut` slice is `noalias`, which also lets the value array's buffer pointer stay in a
+/// register. On h2o-groupby q4 those reloads were the hottest instructions in the profile.
 macro_rules! block_loop {
-    ($ids:expr, $start:expr, $end:expr, |$i:ident, $g:ident| $body:block) => {
-        for $i in $start..$end {
-            let $g = $ids[$i] as usize;
-            $body
+    ($ids:expr, $start:expr, $end:expr, [$($state:ident),*], |$i:ident, $g:ident| $body:block) => {
+        {
+            $(let $state = $state.as_mut_slice();)*
+            for $i in $start..$end {
+                let $g = $ids[$i] as usize;
+                $body
+            }
         }
     };
 }
@@ -205,7 +214,7 @@ impl FusedAcc<'_> {
                 }
             }
             FusedAcc::SumF64 { v, sums, valid } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [sums, valid], |i, g| {
                     if v.is_valid(i) {
                         sums[g] += v.value(i);
                         valid[g] = true;
@@ -219,7 +228,7 @@ impl FusedAcc<'_> {
                 wide,
             } => {
                 if let Some(w) = wide {
-                    block_loop!(ids, start, end, |i, g| {
+                    block_loop!(ids, start, end, [w, valid], |i, g| {
                         if v.is_valid(i) {
                             w[g] += i128::from(v.value(i));
                             valid[g] = true;
@@ -227,6 +236,8 @@ impl FusedAcc<'_> {
                     });
                     return Ok(());
                 }
+                // Slices for the aliasing reason `block_loop!` gives.
+                let (sums, valid) = (sums.as_mut_slice(), valid.as_mut_slice());
                 for i in start..end {
                     let g = ids[i] as usize;
                     if !v.is_valid(i) {
@@ -256,7 +267,7 @@ impl FusedAcc<'_> {
                 }
             }
             FusedAcc::SumDecimal { v, sums, valid, .. } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [sums, valid], |i, g| {
                     if v.is_valid(i) {
                         // checked_add: a decimal SUM past i128 range errors, not wraps (as the
                         // i64 SumInt arm above does).
@@ -269,13 +280,15 @@ impl FusedAcc<'_> {
             }
             FusedAcc::MeanSumI64NoNull { v, sums } => {
                 // Unchecked by proof, not by omission: `i128` holds `n · 2^63` for every
-                // addressable `n` (`accum::mean_sum_i128`).
-                block_loop!(ids, start, end, |i, g| {
-                    sums[g] += i128::from(v[i]);
-                })
+                // addressable `n` (`accum::mean_sum_i128`). Zipped slices for the reason the
+                // no-null sums give above.
+                let sums = sums.as_mut_slice();
+                for (&gid, &x) in ids[start..end].iter().zip(&v[start..end]) {
+                    sums[gid as usize] += i128::from(x);
+                }
             }
             FusedAcc::MeanSumI64 { v, sums, valid } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [sums, valid], |i, g| {
                     if v.is_valid(i) {
                         sums[g] += i128::from(v.value(i));
                         valid[g] = true;
@@ -283,13 +296,16 @@ impl FusedAcc<'_> {
                 })
             }
             FusedAcc::CountStar { counts } | FusedAcc::CountNoNull { counts } => {
-                block_loop!(ids, start, end, |i, g| {
-                    let _ = i;
-                    counts[g] += 1;
-                })
+                // A slice, not the `&mut Vec`: through the `Vec` every `i64` store may alias the
+                // `Vec`'s own header (its pointer and length are 64-bit words too), so LLVM
+                // reloads both on every row — measured as the hottest instructions of h2o q4.
+                let counts = counts.as_mut_slice();
+                for &gid in &ids[start..end] {
+                    counts[gid as usize] += 1;
+                }
             }
             FusedAcc::CountNull { v, counts } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [counts], |i, g| {
                     if v.is_valid(i) {
                         counts[g] += 1;
                     }
@@ -301,7 +317,7 @@ impl FusedAcc<'_> {
                 valid,
                 is_min,
             } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [cur, valid], |i, g| {
                     if v.is_valid(i) {
                         let val = v.value(i);
                         if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
@@ -317,7 +333,7 @@ impl FusedAcc<'_> {
                 valid,
                 is_min,
             } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [cur, valid], |i, g| {
                     if v.is_valid(i) {
                         let val = v.value(i);
                         // Same total order the per-call `minmax_acc` uses (`crate::keys`), not
@@ -344,7 +360,7 @@ impl FusedAcc<'_> {
                 is_min,
                 ..
             } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [cur, valid], |i, g| {
                     if v.is_valid(i) {
                         let val = v.value(i);
                         if !valid[g] || (*is_min && val < cur[g]) || (!*is_min && val > cur[g]) {
@@ -355,7 +371,7 @@ impl FusedAcc<'_> {
                 })
             }
             FusedAcc::MinMaxStr { v, cur, is_min } => {
-                block_loop!(ids, start, end, |i, g| {
+                block_loop!(ids, start, end, [cur], |i, g| {
                     if v.is_valid(i) {
                         let val = v.value(i);
                         let replace = match &cur[g] {
@@ -382,10 +398,12 @@ impl FusedAcc<'_> {
                 let n = sums.len();
                 Arc::new(masked_f64(sums, vec![true; n]))
             }
+            // An `Int64` `SUM` finishes bare when its total fits, and as its exact 128-bit
+            // state when a promoted accumulator's does not (`agg::int_sum`).
             FusedAcc::SumI64NoNull { sums, wide, .. } => {
                 let n = sums.len();
                 match wide {
-                    Some(w) => Arc::new(masked_i64(super::narrow_wide(w)?, vec![true; n])),
+                    Some(w) => super::int_sum::from_i128(w, vec![true; n])?,
                     None => Arc::new(masked_i64(sums, vec![true; n])),
                 }
             }
@@ -393,7 +411,7 @@ impl FusedAcc<'_> {
             FusedAcc::SumI64 {
                 sums, valid, wide, ..
             } => match wide {
-                Some(w) => Arc::new(masked_i64(super::narrow_wide(w)?, valid)),
+                Some(w) => super::int_sum::from_i128(w, valid)?,
                 None => Arc::new(masked_i64(sums, valid)),
             },
             FusedAcc::SumDecimal {
@@ -545,11 +563,11 @@ fn sum_acc(values: &ArrayRef, num_groups: usize) -> Option<FusedAcc<'_>> {
         }
         // No no-null arm for decimal, unlike the two above: it was built, measured and
         // removed — see `accum::sum_acc`'s decimal arm for the numbers.
-        DataType::Decimal128(p, s) => FusedAcc::SumDecimal {
+        DataType::Decimal128(_, s) => FusedAcc::SumDecimal {
             v: values.as_primitive::<Decimal128Type>(),
             sums: vec![0; num_groups],
             valid: vec![false; num_groups],
-            precision: *p,
+            precision: super::DECIMAL_SUM_PRECISION,
             scale: *s,
         },
         _ => return None, // unsupported dtype → per-call path emits the canonical error
@@ -711,16 +729,25 @@ mod tests {
     use super::*;
     use arrow::array::{Decimal128Array, Float64Array, Int64Array};
 
-    /// Reference oracle: today's per-call kernel (`super::accumulate`, the parent's
-    /// private fn — a child module may call it). Only fusable funcs are tested, all
-    /// of which `accumulate` handles directly.
+    /// Reference oracle: the per-call kernel `partial` runs for a call the fused scan does
+    /// not take (`accum::accumulate_call`). Not bare `accumulate`: an `Int64` `SUM`'s partial
+    /// state is built one level up, in `accumulate_call` (`agg::int_sum`).
     fn per_call(calls: &[AggCall], group_ids: &[u32], num_groups: usize) -> Vec<Vec<ArrayRef>> {
         calls
             .iter()
-            .map(|c| {
-                super::super::accumulate(c.func, c.values.as_ref(), group_ids, num_groups).unwrap()
-            })
+            .map(|c| super::super::accum::accumulate_call(c, group_ids, num_groups).unwrap())
             .collect()
+    }
+
+    /// An `Int64` `SUM`'s finished value: its partial state -- bare, or the 128-bit form --
+    /// finalized.
+    fn int_sum(state: &ArrayRef) -> Result<Int64Array, RuntimeError> {
+        let p = super::super::Partial {
+            group_columns: Vec::new(),
+            states: vec![vec![state.clone()]],
+        };
+        let out = super::super::finalize(&[AggFunc::Sum], &p)?.remove(0);
+        Ok(out.as_primitive::<Int64Type>().clone())
     }
 
     fn fused(calls: &[AggCall], group_ids: &[u32], num_groups: usize) -> Vec<Vec<ArrayRef>> {
@@ -873,7 +900,7 @@ mod tests {
         }
         // And the validity the no-null arm asserts rather than accumulates: every group is
         // non-empty, so every sum is non-null.
-        let sums = got[0][0].as_primitive::<Int64Type>();
+        let sums = int_sum(&got[0][0]).unwrap();
         assert_eq!(sums.null_count(), 0, "a no-null input yields no null sums");
     }
 
@@ -890,21 +917,27 @@ mod tests {
         let want = per_call(&calls, &group_ids, 2);
         let got = fused(&calls, &group_ids, 2);
         assert_cols_eq(&want[0], &got[0]);
-        let sums = got[0][0].as_primitive::<Int64Type>();
+        let sums = int_sum(&got[0][0]).unwrap();
         assert_eq!(sums.value(0), 10);
         assert!(sums.is_null(1), "an all-null group sums to null, not 0");
     }
 
+    /// A fused partial whose own total exceeds `i64` is not an error: it is a partial, and
+    /// another partition may bring the grand total back. It keeps the exact total, and the
+    /// overflow is raised where the true total is known — `finalize`.
     #[test]
-    fn fused_sum_overflow_still_errors() {
+    fn fused_sum_overflow_is_kept_exactly_and_raised_at_finalize() {
         let i: ArrayRef = Arc::new(Int64Array::from(vec![i64::MAX, 1]));
         let group_ids = [0u32, 0];
         let calls = vec![
             AggCall::new(AggFunc::Sum, Some(i.clone())),
             AggCall::new(AggFunc::CountStar, None),
         ];
-        let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
-        let r = run_fused(&calls, &group_ids, 1, &mut out);
+        let got = fused(&calls, &group_ids, 1);
+        let exact = got[0][0].as_struct().column(0).clone();
+        let exact = exact.as_primitive::<Decimal128Type>();
+        assert_eq!(exact.value(0), i128::from(i64::MAX) + 1);
+        let r = int_sum(&got[0][0]);
         assert!(matches!(r, Err(RuntimeError::SumOverflow)), "got {r:?}");
     }
 
@@ -929,8 +962,7 @@ mod tests {
             let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
             run_fused(&calls, &[0u32; 4], 1, &mut out)
                 .unwrap_or_else(|e| panic!("{order:?} failed: {e:?}"));
-            let got = out[0].as_ref().expect("sum produced")[0].clone();
-            let got = got.as_primitive::<Int64Type>();
+            let got = int_sum(&out[0].as_ref().expect("sum produced")[0]).unwrap();
             assert_eq!(got.value(0), 0, "order {order:?}");
         }
     }
@@ -957,8 +989,7 @@ mod tests {
         ];
         let mut out: Vec<Option<Vec<ArrayRef>>> = vec![None; calls.len()];
         run_fused(&calls, &group_ids, 3, &mut out).expect("must promote, not error");
-        let got = out[0].as_ref().expect("sum produced")[0].clone();
-        let got = got.as_primitive::<Int64Type>();
+        let got = int_sum(&out[0].as_ref().expect("sum produced")[0]).unwrap();
         assert_eq!(got.value(0), 0, "group 0 overflowed partway and came back");
         assert_eq!(got.value(1), 12, "group 1 must survive the promotion");
         assert!(got.is_null(2), "an all-null group stays null");

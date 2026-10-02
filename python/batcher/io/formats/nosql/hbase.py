@@ -27,11 +27,13 @@ import pyarrow as pa
 
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.formats.nosql.base import (
+    SCHEMA_SAMPLE_ROWS,
     BulkSink,
     PartitionSpec,
     ScanSource,
     require_driver,
     rows_to_batches,
+    schema_from_rows,
 )
 
 __all__ = ["HBaseSink", "HBaseSource"]
@@ -68,8 +70,10 @@ class HBaseSource(ScanSource):
         table: str,
         port: int = 9090,
         partition_spec: PartitionSpec | None = None,
+        schema: pa.Schema | None = None,
     ) -> None:
         super().__init__(
+            schema=schema,
             partition_spec=partition_spec,
             host=host,
             table=table,
@@ -89,12 +93,12 @@ class HBaseSource(ScanSource):
         conn = self._connection()
         try:
             table = conn.table(self._conn_kwargs["table"])
-            rows = [_decode_row(key, data) for key, data in table.scan(limit=1)]
+            rows = [_decode_row(key, data) for key, data in table.scan(limit=SCHEMA_SAMPLE_ROWS)]
         finally:
             conn.close()
         if not rows:
             return pa.schema([("row_key", pa.string())])
-        return pa.RecordBatch.from_pylist(rows).schema
+        return schema_from_rows(rows)
 
     def _enumerate_partitions(self) -> list[_KeyRange]:
         conn = self._connection()

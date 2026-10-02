@@ -197,7 +197,7 @@ def _as_type(dtype: object) -> pa.DataType:
         try:
             return pa.type_for_alias(dtype)
         except ValueError:
-            pass
+            pass  # not a pyarrow alias; fall through to the PlanError naming both forms
     raise PlanError(
         f"by_dtype() takes pyarrow types such as pa.int64() or their names such as 'int64', "
         f"got {type(dtype).__name__} {dtype!r}"

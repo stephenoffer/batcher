@@ -15,7 +15,6 @@ __all__ = [
     "estimated_rows",
     "is_empty",
     "num_columns",
-    "row_count_is_exact",
     "shape",
 ]
 
@@ -52,8 +51,3 @@ def estimated_rows(facts: Facts) -> float:
     is this?" for sizing and planning; it must never answer `count()`.
     """
     return facts.estimated_rows
-
-
-def row_count_is_exact(facts: Facts) -> bool:
-    """Whether `count()` can be answered from metadata — i.e. whether it is free."""
-    return facts.rows_known

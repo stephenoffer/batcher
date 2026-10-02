@@ -147,6 +147,24 @@ class PressureMonitor:
         """Bytes of RAM available right now (psutil) or total RAM as a fallback."""
         return self._available_bytes(probe.total_memory_bytes())
 
+    def reach_bytes(self) -> int:
+        """The memory this process could hold in all: the configured cap, else what is
+        available plus what it already holds.
+
+        `envelope_bytes` answers "how much more may a query draw", so it shrinks by every page
+        this process keeps. A ceiling on the process's *own* resident set cannot be a fraction
+        of that figure: the more the process holds, the lower its ceiling, until it sits over
+        it permanently. Measured on the H2O join suite in one benchmark process holding four
+        engines' copies of the data: a 21 GB resident set against an envelope that had fallen
+        from 65 to 53 GB, so the allocator purged on half the queries.
+        """
+        mem = self._config.memory
+        if mem.max_memory_bytes is not None:
+            return mem.max_memory_bytes
+        total = probe.total_memory_bytes()
+        held = probe.process_rss_bytes() or 0
+        return int(min(total, self._available_bytes(total) + held) * self._oom_history_factor())
+
     def budget_bytes(self) -> int:
         """The soft envelope: the share of total RAM the engine aims to stay under."""
         return int(probe.total_memory_bytes() * self._config.memory.soft_limit)

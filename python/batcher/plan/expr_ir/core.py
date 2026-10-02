@@ -64,7 +64,7 @@ def _wrap(value: IntoExpr) -> Expr:
     # pass it through rather than lifting it to a `Lit`. `group_by().agg()` splits such
     # leaves back out; any that reach `to_ir()` elsewhere raise a clear error there.
     if isinstance(value, (Expr, AggExpr)):
-        return value  # type: ignore[return-value]
+        return value
     # A CASE builder is the one non-`Expr` users hand us as an expression on purpose: a
     # ``when(...).then(...)`` without ``.otherwise`` is SQL's ``CASE ... END``, NULL where
     # nothing matched. It finishes into a `Case` here. Matched by name to avoid importing
@@ -6023,9 +6023,10 @@ class Lit(Expr):
             # it one would be a two-sided IR change across the FFI for something the engine
             # already evaluates correctly by this route.
             #
-            # Until this existed, ``col("t") > time(1, 0)`` raised ``unsupported literal
-            # type: time`` while ``WHERE t > TIME '01:00:00'`` answered it — the same query,
-            # over the same engine, working through one front-end and not the other.
+            # Until this existed, ``col("t") > time(1, 0)`` raised
+            # ``unsupported literal type: time`` while ``WHERE t > TIME '01:00:00'``
+            # answered it — the same query, over the same engine, working through one
+            # front-end and not the other.
             if v.tzinfo is not None:
                 raise TypeError(
                     "a time literal cannot carry a timezone: arrow's time64 has no zone, "

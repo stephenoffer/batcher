@@ -1,11 +1,10 @@
 """List and vector expressions, built from the two primitives both dataframe libraries have.
 
-Neither backend exposes a list *reduction*. cuDF has some on its list accessor and pandas has
-none at all, so translating those directly would ship a path only the device can run and only
-the device could ever be wrong about — which is why this family used to be declined whole, and
-why `.list.sum()`, `.list.dot()` and every vector distance sent an otherwise perfect chain to
-the host. On a GPU cluster that is the wrong way round: an embedding column is the single most
-common thing anyone has a device for.
+Neither backend exposes a list *reduction*. cuDF has some on its list accessor and pandas has none
+at all, so translating those directly would ship a path only the device can run and only the device
+could ever be wrong about, and declining the family whole would send `.list.sum()`, `.list.dot()`
+and every vector distance's otherwise perfect chain to the host. On a GPU cluster that is the wrong
+way round: an embedding column is the single most common thing anyone has a device for.
 
 The construction here is `explode` + `groupby`, which both libraries implement as one kernel
 each and which the `unnest` operator already relies on. One row per element, grouped by the row
@@ -77,15 +76,8 @@ _TRANSFORMED = {
 #: Pairwise reductions over two lists walked together, as the term each sums.
 LIST_BINARY_FNS = frozenset({"dot", "cosine_similarity", "l1_distance", "l2_distance", "hamming"})
 
-#: The list functions this module translates. `n_unique` is separate from `LIST_REDUCTIONS`
-#: because its answer over an *empty* list is `0` rather than null: it counts, and a count over
-#: nothing is zero, where a measurement over nothing is unknown.
 #: The two positional reductions: the index of the extreme element rather than its value.
 _ARG_FNS = {"arg_max": "max", "arg_min": "min"}
-
-_SCALAR_FNS = (
-    frozenset(LIST_REDUCTIONS) | frozenset(_TRANSFORMED) | frozenset(_ARG_FNS) | {"len", "n_unique"}
-)
 
 
 def _arrow(name: str):

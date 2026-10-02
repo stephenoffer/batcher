@@ -13,6 +13,7 @@ pyarrow silently and produces the same rows, so the choice is only ever about sp
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterator
 from typing import IO, Any
 
@@ -25,7 +26,7 @@ from batcher.io.formats.structured import _parquet_native
 from batcher.io.formats.structured.parquet import _native_stream
 from batcher.io.predicate import to_pyarrow_expression
 from batcher.io.splits import FileSplit, Split, parquet_row_group_splits
-from batcher.io.splits.parquet import _parquet_footer
+from batcher.io.splits.parquet import FileKeyBounds, _parquet_footer
 from batcher.io.stats import RowGroupBounds
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 from batcher.plan.source_stats import SourceStatistics
@@ -165,9 +166,10 @@ class ParquetSource(FileSource):
         result is then *exactly* the matching rows, as small as PyArrow's and decoded at
         native speed.
 
-        ``None`` (caller falls back to PyArrow) when the predicate has no native translation
-        — notably temporal literals, which `to_native_predicate` refuses because it cannot
-        verify the parquet physical unit and which PyArrow *can* prune on — or when any
+        ``None`` (caller falls back to PyArrow) when no term of the predicate has a native
+        translation — notably one made only of temporal comparisons, which `to_native_predicate`
+        refuses because it cannot verify the parquet physical unit and which PyArrow *can*
+        prune on — or when any
         file's native read or filter fails. Failing all-or-nothing keeps one read path per
         call, so a partial native result is never concatenated with a differently-derived one.
         """
@@ -424,6 +426,56 @@ class ParquetSource(FileSource):
             return batched if batched is not None else super().read(projection)
         return self._pyarrow_read_filtered(projection, pa_filter)
 
+    def iter_chunks(
+        self,
+        projection: list[str] | None = None,
+        predicate: dict | None = None,
+        target_bytes: int = 1 << 30,
+    ) -> Iterator[list[pa.RecordBatch]]:
+        """Read the files a group at a time, each group through `read`, in file order.
+
+        The bounded-memory counterpart of `read` for a caller that folds its input chunk by
+        chunk (the out-of-core aggregate): each chunk is a whole group of files decoded by
+        the same concurrent native reader `read` uses, with the same pruning and the same
+        schema conformance, rather than the one-batch-at-a-time stream of `iter_batches`.
+        Groups are cut by the files' on-disk size scaled to the projected share of their
+        columns, so a chunk is roughly `target_bytes` decoded however the dataset is laid out.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io import ParquetSource  # doctest: +SKIP
+                >>> src = ParquetSource("s3://bucket/lineitem/")  # doctest: +SKIP
+                >>> sum(len(c) for c in src.iter_chunks(["l_orderkey"])) > 0  # doctest: +SKIP
+                True
+
+        Args:
+            projection: Columns to read. All columns when omitted.
+            predicate: A predicate-IR filter, pushed exactly as `read` pushes it.
+            target_bytes: Rough decoded size to aim for per chunk.
+
+        Returns:
+            An iterator over the chunks, each a list of batches; together they are what
+            `read` returns.
+        """
+        files = self._files()
+        if len(files) <= 1 or self._schema_mode != "strict":
+            yield self.read(projection, predicate)
+            return
+        for group in _file_groups(files, self._fs, self._projected_share(projection), target_bytes):
+            part = copy.copy(self)
+            part._files_cache = group
+            batches = part.read(projection, predicate)
+            if batches:
+                yield batches
+
+    def _projected_share(self, projection: list[str] | None) -> float:
+        """The fraction of the source's columns `projection` reads (1.0 when unknown)."""
+        schema = self._read_schema_or_none()
+        if projection is None or schema is None or not len(schema):
+            return 1.0
+        return max(1, len(projection)) / len(schema)
+
     def _pyarrow_read_filtered(
         self, projection: list[str] | None, pa_filter: Any
     ) -> list[pa.RecordBatch]:
@@ -563,6 +615,55 @@ class ParquetSource(FileSource):
             return [FileSplit(self.format_name, path, self._reader_kwargs())]
         return parquet_row_group_splits(path, target_size, predicate, self._fs)
 
+    def column_byte_sizes(self) -> dict[str, int] | None:
+        """Estimated uncompressed bytes of each column across the source, from its footers.
+
+        What a read of a projection costs in decoded bytes, which the column count does not
+        say: one long string column can outweigh every other column of a table together.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io import ParquetSource  # doctest: +SKIP
+                >>> ParquetSource("customer/").column_byte_sizes()["c_comment"]  # doctest: +SKIP
+                9123456789
+
+        Returns:
+            Bytes per column name, or None when the footers cannot be read.
+        """
+        from batcher.io.splits.parquet import footer_column_bytes
+
+        if self._filesystem is not None:
+            return None
+        return footer_column_bytes(self._files(), self._fs)
+
+    def key_bounds(self, column: str) -> list[FileKeyBounds] | None:
+        """Each file's min/max of `column` from its footer, the layout a key-range split reads.
+
+        A table written in key order stores disjoint key ranges in its files, which is what
+        lets a distributed join give each worker one range of every table and skip the
+        shuffle. This reports those ranges without reading a data page.
+
+        Examples:
+            .. doctest::
+
+                >>> from batcher.io import ParquetSource  # doctest: +SKIP
+                >>> ParquetSource("lineitem/").key_bounds("l_orderkey")[0].lo  # doctest: +SKIP
+                1
+
+        Args:
+            column: The column whose per-file range to return.
+
+        Returns:
+            One entry per file, in file order, or None when a footer does not bound the
+            column or the source has more files than a footer sweep is worth.
+        """
+        from batcher.io.splits.parquet import file_key_bounds
+
+        if self._too_many_files_to_sweep() or self._filesystem is not None:
+            return None
+        return file_key_bounds(self._files(), column, self._fs)
+
     def row_group_bounds(self, columns: list[str]) -> list[RowGroupBounds] | None:
         """Per-row-group min/max/null-count of `columns`, read from the footers alone.
 
@@ -623,3 +724,27 @@ class ParquetSource(FileSource):
             return self._stats_apply(parquet_statistics(self._fs, self._files(), self.schema()))
         except Exception:
             return None
+
+
+# Decoded bytes per on-disk byte, roughly: Parquet's compression and encoding typically shrink
+# a numeric column 2-4x. Only sizes a read chunk, so erring either way costs a chunk that is
+# somewhat larger or smaller than asked for, never a different result.
+_DECODE_EXPANSION = 3.0
+
+
+def _file_groups(files: list[str], fs: Any, share: float, target_bytes: int) -> list[list[str]]:
+    """`files` cut into consecutive groups of about `target_bytes` decoded, each non-empty."""
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_bytes = 0.0
+    for path in files:
+        ident = file_identity(path, fs)
+        size = ident[1] if ident is not None else target_bytes
+        current.append(path)
+        current_bytes += size * share * _DECODE_EXPANSION
+        if current_bytes >= target_bytes:
+            groups.append(current)
+            current, current_bytes = [], 0.0
+    if current:
+        groups.append(current)
+    return groups

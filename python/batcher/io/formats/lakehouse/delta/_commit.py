@@ -327,6 +327,7 @@ def commit_add_actions(
     storage_options: dict[str, str] | None = None,
     app_txn: tuple[str, int] | None = None,
     table_properties: dict[str, str] | None = None,
+    replace_partitions: list[list[tuple[str, str, str]]] | None = None,
 ) -> None:
     """Commit the manifest's already-written data files as one Delta transaction.
 
@@ -347,6 +348,9 @@ def commit_add_actions(
         storage_options: Cloud storage options for delta-rs.
         app_txn: Optional ``(app_id, version)`` recorded as a Delta `txn` action, making
             the commit idempotent under replay.
+        replace_partitions: An OR of partition-equality conjunctions whose live files this
+            commit removes alongside its adds, so several partitions are replaced in one
+            version (`_partition_replace`). Takes the place of `partition_filters`.
         table_properties: Delta table properties (Spark's ``TBLPROPERTIES``) to set — on
             the ``metaData`` action when this commit creates the table, or as an
             ``ALTER TABLE SET TBLPROPERTIES`` when it already exists.
@@ -410,6 +414,11 @@ def commit_add_actions(
         # taking effect one write late.
         _set_table_properties(table, table_properties)
         _reconcile_schema(table, schema, merge_schema=merge_schema)
+        if replace_partitions is not None:
+            from batcher.io.formats.lakehouse.delta._partition_replace import partition_removes
+
+            actions = [*partition_removes(table, replace_partitions), *actions]
+            mode = "append"  # the removals are explicit; the write itself only adds
         table.create_write_transaction(
             actions,
             mode,

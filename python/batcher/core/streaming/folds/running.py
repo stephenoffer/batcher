@@ -15,7 +15,6 @@ import pyarrow as pa
 from batcher._internal.native import engine
 from batcher.config import active_config
 from batcher.core.mergeable import RunningAggregate
-from batcher.core.streaming.folds.shared import check_agg_state_bounded  # noqa: F401
 from batcher.plan.logical import Aggregate
 from batcher.plan.streaming import StateOperatorProgress
 

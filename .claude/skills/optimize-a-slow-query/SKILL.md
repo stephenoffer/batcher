@@ -65,8 +65,8 @@ provenance — `default` means Kyber guessed. Kyber reorders joins by DP over co
 join graph, with a greedy fallback, and decides how hard to search per query: it prices
 the join region and grants a share of that estimated cost back as search time
 (`kyber/rules/joins/order_budget.py`). So a query too cheap to repay the search takes the
-greedy order by design — that is not a knob you need to set, and
-`optimizer.join_dp_max_tables` / `greedy_max_tables` are read by nothing. If a large
+greedy order by design — that is not a knob you need to set, and no config option
+caps the search by table count. If a large
 query is still getting a poor order, the cardinalities feeding the cost model are the
 thing to look at, not the search. Broadcast kicks in under
 `optimizer.broadcast_max_bytes` (4 MiB).

@@ -17,9 +17,10 @@ from __future__ import annotations
 
 from sqlglot import expressions as exp
 
+from batcher._internal.errors import PlanError
 from batcher._sql.parser.expressions.literals import _const_int_arg, _const_str_arg
 from batcher._sql.parser.expressions.maps import map_subscript
-from batcher.plan.expr_ir import Expr, array, lit, nullif
+from batcher.plan.expr_ir import Expr, array, lit, nullif, when
 from batcher.plan.functions.collection import element, sequence
 
 __all__ = ["collection_function", "list_function"]
@@ -348,7 +349,11 @@ def list_function(tr, node):
         return tr._scalar(node.this).list.flatten()
     if isinstance(node, exp.ArraySort):  # array_sort(l) without a comparator
         if node.expression is not None:
-            raise NotImplementedError("array_sort with a comparator is not supported")
+            raise NotImplementedError(
+                "array_sort with a comparator lambda is not supported: the list kernels sort "
+                "by value. Sort by a derived key instead, e.g. build the keys with "
+                "list_transform, order positions with list_grade_up, and list_select them"
+            )
         return tr._scalar(node.this).list.sort()
     if isinstance(node, exp.ArrayToString):  # array_join(l, sep) / list_aggr concat
         sep = _const_str_arg(node.expression, "array_join()", "separator")
@@ -367,6 +372,8 @@ def list_function(tr, node):
         length = _const_int_arg(size, "slice(): length") if size is not None else None
         return tr._scalar(node.this).list.slice(start - 1, length)
     if isinstance(node, exp.ArrayContains):  # list_contains(a, v)
+        if not isinstance(node.expression, exp.Literal):
+            return _contains_per_row(tr._scalar(node.this), tr._scalar(node.expression))
         return tr._scalar(node.this).list.contains(_raw_value(node.expression))
     if isinstance(node, exp.Bracket):
         # `a[i]`. sqlglot 0-bases the index for the dialects whose subscript is 1-based
@@ -417,12 +424,16 @@ def list_function(tr, node):
         # `list_reverse_sort` returned the ascending order.
         value = tr._scalar(node.this)
         asc = node.args.get("asc")
-        descending = asc is not None and not _boolean_arg(asc)
-        # Descending is its own kernel rather than `sort().reverse()`. Ascending places
-        # nulls last, so reversing lands them at the *front*, where DuckDB keeps them at
-        # the back — `list_reverse_sort([4, NULL, 6])` is `[6, 4, NULL]`, not
-        # `[NULL, 6, 4]`.
-        return value.list.sort(descending=descending)
+        # DuckDB spells the direction as a string (`list_sort(l, 'DESC')`), which the
+        # boolean read took as true, returning the ascending order for a descending sort.
+        if isinstance(asc, exp.Literal) and asc.is_string:
+            direction = asc.name.strip().upper()
+            if direction not in ("ASC", "DESC"):
+                raise PlanError(f"list sort order must be 'ASC' or 'DESC', got {asc.sql()}")
+            descending = direction == "DESC"
+        else:
+            descending = asc is not None and not _boolean_arg(asc)
+        return _sorted(value, descending, node.args.get("nulls_first"))
     # sqlglot promotes a few vector functions to typed nodes (two args in `this`/`expression`)
     # rather than `Anonymous`; dispatch them to the same binary `.list` methods.
     typed_binary = _LIST_TYPED_BINARY.get(type(node).__name__)
@@ -438,6 +449,11 @@ def list_function(tr, node):
             # mapped straight to `len`, which returned the element count including nulls —
             # the same number for a list of four values and a list of four nulls.
             return tr._scalar(node.expressions[0]).list.drop_nulls().list.len()
+        if name in ("list_reverse_sort", "array_reverse_sort") and node.expressions:
+            # Parsed as a plain call (`_internal.sql_errors._ORDINARY_CALLS`): sqlglot's
+            # `SortArray` for it drops the null-order argument.
+            nulls = node.expressions[1] if len(node.expressions) > 1 else None
+            return _sorted(tr._scalar(node.expressions[0]), True, nulls)
         method = _list_anon_method(name)
         if method is not None and node.expressions:
             return getattr(tr._scalar(node.expressions[0]).list, method)()
@@ -471,29 +487,47 @@ def _subscript_value(node) -> int:
 def _list_slice(tr, node, sl) -> Expr:
     """``a[lo:hi]`` — a list slice, in SQL's 1-based, both-ends-inclusive convention.
 
-    ``list.slice`` is 0-based and takes a *length*, so ``a[2:3]`` is ``slice(1, 2)``.
-    Either bound may be omitted (``a[2:]``, ``a[:3]``).
-
-    A negative bound is rejected rather than translated: DuckDB counts it back from the
-    end, while `list.slice` clamps it to the start and returns the whole list — so
-    ``a[-2:]`` would answer the entire list instead of its last two elements. Declining
-    costs an error; translating it would cost a wrong answer.
+    Either bound may be omitted (``a[2:]``, ``a[:3]``). See `sql_list_slice`.
     """
     lo_node, hi_node = sl.this, sl.expression
-    lo = _const_int_arg(lo_node, "list slice: lower bound") if lo_node is not None else 1
+    lo = _const_int_arg(lo_node, "list slice: lower bound") if lo_node is not None else None
     hi = _const_int_arg(hi_node, "list slice: upper bound") if hi_node is not None else None
-    for bound, value in (("lower", lo), ("upper", hi)):
-        if value is not None and value < 0:
-            raise NotImplementedError(
-                f"a negative {bound} bound in a list slice ({node.sql()}) is not supported; "
-                "index from the start, or use list_reverse first"
-            )
-    if lo < 1:
-        # DuckDB treats `a[0:n]` as `a[1:n]`; 0-basing it here would take one element
-        # too many.
-        lo = 1
-    length = None if hi is None else max(hi - lo + 1, 0)
-    return tr._scalar(node.this).list.slice(lo - 1, length)
+    return sql_list_slice(tr._scalar(node.this), lo, hi)
+
+
+def sql_list_slice(xs: Expr, lo: int | None, hi: int | None) -> Expr:
+    """DuckDB's list slice: 1-based, both ends inclusive, a negative bound counted from the end.
+
+    ``list.slice`` is 0-based and takes a *length*, so a non-negative ``a[2:3]`` is
+    ``slice(1, 2)``, and a ``0`` lower bound reads as ``1``, as DuckDB reads it. A negative
+    bound depends on each row's length (``a[-2:]`` is the last two elements, ``a[1:-1]`` the
+    whole list), which a constant offset cannot say; handing it to ``list.slice`` anyway
+    clamped it to the start and answered the wrong elements. So a negative bound gathers the
+    positions ``greatest(n + lo, 0) .. least(hi, n) - 1`` (0-based, ``n`` the row's length),
+    a range that is empty when the bounds cross and NULL when the list is.
+
+    Args:
+        xs: The list expression.
+        lo: The 1-based lower bound, or None for the start.
+        hi: The 1-based upper bound, or None for the end.
+
+    Returns:
+        The sliced list expression.
+    """
+    from batcher.plan.expr_ir import greatest, least
+
+    lo = 1 if lo is None or lo == 0 else lo
+    if lo > 0 and (hi is None or hi >= 0):
+        return xs.list.slice(lo - 1, None if hi is None else max(hi - lo + 1, 0))
+    n = xs.list.len()
+    start = greatest(n + lit(lo), lit(0)) if lo < 0 else lit(lo - 1)
+    if hi is None:
+        stop = n - lit(1)
+    elif hi < 0:
+        stop = n + lit(hi)
+    else:
+        stop = least(lit(hi), n) - lit(1)
+    return xs.list.gather(sequence(start, stop))
 
 
 def _list_anon_method(name: str) -> str | None:
@@ -513,6 +547,35 @@ def _boolean_arg(node) -> bool:
     if isinstance(node, exp.Boolean):
         return bool(node.this)
     return str(node.this).lower() not in ("false", "0")
+
+
+def _sorted(value: Expr, descending: bool, nulls) -> Expr:
+    """`value` sorted, with an optional ``'NULLS FIRST'`` / ``'NULLS LAST'`` argument node.
+
+    Descending is its own kernel rather than `sort().reverse()`. Ascending places nulls last,
+    so reversing would land them at the *front*, where DuckDB keeps them at the back:
+    ``list_reverse_sort([4, NULL, 6])`` is ``[6, 4, NULL]``, not ``[NULL, 6, 4]``.
+    """
+    if nulls is None:
+        return value.list.sort(descending=descending)
+    placement = nulls.name.strip().upper() if isinstance(nulls, exp.Literal) else ""
+    if placement not in ("NULLS FIRST", "NULLS LAST"):
+        raise PlanError(
+            f"list sort null order must be 'NULLS FIRST' or 'NULLS LAST', got {nulls.sql()}"
+        )
+    return value.list.sort(descending=descending, nulls_last=placement == "NULLS LAST")
+
+
+def _contains_per_row(xs: Expr, value: Expr) -> Expr:
+    """``list_contains(l, v)`` with `v` a column or expression rather than a constant.
+
+    Membership of one per-row value is ``list_has_any(l, [v])``, which already compares
+    element-wise per row and never matches a NULL element. DuckDB answers NULL for a NULL
+    `v`, where the one-element list would answer FALSE, so that case is taken first.
+    """
+    return (
+        when(value.is_null()).then(lit(None, dtype="bool")).otherwise(xs.list.has_any(array(value)))
+    )
 
 
 def _raw_value(node):

@@ -111,48 +111,17 @@ def _flatten(items: tuple[Any, ...]) -> list[Any]:
 
 
 def _typed_null(dtype: Any) -> Any:
-    """A NULL expression of `dtype`, for a column a diagonal input does not have.
+    """A NULL expression of exactly `dtype`, for a column a diagonal input does not have."""
+    from batcher.plan.expr_ir.constructors import null_of_type
 
-    The IR carries no null literal (adding one is a wire-contract change), so the null
-    is built as ``nullif(0, 0)`` and cast to the target type — which the engine folds
-    to a typed null column.
-    """
-    from batcher.plan.expr_ir import lit, nullif
-
-    name = _CAST_NAMES.get(str(dtype))
-    if name is None:
+    null = null_of_type(dtype)
+    if null is None:
         raise PlanError(
             f"concat(how='diagonal'): cannot synthesize a null {dtype} column. Add the "
             "missing column explicitly with with_columns() before concatenating, or use "
             "how='vertical' once every input has the same schema."
         )
-    return nullif(lit(0), lit(0)).cast(name)
-
-
-# Arrow type name to the cast name that produces a null of that type. Only the types the
-# engine can cast to are here; anything else is reported rather than silently retyped.
-_CAST_NAMES = {
-    "bool": "bool",
-    "int8": "int64",
-    "int16": "int64",
-    "int32": "int64",
-    "int64": "int64",
-    "uint8": "int64",
-    "uint16": "int64",
-    "uint32": "int64",
-    "uint64": "int64",
-    "halffloat": "float64",
-    "float": "float64",
-    "double": "float64",
-    "string": "string",
-    "large_string": "string",
-    "date32[day]": "date32",
-    "date64[ms]": "date32",
-    "timestamp[us]": "timestamp",
-    "timestamp[ns]": "timestamp",
-    "timestamp[ms]": "timestamp",
-    "timestamp[s]": "timestamp",
-}
+    return null
 
 
 def _widen(datasets: list[Dataset]) -> list[Dataset]:

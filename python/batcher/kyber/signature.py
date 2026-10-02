@@ -205,10 +205,25 @@ def _udf_identity(fn: object) -> str:
 
 
 def _norm(ir):
-    """Normalize an expression IR, replacing literal values with a placeholder."""
+    """Normalize an expression IR, replacing literal values with a placeholder.
+
+    Except the operand of an equality or inequality (`eq`/`ne`). Normalizing a range bound is
+    the point: `x > 5` and `x > 6` describe one predicate shape whose learned selectivity
+    carries over. An equality's literal is not a bound, it names *which* value, and on a
+    skewed column two values of one shape are different predicates: JOB q10b's
+    `country_code = '[ru]'` keeps 0.6% of `company_name` and q23b's `= '[us]'` keeps 39%, and
+    sharing one signature let q10b's measurement plan q23b at 816M join rows, route it out of
+    core, and take it from 26 ms to 560 ms. Membership lists and string patterns already keep
+    their values (they are not `lit` nodes), which is the same rule.
+    """
     if isinstance(ir, dict):
         if ir.get("e") == "lit":
             return {"e": "lit"}
+        if ir.get("e") == "binary" and ir.get("op") in ("eq", "ne"):
+            return {
+                k: v if isinstance(v, dict) and v.get("e") == "lit" else _norm(v)
+                for k, v in ir.items()
+            }
         return {k: _norm(v) for k, v in ir.items()}
     if isinstance(ir, list):
         return [_norm(x) for x in ir]

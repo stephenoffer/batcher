@@ -460,7 +460,7 @@ state instead, and merge in constant space.
 
 - {doc}`Architecture </architecture/index>`: where an operator's state is allowed to live.
 - {doc}`Execution engine </architecture/internals/execution>`: the operator the plan node lowers to.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): the sketch error bounds behind `approx_*`.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the sketch error bounds behind `approx_*`.
 - {doc}`Aggregations </user-guide/analyze/aggregations>`: the API this page is under.
 - {doc}`Distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`: the `DISTINCT` surface.
 - {doc}`Analytics benchmarks </benchmarks/results/analytics>`: the group-by numbers quoted above.

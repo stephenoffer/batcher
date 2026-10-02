@@ -384,7 +384,7 @@ class _BatchFilter:
 class _AsyncBatchFilter(_BatchFilter):
     """`_BatchFilter` for an ``async def`` predicate, awaited on the async batch path."""
 
-    async def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:  # type: ignore[override]
+    async def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         try:
             answer = await self.fn(self._view(batch))
         except KeyError as exc:

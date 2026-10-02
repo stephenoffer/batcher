@@ -92,7 +92,7 @@ print(
 
 That gap is the signal. A generation that scores well on ROUGE-N and badly on ROUGE-L has the right content in the wrong arrangement.
 
-ROUGE-L is the expensive one. Its cost is quadratic in the two token counts where every other metric here is linear. On sentences that's nothing. On two thousand-token documents it's a million cell updates per row, and it dominates the scan. Truncate, or score per sentence.
+ROUGE-L is the expensive one. Its cost is quadratic in the two token counts where every other metric here is linear. Past 32 tokens on the shorter side, the kernel advances 64 cells per machine-word operation, so two thousand-token documents cost about 64 thousand word updates per row rather than four million cell updates. It's still quadratic, so on long documents it dominates the scan. Truncate, or score per sentence.
 
 ### How the text is tokenized
 

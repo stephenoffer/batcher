@@ -89,6 +89,8 @@ correction look error-free and decay it back to 1.0. `expr_factor` is the per-ro
 expressions the operator evaluated, which calibration divides back out so a fitted coefficient
 describes the engine rather than the workload's expressions.
 
+One count is withheld from that pairing. A runtime join filter removes probe rows at the scan before the join sees them, so every operator between that scan and the join counts only the rows the filter let through. That count depends on whether the chosen plan put a filter there, so it is not the operator's cardinality. Read as one, it taught TPC-H q7 at sf10 a correction that the next plan's filters contradicted, and the plan cache re-planned every few runs, alternating between a 76 ms plan and a 95 ms one. The engine lists those operators in the metrics document (`runtime_filtered`), and Core records them with `n_estimated = 0`, which the correction loop reads as nothing to learn from. Their timing and width are recorded as usual.
+
 The `op_id` correspondence is what makes the loop close: Kyber's `annotate_ops` numbers the
 plan in pre-order and stamps each node's estimate and signature onto it; the Rust executor
 numbers the same tree the same way; so a measured `rows_out` can be matched to the estimate
@@ -137,12 +139,18 @@ hub.put_keyed_param(namespace, key, value)
 ```
 
 `put_keyed_param` rather than a whole-blob write, because two concurrent writers learning
-about *different* query shapes must not clobber each other.
+about *different* query shapes must not clobber each other. Two writers updating the *same*
+key are a different matter. A learned value is read, folded, and written back as three steps
+with no compare-and-swap between them, so when two drivers fold into one signature at the same
+moment one fold can be lost. The store stays consistent, since each write is a whole value, but
+that observation is dropped rather than merged.
 
 The derived views (`_by_kind`, `_signed`) are maintained incrementally and bounded at 4,096
-rows each, so the backend is scanned exactly once per view per process. The `op_stats` table
+rows each, per operator family in the by-kind view, so the backend is scanned exactly once per view per process. The `op_stats` table
 beneath them is pruned to 65,536 rows on any backend that supports deletes, so a store written
-for months still opens quickly.
+for months still opens quickly. The two horizons differ on purpose: calibration and the
+q-error correction read the views, so what trains them is the most recent 4,096 rows, while
+the table keeps up to 65,536 for a process that rebuilds its views from it.
 :::
 
 ## Signatures
@@ -157,13 +165,16 @@ def plan_signature(node) -> str:
     return hashlib.sha1(payload.encode()).hexdigest()[:16]
 ```
 
-`_struct` normalizes literals away: every `{"e": "lit"}` becomes a bare `{"e": "lit"}`, so
-`x > 5` and `x > 6` share a signature. That is the point: you want a dashboard's daily
-query to accumulate evidence, not to start cold every time the date literal moves.
+Sixteen hex characters are 64 bits. By the birthday bound, the chance that any two of `k`
+distinct plan shapes share a signature is about `k² / 2⁶⁵`: one in 37 million at a million
+shapes. There is no second structural check behind the signature, so a collision would merge
+two shapes' learned statistics, which costs estimate quality and never a result.
 
-Column statistics are keyed differently, and the difference is a bug that was caught:
-`plan_signature` degenerates a `Scan` to the bare token `["scan"]` with no source identity.
-So column stats are qualified by source instead:
+`_struct` normalizes a range bound's literal away, so `x > 5` and `x > 6` share a signature. That is the point: a dashboard's daily query should accumulate evidence rather than start cold every time the date literal moves.
+
+An equality keeps its literal. `country_code = '[ru]'` and `country_code = '[us]'` are different predicates on a skewed column, and sharing one signature let the first query's measured selectivity, 0.6% of rows, plan the second, which keeps 39%. On the Join Order Benchmark that estimated one of JOB q23b's build sides at 94 billion rows, sent the query out of core, and took it from 26 ms to 1.5 s. Membership lists and string patterns keep their values for the same reason.
+
+A `Scan` signs as its source's identity, so two filters of one shape over different tables don't average their measurements. Column statistics are keyed separately, qualified by source:
 
 ```python
 # docs: skip
@@ -200,11 +211,15 @@ comparison does, so a prefix `scan` is a seek and a walk on both. RocksDB locks 
 so only one process may hold it open; use `redis` or `object_storage` to share across drivers.
 `LayeredBackend` writes durable-first then caches, and
 reads cache-first with fall-through. Its `refresh()` drops the cache entirely, which is the
-cross-driver freshness hook.
+cross-driver freshness hook. Nothing calls it on a schedule, so a driver on a layered store
+sees what other drivers learned only after it refreshes. There is no freshness bound beyond
+that.
 
 The hub is a process-wide singleton built by `core/runtime.py::default_hub()`, and it
 **degrades to `in_process` on any construction failure** with a warning. A misconfigured
-Redis costs you learning, not your query.
+Redis costs you learning, not your query. Where cross-run learning is expected rather than
+optional, set `metadata.require_durable=True` and the same failure raises a `ConfigError`
+instead.
 
 ## What is learned
 
@@ -288,19 +303,19 @@ backend the warm numbers quoted here describe a repeated query inside one proces
 the behavior of a new one.
 
 :::{warning}
-**Nothing expires.** `metadata.decay_per_day` is declared and validated and has no reader. There
-is no TTL and no aging on any backend. What provides recency is smoothing, not expiry: a
+**Nothing expires.** There is no TTL, no decay option and no aging on any backend. What provides recency is smoothing, not expiry: a
 per-signature EWMA with step `max(learned_scalar_alpha_floor, 1/(n_obs+1))`, a running mean while
 evidence is thin and then a roughly 10-observation memory, plus the 8-sample window on
 cardinality corrections.
 :::
 
-Three more, each a real hole rather than a rough edge:
+Four more, each a real hole rather than a rough edge:
 
 | Limit | Consequence |
 |---|---|
 | The join bandit only learns from single-join plans (`record_join_outcomes` bails above one join, because whole-query wall time must be unambiguously attributable to *that* join) | a TPC-H query with five joins contributes nothing to the bandit |
 | Distributed workers' feedback carries no signature, because a worker's `op_id`s address its own sub-plan and cannot be correlated with the driver's tree | those rows feed per-kind cost calibration but are excluded from cardinality correction |
+| Operators between a runtime join filter and the join it serves record no q-error, because the filter reduced their counts | a shape that only ever runs beneath a runtime filter never earns a cardinality correction |
 | `learned_broadcast_max_bytes` only trains on the distributed path | on a single-node deployment it returns `None` forever and the static threshold never moves |
 
 ## Code map
@@ -324,7 +339,7 @@ measurement from recording to reuse:
 - {doc}`Architecture </architecture/index>`: the contract loop, and why the subsystems meet only here.
 - {doc}`Kyber optimizer </architecture/internals/kyber>`: the biggest reader.
 - {doc}`Carbonite </architecture/internals/carbonite>`: the second-biggest.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page): UCB1, the shrinkage estimator, the EWMA.
+- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers UCB1, the shrinkage estimator, the EWMA.
 - {doc}`Configuration options </configuration/options>`: the `metadata.*` backend settings.
 - {doc}`Adaptive execution </getting-started/concepts/adaptive>`: what a user actually sees from this.
 - {doc}`TPC-H benchmarks </benchmarks/results/tpch>`: cold versus warm, measured.

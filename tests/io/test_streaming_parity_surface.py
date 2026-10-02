@@ -262,12 +262,12 @@ def test_process_all_available_has_the_snake_case_spelling_too():
 
 
 @pytest.mark.integration
-def test_a_driver_path_query_reports_no_state_metrics_and_counts_its_own_rows():
-    """Pinned because the monitoring guide now says so. A stream-stream join, a session
-    window, a dedup, a limit and a stream union all run through a driver that hands the
-    engine finished rows, so the engine cannot see what the driver read or what it
-    retained. The guard on that state still fires; only the per-batch reporting is
-    missing, and a test is the difference between a documented limit and a drifting one."""
+def test_a_driver_path_limit_counts_what_it_read_and_reports_no_state():
+    """Pinned because the monitoring guide says so. A driver-path query (a stream-stream
+    join, a session window, a dedup, a limit, a stream union) reports the rows it read from
+    its unbounded sources, not the rows it emitted, and a limit keeps no rows between
+    batches, so it reports no state operator. It used to report its two emitted rows as its
+    input, which is what this pinned before `plan.streaming.driver_stats` existed."""
     schema = pa.schema([("k", pa.string()), ("v", pa.int64())])
 
     def feed():
@@ -280,4 +280,5 @@ def test_a_driver_path_query_reports_no_state_metrics_and_counts_its_own_rows():
     )
     assert query.await_termination(timeout=60) is True
     assert all(progress.state_operators == () for progress in query.recent_progress)
-    assert sum(p.num_input_rows for p in query.recent_progress) == 2
+    assert sum(p.num_output_rows for p in query.recent_progress) == 2
+    assert sum(p.num_input_rows for p in query.recent_progress) == 3

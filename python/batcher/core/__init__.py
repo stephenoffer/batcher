@@ -21,7 +21,10 @@ from batcher.core.base import ExecutionContext, Executor
 from batcher.core.executor import (
     LocalExecutor,
     execute_local,
+    execute_local_chunked,
     execute_local_metered,
+    execute_local_parquet,
+    plan_chunkable,
     record_exec_metrics,
 )
 from batcher.core.runtime import default_hub, reset_default_hub
@@ -51,11 +54,14 @@ __all__ = [
     "column_statistics",
     "default_hub",
     "execute_local",
+    "execute_local_chunked",
     "execute_local_metered",
+    "execute_local_parquet",
     "execute_with_udfs",
     "has_map_batches",
     "heavy_hitters",
     "make_processor",
+    "plan_chunkable",
     "prebuild_factories",
     "record_exec_metrics",
     "release_prebuilt",

@@ -31,9 +31,8 @@ decision**, taken before the search starts and re-checked inside it, and the fal
 not a failure mode but a second real search. Drawing the budget as a step in the flow is
 the only way to make that read as deliberate rather than as a timeout.
 
-Note for anyone keeping this in step: `config.py`'s `join_dp_max_tables` and
-`greedy_max_tables` are *not* read by this search. The live limits are the two module
-constants above.
+Note for anyone keeping this in step: no config option limits this search. The live limits
+are the two module constants above.
 
 Form: a serpentine flow (region, budget, DP, greedy) over a band holding the two things
 every candidate is ranked by, because both searches rank with the same two.

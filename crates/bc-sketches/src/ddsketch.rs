@@ -13,6 +13,13 @@
 //! bucket. Buckets are counts in a `BTreeMap` (ordered iteration = quantile walk).
 //! Zeros are counted separately (log is undefined at 0), negatives live in a
 //! mirror map keyed by `|v|`. Min/max are tracked exactly so `q=0`/`q=1` are precise.
+//!
+//! Memory is bounded but not constant. Only occupied buckets are stored, and the values in
+//! `[lo, hi]` occupy at most `⌈ln(hi/lo) / ln γ⌉ + 1` buckets per sign, so the size grows with
+//! the data's dynamic range and with `1/α`, not with the row count. `ln γ = 2·atanh(α) ≈ 2α`,
+//! so at the default `α = 0.01` a column spanning `1e-9..1e9` holds at most 2,074 buckets per
+//! sign, 12 serialized bytes each, and the whole finite `f64` range about 72,700. There is no
+//! bucket cap that collapses the lowest buckets, as the paper's bounded variant has.
 
 use crate::Mergeable;
 use std::collections::BTreeMap;
@@ -37,6 +44,23 @@ pub struct DDSketch {
 /// Default relative accuracy (1%).
 const DEFAULT_ALPHA: f64 = 0.01;
 
+/// The smallest supported relative accuracy.
+///
+/// Two things fail below a floor. At `α` under about `1.1e-16`, `(1+α)/(1-α)` rounds to
+/// exactly 1, so `ln γ` is 0 and every bucket index is `±∞` or NaN. Well above that, the
+/// index `⌈ln v / ln γ⌉` stops fitting the `i32` it is stored in: the largest `|ln v|` of a
+/// finite `f64` is 744.4 (the smallest subnormal), and `ln γ ≈ 2α`, so the index overflows
+/// once `α < 744.4 / (2 · i32::MAX) ≈ 1.7e-7`. The `as i32` cast saturates rather than
+/// failing, so every extreme value would share one bucket and the `α` guarantee would be
+/// silently void for them. `1e-6` clears that bound with a margin.
+pub const MIN_ALPHA: f64 = 1e-6;
+
+/// Whether `alpha` is a relative accuracy this sketch can honour: in `[MIN_ALPHA, 1)`.
+#[inline]
+fn supported_alpha(alpha: f64) -> bool {
+    (MIN_ALPHA..1.0).contains(&alpha)
+}
+
 impl Default for DDSketch {
     fn default() -> Self {
         Self::new(DEFAULT_ALPHA)
@@ -44,13 +68,17 @@ impl Default for DDSketch {
 }
 
 impl DDSketch {
-    /// Create an empty sketch with relative accuracy `alpha ∈ (0, 1)` (e.g. 0.01
-    /// for 1%). Smaller `alpha` → tighter buckets and more memory.
+    /// Create an empty sketch with relative accuracy `alpha ∈ [MIN_ALPHA, 1)` (e.g.
+    /// 0.01 for 1%). Smaller `alpha` → tighter buckets and more memory.
+    ///
+    /// # Panics
+    ///
+    /// When `alpha` is outside `[MIN_ALPHA, 1)`, NaN included. See [`MIN_ALPHA`].
     #[must_use]
     pub fn new(alpha: f64) -> Self {
         assert!(
-            alpha > 0.0 && alpha < 1.0,
-            "alpha must be in (0, 1), got {alpha}"
+            supported_alpha(alpha),
+            "alpha must be in [{MIN_ALPHA}, 1), got {alpha}"
         );
         let gamma = (1.0 + alpha) / (1.0 - alpha);
         Self {
@@ -89,8 +117,9 @@ impl DDSketch {
     }
 
     /// The configured relative accuracy `α`.
+    #[cfg(test)]
     #[must_use]
-    pub fn relative_accuracy(&self) -> f64 {
+    pub(crate) fn relative_accuracy(&self) -> f64 {
         self.alpha
     }
 
@@ -102,9 +131,13 @@ impl DDSketch {
 
     /// Representative value of bucket `i` (the bucket's geometric "centre"): it is
     /// within a factor `1±α` of every magnitude that maps to `i`.
+    ///
+    /// The factor `2/(γ+1)` is below 1 and is applied last. Doubling `γ^i` first, as
+    /// `2·γ^i / (γ+1)` reads, overflows to infinity for a bucket near `f64::MAX` whose
+    /// representative is finite.
     #[inline]
     fn value_of(&self, i: i32) -> f64 {
-        2.0 * self.gamma.powi(i) / (self.gamma + 1.0)
+        self.gamma.powi(i) * (2.0 / (self.gamma + 1.0))
     }
 
     /// Add one value. NaN/±inf are ignored (they have no finite bucket).
@@ -138,9 +171,13 @@ impl DDSketch {
     /// Approximate value at quantile `q ∈ [0, 1]` (`None` if empty). `q=0`/`q=1`
     /// return the exact min/max; otherwise the result is within relative error
     /// `α` of the true quantile, and always inside the observed `[min, max]`.
+    ///
+    /// A NaN `q` names no quantile and answers `None`. It used to pass the clamp unchanged
+    /// (`NaN.clamp` is NaN), fail every comparison in the walk and fall through to the
+    /// maximum, which reads as a real answer.
     #[must_use]
     pub fn quantile(&self, q: f64) -> Option<f64> {
-        if self.n == 0 {
+        if self.n == 0 || q.is_nan() {
             return None;
         }
         let q = q.clamp(0.0, 1.0);
@@ -328,7 +365,7 @@ impl DDSketch {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
         let alpha = c.f64()?;
-        if !(alpha > 0.0 && alpha < 1.0) {
+        if !supported_alpha(alpha) {
             return None;
         }
         let zeros = c.u64()?;
@@ -436,6 +473,65 @@ impl Mergeable for DDSketch {
 mod tests {
     use super::*;
     use crate::merge_all;
+
+    /// A NaN quantile is refused, not answered with the maximum.
+    #[test]
+    fn a_nan_quantile_is_none_not_the_maximum() {
+        let mut s = DDSketch::new(0.01);
+        for v in 1..=100 {
+            s.add(f64::from(v));
+        }
+        assert_eq!(s.quantile(f64::NAN), None);
+        // The ordinary quantiles are untouched, and out-of-range `q` still clamps.
+        assert_eq!(s.quantile(0.0), Some(1.0));
+        assert_eq!(s.quantile(2.0), Some(100.0));
+    }
+
+    /// An accuracy below [`MIN_ALPHA`] is refused rather than collapsing `γ` to 1.
+    #[test]
+    fn an_unrepresentable_alpha_is_refused() {
+        for bad in [1e-17, 1e-12, 1e-7, 0.0, -0.5, 1.0, f64::NAN] {
+            let caught = std::panic::catch_unwind(|| DDSketch::new(bad));
+            assert!(caught.is_err(), "alpha {bad} was accepted");
+            let mut blob = DDSketch::new(0.01).to_bytes();
+            blob[..8].copy_from_slice(&bad.to_le_bytes());
+            assert!(
+                DDSketch::from_bytes(&blob).is_none(),
+                "alpha {bad} deserialized"
+            );
+        }
+        // At the floor, both ends of the finite range index without saturating `i32`.
+        let s = DDSketch::new(MIN_ALPHA);
+        for v in [f64::MAX, f64::MIN_POSITIVE, 5e-324] {
+            let raw = (v.ln() / s.ln_gamma).ceil();
+            assert!(raw.abs() < f64::from(i32::MAX), "{v} indexes to {raw}");
+        }
+    }
+
+    /// The representative of a bucket near `f64::MAX` is finite, and within `α` of the value.
+    #[test]
+    fn the_top_bucket_representative_does_not_overflow() {
+        let s = DDSketch::new(0.01);
+        for v in [1e308, f64::MAX / 1.5, 1.7e308] {
+            let rep = s.value_of(s.index(v));
+            assert!(rep.is_finite(), "{v} -> {rep}");
+            assert!(((rep - v) / v).abs() <= 0.01 + 1e-12, "{v} -> {rep}");
+        }
+    }
+
+    /// The module doc's bucket bound, checked: `1e-9..1e9` occupies at most 2,074 buckets.
+    #[test]
+    fn occupied_buckets_follow_the_dynamic_range_bound() {
+        let mut s = DDSketch::new(0.01);
+        let mut v = 1e-9f64;
+        while v <= 1e9 {
+            s.add(v);
+            v *= 1.001;
+        }
+        let bound = ((1e9f64 / 1e-9).ln() / s.ln_gamma).ceil() as usize + 1;
+        assert_eq!(bound, 2_074);
+        assert!(s.positive.len() <= bound, "{} > {bound}", s.positive.len());
+    }
 
     // Deterministic shuffle so insertion order isn't sorted.
     fn shuffled(n: u64) -> Vec<f64> {

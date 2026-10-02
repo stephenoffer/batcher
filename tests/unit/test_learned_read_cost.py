@@ -197,7 +197,7 @@ class TestCostModelUsesIt:
 
 class TestPlanCacheSeesIt:
     def test_the_key_moves_when_a_source_gets_relatively_slower(self) -> None:
-        from batcher.kyber.plan_cache import _read_cost_key
+        from batcher.kyber.plan_cache.keys import _read_cost_key
 
         class _Src:
             def __init__(self, name: str) -> None:
@@ -212,7 +212,7 @@ class TestPlanCacheSeesIt:
         assert even != skewed
 
     def test_the_key_is_stable_under_a_small_drift(self) -> None:
-        from batcher.kyber.plan_cache import _read_cost_key
+        from batcher.kyber.plan_cache.keys import _read_cost_key
 
         class _Src:
             def __init__(self, name: str) -> None:
@@ -228,7 +228,7 @@ class TestPlanCacheSeesIt:
         assert base == drifted
 
     def test_a_cold_store_keys_as_before(self) -> None:
-        from batcher.kyber.plan_cache import _read_cost_key
+        from batcher.kyber.plan_cache.keys import _read_cost_key
 
         assert _read_cost_key(None, None) == "-"
         assert _read_cost_key(MetadataHub(InProcessBackend()), None) == "-"
@@ -257,10 +257,10 @@ class TestTheDegradedKeyIsTraced:
         monkeypatch.setattr("batcher.metadata.io_stats.relative_read_cost", _boom)
         traced: list[tuple] = []
         monkeypatch.setattr(
-            plan_cache, "note_suppressed", lambda *a: traced.append(a), raising=True
+            plan_cache.keys, "note_suppressed", lambda *a: traced.append(a), raising=True
         )
 
-        assert plan_cache._read_cost_key(object(), [_Src()]) == "-"
+        assert plan_cache.keys._read_cost_key(object(), [_Src()]) == "-"
         assert traced, "the degraded read left no trace"
         assert traced[0][0] == "kyber"
         assert isinstance(traced[0][2], RuntimeError)

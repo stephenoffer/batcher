@@ -34,6 +34,7 @@ from batcher.plan.logical import (
     LogicalPlan,
     Sample,
     Sort,
+    is_empty_relation,
 )
 
 __all__ = [
@@ -60,11 +61,6 @@ def _exact_rows(node: LogicalPlan, ctx: OptimizerContext) -> float | None:
         return None
     stats = ctx.estimator.estimate(node)
     return stats.rows if stats.provenance.is_exact else None
-
-
-def _is_empty_marker(node: LogicalPlan) -> bool:
-    """Whether `node` is already the canonical empty relation `Limit(_, 0)`."""
-    return isinstance(node, Limit) and node.n == 0
 
 
 @rule(name="drop_inert_limit", phase=Phase.PUSHDOWN, matches=(Limit,))
@@ -157,7 +153,7 @@ def fold_exact_empty_input(node: LogicalPlan, ctx: OptimizerContext) -> LogicalP
             True
     """
     child = node.input
-    if _is_empty_marker(child):
+    if is_empty_relation(child):
         return None  # already the marker — leave it to propagate_empty_relation
     if _exact_rows(child, ctx) == 0:
         return Limit(child, 0)

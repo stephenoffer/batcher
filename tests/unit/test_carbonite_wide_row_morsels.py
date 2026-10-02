@@ -90,6 +90,21 @@ def test_a_tensor_column_is_sized_from_its_schema_before_anything_is_measured():
     assert rows < MIN_MORSEL_ROWS  # the flat floor would have been 170x over budget
 
 
+def test_a_join_is_charged_its_widest_input_not_the_sum_of_its_inputs():
+    # A join makes no morsel wider than its inputs were: the engine bounds its batches on real
+    # bytes. Charging the combined 41-column output cut every scan in the plan to the join's
+    # width (TPC-DS q59 ran on 173-row morsels), so the join's cap must be its input's.
+    cfg = active_config()
+    left = bt.from_pydict({f"l{i}": list(range(10)) for i in range(20)} | {"k": list(range(10))})
+    right = bt.from_pydict({f"r{i}": list(range(10)) for i in range(20)} | {"k": list(range(10))})
+    joined = left.join(right, on="k")
+    assert len(joined.columns) >= 40
+    assert planned_row_cap(cfg, joined._plan) == planned_row_cap(cfg, left._plan)
+    # Positive control: the same columns scanned as one relation are charged in full.
+    wide = bt.from_pydict({f"c{i}": list(range(10)) for i in range(41)})
+    assert planned_row_cap(cfg, wide._plan) < planned_row_cap(cfg, left._plan)
+
+
 def test_a_wider_tensor_gets_a_smaller_morsel():
     # The cap tracks the width rather than snapping to a constant.
     cfg = active_config()
@@ -111,7 +126,7 @@ def test_the_more_binding_of_the_two_widths_wins():
         def __init__(self, width):
             self._width = width
 
-        def max_bytes_per_row(self, families=None):
+        def max_row_width(self, families=None):
             return self._width
 
     ds = _tensor_frame()

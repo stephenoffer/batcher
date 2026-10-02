@@ -139,7 +139,13 @@ pub(crate) fn cast_expr(
             return Ok(cast_with_options(&rounded, target, &opts)?);
         }
     }
+    if let Some(out) = narrow_int(arr, target) {
+        return Ok(out);
+    }
     if int_target && float_src {
+        if let Some(out) = round_f64_to_int(arr, target) {
+            return Ok(out);
+        }
         // Round half-to-even first (DuckDB DOUBLE→BIGINT), then cast the now-integral
         // floats. `f64::round_ties_even` is banker's rounding.
         let f = cast_with_options(arr, &Float64, &opts)?;
@@ -610,6 +616,95 @@ fn float_to_string(
     }
 }
 
+/// `Float64` to `Int32`/`Int64` in one pass, when every value rounds to one the target holds.
+///
+/// The general path below writes a rounded copy of the column and hands it to arrow's checked
+/// cast, two passes and an allocation; under `SUM(CAST(FLOOR(price) AS BIGINT))` the casts were
+/// over a third of the query. Rounding, range check and conversion fuse into one loop the
+/// compiler vectorizes. The check is a strict subset of arrow's -- an integral value strictly
+/// inside the target's range, so NaN, the infinities and the boundary values all fail it -- and
+/// a column with any value failing it (including one sitting under a null) returns `None` and
+/// takes the general path, which raises or nulls exactly as it always did. Where every value
+/// passes, both paths convert the same integral floats exactly, so the arrays are equal.
+fn round_f64_to_int(arr: &ArrayRef, target: &arrow::datatypes::DataType) -> Option<ArrayRef> {
+    use arrow::array::PrimitiveArray;
+    use arrow::datatypes::{DataType, Int32Type, Int64Type};
+
+    let f = arr.as_primitive_opt::<Float64Type>()?;
+    let nulls = f.nulls().cloned();
+    match target {
+        DataType::Int64 => {
+            // Both ends of the i64 range excluded, so the edge itself is the general path's call.
+            let (lo, hi) = (
+                -9_223_372_036_854_775_808.0_f64,
+                9_223_372_036_854_775_808.0_f64,
+            );
+            let (out, ok) = round_all(f.values(), |r| (r > lo) & (r < hi), |r| r as i64);
+            ok.then(|| Arc::new(PrimitiveArray::<Int64Type>::new(out.into(), nulls)) as ArrayRef)
+        }
+        DataType::Int32 => {
+            let (lo, hi) = (f64::from(i32::MIN), f64::from(i32::MAX));
+            let (out, ok) = round_all(f.values(), |r| (r > lo) & (r < hi), |r| r as i32);
+            ok.then(|| Arc::new(PrimitiveArray::<Int32Type>::new(out.into(), nulls)) as ArrayRef)
+        }
+        _ => None,
+    }
+}
+
+/// `Int64` to `Int32`/`Int16`/`Int8` in one pass, when every value fits the target.
+///
+/// Arrow's checked narrowing converts value by value through an `Option`, which does not
+/// vectorize: `CAST(l_quantity AS INTEGER)` was 17% of `op-expr-cast-chain`. A min/max fold
+/// decides that nothing can overflow, after which the conversion is a plain truncating `as`
+/// that the compiler packs. A column whose fold fails -- including on a value under a null --
+/// returns `None` and takes arrow's kernel, which raises or nulls exactly as before.
+fn narrow_int(arr: &ArrayRef, target: &arrow::datatypes::DataType) -> Option<ArrayRef> {
+    use arrow::array::PrimitiveArray;
+    use arrow::datatypes::{DataType, Int16Type, Int32Type, Int64Type, Int8Type};
+
+    let a = arr.as_primitive_opt::<Int64Type>()?;
+    let values = a.values();
+    let (lo, hi) = values
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let nulls = a.nulls().cloned();
+    macro_rules! narrow {
+        ($t:ty, $native:ty) => {{
+            let fits = values.is_empty()
+                || (lo >= i64::from(<$native>::MIN) && hi <= i64::from(<$native>::MAX));
+            fits.then(|| {
+                let out: Vec<$native> = values.iter().map(|&v| v as $native).collect();
+                Arc::new(PrimitiveArray::<$t>::new(out.into(), nulls)) as ArrayRef
+            })
+        }};
+    }
+    match target {
+        DataType::Int32 => narrow!(Int32Type, i32),
+        DataType::Int16 => narrow!(Int16Type, i16),
+        DataType::Int8 => narrow!(Int8Type, i8),
+        _ => None,
+    }
+}
+
+/// Every value rounded half-to-even and converted, and whether all of them passed `fits`.
+#[inline(always)]
+fn round_all<T>(
+    values: &[f64],
+    fits: impl Fn(f64) -> bool,
+    convert: impl Fn(f64) -> T,
+) -> (Vec<T>, bool) {
+    let mut ok = true;
+    let out = values
+        .iter()
+        .map(|&v| {
+            let r = v.round_ties_even();
+            ok &= fits(r);
+            convert(r)
+        })
+        .collect();
+    (out, ok)
+}
+
 #[cfg(test)]
 mod narrowing_float_tests {
     use super::*;
@@ -1024,6 +1119,138 @@ mod float_to_string_tests {
                 Some("100000000.0"),
                 None,
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod fused_float_to_int_tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+
+    /// The general path, spelled out: round half-to-even, then arrow's checked cast.
+    fn general(arr: &ArrayRef, target: &DataType, try_cast: bool) -> Result<ArrayRef, ArrowError> {
+        let f = arr.as_primitive::<Float64Type>();
+        let rounded: Float64Array = arrow::compute::kernels::arity::unary(f, f64::round_ties_even);
+        let opts = CastOptions {
+            safe: try_cast,
+            ..Default::default()
+        };
+        cast_with_options(&(Arc::new(rounded) as ArrayRef), target, &opts)
+    }
+
+    /// Ties both ways, negatives, nulls and a sliced column are served and equal the general
+    /// path; NaN, infinities and values at or past the target's range are declined, so the
+    /// general path keeps the error (or the NULL of a `TRY_CAST`) it always produced.
+    #[test]
+    fn the_fused_cast_equals_round_then_cast_or_declines() {
+        let served: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.5),
+            Some(1.5),
+            Some(2.5),
+            Some(-0.5),
+            Some(-2.5),
+            Some(-0.0),
+            None,
+            Some(123_456.499_999),
+            Some(2_147_483_646.4),
+            Some(-2_147_483_647.4),
+        ]));
+        for target in [DataType::Int32, DataType::Int64] {
+            for arr in [served.clone(), served.slice(2, 6)] {
+                let got = round_f64_to_int(&arr, &target).expect("served");
+                assert_eq!(&got, &general(&arr, &target, false).unwrap(), "{target}");
+                assert_eq!(&cast_expr(&arr, &target, false).unwrap(), &got);
+            }
+        }
+        let edges = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2_147_483_647.0,
+            -2_147_483_648.0,
+            9.3e18,
+            -9_223_372_036_854_775_808.0,
+        ];
+        for edge in edges {
+            let arr: ArrayRef = Arc::new(Float64Array::from(vec![1.0, edge]));
+            let target = if edge.abs() < 3e9 {
+                DataType::Int32
+            } else {
+                DataType::Int64
+            };
+            assert!(
+                round_f64_to_int(&arr, &target).is_none(),
+                "{edge} must be the general path's"
+            );
+            for try_cast in [false, true] {
+                let fast_or_general = cast_expr(&arr, &target, try_cast);
+                match general(&arr, &target, try_cast) {
+                    Ok(want) => assert_eq!(&fast_or_general.unwrap(), &want),
+                    Err(_) => assert!(fast_or_general.is_err()),
+                }
+            }
+        }
+        // A NaN under a null slot declines too, and the general path ignores the slot.
+        let masked: ArrayRef = Arc::new(Float64Array::new(
+            vec![1.0, f64::NAN].into(),
+            Some(vec![true, false].into()),
+        ));
+        assert!(round_f64_to_int(&masked, &DataType::Int64).is_none());
+        let out = cast_expr(&masked, &DataType::Int64, false).unwrap();
+        assert_eq!(out.null_count(), 1);
+    }
+
+    /// Narrowing an `Int64` column that fits is served and equals arrow's checked cast, sliced
+    /// or not; one that does not fit -- even only under a null -- is declined, so arrow keeps
+    /// the error (or `TRY_CAST`'s NULL).
+    #[test]
+    fn integer_narrowing_equals_arrows_checked_cast_or_declines() {
+        use arrow::array::Int64Array;
+        let fits: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(0),
+            Some(-1),
+            None,
+            Some(i64::from(i32::MAX)),
+            Some(i64::from(i32::MIN)),
+            Some(42),
+        ]));
+        for arr in [fits.clone(), fits.slice(1, 4)] {
+            let got = narrow_int(&arr, &DataType::Int32).expect("served");
+            let opts = CastOptions {
+                safe: false,
+                ..Default::default()
+            };
+            assert_eq!(
+                &got,
+                &cast_with_options(&arr, &DataType::Int32, &opts).unwrap()
+            );
+        }
+        assert!(narrow_int(&fits, &DataType::Int16).is_none());
+        let small: ArrayRef = Arc::new(Int64Array::from(vec![-128, 127, 0]));
+        assert_eq!(
+            &narrow_int(&small, &DataType::Int8).unwrap(),
+            &cast_with_options(&small, &DataType::Int8, &CastOptions::default()).unwrap()
+        );
+        let over: ArrayRef = Arc::new(Int64Array::from(vec![1, i64::from(i32::MAX) + 1]));
+        assert!(narrow_int(&over, &DataType::Int32).is_none());
+        assert!(cast_expr(&over, &DataType::Int32, false).is_err());
+        assert_eq!(
+            cast_expr(&over, &DataType::Int32, true)
+                .unwrap()
+                .null_count(),
+            1
+        );
+        let masked: ArrayRef = Arc::new(Int64Array::new(
+            vec![1, i64::MAX].into(),
+            Some(vec![true, false].into()),
+        ));
+        assert!(narrow_int(&masked, &DataType::Int32).is_none());
+        assert_eq!(
+            cast_expr(&masked, &DataType::Int32, false)
+                .unwrap()
+                .null_count(),
+            1
         );
     }
 }

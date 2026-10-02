@@ -12,22 +12,57 @@ over its active keys, with the inactive keys grouped by a *typed null*
 level), and the levels are stacked with `union(distinct=False)`. So every level is a
 plan the optimizer, the spill path and the distributed executor already understand,
 and nothing in the aggregate path needs to know that levels exist.
+
+**The levels share one aggregate, not just one input.** Every level recomputing the input
+cost TPC-DS q22 its 11.7M-row inventory join five times, and plan-level common-subplan reuse
+declined to share it: the join's *estimated* result (16.5M rows, against 2.3M actual) was
+over its byte cap. The levels do not need the input, only a summary of it: every level's keys
+are a subset of the union of all of them, so one aggregate at that finest grouping, holding
+each aggregate's *partial* state, determines every level, and a level becomes a second, small
+aggregate over it merging partials (a sum of sums, a sum of counts, a min of mins). That
+finest aggregate is what reuse then materializes once. It is built here, where the levels are
+stacked, rather than as a Kyber rule, because reuse matches repeated subtrees on the plan as
+written -- a sharing only the optimizer could see would never be materialized. Only aggregates
+with a partial form qualify (`agg_pushdown._PREAGG_MERGE`, plus `mean` as its sum/count pair
+over a numeric column); anything else keeps one independent aggregate per level.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+import pyarrow as pa
+
 from batcher._internal.errors import PlanError
-from batcher.plan.expr_ir import AggExpr, Expr, col, nullif
-from batcher.plan.logical import Union, share_sources
+from batcher.kyber.common_subplan import structural_key
+from batcher.kyber.rules.agg_pushdown.rules import _PREAGG_MERGE
+from batcher.plan.expr_ir import AggExpr, Col, Expr, coalesce, col, lit, nullif
+from batcher.plan.expr_ir.nodes import NullIf
+from batcher.plan.logical import (
+    Aggregate,
+    AggregateSpec,
+    Filter,
+    Join,
+    LogicalPlan,
+    Project,
+    Projection,
+    Union,
+    Window,
+    share_sources,
+)
+from batcher.plan.visitor import walk
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
 __all__ = ["MultiLevelGroupBy", "cube_levels", "rollup_levels", "stack_levels"]
+
+# The single-input nodes a level may carry above its aggregate: each reads only the rows of
+# that level, so it is unchanged when the level's aggregate is computed from shared partials.
+_LEVEL_WRAPPERS = (Project, Filter, Window)
 
 
 def rollup_levels(keys: tuple[str, ...]) -> list[tuple[str, ...]]:
@@ -93,7 +128,8 @@ def stack_levels(frames: Sequence[Dataset]) -> Dataset:
     from batcher.api.dataset import Dataset
 
     plans, sources = share_sources([(f._plan, f._sources) for f in frames])
-    return Dataset(Union(tuple(plans), False), sources)
+    union = Union(tuple(plans), False)
+    return Dataset(_share_level_input(union) or union, sources)
 
 
 class MultiLevelGroupBy:
@@ -186,3 +222,210 @@ class MultiLevelGroupBy:
         keyed = {k: col(k) if k in active else nullif(col(k), col(k)) for k in self._keys}
         grouped = self._ds.group_by(**keyed).agg(**named)
         return grouped.select(*self._keys, *named)
+
+
+#: Prefix of the shared aggregate's partial columns; also what marks a union already rewritten.
+_PARTIAL = "__lvl_"
+
+
+def _share_level_input(node: Union) -> LogicalPlan | None:
+    """`UNION ALL` of aggregates over one input -> one finest aggregate, rolled up per level.
+
+    Applies only when every branch is an aggregate (under an optional projection) over a
+    structurally identical input that contains a join or an aggregate -- a cheap input is
+    cheaper to re-read than to summarize -- and every group key is a column or a typed null
+    of one. Result-invariant: each level merges exact partials of its own aggregates.
+
+    Args:
+        node: The stacked levels.
+
+    Returns:
+        The union with each level computed from the shared finest aggregate, or None.
+    """
+    if node.distinct or len(node.inputs) < 2:
+        return None
+    levels = [_level_aggregate(branch) for branch in node.inputs]
+    if any(level is None for level in levels):
+        return None
+    aggregates: list[Aggregate] = [level for level in levels if level is not None]
+    base = aggregates[0].input
+    if _is_shared_partial(base) or not any(isinstance(n, Join | Aggregate) for n in walk(base)):
+        return None
+    base_key = structural_key(base)
+    if base_key is None or any(structural_key(a.input) != base_key for a in aggregates[1:]):
+        return None
+
+    key_columns: dict[str, None] = {}
+    for agg in aggregates:
+        for key in agg.group_keys:
+            column, active = _key_column(key.expr)
+            if column is None:
+                return None
+            if active:
+                key_columns[column] = None
+
+    partials: dict[tuple[str, str], str] = {}
+    specs: list[AggregateSpec] = []
+    for agg in aggregates:
+        for spec in agg.aggregates:
+            states = _partials_of(spec.agg, base, key_columns)
+            if states is None:
+                return None
+            for key, partial in states:
+                if key not in partials:
+                    partials[key] = f"{_PARTIAL}{len(partials)}"
+                    specs.append(AggregateSpec(partials[key], partial))
+    finest = Aggregate(base, tuple(Projection(c, Col(c)) for c in key_columns), tuple(specs))
+
+    rolled = [
+        _roll_up(branch, agg, finest, partials)
+        for branch, agg in zip(node.inputs, aggregates, strict=True)
+    ]
+    return dataclasses.replace(node, inputs=tuple(rolled))
+
+
+def _level_aggregate(branch: LogicalPlan) -> Aggregate | None:
+    """The aggregate a union branch computes, under any chain of per-level nodes.
+
+    A level is its aggregate plus whatever the query computes *from* that level's rows: the
+    projection restoring its columns, a `HAVING` filter, and a window whose partition is the
+    level itself. TPC-DS q70 ranks each level (`rank() OVER (PARTITION BY
+    grouping(...)...)`), so its branches are `Project > Window > Project > Aggregate`, and
+    accepting only one projection above the aggregate left all three levels re-running the
+    whole three-table join. Those nodes read the level aggregate's rows and nothing else, so
+    they sit unchanged on the rolled-up aggregate, which produces the same rows under the
+    same names (`_roll_up`).
+    """
+    while isinstance(branch, _LEVEL_WRAPPERS):
+        branch = branch.input
+    return branch if isinstance(branch, Aggregate) and branch.watermark is None else None
+
+
+def _is_shared_partial(plan: LogicalPlan) -> bool:
+    """Whether `plan` is already a finest aggregate built here, so levels are not re-shared."""
+    return isinstance(plan, Aggregate) and any(
+        spec.alias.startswith(_PARTIAL) for spec in plan.aggregates
+    )
+
+
+def _key_column(expr: Expr) -> tuple[str | None, bool]:
+    """A group key's column and whether it is active, or `(None, False)` for any other key.
+
+    An active key is the column itself; an inactive one is the typed null
+    `nullif(col, col)` the multi-level lowering groups it by.
+    """
+    if isinstance(expr, Col):
+        return expr.name, True
+    if (
+        isinstance(expr, NullIf)
+        and isinstance(expr.left, Col)
+        and isinstance(expr.right, Col)
+        and expr.left.name == expr.right.name
+    ):
+        return expr.left.name, False
+    return None, False
+
+
+def _plain(agg: AggExpr) -> bool:
+    """An aggregate with no second input, parameter, interpolation or ordering."""
+    return agg.input2 is None and agg.param is None and not agg.order_by and not agg.interpolation
+
+
+def _partials_of(
+    agg: AggExpr, base: LogicalPlan, key_columns: dict[str, None]
+) -> list[tuple[tuple[str, str], AggExpr]] | None:
+    """The partial states `agg` is merged from, keyed by `(function, operand IR)`, or None.
+
+    Two levels asking for the same state share one column of the finest aggregate, which is
+    why the key is the operand's wire form rather than the `Expr` object. A `min`/`max` of a
+    column the finest aggregate groups by needs no state at all -- the level reads the key
+    column itself -- which is the grand total's typed-null placeholder, `max(k)` per key.
+    """
+    if not _plain(agg):
+        return None
+    if _reads_key(agg, key_columns):
+        return []
+    operand = _operand_key(agg)
+    if agg.func in _PREAGG_MERGE:
+        return [((agg.func, operand), AggExpr(agg.func, agg.input))]
+    if agg.func == "mean" and _is_numeric_column(agg.input, base):
+        return [
+            (("sum", operand), AggExpr("sum", agg.input)),
+            (("count", operand), AggExpr("count", agg.input)),
+        ]
+    return None
+
+
+def _reads_key(agg: AggExpr, key_columns: dict[str, None]) -> bool:
+    """Whether `agg` is a `min`/`max` of one of the finest aggregate's key columns."""
+    if agg.func not in ("min", "max") or not isinstance(agg.input, Col):
+        return False
+    return agg.input.name in key_columns
+
+
+def _operand_key(agg: AggExpr) -> str:
+    """`agg`'s operand as its IR string: equal for equal computations, whatever the object."""
+    return "" if agg.input is None else repr(agg.input.to_ir())
+
+
+def _is_numeric_column(expr: Expr | None, base: LogicalPlan) -> bool:
+    """Whether `expr` is a column of an integer or floating type in `base`'s schema.
+
+    `mean` over those is a float64, which the sum over the count reproduces. Other input types
+    (decimals above all) are declined rather than assumed to give the same type and rounding.
+    """
+    if not isinstance(expr, Col):
+        return False
+    schema = base.available_schema()
+    if schema is None or expr.name not in schema.arrow.names:
+        return False
+    dtype = schema.arrow.field(expr.name).type
+    return pa.types.is_integer(dtype) or pa.types.is_floating(dtype)
+
+
+def _roll_up(
+    branch: LogicalPlan,
+    level: Aggregate,
+    finest: Aggregate,
+    partials: dict[tuple[str, str], str],
+) -> LogicalPlan:
+    """`branch` with its aggregate computed from `finest` instead of from the input.
+
+    The level keeps its own keys, which read `finest`'s key columns, and merges each
+    aggregate's partials; a projection then restores the aggregate's output names and order,
+    so whatever sat above the aggregate reads exactly the columns it read before.
+    """
+    merged: list[AggregateSpec] = []
+    finals: list[Projection] = []
+    for i, spec in enumerate(level.aggregates):
+        agg = spec.agg
+        operand = _operand_key(agg)
+        if agg.func == "mean":
+            total, count = f"__lvl_s{i}", f"__lvl_c{i}"
+            merged.append(AggregateSpec(total, AggExpr("sum", Col(partials[("sum", operand)]))))
+            merged.append(AggregateSpec(count, AggExpr("sum", Col(partials[("count", operand)]))))
+            expr = Col(total).cast("float64") / Col(count).cast("float64")
+        else:
+            out = f"__lvl_m{i}"
+            # A `min`/`max` of a key column has no partial: it reads the key column itself.
+            key = agg.input.name if isinstance(agg.input, Col) else ""
+            state = Col(partials.get((agg.func, operand), key))
+            merged.append(AggregateSpec(out, AggExpr(_PREAGG_MERGE[agg.func], state)))
+            # A count over no rows is 0, and a sum of no partial counts is NULL: the grand
+            # total of an empty input is the one level where that difference can show.
+            expr = coalesce(Col(out), lit(0)) if agg.func in ("count", "count_star") else Col(out)
+        finals.append(Projection(spec.alias, expr))
+    keys = tuple(Projection(k.alias, Col(k.alias)) for k in level.group_keys)
+    rolled: LogicalPlan = Project(
+        Aggregate(finest, level.group_keys, tuple(merged)), (*keys, *finals)
+    )
+    return _rewrap(branch, level, rolled)
+
+
+def _rewrap(branch: LogicalPlan, level: Aggregate, rolled: LogicalPlan) -> LogicalPlan:
+    """`branch` with its level aggregate replaced by `rolled`, every node above it kept."""
+    if branch is level:
+        return rolled
+    if not isinstance(branch, _LEVEL_WRAPPERS):
+        raise PlanError(f"a grouping level holds a {type(branch).__name__} above its aggregate")
+    return dataclasses.replace(branch, input=_rewrap(branch.input, level, rolled))

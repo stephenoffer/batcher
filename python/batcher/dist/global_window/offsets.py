@@ -67,6 +67,11 @@ from batcher.dist.global_window.admission import (
     unoffsettable_functions,
 )
 from batcher.dist.global_window.boundary import TrailingValues, lag_across_buckets
+from batcher.dist.global_window.frames import (
+    TrailingFrame,
+    frame_for_helpers,
+    trailing_rows_distance,
+)
 from batcher.plan.logical import Window
 
 __all__ = [
@@ -135,9 +140,16 @@ def inject_window_helpers(window: Window, win_ir: dict) -> dict[str, dict[str, s
 
     helpers: dict[str, dict[str, str]] = {}
     for fn in window.functions:
-        roles = _HELPERS.get(fn.func)
+        roles = _HELPERS.get(fn.func, ())
+        if trailing_rows_distance(fn) is not None:
+            # A trailing frame is a boundary exchange, like `lag`: it too has to know which
+            # of the bucket's rows are its first `p`, which only a bucket-local rank names.
+            roles = (*roles, ("lrn", "row_number"))
         if not roles:
             continue
+        # A helper spans exactly the rows its function does, or the correction rebuilt from
+        # it answers a different frame's question (`frames.frame_for_helpers`).
+        frame = frame_for_helpers(fn)
         mine: dict[str, str] = {}
         for role, helper_fn in roles:
             alias = f"__wh_{role}::{fn.alias}"
@@ -147,6 +159,8 @@ def inject_window_helpers(window: Window, win_ir: dict) -> dict[str, dict[str, s
                 # A row count must not be null anywhere, so it counts a literal rather than
                 # the function's input (which `cume_dist` does not even have).
                 spec["input"] = Lit(1).to_ir() if role in _ROW_COUNT_ROLES else fn.input.to_ir()
+                if frame is not None:
+                    spec["frame"] = frame.to_ir()
             win_ir["functions"].append(spec)
         helpers[fn.alias] = mine
     return helpers
@@ -214,6 +228,12 @@ class OrderedBucketOffsets:
         self._first: dict[str, object] = dict.fromkeys(aliases, _UNSET)
         #: The first `k` input values the walk has seen, in order, per running `nth_value`.
         self._head: dict[str, list[object]] = {a: [] for a in aliases}
+        #: The boundary exchange per trailing-``ROWS``-framed aggregate (`frames`).
+        self._frames = {
+            f.alias: TrailingFrame(f)
+            for f in window.functions
+            if trailing_rows_distance(f) is not None
+        }
 
     def apply(self, wt: pa.Table) -> pa.Table:
         """Correct one bucket's window columns to their global values.
@@ -232,7 +252,9 @@ class OrderedBucketOffsets:
             idx = wt.schema.get_field_index(fn.alias)
             col = wt.column(idx)
             alias = fn.alias
-            if fn.func in ("row_number", "rank"):
+            if alias in self._frames:
+                col = self._frames[alias].correct(wt, col, self._helpers[alias])
+            elif fn.func in ("row_number", "rank"):
                 col = pc.add(col, self._prior_rows)
             elif fn.func == "dense_rank":
                 bucket_distinct = pc.max(col).as_py() or 0
@@ -284,7 +306,9 @@ class OrderedBucketOffsets:
                 else:
                     col = pa.array([self._first[alias]] * n, type=col.type)
             wt = wt.set_column(idx, wt.schema.field(idx), col)
-        spent = self._helper_aliases(_MOMENTS | {"avg", "lag", "nth_value"})
+        spent = self._helper_aliases(_MOMENTS | {"avg", "lag", "nth_value"}) | {
+            helper for alias in self._frames for helper in self._helpers[alias].values()
+        }
         if spent:
             # Drop the private columns the one-pass offsets borrowed. The `_ASSEMBLED` helpers
             # stay: `finalize` has not run yet and they are the only record of the running
@@ -451,11 +475,10 @@ class OrderedBucketOffsets:
         # Clamp below at zero while letting a NaN through, because that is what the kernel
         # does: `bc_runtime::window::agg::Moments::variance` clamps with a comparison, so a
         # variance poisoned by a NaN input is NaN (Polars' `rolling_var` answer, and the
-        # `GROUP BY` variance's). It used to clamp with `f64::max(_, 0.0)`, which returns the
-        # non-NaN operand and answered `0.0`; this translation matched that, and follows the
-        # kernel's fix rather than improving on it — `bc-interp` is the oracle here.
-        # `np.where` on the comparison keeps NaN, where `np.maximum` would too but reads as the
-        # thing the old clamp was not.
+        # `GROUP BY` variance's), not with `f64::max(_, 0.0)`, which returns the non-NaN
+        # operand and answers `0.0`. This translation follows the kernel rather than improving
+        # on it — `bc-interp` is the oracle here. `np.where` on the comparison keeps NaN, where
+        # `np.maximum` would too but reads like the `f64::max` clamp it is not.
         out = np.where(out < 0.0, 0.0, out)
         if fn.func == "stddev":
             out = np.sqrt(out)

@@ -9,13 +9,14 @@ not a policy.
 
 from __future__ import annotations
 
-import contextlib
 from collections import deque
 
 from batcher._internal import events
+from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
 from ..capacity import fleet_worker_cpus
+from ..scaling import cluster_topology
 from ..scheduling import map_slots_per_worker
 from ._drain import draining_workers  # noqa: F401  (re-exported for the façade)
 from ._faults import (
@@ -67,11 +68,14 @@ def _pending_window(task_cpus: float = 1.0) -> int:
     d = active_config().distributed
     if d.max_pending_tasks > 0:
         return max(1, d.max_pending_tasks)
+    # The worker-eligible core count every other fan-out sizing in `dist` reads (the head and
+    # draining nodes excluded, snapshot-aware under `topology_scope()`), rather than Ray's raw
+    # `cluster_resources()`, which counts cores no task of this stage will run on.
     cores = 0.0
-    with contextlib.suppress(Exception):
-        import ray
-
-        cores = float(ray.cluster_resources().get("CPU", 0.0))
+    try:
+        cores = float(cluster_topology()["cpus"])
+    except Exception as exc:
+        note_suppressed("dist", "read cluster CPU capacity", exc)
     if cores <= 0:
         return max(1, _DEFAULT_PENDING_WINDOW)
     share = min(1.0, max(float(task_cpus), 1e-3))
@@ -144,7 +148,7 @@ def _relieve_stall(task_cpus: float, *, pinned: bool) -> bool:
 
         if not yield_session_fleet(task_cpus):
             return False
-    except Exception as exc:  # pragma: no cover - relief must never fail the stage
+    except Exception as exc:  # relief must never fail the stage
         note_suppressed("dist", "yield the idle fleet for a stalled stage", exc)
         return False
     log_kv(
@@ -311,17 +315,16 @@ def gather_map_results(
             # A deterministic UDF error fails the same way everywhere, so resubmitting cannot
             # help — surface it immediately. But a CUDA OOM, a throttled model endpoint, or a
             # network timeout also arrives as a `RayTaskError`, and those DO clear on a retry.
-            # Failing the whole job on one used to discard hours of completed inference.
+            # Failing the whole job on one would discard hours of completed inference.
             #
-            # `is_recoverable_task_failure` is the second of those, and it was missing. The
-            # comment in `_faults` reads "a map task that fails reports worker loss as a *Ray*
-            # error", which was true until a map task could **read a Flight intermediate**: a
-            # stage scanning what a previous stage published fetches from a peer inside the
-            # task, so a lost peer arrives here as a `RetryableShuffleError` wrapped in a
-            # `RayTaskError` — the transport's own word for "retry me" — and was re-raised.
-            # Observed as a windowed rank over a hot key dying with `transport error` while
-            # the identical query on a uniform key passed, because only the skewed one moved
-            # a bucket big enough for the fetch to break.
+            # `is_recoverable_task_failure` covers worker loss that arrives as a task error: a
+            # map task can **read a Flight intermediate**, so a stage scanning what a previous
+            # stage published fetches from a peer inside the task, and a lost peer arrives here
+            # as a `RetryableShuffleError` wrapped in a `RayTaskError` — the transport's own
+            # word for "retry me". Re-raising it was observed as a windowed rank over a hot
+            # key dying with `transport error` while the identical query on a uniform key
+            # passed, because only the skewed one moved a bucket big enough for the fetch to
+            # break.
             if not (_is_transient_udf_error(exc) or is_recoverable_task_failure(exc)):
                 raise
             # Almost every failure loses work, which is what a retry is for. A device that
@@ -364,10 +367,10 @@ def gather_map_results(
 def _idle_pool(workers: int, slots: int) -> deque[int]:
     """The pre-filled idle pool, each worker appearing in proportion to the cores it holds.
 
-    The pool is what the barrier deals sources from, and it used to be filled with every worker
-    exactly `slots` times. On a uniform fleet that is right. On an unequal one it is a *static*
-    even deal wearing a dynamic barrier's clothes, because `map_partitions` sizes the source
-    count at `workers x slots` — exactly the pool's depth — so every source is handed out from
+    The pool is what the barrier deals sources from. Filling it with every worker exactly
+    `slots` times is right on a uniform fleet. On an unequal one it is a *static* even deal
+    wearing a dynamic barrier's clothes, because `map_partitions` sizes the source count at
+    `workers x slots` — exactly the pool's depth — so every source is handed out from
     the initial fill and the go-idle path that would have corrected the imbalance never runs.
 
     Measured on the 28-node / 384-core mixed cluster, 128 sources over 32 workers:

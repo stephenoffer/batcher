@@ -385,9 +385,11 @@ def test_a_windowed_sum_over_a_decimal_declares_the_double_it_produces():
     windowed = ds.select(r=col("m").sum().over(partition_by="g", order_by="i"))
     assert _assert_declared_is_produced(windowed) == pa.float64()
     assert windowed.to_pydict()["r"] == [1.25, 23.75, 3.0]
-    # The grouped sum is the one that keeps the decimal — the two genuinely differ.
+    # The grouped sum is the one that keeps the decimal — the two genuinely differ. It keeps
+    # the *scale*, at `Decimal128`'s full precision: `SUM(decimal(p, s))` is `decimal(38, s)`,
+    # DuckDB's rule, since the input's precision cannot hold a sum of its values.
     grouped = ds.group_by("g").agg(r=col("m").sum())
-    assert _assert_declared_is_produced(grouped) == pa.decimal128(10, 2)
+    assert _assert_declared_is_produced(grouped) == pa.decimal128(38, 2)
 
 
 @pytest.mark.parametrize("column", ["i", "f"])

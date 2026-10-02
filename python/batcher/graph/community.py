@@ -15,6 +15,8 @@ degree cap, is the standard mitigation.
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
 import batcher as bt
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
@@ -311,7 +313,13 @@ def label_propagation(g: Graph, *, max_iterations: int = 20) -> Dataset:
     return settled(result, "label_propagation", max_iterations)
 
 
-def modularity(g: Graph, communities: Dataset, *, community: str = "community") -> float:
+def modularity(
+    g: Graph,
+    communities: Dataset,
+    *,
+    community: str = "community",
+    self_loops: Literal["once", "networkx"] = "once",
+) -> float:
     """Score a partition: how much more edge weight sits inside communities than chance.
 
     Ranges from -0.5 to 1. Above about 0.3 usually means real community structure; near
@@ -325,12 +333,18 @@ def modularity(g: Graph, communities: Dataset, *, community: str = "community") 
         g: The graph.
         communities: A dataset of `node` and a community label.
         community: The column holding the label.
+        self_loops: How a self-loop's weight enters the three sums. ``"once"`` counts it
+            once in the total, once inside its community and once in its node's strength,
+            as the symmetrized edge table holds it. ``"networkx"`` counts it twice in all
+            three, as a loop adds 2 to a node's degree in networkx, and gives networkx's
+            `modularity` on an undirected graph. The two agree on a graph without loops.
 
     Returns:
         The modularity of the partition, or 0.0 for a graph with no edges.
 
     Raises:
-        PlanError: If the community table has no `node` column or no label column.
+        PlanError: If the community table has no `node` column or no label column, or
+            `self_loops` is not one of the two names.
 
     Examples:
         .. doctest::
@@ -344,6 +358,8 @@ def modularity(g: Graph, communities: Dataset, *, community: str = "community") 
             >>> round(modularity(g, label_propagation(g)), 4)
             0.5
     """
+    if self_loops not in ("once", "networkx"):
+        raise PlanError(f"self_loops must be 'once' or 'networkx', got {self_loops!r}")
     for col_name in (NODE, community):
         if col_name not in communities.columns:
             raise PlanError(
@@ -355,11 +371,12 @@ def modularity(g: Graph, communities: Dataset, *, community: str = "community") 
     # `to_undirected`, whose `union` under the aggregates would have no distributed path.
     edges = g.edges
     loop = bt.col(SRC) == bt.col(DST)
-    both_ways = (
-        bt.col(WEIGHT)
-        if g.symmetrized
-        else bt.when(loop).then(bt.col(WEIGHT)).otherwise(bt.lit(2.0) * bt.col(WEIGHT))
-    )
+    loop_twice = self_loops == "networkx"
+    # A non-loop edge counts from both ends; the symmetrized table already holds both.
+    # A loop is stored once either way and counts once, or twice under networkx's rule.
+    edge_share = bt.lit(1.0) if g.symmetrized else bt.lit(2.0)
+    loop_share = bt.lit(2.0) if loop_twice else bt.lit(1.0)
+    both_ways = bt.when(loop).then(loop_share).otherwise(edge_share) * bt.col(WEIGHT)
     # 2m: the total weight of the symmetrized edge table, which counts each undirected
     # edge twice by construction.
     total = edges.agg(w=bt.sum(both_ways)).to_pydict()["w"]
@@ -383,9 +400,7 @@ def modularity(g: Graph, communities: Dataset, *, community: str = "community") 
     endpoints = (
         edges.select(SRC, DST, WEIGHT, **{NODE: bt.array(bt.col(SRC), bt.col(DST))})
         .explode(NODE, index="_end")
-        .filter(
-            bt.col("_end") == bt.lit(0) if g.symmetrized else (bt.col("_end") == bt.lit(0)) | ~loop
-        )
+        .filter(_strength_ends(g.symmetrized, loop_twice, loop))
     )
     totals = endpoints.join(labels, on=NODE, how="inner").group_by("_c").agg(_tot=bt.sum(WEIGHT))
     per_community = (
@@ -398,3 +413,16 @@ def modularity(g: Graph, communities: Dataset, *, community: str = "community") 
         .to_pydict()["total"]
     )
     return float(per_community[0]) if per_community and per_community[0] is not None else 0.0
+
+
+def _strength_ends(symmetrized: bool, loop_twice: bool, loop: Any) -> Any:
+    """Which exploded edge endpoints count toward a node's strength.
+
+    Every row contributes both of its ends, except that a symmetrized table already holds
+    the reverse row of each non-loop edge (so only end 0 counts) and a loop's second end
+    is the same node again (counted only under networkx's rule).
+    """
+    first = bt.col("_end") == bt.lit(0)
+    if symmetrized:
+        return (first | loop) if loop_twice else first
+    return bt.lit(True) if loop_twice else (first | ~loop)

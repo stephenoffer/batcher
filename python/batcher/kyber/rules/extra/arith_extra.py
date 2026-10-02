@@ -64,6 +64,7 @@ from batcher.kyber.rules.exprs.guards import schema_rule
 from batcher.kyber.rules.extra.arith_algebra import _is_int_lit
 from batcher.kyber.rules.extra.boolean_algebra import _key, _rewrite_node, _safe
 from batcher.kyber.rules.leaf_rewrite import EXPR_NODES
+from batcher.kyber.rules.literals import INT64_MIN
 from batcher.plan.expr_ir import Binary, Cast, Expr, Lit
 from batcher.plan.expr_ir.core import MathExpr
 from batcher.plan.logical import LogicalPlan
@@ -85,10 +86,6 @@ __all__ = [
     "shift_by_zero",
 ]
 
-# Every node whose expressions these rules rewrite (each has a single `.input`, whose
-# schema types the expressions).
-
-_INT64_MIN = -(2**63)
 
 # Unary math functions that are their own fixpoint: `f(f(x)) == f(x)` for every input,
 # NaN and ±inf included. `abs`/`sign` by definition; the four rounding functions because
@@ -312,7 +309,7 @@ def _math_of_int(fn: str, value: int) -> Lit | None:
     if fn == "abs":
         # `i64::abs(INT64_MIN)` has no i64 result (the engine wraps or traps); Python's
         # arbitrary-precision `abs` would silently produce 2**63, a different number.
-        return None if value == _INT64_MIN else Lit(abs(value))
+        return None if value == INT64_MIN else Lit(abs(value))
     if fn == "sign":
         # An integer's sign is an integer. Folding to a float retyped the column double,
         # where the engine's `(Sign, Int64)` arm and DuckDB both answer an integer type.

@@ -29,7 +29,7 @@ sits at the bottom and feeds `bc-expr`, which is the single scalar expression ty
 type) leading to `bc-runtime`, and `bc-codegen` (the Cranelift JIT, which compiles
 scalar expressions and so has no dependency on `bc-ir`). Both branches converge on
 `bc-interp`, the interpreter and its parallel and distributed drivers. `bc-py` caps the
-graph, but it isn't a thin cap on a single chain: it depends directly on `bc-sketches`,
+graph, but it isn't a thin cap on a single chain: it depends directly on `bc-runtime`, `bc-sketches`,
 `bc-transport`, `bc-io`, and `bc-resource` as well, which makes it a second assembly
 point.
 
@@ -89,8 +89,8 @@ result = (
 
 Step 5 is the feedback loop that separates Batcher from a static optimizer. DuckDB
 optimizes once, before it runs. Batcher's loop is stage-boundary re-optimization, the
-same granularity as Spark AQE, and it runs single-node as well as distributed. Single-node,
-it engages on a joined query that clears a floor of 5 million rows or about 320 MB per
+same granularity as Spark AQE, which also runs on a single machine in local mode. Batcher's
+loop runs inside the Python process, single-node as well as distributed. Single-node, it engages on a joined query that clears a floor of 5 million rows or about 320 MB per
 breaker it would cut at, so most small queries take the one-shot plan. On top of it sits
 a cross-query loop of sketches, calibrated costs and a bandit, so a plan improves the more
 a query runs, whatever its size. Both mechanisms are described in

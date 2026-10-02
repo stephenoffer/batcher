@@ -1,0 +1,90 @@
+name: ML frameworks
+
+# Runs every test that needs torch or TensorFlow, which `ci.yml`'s `gate` job never installs.
+#
+# There those tests skip, and `just lint-skips` ratchets how many do, but a ratchet only stops
+# the hole growing: it cannot say whether the torch loaders, the TensorFlow interop, or the
+# inference paths still work. This lane installs both frameworks on CPU and runs exactly the
+# files `tools/backend_suites.py` selects for them, after holding that selection against its
+# committed inventory, so a suite that stops being detected fails here by name instead of
+# quietly leaving the lane.
+#
+# CPU only. The device paths these suites reach skip without a GPU, as they do everywhere CI
+# runs; a recorded `gpu_shadow_verify=True` run is still the only evidence for those.
+#
+# Weekly, on demand, and on a pull request that touches the ML or interop surface, because the
+# frameworks are large downloads and most changes cannot reach them.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "python/batcher/ml/**"
+      - "python/batcher/interop/**"
+      - "tests/**/test_*torch*"
+      - "tests/**/test_*tensorflow*"
+      - "tools/backend_suites.py"
+      - "tools/backend_suites.json"
+      - ".github/workflows/ml-frameworks.yml"
+
+concurrency:
+  group: ml-frameworks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frameworks:
+    name: torch + TensorFlow (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      # torch from its CPU index: the default wheel pulls several GB of CUDA libraries a
+      # CPU runner cannot use. The version floors are the extras' own (`torch>=2.2`,
+      # `tensorflow>=2.15` in pyproject.toml).
+      - name: Install engine + dev dependencies + frameworks
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'torch>=2.2' --index-url https://download.pytorch.org/whl/cpu
+          pip install -e '.[dev,tensorflow]'
+          pip freeze > "$RUNNER_TEMP/resolved-requirements.txt"
+
+      - name: Record the resolved dependency set
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolved-requirements-ml-frameworks
+          path: ${{ runner.temp }}/resolved-requirements.txt
+
+      - name: Build engine into the environment
+        run: just build
+
+      - name: Collect the framework suites
+        id: suites
+        run: |
+          python tools/backend_suites.py --dep torch
+          python tools/backend_suites.py --dep tensorflow
+          files=$( (python tools/backend_suites.py --dep torch --list;
+                    python tools/backend_suites.py --dep tensorflow --list) | sort -u | tr '\n' ' ')
+          echo "running $(printf '%s' "$files" | wc -w) files"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      - name: Framework tests
+        run: pytest ${{ steps.suites.outputs.files }} -q --timeout=600 -p no:randomly
+        timeout-minutes: 45

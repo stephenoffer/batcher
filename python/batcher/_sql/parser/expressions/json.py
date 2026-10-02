@@ -61,9 +61,17 @@ def json_extract(tr, node) -> Expr:
     Returns:
         The extraction expression.
     """
-    from batcher.plan.expr_ir import StrFunc
+    from batcher.plan.expr_ir import StrFunc, StrFuncDyn
 
-    doc, path = tr._scalar(node.this), json_path(node.expression)
+    doc = tr._scalar(node.this)
+    fn = "json_extract_string" if isinstance(node, exp.JSONExtractScalar) else "json_extract"
+    if not isinstance(node.expression, (exp.Literal, exp.JSONPath)):
+        # A path computed per row (`j ->> path_col`). `StrFuncDyn` groups the rows by their
+        # distinct path and runs the same extraction kernel per group, so a per-row path
+        # answers exactly what the constant one does. It must be `$`-rooted: the prefix a
+        # bare key gets below is a plan-time rewrite of a constant.
+        return StrFuncDyn(fn, doc, pattern=tr._scalar(node.expression))
+    path = json_path(node.expression)
     if isinstance(node, exp.JSONExtractScalar):
         return doc.json.extract_string(path)
     return StrFunc("json_extract", doc, pattern=path)

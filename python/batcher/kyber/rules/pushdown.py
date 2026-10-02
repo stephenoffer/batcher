@@ -21,6 +21,13 @@ from __future__ import annotations
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
+from batcher.kyber.rules.equi_expr_keys import (
+    ExprKeyPair,
+    attach_expr_keys,
+    drop_cross_keys,
+    expr_key_pair,
+)
+from batcher.kyber.rules.joins.outer_float import semijoin_goes_first
 from batcher.kyber.rules.zonemap_pruning import implied_by_bounds
 from batcher.kyber.stats.constants import constant_value
 from batcher.kyber.stats.selectivity import comparison_col_side
@@ -164,6 +171,9 @@ def derive_join_keys(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None
 
     keep: list[Expr] = []
     derived = False
+    # Equalities with an expression operand (`a.x = b.y - 52`), keyed on a hidden column —
+    # see `equi_expr_keys`. Held with their conjunct so a refused pair keeps its predicate.
+    expr_pairs: list[tuple[ExprKeyPair, Expr]] = []
     for conj in split_conjuncts(node.predicate):
         pair = _equi_key_pair(conj, left_src, right_src)
         if pair is not None and pair not in existing:
@@ -171,9 +181,11 @@ def derive_join_keys(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None
             right_keys.append(pair[1])
             existing.add(pair)
             derived = True
+        elif pair is None and (ek := expr_key_pair(conj, left_src, right_src)) is not None:
+            expr_pairs.append((ek, conj))
         else:
             keep.append(conj)
-    if not derived:
+    if not derived and not expr_pairs:
         return None
 
     # A real key now drives the join, so the cartesian pseudo-keys (`__cross_key`) are
@@ -196,6 +208,14 @@ def derive_join_keys(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | None
         join.output,
         join.strategy,
     )
+    if expr_pairs:
+        new_join, refused = attach_expr_keys(new_join, [ek for ek, _ in expr_pairs])
+        # Identity, not `in`: `Expr.__eq__` builds an expression rather than comparing.
+        refused_ids = {id(r) for r in refused}
+        keep.extend(conj for ek, conj in expr_pairs if id(ek) in refused_ids)
+        if not derived and len(refused) == len(expr_pairs):
+            return None
+        new_join = drop_cross_keys(new_join)
     return new_join if not keep else Filter(new_join, combine_conjuncts(keep))
 
 
@@ -232,10 +252,14 @@ def infer_join_predicates(node: Join, ctx: OptimizerContext) -> LogicalPlan | No
     zone-map pruning can use to skip whole row groups. The classic star-schema
     accelerant.
 
-    Restricted to inner joins (an outer join's preserved side must keep its
-    unmatched rows, so a key constraint does not transfer). The added predicate is a
-    superset of what the join already enforces, so the result is unchanged; the
-    presence check makes the rule idempotent.
+    An outer join mirrors one way only: a constraint on the preserved side's key filters
+    the null-extended side, whose rows failing it could never have matched, but nothing
+    may filter the preserved side, which must keep its unmatched rows. A semi or anti join
+    mirrors from its left onto its right for the same reason (`_MIRRORS`). TPC-DS q78 is
+    the outer case: `ss LEFT JOIN ws ON ss_sold_year = ws_sold_year ...` with `ss` one
+    year's aggregate, which scoped `ws`'s aggregate to that year instead of all five.
+    The added predicate is a superset of what the join already enforces, so the result is
+    unchanged; the presence check makes the rule idempotent.
 
     Idempotent is not the same as *confluent*, and this rule was the second and larger
     half of a cycle whose first half was fixed in `infer_join_predicate_from_constant_key`
@@ -259,19 +283,22 @@ def infer_join_predicates(node: Join, ctx: OptimizerContext) -> LogicalPlan | No
     fresh process). A query that never cycled pays for the walk and gets nothing back: q14
     is ~4% slower. Net, and on the tail especially, closing the cycle wins.
     """
-    if node.join_type != "inner":
+    mirrors = _MIRRORS.get(node.join_type, ())
+    if not mirrors:
         return None
     new_left, new_right = node.left, node.right
     changed = False
     for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
-        left_cons = _column_constraints(node.left, lk)
-        if left_cons:
-            new_right, added = _add_inferred(new_right, rk, left_cons, lk, ctx)
-            changed = changed or added
-        right_cons = _column_constraints(node.right, rk)
-        if right_cons:
-            new_left, added = _add_inferred(new_left, lk, right_cons, rk, ctx)
-            changed = changed or added
+        if ("left", "right") in mirrors:
+            left_cons = _column_constraints(node.left, lk)
+            if left_cons:
+                new_right, added = _add_inferred(new_right, rk, left_cons, lk, ctx)
+                changed = changed or added
+        if ("right", "left") in mirrors:
+            right_cons = _column_constraints(node.right, rk)
+            if right_cons:
+                new_left, added = _add_inferred(new_left, lk, right_cons, rk, ctx)
+                changed = changed or added
     if not changed:
         return None
     return Join(
@@ -376,7 +403,7 @@ def infer_join_predicate_from_constant_key(node: Join, ctx: OptimizerContext) ->
 
 
 @rule(name="push_semijoin_through_join", phase=Phase.PUSHDOWN, matches=(Join,))
-def push_semijoin_through_join(node: Join, _ctx: OptimizerContext) -> LogicalPlan | None:
+def push_semijoin_through_join(node: Join, ctx: OptimizerContext) -> LogicalPlan | None:
     """Sink a semi/anti join below an inner join, onto the child its keys come from.
 
     `SemiJoin(InnerJoin(A, B) ON k, S) ON A.col` == `InnerJoin(SemiJoin(A, S) ON A.col, B) ON k`
@@ -391,6 +418,8 @@ def push_semijoin_through_join(node: Join, _ctx: OptimizerContext) -> LogicalPla
     Restricted to an inner join below (an outer join's null-extended side would change
     key membership), and only when the semijoin's keys all attribute to one child —
     via the inner join's output map, so a renamed key resolves to its source column.
+    And only when the semijoin is the more selective of the two filters on that child
+    (`outer_float.semijoin_goes_first`, shared with the rule that floats it back up).
     """
     if node.join_type not in ("semi", "anti"):
         return None
@@ -427,6 +456,8 @@ def push_semijoin_through_join(node: Join, _ctx: OptimizerContext) -> LogicalPla
     on_left = sides.pop() == "left"
     target = inner.left if on_left else inner.right
     pushed = _semijoin_onto(target, node, tuple(src_keys))
+    if not semijoin_goes_first(ctx, target, pushed, inner):
+        return None
     result: LogicalPlan = Join(
         pushed if on_left else inner.left,
         inner.right if on_left else pushed,
@@ -459,11 +490,11 @@ def _column_constraints(side: LogicalPlan, col: str) -> list[Expr]:
 
     Following the column through filters (collect), through row-preserving operators
     (sort/limit/sample/distinct), through a projection that merely renames it, and into
-    the originating side of an **inner** join is what makes inference *transitive*: a
-    constraint deep under a chain of joins (`a.k = b.k = c.k AND a.k > 10`) reaches
-    every member. Renames are followed by name, never guessed — a projection that
-    *computes* `col`, or a non-inner join (whose rows may be null-extended), stops the
-    trace, so a found constraint always holds for `side`'s output rows. Constraints are
+    the originating side of a join is what makes inference *transitive*: a constraint deep
+    under a chain of joins (`a.k = b.k = c.k AND a.k > 10`) reaches every member. A group
+    key is followed into its aggregate's input. Renames are followed by name, never guessed
+    — a projection that *computes* `col`, or a join side that may be null-extended, stops
+    the trace, so a found constraint always holds for `side`'s output rows. Constraints are
     rephrased onto `col` so the caller can mirror them across the join's key pair.
     """
     if isinstance(side, Filter):
@@ -479,14 +510,50 @@ def _column_constraints(side: LogicalPlan, col: str) -> list[Expr]:
                 src = item.expr.name
                 return [remap_columns(c, {src: col}) for c in _column_constraints(side.input, src)]
         return []
-    if isinstance(side, Join) and side.join_type == "inner":
+    if isinstance(side, Join):
         for o in side.output:
-            if o.alias == col:  # map the output alias to its source side+name
+            # An output column carries its input's values exactly when its side is never
+            # null-extended: both sides of an inner join, the preserved side of an outer one,
+            # and the left of a semi/anti join, which only filters it.
+            if o.alias == col and o.side in _UNEXTENDED.get(side.join_type, ()):
                 child = side.left if o.side == "left" else side.right
                 below = _column_constraints(child, o.name)
                 return [remap_columns(c, {o.name: col}) for c in below]
         return []
-    return []  # Scan / Aggregate / Window / Union / non-inner join: stop the trace
+    if isinstance(side, Aggregate):
+        # A group key's values are drawn from its input's, so a constraint every input row
+        # satisfies, every group satisfies. TPC-DS q78's `ss_sold_year` is the `d_year`
+        # group key of an aggregate over `date_dim` filtered to one year.
+        for key in side.group_keys:
+            if key.alias == col and isinstance(key.expr, Col):
+                below = _column_constraints(side.input, key.expr.name)
+                return [remap_columns(c, {key.expr.name: col}) for c in below]
+        return []
+    return []  # Scan / Window / Union / a null-extended join side: stop the trace
+
+
+#: Per join type, the sides whose output columns are never null-extended.
+_UNEXTENDED = {
+    "inner": ("left", "right"),
+    "left": ("left",),
+    "right": ("right",),
+    "semi": ("left",),
+    "anti": ("left",),
+}
+
+#: Per join type, the directions a key constraint may be mirrored in, as (from, to) sides.
+#: A constraint proven on one side's key holds on every row that side contributes, so the
+#: other side's rows failing it can never match. That licenses filtering the *other* side
+#: unless it is preserved -- an outer join must keep its unmatched rows -- and it is why a
+#: semi/anti join's right side, which only answers "does a match exist", may be filtered
+#: by the left side's constraints.
+_MIRRORS = {
+    "inner": (("left", "right"), ("right", "left")),
+    "left": (("left", "right"),),
+    "right": (("right", "left"),),
+    "semi": (("left", "right"),),
+    "anti": (("left", "right"),),
+}
 
 
 def _sole_constrained_column(conj: Expr) -> str | None:
@@ -529,7 +596,7 @@ def _add_inferred(
     current = split_conjuncts(target.predicate) if isinstance(target, Filter) else []
     # A set of canonical (memoized) keys, not a list of IR dicts: dicts are unhashable, so
     # the "already present?" test was a linear scan with a full dict comparison per step.
-    existing = {expr_key(c) for c in current}
+    existing = {expr_key(c) for c in current} | _proven_below(target, target_key)
     fresh = [
         remapped
         for c in constraints
@@ -543,6 +610,18 @@ def _add_inferred(
         combined = combine_conjuncts(split_conjuncts(target.predicate) + fresh)
         return Filter(target.input, combined), True
     return Filter(target, combine_conjuncts(fresh)), True
+
+
+def _proven_below(target: LogicalPlan, target_key: str) -> set[str]:
+    """The keys of every constraint `target` already proves on `target_key`, at any depth.
+
+    A constraint sunk beneath an aggregate's group key by an earlier pass is present even
+    though no `Filter` at the top of `target` spells it, and the bounds oracle
+    `_add_inferred` also asks cannot see through an aggregate. Without this the conjunct is
+    re-added above, pushed down, deduplicated and re-added for the whole PUSHDOWN iteration
+    budget -- the cycle `infer_join_predicates` documents, one operator further down.
+    """
+    return {expr_key(c) for c in _column_constraints(target, target_key)}
 
 
 @rule(name="push_filter_through_aggregate", phase=Phase.PUSHDOWN, matches=(Filter,))

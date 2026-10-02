@@ -8,6 +8,7 @@ use arrow::datatypes::DataType;
 
 use crate::{ExprError, StrFunc};
 
+mod ascii;
 mod case;
 mod chunk;
 mod compress;
@@ -152,20 +153,26 @@ pub(crate) fn eval_str(
         // case and is byte-parallel; `to_uppercase` walks a Unicode case-mapping table per
         // scalar value. The results are identical on ASCII input — no ASCII character has a
         // non-ASCII or multi-character case mapping — so this is a pure short-circuit.
-        StrFunc::Upper => Arc::new(map_str(s, |v| {
-            if v.is_ascii() {
-                v.to_ascii_uppercase()
-            } else {
-                v.to_uppercase()
-            }
-        })),
-        StrFunc::Lower => Arc::new(map_str(s, |v| {
-            if v.is_ascii() {
-                v.to_ascii_lowercase()
-            } else {
-                v.to_lowercase()
-            }
-        })),
+        StrFunc::Upper => match ascii::case_map(s, true) {
+            Some(mapped) => Arc::new(mapped),
+            None => Arc::new(map_str(s, |v| {
+                if v.is_ascii() {
+                    v.to_ascii_uppercase()
+                } else {
+                    v.to_uppercase()
+                }
+            })),
+        },
+        StrFunc::Lower => match ascii::case_map(s, false) {
+            Some(mapped) => Arc::new(mapped),
+            None => Arc::new(map_str(s, |v| {
+                if v.is_ascii() {
+                    v.to_ascii_lowercase()
+                } else {
+                    v.to_lowercase()
+                }
+            })),
+        },
         StrFunc::Len => Arc::new(char_len_array(s)),
         StrFunc::Contains => {
             let pat = require_pattern(pattern, func)?;
@@ -185,7 +192,10 @@ pub(crate) fn eval_str(
             // avoids the per-row `Vec<char>` + `String` allocation the generic
             // `map_str` closure would force (the array builder copies the slices once).
             let start = start.unwrap_or(1);
-            Arc::new(map_str_borrow(s, |v| substr_slice(v, start, length)))
+            match ascii::substr(s, |n| substr_window(n, start, length)) {
+                Some(sub) => Arc::new(sub),
+                None => Arc::new(map_str_borrow(s, |v| substr_slice(v, start, length))),
+            }
         }
         StrFunc::Replace => {
             let pat = require_pattern(pattern, func)?;
@@ -560,6 +570,9 @@ pub(crate) fn eval_str(
             Arc::new(map_str(s, |v| {
                 hex_lower(Sha256::digest(v.as_bytes()).as_slice())
             }))
+        }
+        StrFunc::Sha224 | StrFunc::Sha384 | StrFunc::Sha512 => {
+            Arc::new(map_str(s, |v| sha2_hex(func, v.as_bytes())))
         }
         StrFunc::Crc32 => Arc::new(
             s.iter()
@@ -1351,6 +1364,12 @@ fn eval_bytes(
                     .collect::<StringArray>(),
             )
         }
+        StrFunc::Sha224 | StrFunc::Sha384 | StrFunc::Sha512 => Arc::new(
+            bytes
+                .iter()
+                .map(|o| o.map(|v| sha2_hex(func, v)))
+                .collect::<StringArray>(),
+        ),
         StrFunc::Base64 => {
             use base64::Engine as _;
             Arc::new(
@@ -1427,6 +1446,17 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// The lowercase-hex SHA-2 digest `func` names, for the widths other than 256 (which keeps
+/// its own arm). Spark's `sha2(s, bits)` reaches these; the digest is the `sha2` crate's.
+fn sha2_hex(func: StrFunc, bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha224, Sha384, Sha512};
+    match func {
+        StrFunc::Sha224 => hex_lower(Sha224::digest(bytes).as_slice()),
+        StrFunc::Sha384 => hex_lower(Sha384::digest(bytes).as_slice()),
+        _ => hex_lower(Sha512::digest(bytes).as_slice()),
+    }
+}
+
 /// Parse a string of hex-digit pairs into bytes (DuckDB `unhex`). Returns `None`
 /// for an odd number of digits or any non-hex character.
 fn hex_decode(v: &str) -> Option<Vec<u8>> {
@@ -1473,28 +1503,7 @@ fn char_len(v: &str) -> usize {
 /// than a change of meaning: for ASCII the two agree by definition (every ASCII byte is a
 /// one-byte character), and for anything else the old code runs.
 fn char_len_array(s: &StringArray) -> Int64Array {
-    use arrow::array::Array;
-
-    let offsets = s.value_offsets();
-    // **This array's own bytes, not the buffer's.** A morsel is a *slice* of the column, and
-    // `value_data()` hands back the whole shared values buffer — so testing that would re-scan
-    // the entire column once per morsel. Measured that way the "optimization" ran 10.9 ms ->
-    // 14.5 ms on `SUM(LENGTH(l_comment))`, which is how this comment came to exist.
-    let (lo, hi) = match (offsets.first(), offsets.last()) {
-        (Some(&lo), Some(&hi)) => (lo as usize, hi as usize),
-        _ => return Int64Array::from(Vec::<Option<i64>>::new()),
-    };
-    if !s.value_data()[lo..hi].is_ascii() {
-        return s.iter().map(|o| o.map(|v| char_len(v) as i64)).collect();
-    }
-    // `from_iter` with the row's own validity: a null row must stay null rather than report
-    // the zero-width its offsets happen to span.
-    (0..s.len())
-        .map(|i| {
-            s.is_valid(i)
-                .then(|| i64::from(offsets[i + 1] - offsets[i]))
-        })
-        .collect()
+    ascii::len(s).unwrap_or_else(|| s.iter().map(|o| o.map(|v| char_len(v) as i64)).collect())
 }
 
 /// 1-based character position of the first occurrence of `finder`'s needle in `v`, or 0 if
@@ -1622,7 +1631,19 @@ fn map_bool(s: &StringArray, f: impl Fn(&str) -> bool) -> BooleanArray {
 /// so it allocates nothing per row (no `Vec<char>`, no `String`); correct for
 /// multi-byte UTF-8.
 fn substr_slice(v: &str, start: i64, length: Option<i64>) -> &str {
-    let n = v.chars().count() as i64;
+    let (from, to) = substr_window(v.chars().count() as i64, start, length);
+    if from == to {
+        return "";
+    }
+    // Byte offset of char index `k` (or the string's end when `k == n`).
+    let byte_at = |k: usize| v.char_indices().nth(k).map_or(v.len(), |(b, _)| b);
+    &v[byte_at(from)..byte_at(to)]
+}
+
+/// The half-open character window `[from, to)` that `substr` keeps of a string of `n`
+/// characters — `(0, 0)` when it keeps nothing. Shared by the per-row path and the ASCII
+/// column kernel, so the two cannot disagree on a window.
+fn substr_window(n: i64, start: i64, length: Option<i64>) -> (usize, usize) {
     // Saturating arithmetic: `start`/`length` are user i64s, so `n + start + 1`,
     // `s + len - 1`, etc. overflowed at the i64 extremes (panic in debug, wrap in
     // release — a wrapped window could even yield a wrong slice). Clamped to `[1, n]`
@@ -1639,11 +1660,9 @@ fn substr_slice(v: &str, start: i64, length: Option<i64>) -> &str {
     };
     let (lo, hi) = (lo.max(1), hi.min(n)); // clip to [1, n] inclusive
     if hi < lo {
-        return "";
+        return (0, 0);
     }
-    // Byte offset of char index `k` (or the string's end when `k == n`).
-    let byte_at = |k: i64| v.char_indices().nth(k as usize).map_or(v.len(), |(b, _)| b);
-    &v[byte_at(lo - 1)..byte_at(hi)]
+    ((lo - 1) as usize, hi as usize)
 }
 
 /// FNV-1a 64-bit hash of `bytes` — a tiny, deterministic, dependency-free hash whose
@@ -1661,15 +1680,13 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 }
 
 /// 64-bit xxHash of `bytes` — fast, deterministic, and stable across machines (the
-/// standard bucketing/sharding hash). Uses the portable `Hasher` API.
+/// standard bucketing/sharding hash). The engine's one implementation,
+/// [`bc_arrow::xxhash64`], which the shuffle also routes by.
 ///
 /// `seed` is the `start` slot, `0` when absent; the `i64` is reinterpreted as the `u64`
 /// seed, which is how Spark passes its `long` seed (`42`) to the same algorithm.
 fn xxhash64(bytes: &[u8], seed: Option<i64>) -> u64 {
-    use std::hash::Hasher;
-    let mut h = twox_hash::XxHash64::with_seed(seed.unwrap_or(0) as u64);
-    h.write(bytes);
-    h.finish()
+    bc_arrow::xxhash64(bytes, seed.unwrap_or(0) as u64)
 }
 
 /// Translate a SQL `LIKE`/`ILIKE` pattern into an anchored `regex::Regex`.
@@ -2354,6 +2371,10 @@ mod tests {
             str_of(StrFunc::Sha256).0,
             hex_lower(Sha256::digest(raw).as_slice())
         );
+        assert_eq!(
+            str_of(StrFunc::Sha512).0,
+            hex_lower(sha2::Sha512::digest(raw).as_slice())
+        );
         // base64 of the four raw bytes.
         assert_eq!(str_of(StrFunc::Base64).0, "3q2+7w==");
     }
@@ -2370,6 +2391,21 @@ mod tests {
         assert_eq!(
             hex_lower(Sha256::digest(b"abc").as_slice()),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // FIPS 180-4 test vectors for "abc", reached through the `sha2(s, bits)` arms.
+        assert_eq!(
+            super::sha2_hex(crate::StrFunc::Sha224, b"abc"),
+            "23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7"
+        );
+        assert_eq!(
+            super::sha2_hex(crate::StrFunc::Sha384, b"abc"),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+             8086072ba1e7cc2358baeca134c825a7"
+        );
+        assert_eq!(
+            super::sha2_hex(crate::StrFunc::Sha512, b"abc"),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
         );
         // crc32(IEEE) "abc" = 0x352441C2; empty = 0.
         assert_eq!(crc32fast::hash(b"abc"), 0x3524_41c2);

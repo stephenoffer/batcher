@@ -741,6 +741,29 @@ impl RelOp {
         }
     }
 
+    /// [`Self::children`], mutably and in the same order — for an executor that rewrites a copy
+    /// of a plan in place (substituting a materialized result for a subtree it has run).
+    pub fn children_mut(&mut self) -> Vec<&mut RelOp> {
+        match self {
+            RelOp::Scan { .. } => Vec::new(),
+            RelOp::Filter { input, .. }
+            | RelOp::Project { input, .. }
+            | RelOp::Aggregate { input, .. }
+            | RelOp::Sort { input, .. }
+            | RelOp::Limit { input, .. }
+            | RelOp::Distinct { input, .. }
+            | RelOp::Window { input, .. }
+            | RelOp::Unnest { input, .. }
+            | RelOp::RowId { input, .. }
+            | RelOp::Unpivot { input, .. }
+            | RelOp::Sample { input, .. } => vec![input.as_mut()],
+            RelOp::HashJoin { left, right, .. }
+            | RelOp::AsofJoin { left, right, .. }
+            | RelOp::RangeJoin { left, right, .. } => vec![left.as_mut(), right.as_mut()],
+            RelOp::Union { inputs, .. } => inputs.iter_mut().collect(),
+        }
+    }
+
     /// Number of operators in this subtree — i.e. how many pre-order ids executing it consumes.
     ///
     /// Lets an executor know a subtree's id span *without running it*, so it can execute the

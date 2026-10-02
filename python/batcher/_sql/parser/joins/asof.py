@@ -24,11 +24,12 @@ from batcher.plan.expr_ir import col, lit
 
 __all__ = ["asof_join", "is_asof"]
 
-# The nearest-match operators, mapped to the direction they scan in. Only the inclusive
-# forms appear: `AsofJoin.direction` is defined as "largest right <= left" / "smallest
-# right >= left", so a *strict* `>` or `<` has no representation and is rejected below
-# rather than silently answered with the inclusive match.
-_DIRECTIONS = {exp.GTE: "backward", exp.LTE: "forward"}
+# The nearest-match operators, mapped to the direction they scan in and whether an equal
+# key may match. A strict `>` / `<` is `join_asof(allow_exact_matches=False)`: the last
+# right row strictly before (or first strictly after) the left key, which DuckDB answers
+# the same way. Post-filtering the inclusive match would drop the row rather than moving
+# on to the next valid match, so the flag is carried to the engine instead.
+_DIRECTIONS = {exp.GTE: "backward", exp.LTE: "forward", exp.GT: "backward", exp.LT: "forward"}
 _STRICT = (exp.GT, exp.LT)
 
 # Marks a right row as present so an inner ASOF can drop the rows that matched nothing.
@@ -64,7 +65,7 @@ def _oriented(conj, left_cols: set[str], right_cols: set[str]) -> tuple[str, str
     )
 
 
-def _split(on, left_cols: set[str], right_cols: set[str]) -> tuple[list, str, str, str]:
+def _split(on, left_cols: set[str], right_cols: set[str]) -> tuple[list, str, str, str, bool]:
     """Split the ``ON`` into exact-match `by` pairs plus the one nearest-match key."""
     pairs: list[tuple[str, str]] = []
     match: tuple[str, str, str] | None = None
@@ -72,16 +73,11 @@ def _split(on, left_cols: set[str], right_cols: set[str]) -> tuple[list, str, st
         if isinstance(conj, exp.EQ):
             pairs.append(_oriented(conj, left_cols, right_cols))
             continue
-        if isinstance(conj, _STRICT):
-            raise PlanError(
-                f"ASOF JOIN with the strict inequality {conj.sql()} is not supported; "
-                "the nearest-match key is inclusive, so use >= or <="
-            )
         direction = _DIRECTIONS.get(type(conj))
         if direction is None:
             raise PlanError(
                 f"ASOF JOIN condition {conj.sql()} must be an equality (an exact-match "
-                "key) or a >= / <= inequality (the nearest-match key)"
+                "key) or a >= / <= / > / < inequality (the nearest-match key)"
             )
         if match is not None:
             raise PlanError(
@@ -94,14 +90,15 @@ def _split(on, left_cols: set[str], right_cols: set[str]) -> tuple[list, str, st
         # pair rather than from the operator as typed.
         if conj.this.name != left_on:
             direction = "forward" if direction == "backward" else "backward"
-        match = (left_on, right_on, conj.sql(), direction)  # type: ignore[assignment]
+        strict = isinstance(conj, _STRICT)
+        match = (left_on, right_on, conj.sql(), direction, strict)  # type: ignore[assignment]
     if match is None:
         raise PlanError(
             "ASOF JOIN requires a nearest-match inequality (>= or <=) in its ON "
             "condition; an ON with equalities alone is an ordinary join"
         )
-    left_on, right_on, _, direction = match  # type: ignore[misc]
-    return pairs, left_on, right_on, direction
+    left_on, right_on, _, direction, strict = match  # type: ignore[misc]
+    return pairs, left_on, right_on, direction, strict
 
 
 def asof_join(left: Dataset, right: Dataset, join, how: str) -> Dataset:
@@ -128,7 +125,7 @@ def asof_join(left: Dataset, right: Dataset, join, how: str) -> Dataset:
             f"ASOF {how.upper()} JOIN is not supported; ASOF matches each left row, so "
             "only ASOF JOIN (inner) and ASOF LEFT JOIN are defined"
         )
-    pairs, left_on, right_on, direction = _split(on, set(left.columns), set(right.columns))
+    pairs, left_on, right_on, direction, strict = _split(on, set(left.columns), set(right.columns))
 
     # `join_asof` *coalesces* its key columns: the output carries the left side's and drops
     # the right's. That is right for the DataFrame API, and wrong for SQL's ON form, where
@@ -151,6 +148,7 @@ def asof_join(left: Dataset, right: Dataset, join, how: str) -> Dataset:
         left_by=[p for p, _ in pairs],
         right_by=[q for _, q in pairs],
         direction=direction,
+        allow_exact_matches=not strict,
     )
     if how == "inner":
         joined = joined.filter(col(_WITNESS).is_not_null()).drop(_WITNESS)

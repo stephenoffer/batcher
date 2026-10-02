@@ -3,10 +3,11 @@
 Three responsibilities, one per module, all speaking about the same operator:
 
 - `rewrites`: change a join's *type* or drop a side (`outer_to_inner_join`,
-  `join_to_semijoin`, `eliminate_left_join`, `runtime_join_filter`). It owns the
-  engine's uniqueness proof (`_right_unique_on_keys`) and the filterable-side table
-  (`_FILTERABLE_SIDES`), which the elimination and runtime-filter families read from
-  here rather than restate.
+  `join_to_semijoin`, `eliminate_left_join`). It owns the engine's uniqueness proof
+  (`_right_unique_on_keys`), which the elimination family reads from here.
+- `runtime_range`: `runtime_join_filter`, the key range one side implies about the other,
+  and the filterable-side table (`_FILTERABLE_SIDES`) the runtime-filter family reads.
+  Imported right after `rewrites`, the run-order position the rule always held.
 - `order`: cost-based reordering of a connected inner-join subtree (the JOIN_REORDER
   phase — exact DP, DPhyp, greedy fallback).
 - `projection`: push a derived projection through a join onto the side it reads.
@@ -23,7 +24,6 @@ from __future__ import annotations
 # The private names are re-exported deliberately (redundant alias = an explicit
 # re-export): `_right_unique_on_keys` / `_FILTERABLE_SIDES` are the one uniqueness proof
 # and the one filterable-side table the elimination and runtime-filter families read.
-from batcher.kyber.rules.joins.rewrites import _FILTERABLE_SIDES as _FILTERABLE_SIDES
 from batcher.kyber.rules.joins.rewrites import _null_rejecting_cols as _null_rejecting_cols
 from batcher.kyber.rules.joins.rewrites import _right_unique_on_keys as _right_unique_on_keys
 from batcher.kyber.rules.joins.rewrites import _strengthened as _strengthened
@@ -33,8 +33,9 @@ from batcher.kyber.rules.joins.rewrites import (
     eliminate_left_join,
     join_to_semijoin,
     outer_to_inner_join,
-    runtime_join_filter,
 )
+from batcher.kyber.rules.joins.runtime_range import _FILTERABLE_SIDES as _FILTERABLE_SIDES
+from batcher.kyber.rules.joins.runtime_range import runtime_join_filter
 
 __all__ = [
     "drop_redundant_cross_key",

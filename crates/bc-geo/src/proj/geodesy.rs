@@ -31,9 +31,6 @@ pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
 pub const WGS84_A: f64 = 6_378_137.0;
 /// WGS 84 flattening.
 pub const WGS84_F: f64 = 1.0 / 298.257_223_563;
-/// WGS 84 semi-minor axis in metres.
-pub const WGS84_B: f64 = WGS84_A * (1.0 - WGS84_F);
-
 fn check_lonlat(lon: f64, lat: f64) -> GeoResult<()> {
     if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
         return Err(GeoError::domain(format!(
@@ -62,8 +59,9 @@ pub fn haversine(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
 ///
 /// "Initial" is not a hedge: a great circle's bearing changes along its length, so the
 /// bearing at the destination is generally not this value plus 180. A route that holds
-/// one bearing is a rhumb line, which is `rhumb_bearing`.
-pub fn bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
+/// one bearing is a rhumb line. Kept as the test oracle for [`destination`].
+#[cfg(test)]
+fn bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
     check_lonlat(lon1, lat1)?;
     check_lonlat(lon2, lat2)?;
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
@@ -106,57 +104,6 @@ pub fn ellipsoidal_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoRe
     check_lonlat(lon1, lat1)?;
     check_lonlat(lon2, lat2)?;
     Ok(crate::proj::karney::distance(lon1, lat1, lon2, lat2))
-}
-
-/// Rhumb-line (constant-bearing) distance in metres.
-///
-/// Longer than the great circle, and the one a vessel holding a compass heading
-/// actually travels. Reported separately because a route length and a straight-line
-/// distance are different questions and conflating them under one name is how a
-/// logistics estimate quietly runs short.
-pub fn rhumb_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
-    check_lonlat(lon1, lat1)?;
-    check_lonlat(lon2, lat2)?;
-    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
-    let dp = p2 - p1;
-    let mut dl = (lon2 - lon1).to_radians();
-    // The stretched latitude difference; the limit as dp → 0 is cos(lat).
-    let dpsi = ((p2 / 2.0 + std::f64::consts::FRAC_PI_4).tan()
-        / (p1 / 2.0 + std::f64::consts::FRAC_PI_4).tan())
-    .ln();
-    let q = if dpsi.abs() > 1e-12 {
-        dp / dpsi
-    } else {
-        p1.cos()
-    };
-    // Always take the shorter way round the globe.
-    if dl.abs() > std::f64::consts::PI {
-        dl = if dl > 0.0 {
-            dl - std::f64::consts::TAU
-        } else {
-            dl + std::f64::consts::TAU
-        };
-    }
-    Ok((dp * dp + q * q * dl * dl).sqrt() * EARTH_RADIUS_M)
-}
-
-/// Constant bearing of the rhumb line, in degrees clockwise from north.
-pub fn rhumb_bearing(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> GeoResult<f64> {
-    check_lonlat(lon1, lat1)?;
-    check_lonlat(lon2, lat2)?;
-    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
-    let mut dl = (lon2 - lon1).to_radians();
-    if dl.abs() > std::f64::consts::PI {
-        dl = if dl > 0.0 {
-            dl - std::f64::consts::TAU
-        } else {
-            dl + std::f64::consts::TAU
-        };
-    }
-    let dpsi = ((p2 / 2.0 + std::f64::consts::FRAC_PI_4).tan()
-        / (p1 / 2.0 + std::f64::consts::FRAC_PI_4).tan())
-    .ln();
-    Ok((dl.atan2(dpsi).to_degrees() + 360.0) % 360.0)
 }
 
 /// The ellipsoidal (WGS 84) area of a lon/lat ring, in square metres.
@@ -342,25 +289,6 @@ mod tests {
         close(bearing(0.0, 0.0, 0.0, 1.0).unwrap() + 1.0, 1.0, 1e-6); // due north = 0
         close(bearing(0.0, 0.0, 1.0, 0.0).unwrap(), 90.0, 1e-6); // due east
         close(bearing(0.0, 0.0, 0.0, -1.0).unwrap(), 180.0, 1e-6); // due south
-    }
-
-    #[test]
-    fn a_rhumb_line_is_never_shorter_than_the_great_circle() {
-        for (a, b, c, d) in [
-            (-0.1278, 51.5074, -74.0060, 40.7128),
-            (0.0, 0.0, 90.0, 0.0),
-            (-122.0, 37.0, 139.0, 35.0),
-        ] {
-            let gc = haversine(a, b, c, d).unwrap();
-            let rl = rhumb_distance(a, b, c, d).unwrap();
-            assert!(rl >= gc * 0.9999, "rhumb {rl} < great circle {gc}");
-        }
-        // Along the equator the two coincide.
-        close(
-            rhumb_distance(0.0, 0.0, 10.0, 0.0).unwrap(),
-            haversine(0.0, 0.0, 10.0, 0.0).unwrap(),
-            0.001,
-        );
     }
 
     #[test]

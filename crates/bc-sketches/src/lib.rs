@@ -1,7 +1,7 @@
 //! `bc-sketches` — mergeable probabilistic sketches for the optimizer.
 //!
 //! Sketches trade a little accuracy for a lot of space: they answer "how many
-//! distinct values?", "what's the p95?", "how often does this key occur?" in
+//! distinct values?", "what's the p95?", "which keys are hot?" in
 //! kilobytes instead of gigabytes. Cheap-but-good answers are exactly what the
 //! optimizer needs to pick join sides, size hash tables, place histograms, and
 //! detect skew — without scanning the data twice.
@@ -19,7 +19,6 @@
 use std::hash::{BuildHasher, Hash};
 
 mod bloom;
-mod countmin;
 mod ddsketch;
 mod frequent;
 mod hll;
@@ -29,7 +28,6 @@ mod stats;
 mod tdigest;
 
 pub use bloom::BloomFilter;
-pub use countmin::CountMinSketch;
 pub use ddsketch::DDSketch;
 pub use frequent::FrequentItems;
 pub use hll::HyperLogLog;
@@ -42,7 +40,7 @@ pub use tdigest::TDigest;
 /// summary of the combined input.
 ///
 /// Implementations require the two sides to share their construction parameters
-/// (HLL precision, KLL `k`, Count-Min dimensions); a mismatch is a programming
+/// (HLL precision, KLL `k`, Bloom dimensions); a mismatch is a programming
 /// error and panics rather than silently producing a meaningless merge. Because
 /// the contract is uniform, generic code can merge a whole `Vec<S: Mergeable>`
 /// from many partitions with a single fold.

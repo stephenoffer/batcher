@@ -24,6 +24,7 @@ import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
+from batcher.dist.executors.join import _byte_chunks
 from batcher.dist.executors.partition_io import partition_descriptors, source_pushdown
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import engine_config_json
@@ -234,24 +235,6 @@ def _charge(held: int, budget: int, batches) -> int:
     return held
 
 
-def _byte_chunks(batches, target_bytes: int):
-    """Group batches into lists of about `target_bytes` of *retained* bytes each.
-
-    Retained, not addressed: a batch sliced from a larger parent pins the parent, so
-    `nbytes` would under-report exactly the case the bound exists for.
-    """
-    chunk: list[pa.RecordBatch] = []
-    size = 0
-    for b in batches:
-        chunk.append(b)
-        size += retained_bytes(b)
-        if size >= target_bytes:
-            yield chunk
-            chunk, size = [], 0
-    if chunk:
-        yield chunk
-
-
 def execute_broadcast_join_flight(
     above: list[LogicalPlan],
     join: Join,
@@ -452,12 +435,13 @@ def _bounded_build_side(nat, build_plan, source: Source, proj, pred, cfg_json: s
     """The build side's batches, or None as soon as they are known to exceed `budget`.
 
     The measured re-check is what makes an *estimated* broadcast decision safe to act on,
-    and it used to buy that safety by reading the whole build relation on the driver —
-    one node, one stream — before it could say no. Measured on TPC-H sf100
+    but reading the whole build relation on the driver — one node, one stream — before it
+    can say no is too expensive a way to buy that safety. Measured on TPC-H sf100
     `lineitem ⋈ orders` over 8 workers, where a runtime-filtered build side estimates
-    small and materializes at gigabytes: **10.2 s of driver time spent to learn the answer
-    and then discard the data**, turning an 11.7 s query into 23.5 s. The guard has to
-    stay; what it must not do is cost more than the strategy it is guarding.
+    small and materializes at gigabytes, the whole-relation read spent **10.2 s of driver
+    time to learn the answer and then discard the data**, turning an 11.7 s query into
+    23.5 s. The guard has to stay; what it must not do is cost more than the strategy it is
+    guarding.
 
     So stop at the budget instead of at the end of the relation. When the build plan is
     row-wise — a chain of scan/filter/project, which is what a build side under a pushed
@@ -469,7 +453,7 @@ def _bounded_build_side(nat, build_plan, source: Source, proj, pred, cfg_json: s
     a budget's worth of reading rather than a relation's.
 
     Any other shape — an aggregate or a join underneath, a source that will not split —
-    falls back to the whole-relation read, which is the behaviour before this existed.
+    falls back to the whole-relation read.
 
     Bailing early is never a correctness question: the caller runs the co-partition
     shuffle, which produces the same relation.

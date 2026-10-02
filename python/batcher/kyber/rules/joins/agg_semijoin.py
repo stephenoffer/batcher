@@ -26,7 +26,7 @@ semi-join *is* the bloom pushdown, expressed as algebra the whole stack understa
 **Why restricting the right side is semantics-preserving.** A row of the aggregate's
 output whose key is absent from `L` cannot join with any `L` row. Deleting it changes
 the join's result only if the join is required to emit right-side rows that found no
-match — which is exactly what `FILTERABLE_SIDES` (owned by `joins.rewrites`, the one
+match — which is exactly what `FILTERABLE_SIDES` (owned by `joins.runtime_range`, the one
 table the runtime-filter families read) already encodes. `inner`, `left`, `semi`, and
 `anti` all discard unmatched *right* rows, so the restriction is invisible to them;
 `right` and `full` preserve them, so they are refused. Note this makes the rule safe
@@ -47,7 +47,7 @@ from collections.abc import Callable
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase, RuleCategory
-from batcher.kyber.rules.joins.rewrites import _FILTERABLE_SIDES
+from batcher.kyber.rules.joins.runtime_range import _FILTERABLE_SIDES
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import (
     Aggregate,

@@ -145,7 +145,8 @@ class InMemorySource:
     query. An object keyed that way is ephemeral in lifetime and stable in identity, which is
     exactly what a memo needs: `kyber.plan_cache` will cache a plan built over it (see
     `_source_keys`), where an `id()`-keyed relation could only ever be written and never read
-    back. `api.subplan_reuse` is the one caller.
+    back. `api.subplan_reuse` and `api.adaptive.staging` set it, from
+    `plan.source_stats.derivation_key`.
 
     Examples:
         .. doctest::
@@ -159,6 +160,7 @@ class InMemorySource:
 
     __slots__ = (
         "__weakref__",  # lets `plan.source_stats` key statistics per instance, not by `id()`
+        "_ascending_cache",
         "_batches",
         "_bounds_cache",
         "_cache",
@@ -227,6 +229,7 @@ class InMemorySource:
         self._sum_cache: dict[str, float | int | None] = {}
         self._valuecount_cache: dict[tuple[str, str, object], int | None] = {}
         self._bounds_cache: dict[str, object] = {}
+        self._ascending_cache: dict[str, bool] = {}
 
     def schema(self) -> pa.Schema:
         """The batches' schema, with narrow numeric columns widened.
@@ -383,6 +386,14 @@ class InMemorySource:
             predicates name. So the exact null count was thrown away with the bounds it sat
             beside, on precisely the column types most tables are made of.
         """
+        if not self._zone_maps:
+            # The constructor's contract: an engine-produced, consume-once relation reports no
+            # bounds. This narrowed form is the one the conductor calls, and it ignored the flag,
+            # so every intermediate paid the O(rows) pass anyway — and exposed a float SUM whose
+            # last bit moves with parallel summation order, which changed the plan-cache key and
+            # re-planned TPC-DS q80's final stage on alternate runs (~50 ms each). Only the O(1)
+            # facts remain, which is what `column_cheap_stat` already reports.
+            return self.column_cheap_stat(name)
         if name not in self._bounds_cache:
             from batcher.io.source import inmemory_stats
 
@@ -391,6 +402,38 @@ class InMemorySource:
                 self._build_column, field.type, name
             )
         return self._bounds_cache[name]
+
+    def column_ascending(self, name: str) -> bool:
+        """Whether `name` never decreases in storage order, computed once and cached.
+
+        The single-column form of `SourceStatistics.ascending`, for the narrowed statistics a
+        query's plan actually receives (`api.source_stats._resident_subset_stats`). An
+        estimation hint, never a sort proof: see `inmemory_stats.column_ascending`.
+
+        Examples:
+            .. doctest::
+
+                >>> import pyarrow as pa
+                >>> from batcher.io import InMemorySource
+                >>> src = InMemorySource([pa.record_batch({"x": [1, 2, 2], "y": [3, 1, 2]})])
+                >>> src.column_ascending("x"), src.column_ascending("y")
+                (True, False)
+
+        Args:
+            name: The column to test.
+
+        Returns:
+            True when every value is at least the one before it and none is null.
+        """
+        if not self._zone_maps:
+            return False  # no bounds, so no order claim either (see `column_bounds`)
+        if name not in self._ascending_cache:
+            from batcher.io.source import inmemory_stats
+
+            self._ascending_cache[name] = inmemory_stats.column_ascending(
+                self._build_column, self._schema.field(name).type, name
+            )
+        return self._ascending_cache[name]
 
     def column_cheap_stat(self, name: str):
         """`name`'s null count and average width — the facts that cost O(1), no bounds pass.

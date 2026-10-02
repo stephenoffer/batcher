@@ -17,7 +17,6 @@ from .lifecycle import (
     _single_node,
     _wrap_tasks,
     engine_config_json,
-    resolve_transport,
 )
 from .metering import (
     drain_worker_metrics,
@@ -31,17 +30,23 @@ from .policies import (
     fault_options,
     gather_map_results,
     is_recoverable_task_failure,
+    kill_workers,
     map_barrier,
-    topn_partition,
     recovery_policy,
     runtime_bloom_join,
     skew_join_salt,
     speculation_policy,
     task_event_options,
+    topn_partition,
 )
-from .readiness import await_autoscale
+from .readiness import await_autoscale, resolve_transport
 from .reduce import gather_in_windows, run_bucket_reduce
-from .reducers import buckets_for_envelope, map_partitions, shuffle_partitions
+from .reducers import (
+    buckets_for_envelope,
+    map_partitions,
+    memory_bounded_map_partitions,
+    shuffle_partitions,
+)
 from .scaling import (
     alive_node_count,
     clamp_workers,
@@ -88,9 +93,10 @@ __all__ = [
     "gather_in_windows",
     "gather_map_results",
     "is_recoverable_task_failure",
+    "kill_workers",
     "map_barrier",
-    "topn_partition",
     "map_partitions",
+    "memory_bounded_map_partitions",
     "node_class_selector",
     "placement_actor_options",
     "record_worker_metrics",
@@ -108,6 +114,7 @@ __all__ = [
     "speculation_policy",
     "task_event_options",
     "task_options",
+    "topn_partition",
     "topology_scope",
     "worker_node_memory_bytes",
 ]

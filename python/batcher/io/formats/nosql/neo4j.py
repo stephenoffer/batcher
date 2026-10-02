@@ -21,6 +21,7 @@ import pyarrow as pa
 
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.nosql.base import (
+    SCHEMA_SAMPLE_ROWS,
     PartitionSpec,
     ScanSource,
     offset_windows,
@@ -68,8 +69,10 @@ class Neo4jSource(ScanSource):
         order_by: str | None = None,
         database: str | None = None,
         partition_spec: PartitionSpec | None = None,
+        schema: pa.Schema | None = None,
     ) -> None:
         super().__init__(
+            schema=schema,
             partition_spec=partition_spec,
             uri=uri,
             username=username,
@@ -117,7 +120,9 @@ class Neo4jSource(ScanSource):
     def _infer_schema(self) -> pa.Schema:
         driver = self._driver()
         try:
-            rows = list(self._run(driver, f"{self._conn_kwargs['cypher']} LIMIT 1"))
+            rows = list(
+                self._run(driver, f"{self._conn_kwargs['cypher']} LIMIT {SCHEMA_SAMPLE_ROWS}")
+            )
         finally:
             driver.close()
         return schema_from_rows(rows)

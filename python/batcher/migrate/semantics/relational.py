@@ -73,7 +73,6 @@ def polars_how(ctx: Context, how: Bound, coalesce: Bound) -> Any | None:
     return found
 
 
-@transform
 def spark_mode(_ctx: Context, mode: Bound) -> Any | None:
     """Spark's save mode, with its `errorifexists` default made explicit."""
     value = "error" if is_none(mode.node) else literal(mode.node)
@@ -153,7 +152,6 @@ def spark_read_csv(
     return call(f"{ctx.bt}.read.csv", [cst.Arg(path.node)])
 
 
-@transform
 def spark_session(ctx: Context, builder: Bound) -> Any | None:
     """`SparkSession.builder...getOrCreate()` as `bt.Session()`; dropped config is noted."""
     node = builder.original
@@ -200,19 +198,6 @@ def spark_count(ctx: Context, col: Bound) -> Any | None:
     if found is None:
         return None
     return simple_call(cst.Attribute(value=parens(found), attr=cst.Name("count")), [])
-
-
-@transform
-def polars_contains(
-    _ctx: Context, namespace: Bound, pattern: Bound, is_literal: Bound
-) -> Any | None:
-    """Polars `str.contains` is a regex unless `literal=True`."""
-    flag = literal(is_literal.node)
-    if not isinstance(flag, bool):
-        return None
-    method = "contains" if flag else "regexp_matches"
-    func = cst.Attribute(value=parens(namespace.node), attr=cst.Name(method))
-    return simple_call(func, [cst.Arg(pattern.node)])
 
 
 @transform

@@ -78,9 +78,9 @@ def test_pushdown_matches_no_pushdown(tmp_path):
 
 
 @pytest.mark.integration
-def test_distributed_pushdown_matches_single_node(tmp_path):
+def test_distributed_pushdown_matches_single_node(cluster_tmp_path):
     """Distributed reads push projection + predicate to each worker's split read."""
-    path = str(tmp_path / "big.parquet")
+    path = str(cluster_tmp_path / "big.parquet")
     pq.write_table(
         pa.table({"k": [i % 5 for i in range(1000)], "v": list(range(1000))}),
         path,

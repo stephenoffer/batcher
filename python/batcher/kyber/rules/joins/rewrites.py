@@ -23,7 +23,7 @@ import dataclasses
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
-from batcher.kyber.rule import Phase, RuleCategory
+from batcher.kyber.rule import Phase
 from batcher.plan.expr_ir import (
     Binary,
     Cast,
@@ -31,7 +31,6 @@ from batcher.plan.expr_ir import (
     Expr,
     IsNotNull,
     IsNull,
-    Lit,
     Math2Expr,
     MathExpr,
     Not,
@@ -51,7 +50,6 @@ from batcher.plan.logical import (
     passthrough_renames,
 )
 from batcher.plan.logical.transforms import is_cartesian_key_pair
-from batcher.plan.stats import ColumnStat, ambiguous_float_bound
 
 __all__ = [
     "drop_redundant_cross_key",
@@ -60,7 +58,6 @@ __all__ = [
     "join_to_semijoin",
     "left_join_null_key_to_antijoin",
     "outer_to_inner_join",
-    "runtime_join_filter",
 ]
 
 
@@ -521,128 +518,3 @@ def _null_propagating_cols(expr: Expr) -> set[str]:
         # These yield a non-null boolean from a null input — null does not propagate.
         return set()
     return set()
-
-
-# --- Runtime join filters (sideways information passing) --------------------
-
-# Which side(s) of each join type may be safely reduced by the *other* side's key
-# range. "left"/"right" name the side that receives the filter. A side is filterable
-# only when its unmatched rows are not required in the output: an outer join's
-# preserved side and an anti join's left side must keep their unmatched rows.
-_FILTERABLE_SIDES = {
-    "inner": ("left", "right"),
-    "semi": ("left", "right"),  # semi emits a left row only if it matches → both prunable
-    "anti": ("right",),  # left rows without a match MUST survive; only prune the right
-    "left": ("right",),  # left rows are preserved; only prune the right
-    "right": ("left",),  # right rows are preserved; only prune the left
-    # "full" preserves both sides → nothing is safely prunable.
-}
-
-
-@rule(
-    name="runtime_join_filter",
-    phase=Phase.ENFORCE,
-    matches=(Join,),
-    category=RuleCategory.ENFORCE,
-)
-def runtime_join_filter(node: Join, ctx: OptimizerContext) -> LogicalPlan | None:
-    """Push a `key BETWEEN other_min AND other_max` filter onto a prunable join side.
-
-    For an equi-join every matching row has equal keys, so a row whose key falls
-    outside the *other* side's `[min, max]` range can never match. Pushing that range
-    onto the opposite input is a superset filter — it drops only provably-non-matching
-    rows, never a real match — the cheap form of the sideways-information-passing /
-    bloom-filter join pruning DuckDB and Spark AQE rely on, available here purely from
-    the `ColumnStat.min`/`max` Kyber already propagates. When the prunable side is a
-    scan, the added `Filter` is captured by `required_predicates_per_source` at
-    lowering and pushed to the source, so zonemaps prune whole row-groups / Hive
-    partitions — dynamic partition pruning with no new IR node.
-
-    Multi-key joins are handled per key: a matching row must fall inside the other
-    side's range on **every** key, so each narrowing key contributes a `BETWEEN`
-    conjunct (`k1 BETWEEN .. AND k2 BETWEEN ..`). Runs once in ENFORCE (after physical
-    selection) so it never re-adds, and fires only when bounds are known *and*
-    genuinely narrower (so the filter prunes rather than adds overhead), on a side the
-    join does not preserve.
-    """
-    sides = _FILTERABLE_SIDES.get(node.join_type)
-    if sides is None or not node.left_keys or len(node.left_keys) != len(node.right_keys):
-        return None
-    left_stats = ctx.estimator.estimate(node.left)
-    right_stats = ctx.estimator.estimate(node.right)
-
-    # Per side, collect a BETWEEN conjunct for every key the opposite range narrows.
-    right_preds: list[Expr] = []
-    left_preds: list[Expr] = []
-    for lk, rk in zip(node.left_keys, node.right_keys, strict=True):
-        left_col = left_stats.column(lk)
-        right_col = right_stats.column(rk)
-        if "right" in sides and _narrows(left_col, right_col):
-            right_preds.append(_between(rk, left_col))
-        if "left" in sides and _narrows(right_col, left_col):
-            left_preds.append(_between(lk, right_col))
-
-    new_left, new_right = node.left, node.right
-    changed = False
-    if right_preds:
-        new_right = Filter(new_right, _conjoin(right_preds))
-        changed = True
-    if left_preds:
-        new_left = Filter(new_left, _conjoin(left_preds))
-        changed = True
-    if not changed:
-        return None
-    ctx.notes.setdefault("runtime_join_filters", []).append(node.join_type)
-    return Join(
-        new_left,
-        new_right,
-        node.left_keys,
-        node.right_keys,
-        node.join_type,
-        node.output,
-        node.strategy,
-    )
-
-
-def _narrows(source: ColumnStat, target: ColumnStat) -> bool:
-    """Whether `source`'s key range is known and strictly inside `target`'s — so a
-    `target BETWEEN source.min AND source.max` filter would actually drop rows.
-
-    Both ranges must be known: without the target's spread we cannot tell the filter
-    is selective, and adding a non-selective filter is pure overhead.
-
-    An **ambiguous float bound refuses outright**, and this is a soundness gate, not a
-    heuristic. The rule's whole licence is that the pushed `BETWEEN` "drops only
-    provably-non-matching rows, never a real match" — and on a float key that is false. An
-    equi-join *canonicalizes* its key (`bc_runtime::keys` folds `-0.0` into `0.0` and every NaN
-    into one value), so the join matches `-0.0` on one side to `0.0` on the other; a `BETWEEN`
-    does not canonicalize, and on the engine's total order `-0.0 < 0.0`, so the filter deletes
-    precisely that matching row. Joining `k = [-0.0, 1.5, 2.0]` to `k = [0.0, 1.5]` returned one
-    row where the join returns two.
-
-    The bug was latent for as long as float join-key bounds were never *fetched* (they weren't:
-    `column_bounds_needed` only collected filter columns). It became reachable the moment they
-    were, which is the honest reason it is being fixed here and not earlier.
-    """
-    if source.min is None or source.max is None or target.min is None or target.max is None:
-        return False
-    if any(ambiguous_float_bound(v) for v in (source.min, source.max, target.min, target.max)):
-        return False
-    try:
-        return source.min > target.min or source.max < target.max
-    except TypeError:
-        return False  # incomparable bound types → leave the join untouched
-
-
-def _between(column: str, bounds: ColumnStat) -> Expr:
-    """`column >= bounds.min AND column <= bounds.max`."""
-    col = Col(column)
-    return (col >= Lit(bounds.min)) & (col <= Lit(bounds.max))
-
-
-def _conjoin(preds: list[Expr]) -> Expr:
-    """AND a non-empty list of predicates (a single predicate is returned as-is)."""
-    out = preds[0]
-    for pred in preds[1:]:
-        out = out & pred
-    return out

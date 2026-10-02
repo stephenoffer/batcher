@@ -9,6 +9,7 @@ test can exercise a piece of.
 
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -18,6 +19,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import batcher as bt
 from _common import tpch
 from batcher import col
+
+
+def _same_answer(got: dict, want: dict) -> bool:
+    """The same groups, and totals equal up to floating-point summation order.
+
+    A float `SUM` is exact only up to reassociation: a plan the optimizer later re-chooses
+    from what it measured may add the same values in another order and differ in the last
+    bits, which is not a different answer.
+    """
+    return got["l_shipmode"] == want["l_shipmode"] and all(
+        math.isclose(a, b, rel_tol=1e-9) for a, b in zip(got["total"], want["total"], strict=True)
+    )
 
 
 def main() -> None:
@@ -57,8 +70,8 @@ def main() -> None:
     # All three build the same plan and give the same answer.
     assert piped.explain() == chained.explain()
     assert folded.explain() == chained.explain()
-    assert piped.to_pydict() == reference
-    assert folded.to_pydict() == reference
+    assert _same_answer(piped.to_pydict(), reference)
+    assert _same_answer(folded.to_pydict(), reference)
 
     # The named steps are individually testable, which the chain is not.
     assert big_lines(lineitem).count() < lineitem.count()

@@ -511,7 +511,7 @@ class CSVSink(FileSink):
         for buf in buffers:
             fh.write(memoryview(buf))
 
-    def write_stream(self, batches, path, *, schema=None, resume=False):  # type: ignore[override]
+    def write_stream(self, batches, path, *, schema=None, resume=False):
         """Stream to one CSV file with a **parallel** encode, in bounded memory.
 
         The base streaming write appends one batch at a time through pyarrow's

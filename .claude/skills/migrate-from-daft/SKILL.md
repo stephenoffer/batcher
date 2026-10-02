@@ -153,7 +153,7 @@ credit-based flow control**, bypassing the object store entirely. Practically:
 Compare **order-independently** unless the query has an explicit `sort` (a plan with
 no `ORDER BY` has no defined row order in either engine; conversely, a sorted query
 must be compared *in order*, because an order-independent comparison cannot see a
-sort bug). The in-repo pattern is `tests/differential/conftest.py::assert_same` —
+sort bug). The in-repo pattern is `tests/_harness.py::assert_same` —
 normalize to pyarrow, rows to tuples, sort by a total order, compare as multisets
 with int↔float and float-rounding tolerance. Reuse it:
 

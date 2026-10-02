@@ -256,7 +256,7 @@ def test_measured_jit_speedup_ignores_mixed_tier_rows():
 def test_a_noisy_refit_settles_instead_of_alternating():
     """Successive fits of the same quantity must converge, not oscillate.
 
-    The coefficients are the plan cache's key (`plan_cache._bucketed` buckets them), so a fit
+    The coefficients are the plan cache's key (`plan_cache.keys._bucketed` buckets them), so a fit
     that swings run to run is not merely an imprecise estimate — it is a cache miss on every
     execution. Measured on TPC-DS q77 at scale 1, `hash_build_row` alternated between adjacent
     half-octave buckets on consecutive refits (over 40%), the memo never hit once, and the

@@ -152,13 +152,13 @@ one for dumping a billion analytical rows. Write those to Parquet or Delta.
 
 ## Requirements and limitations
 
-Schema inference reads one document. The Arrow schema comes from a `limit=1` sample, so a collection whose documents disagree gives a schema that does not describe it. A field that is an `int` in some documents and a `string` in others, or one missing from the sampled document, makes later batches fail to convert or arrive null. Constrain the shape with an explicit `query=`, or project the fields you need.
+Schema inference reads a sample of 100 documents through `pymongoarrow`, not the whole collection, so a collection whose documents disagree can still give a schema that doesn't describe it. Without a declared schema each `_id` range is typed from its own documents too. Pass `schema=` with a `pyarrow.Schema` to declare the columns: inference is skipped, and every partition reads to that schema. Otherwise constrain the shape with an explicit `query=`, or project the fields you need.
 
 Range splitting assumes `_id` is ordered and comparable, as an ObjectId is. A collection with a custom, unordered `_id` such as a random UUID string still splits, but the ranges will not be balanced.
 
 A slow downstream pipeline holds each split's cursor open while the engine consumes it. If a long job hits cursor-not-found errors, lower `segments` so each cursor drains faster rather than raising the server timeout.
 
-The bulk write is `ordered=False` with no commit phase. A write that fails halfway leaves the documents it already applied in place, so recovery means re-running it, which a keyed `upsert` makes safe.
+The bulk write is `ordered=False` with no commit phase. A write that fails halfway leaves the documents it already applied in place. The `BackendError` it raises says how many documents were inserted, upserted, modified and removed before the failure, and names the `key_field` of each operation that failed, up to ten. Recovery means re-running the write, which a keyed `upsert` makes safe.
 
 `overwrite` is single-node only. Past the first shard of a distributed write it is refused, because every shard would empty the one collection they all target and discard the shards before it. Distribute an `upsert` instead, which only touches the keys its own rows name.
 

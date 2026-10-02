@@ -61,6 +61,9 @@ use bc_ir::{JoinType, RelOp};
 
 mod breaker;
 mod builds;
+pub mod chunked;
+use chunked::units::LazyScan;
+pub use chunked::units::{UnitSource, LOCATOR};
 mod fanout;
 mod folds;
 mod meter;
@@ -78,11 +81,13 @@ pub use parallel::{
 };
 
 use breaker::{drain, exec_breaker};
-pub(crate) use builds::{node_key, prebuild_joins, BuildCache, MatCache};
+pub(crate) use builds::{
+    node_key, prebuild_joins, prebuild_joins_for_chunks, BuildCache, MatCache,
+};
 pub(crate) use folds::{combine_and_finalize, finalize_partial, fold_partial};
 pub(crate) use meter::Meter;
 pub(crate) use pipeline::limit_stream;
-use pipeline::scan_stream;
+use pipeline::{scan_stream, unit_stream};
 use probe_chunks::{PendingProbe, ProbeSlicer};
 
 /// Everything a stream stage needs, in one `Copy` handle so an iterator closure can capture it
@@ -120,6 +125,8 @@ pub(crate) struct Ctx<'a> {
     /// in any order. Set by an order-insensitive consumer and cleared by every operator that is
     /// not one; see [`order`].
     order_free: bool,
+    /// The driving scan read unit by unit instead of from `sources` (see [`UnitSource`]).
+    lazy: Option<&'a LazyScan<'a>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -148,7 +155,14 @@ impl<'a> Ctx<'a> {
             budget,
             workers,
             order_free: false,
+            lazy: None,
         }
+    }
+
+    /// This context, with its driving scan read lazily from `lazy`.
+    pub(crate) fn with_lazy(mut self, lazy: &'a LazyScan<'a>) -> Self {
+        self.lazy = Some(lazy);
+        self
     }
 
     /// This context, with its consumer's order-freedom set to `free`.
@@ -260,7 +274,12 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
     // against this worker's *shard*. Metrics are not re-recorded: the run that filled the cache
     // was metered, and counting it again in every worker would inflate the very cardinalities
     // Kyber learns from.
-    if let Some(batches) = ctx.mats.and_then(|m| m.get(&node_key(plan))) {
+    let key = node_key(plan);
+    if let Some(batches) = ctx
+        .mats
+        .and_then(|m| m.get(&key))
+        .or_else(|| ctx.cache.probe_leaf(key))
+    {
         let batches = Arc::clone(batches);
         let n = batches.len();
         return Ok(Box::new((0..n).map(move |i| Ok(batches[i].clone()))));
@@ -280,6 +299,17 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
     };
     let id = ctx.id(plan);
     match plan {
+        RelOp::Scan { source_id } if ctx.lazy.is_some_and(|l| l.source_id == *source_id) => {
+            let lazy = ctx.lazy.expect("guarded above");
+            Ok(Box::new(unit_stream(lazy.src, lazy.units.clone()).map(
+                move |b| {
+                    let t = std::time::Instant::now();
+                    let b = b?;
+                    ctx.morsel(id, b.num_rows() as u64, &b, t);
+                    Ok(b)
+                },
+            )))
+        }
         RelOp::Scan { source_id } => {
             let batches = ctx
                 .sources
@@ -305,22 +335,7 @@ fn build_node<'a>(plan: &'a RelOp, ctx: Ctx<'a>) -> Result<Morsels<'a>, InterpEr
         // SIMD, so a scalar Cranelift loop has nothing to win on these predicates, and the real
         // cost on this path is in the joins and aggregates rather than the scalar expressions.
         // `par.rs` still compiles, which is where the fused-pipeline shapes make it pay.
-        RelOp::Filter { input, predicate } => {
-            let child = build_with(input, ctx)?;
-            // Per-operator conjunct order, built once and captured by the per-morsel
-            // closure. This path is the engine default and never carries a JIT (see the
-            // note above), so it is the one that most wants a measured order rather than a
-            // static-cost guess. Result-invariant: the conjuncts of an `AND` commute.
-            let order = bc_expr::ConjunctOrder::new(predicate);
-            Ok(Box::new(child.map(move |b| {
-                let b = b?;
-                let rows_in = b.num_rows() as u64;
-                let t = std::time::Instant::now();
-                let out = ops::filter_batch_jit(&b, predicate, &None, order.as_ref())?;
-                ctx.morsel(id, rows_in, &out, t);
-                Ok(out)
-            })))
-        }
+        RelOp::Filter { input, predicate } => pipeline::filter_stream(input, predicate, id, ctx),
 
         RelOp::Project { input, exprs } => {
             let child = build_with(input, ctx)?;
@@ -722,17 +737,11 @@ fn materialized_join_from<'a>(
     //
     // The exception is a join whose output order nothing above it can see (`order`): a
     // `COUNT(*)` over it, or a grouped aggregate sorted on every group key. The order this arm
-    // protects is then unobservable, and the partitioned join runs the same rows on every core.
+    // protects is then unobservable, and the partitioned join runs the same rows on every core
+    // — built on whichever side is smaller (`join_par::order_free_swap_pays`).
     let out = if ctx.order_free && ctx.workers > 1 {
-        let (parts, _) = crate::par::join_partitioned(
-            std::slice::from_ref(&probe_side),
-            std::slice::from_ref(&build_side),
-            left_keys,
-            right_keys,
-            join_type,
-            output,
-            strategy,
-            &crate::ExecOptions::default(),
+        let parts = crate::join_par::join_partitioned_order_free(
+            probe_side, build_side, left_keys, right_keys, join_type, output, strategy,
         )?;
         // One batch, as the serial arm emits, for the reason given below.
         match ops::materialize_opt(&parts)? {

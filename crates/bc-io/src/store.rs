@@ -28,6 +28,9 @@ pub(crate) struct Resolved {
     /// is, so a big read has to be split across several to go fast; a local read is served by
     /// the page cache at memory speed and splitting it only adds syscalls.
     pub remote: bool,
+    /// The file's absolute path when the object is on the local filesystem, for readers that
+    /// can do better than a byte-range request against it (see [`crate::mapped`]).
+    pub local: Option<std::path::PathBuf>,
 }
 
 /// Process-wide cache of built object stores, keyed by `(scheme, host, sorted-options)`.
@@ -80,6 +83,7 @@ pub(crate) fn resolve(uri: &str) -> Result<Resolved, IoError> {
             store,
             path,
             remote: false,
+            local: Some(abs),
         });
     }
 
@@ -121,10 +125,16 @@ pub(crate) fn resolve(uri: &str) -> Result<Resolved, IoError> {
         .map_err(|e| IoError::Store(format!("{uri}: {e}")))?;
     // `file://` reaches here as a URL but is still a local read, so it must not be split.
     let remote = !matches!(scheme, object_store::ObjectStoreScheme::Local);
+    let local = if remote {
+        None
+    } else {
+        url.to_file_path().ok()
+    };
     Ok(Resolved {
         store,
         path,
         remote,
+        local,
     })
 }
 

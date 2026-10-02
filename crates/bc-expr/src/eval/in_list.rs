@@ -76,14 +76,35 @@ struct Ranged<T> {
     members: Members<T>,
     /// `None` for an empty set: nothing is a member.
     bounds: Option<(T, T)>,
+    /// One bit per value in `[lo, hi]`, when that span is at most [`BITMAP_MAX_SPAN`] wide.
+    bitmap: Option<Vec<u64>>,
 }
 
-impl<T: Hash + Eq + Ord + Copy> Ranged<T> {
+/// Widest `[min, max]` span a set is held as a bitmap for: 64K bits, 8 KB, L1-resident.
+///
+/// A dashboard's `supplier IN (1, 7, 42, …)` or a join filter's narrow key range is a set of
+/// small integers, and a bit test answers it with one load and no hash. Measured on TPC-H
+/// `l_suppkey IN (11 keys)` the hashed probe was the largest single cost of the filter.
+const BITMAP_MAX_SPAN: i64 = 1 << 16;
+
+impl<T: Hash + Eq + Ord + Copy + Into<i64>> Ranged<T> {
     fn new(items: Vec<T>) -> Self {
         let bounds = items.iter().copied().min().zip(items.iter().copied().max());
+        let bitmap = bounds.and_then(|(lo, hi)| {
+            let (lo, hi): (i64, i64) = (lo.into(), hi.into());
+            // `checked_sub`: the span of `i64::MIN..=i64::MAX` does not fit, and is not small.
+            let span = hi.checked_sub(lo).filter(|&s| s < BITMAP_MAX_SPAN)? as usize + 1;
+            let mut words = vec![0u64; span.div_ceil(64)];
+            for &v in &items {
+                let off = (v.into() - lo) as usize;
+                words[off / 64] |= 1 << (off % 64);
+            }
+            Some(words)
+        });
         Self {
             members: Members::new(items),
             bounds,
+            bitmap,
         }
     }
 
@@ -94,6 +115,88 @@ impl<T: Hash + Eq + Ord + Copy> Ranged<T> {
             None => false,
         }
     }
+
+    /// One membership bit per value (nulls included; the caller masks them).
+    ///
+    /// With a bitmap the test is branch-free -- an offset, a clamped word load and a bit --
+    /// and packed by `cmp::fill`, so it vectorizes where a probe per row cannot. The offset is
+    /// taken with wrapping arithmetic: a value below `lo` wraps past the span and reads false,
+    /// and no value of `i64` can wrap back *into* a span of at most [`BITMAP_MAX_SPAN`], since
+    /// that would need a value at least 2^64 below `lo`.
+    fn mask(&self, values: &[T]) -> BooleanBuffer {
+        match (&self.bitmap, self.bounds) {
+            (Some(words), Some((lo, _))) => {
+                let lo: i64 = lo.into();
+                let last = (words.len() * 64 - 1) as u64;
+                crate::eval::cmp::fill(values, |v| {
+                    let off = v.into().wrapping_sub(lo) as u64;
+                    let word = words[(off.min(last) / 64) as usize];
+                    (off <= last) & ((word >> (off % 64)) & 1 != 0)
+                })
+            }
+            _ => BooleanBuffer::collect_bool(values.len(), |i| self.contains(values[i])),
+        }
+    }
+}
+
+/// `utf8_col IN (...)` over a small set of members of at most seven bytes, as integer compares.
+///
+/// Each row is first reduced to one `u64` key: its bytes little-endian, zero above its length,
+/// with the length in the top byte -- which a string of at most seven bytes leaves free, so the
+/// key is injective on such strings -- and `u64::MAX` for a row of eight bytes or more, which
+/// no member's key can equal (a member's top byte is its length, at most seven). Membership is
+/// then a fixed number of `u64` equalities per row, which `cmp::fill` packs without a branch.
+/// The slice path it replaces paid a `memcmp` call per member of the row's length, behind an
+/// unpredictable branch on each: 5.2 ns a row on a three-member set, against ~1.5 here.
+///
+/// `None` for a set past [`LINEAR_SCAN_MAX`] or with a member of eight bytes or more, which
+/// keep the slice path.
+fn short_str_membership(a: &arrow::array::StringArray, items: &[&str]) -> Option<BooleanArray> {
+    if items.len() > LINEAR_SCAN_MAX || items.iter().any(|m| m.len() > 7) {
+        return None;
+    }
+    // Padded to a fixed width with a key no row produces (top byte 0xFF, and not `u64::MAX`),
+    // so the compare loop has a constant trip count.
+    let mut members = [u64::MAX - 1; LINEAR_SCAN_MAX];
+    for (slot, m) in members.iter_mut().zip(items) {
+        *slot = short_key(m.as_bytes(), 0, m.len());
+    }
+    let values = a.values().as_slice();
+    let keys: Vec<u64> = a
+        .value_offsets()
+        .windows(2)
+        .map(|w| short_key(values, w[0] as usize, (w[1] - w[0]) as usize))
+        .collect();
+    let bits = crate::eval::cmp::fill(&keys, |k| {
+        members.iter().fold(false, |hit, &m| hit | (m == k))
+    });
+    Some(masked(bits, a.nulls()))
+}
+
+/// The `u64` key [`short_str_membership`] compares: the bytes, then the length in the top byte;
+/// `u64::MAX` past seven bytes.
+#[inline(always)]
+fn short_key(bytes: &[u8], start: usize, len: usize) -> u64 {
+    if len > 7 {
+        return u64::MAX;
+    }
+    le_word(bytes, start, len) | ((len as u64) << 56)
+}
+
+/// The first `min(len, 8)` bytes of `bytes[start..]`, little-endian, zero above them.
+#[inline(always)]
+fn le_word(bytes: &[u8], start: usize, len: usize) -> u64 {
+    let keep = len.min(8);
+    let word = match bytes.get(start..start + 8) {
+        Some(eight) => u64::from_le_bytes(eight.try_into().expect("eight bytes")),
+        None => {
+            let mut buf = [0u8; 8];
+            buf[..keep].copy_from_slice(&bytes[start..start + keep]);
+            return u64::from_le_bytes(buf);
+        }
+    };
+    // A shift by 64 is undefined, so eight bytes keep the whole word.
+    word & u64::MAX.checked_shr(64 - 8 * keep as u32).unwrap_or(0)
 }
 
 /// Evaluate `array IN set` to a `BooleanArray` (null where `array` is null).
@@ -126,7 +229,7 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
                 return membership_generic(array, set);
             };
             let members = Ranged::new(items);
-            membership(a.nulls(), a.len(), |i| members.contains(a.value(i)))
+            masked(members.mask(a.values()), a.nulls())
         }
         DataType::Date32 => {
             let a = array.as_primitive::<Date32Type>();
@@ -134,7 +237,7 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
                 return membership_generic(array, set);
             };
             let members = Ranged::new(items);
-            membership(a.nulls(), a.len(), |i| members.contains(a.value(i)))
+            masked(members.mask(a.values()), a.nulls())
         }
         // A float column can reach `InList`: the fold rule collapses a chain of
         // `float_col = <int literal>` disjuncts (integers are foldable literals) into an
@@ -159,6 +262,9 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
             let Some(items) = all_converted(set, literal_str) else {
                 return membership_generic(array, set);
             };
+            if let Some(out) = short_str_membership(a, &items) {
+                return Ok(Arc::new(out));
+            }
             let members = Members::new(items);
             membership(a.nulls(), a.len(), |i| members.contains(&a.value(i)))
         }
@@ -236,6 +342,37 @@ fn membership(
         None => BooleanArray::new(values, None),
         Some(nb) => BooleanArray::new(&values & nb.inner(), Some(nb.clone())),
     }
+}
+
+/// A membership mask with the input's validity applied, as [`membership`] produces it.
+fn masked(values: BooleanBuffer, nulls: Option<&arrow::buffer::NullBuffer>) -> BooleanArray {
+    match nulls {
+        None => BooleanArray::new(values, None),
+        Some(nb) => BooleanArray::new(&values & nb.inner(), Some(nb.clone())),
+    }
+}
+
+/// Whether `x IN set` is answered without probing a hash table: an integer or date set small
+/// enough to scan or narrow enough to hold as a bitmap. `Expr::eval_cost` prices these like a
+/// comparison, which is what they cost; a hashed or string set keeps its higher price.
+pub(crate) fn is_direct(set: &[Literal]) -> bool {
+    let bounds = |vals: Vec<i64>| {
+        vals.iter()
+            .min()
+            .zip(vals.iter().max())
+            .is_some_and(|(lo, hi)| hi.checked_sub(*lo).is_some_and(|s| s < BITMAP_MAX_SPAN))
+    };
+    if set.len() <= LINEAR_SCAN_MAX {
+        return set
+            .iter()
+            .all(|l| matches!(l, Literal::Int(_)) || matches!(l, Literal::Date(_)))
+            && !set.is_empty();
+    }
+    if let Some(ints) = all_converted(set, literal_i64) {
+        return bounds(ints);
+    }
+    all_converted(set, literal_date)
+        .is_some_and(|days| bounds(days.into_iter().map(i64::from).collect()))
 }
 
 fn literal_i64(lit: &Literal) -> Option<i64> {
@@ -519,5 +656,132 @@ mod tests {
             run(arr, &set),
             vec![Some(true), Some(true), Some(false), None]
         );
+    }
+}
+
+#[cfg(test)]
+mod bitmap_and_short_key_tests {
+    use arrow::array::{Date32Array, Int64Array, StringArray};
+
+    use super::*;
+
+    fn agrees(arr: ArrayRef, set: &[Literal]) {
+        let typed = eval_in_list(&arr, set).unwrap();
+        let generic = membership_generic(&arr, set).unwrap();
+        assert_eq!(&typed, &generic, "set={set:?}");
+    }
+
+    /// Spans just under, at and over the bitmap's limit, negative and extreme values, every
+    /// row a member, a near-member or an outsider — held to the OR-of-equality oracle.
+    #[test]
+    fn the_bitmap_agrees_with_the_or_chain_across_its_size_limit() {
+        for span in [
+            0,
+            1,
+            63,
+            64,
+            65,
+            BITMAP_MAX_SPAN - 1,
+            BITMAP_MAX_SPAN,
+            BITMAP_MAX_SPAN + 1,
+        ] {
+            for base in [-70_000_i64, -1, 0, 5, i64::MAX - span, i64::MIN] {
+                let members = [base, base + span / 3, base + span];
+                let set: Vec<Literal> = members.iter().map(|&v| Literal::Int(v)).collect();
+                let mut rows: Vec<Option<i64>> = members
+                    .iter()
+                    .flat_map(|&m| [m.checked_sub(1), Some(m), m.checked_add(1)])
+                    .collect();
+                rows.extend([None, Some(i64::MIN), Some(i64::MAX), Some(0)]);
+                agrees(Arc::new(Int64Array::from(rows)), &set);
+            }
+        }
+        // The extreme span cannot be a bitmap at all.
+        let set = [Literal::Int(i64::MIN), Literal::Int(i64::MAX)];
+        let rows = vec![Some(i64::MIN), Some(0), Some(i64::MAX), None];
+        agrees(Arc::new(Int64Array::from(rows)), &set);
+    }
+
+    #[test]
+    fn the_bitmap_serves_dates_before_and_after_the_epoch() {
+        let set: Vec<Literal> = [-719_528, -1, 0, 11_016, 11_017]
+            .iter()
+            .map(|&d| Literal::Date(d))
+            .collect();
+        let rows: Vec<Option<i32>> = (-10..12_000)
+            .step_by(7)
+            .map(Some)
+            .chain([
+                Some(-719_528),
+                Some(11_016),
+                None,
+                Some(i32::MIN),
+                Some(i32::MAX),
+            ])
+            .collect();
+        agrees(Arc::new(Date32Array::from(rows)), &set);
+    }
+
+    /// Members and rows straddling every edge of the eight-byte key: empty, one to nine bytes,
+    /// embedded and trailing NULs (which zero padding must not confuse with an end), shared
+    /// prefixes, multi-byte UTF-8, a value sliced away from offset zero, and nulls.
+    #[test]
+    fn short_string_keys_agree_with_the_or_chain() {
+        let rows: Vec<Option<&str>> = vec![
+            Some(""),
+            Some("A"),
+            Some("AIR"),
+            Some("AIR\0"),
+            Some("AI"),
+            Some("MAIL"),
+            Some("SHIP"),
+            Some("REG AIR"),
+            Some("REG AIRX"),
+            Some("REG AIRXY"),
+            Some("é"),
+            Some("日本"),
+            None,
+            Some("SHIPS"),
+            // Eight bytes whose last would be the length byte of "AIR" if the key kept it.
+            Some("AIR\0\0\0\0\x03"),
+            Some("REG AI\0"),
+        ];
+        let sets: Vec<Vec<&str>> = vec![
+            vec!["MAIL", "SHIP", "AIR"],
+            vec!["", "AIR\0", "REG AIR"],
+            // An eight-byte member keeps the slice path.
+            vec!["", "AIR\0", "REG AIRX"],
+            vec!["é", "日本", "A"],
+            // Past the linear-scan size, which keeps the hashed slice path.
+            vec!["A", "B", "C", "D", "E", "F", "G", "H", "AIR", "SHIP"],
+            // A member too long for a key keeps the slice path.
+            vec!["REG AIRXY", "AIR"],
+        ];
+        let arr = StringArray::from(rows);
+        for set in sets {
+            let lits: Vec<Literal> = set.iter().map(|s| Literal::Str((*s).into())).collect();
+            agrees(Arc::new(arr.clone()), &lits);
+            agrees(Arc::new(arr.slice(2, 9)), &lits);
+        }
+        let long = StringArray::from(vec!["REG AIRX"]);
+        assert!(short_str_membership(&long, &["REG AIRX"]).is_none());
+        assert!(short_str_membership(&long, &["REG AIR"]).is_some());
+    }
+
+    /// The sets priced like a comparison are exactly the ones the kernel answers without a
+    /// hash probe: a few integers or dates, or a narrow range of them.
+    #[test]
+    fn direct_sets_are_small_or_narrow_integer_sets() {
+        let ints = |v: &[i64]| v.iter().map(|&x| Literal::Int(x)).collect::<Vec<_>>();
+        assert!(is_direct(&ints(&[1, 7, 42])));
+        assert!(is_direct(&ints(&[
+            1, 7, 42, 99, 123, 256, 512, 1024, 2048, 4096, 8192
+        ])));
+        let wide: Vec<i64> = (0..20).map(|i| i * 100_000).collect();
+        assert!(!is_direct(&ints(&wide)));
+        assert!(!is_direct(&[Literal::Str("MAIL".into())]));
+        assert!(!is_direct(&[]));
+        let days: Vec<Literal> = (0..20).map(|d| Literal::Date(d * 30)).collect();
+        assert!(is_direct(&days));
     }
 }

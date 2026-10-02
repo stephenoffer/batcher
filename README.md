@@ -4,8 +4,8 @@
 across CPU and GPU, from a laptop to a cluster, on the same code.**
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://pypi.org/project/batcher-engine/)
-[![PyPI](https://img.shields.io/badge/pypi-batcher--engine-blue.svg)](https://pypi.org/project/batcher-engine/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![PyPI](https://img.shields.io/badge/pypi-not%20yet%20released-lightgrey.svg)](#install)
 [![Docs](https://img.shields.io/badge/docs-batcher-blue.svg)](https://stephenoffer.github.io/batcher/)
 
 [Documentation](https://stephenoffer.github.io/batcher/) ·
@@ -40,10 +40,20 @@ print(revenue.to_pydict())  # nothing runs until here
 
 ## Install
 
-Prebuilt wheels ship for Linux (x86_64 and aarch64, glibc and musl/Alpine), macOS (Apple
-silicon and Intel), and Windows x86_64 on Python 3.11+ — no Rust needed.
-Batcher is on PyPI as `batcher-engine` and imported as `batcher` (the bare `batcher`
-name belongs to an unrelated project):
+**No release has been published yet.** PyPI has no `batcher-engine` distribution, the
+repository has no tagged release, and the `ghcr.io` images below are pushed only by a tagged
+release, so `pip install batcher-engine` and `docker run ghcr.io/stephenoffer/batcher` both
+fail today. Install from the repository instead, which compiles the engine and needs a
+[Rust toolchain](https://rustup.rs) (1.89+) and Python 3.11+:
+
+```bash
+pip install "git+https://github.com/stephenoffer/batcher.git"
+```
+
+Once a release is tagged, `.github/workflows/release.yml` publishes prebuilt wheels for Linux
+(x86_64 and aarch64, glibc and musl/Alpine), macOS (Apple silicon and Intel), and Windows
+x86_64 on Python 3.11+, which need no Rust. The distribution is `batcher-engine` and it
+imports as `batcher` (the bare `batcher` name belongs to an unrelated project):
 
 ```bash
 pip install batcher-engine
@@ -57,7 +67,8 @@ print(ds.select(doubled=bt.col("x") * 2).to_pydict())
 # {'doubled': [2, 4, 6]}
 ```
 
-Optional features are extras, e.g. `pip install "batcher-engine[ray,cloud]"`.
+Optional features are extras, e.g. `pip install "batcher-engine[ray,cloud]"`, or before a
+release `pip install "batcher-engine[ray,cloud] @ git+https://github.com/stephenoffer/batcher.git"`.
 
 Other ways to install, each with its own guide in
 [Choose how to install](https://stephenoffer.github.io/batcher/getting-started/install/index.html):
@@ -76,7 +87,7 @@ Other ways to install, each with its own guide in
 | **Query** | SQL and a DataFrame API over the same plan · joins, windows, pivots, `MERGE INTO` · typed accessors for strings, dates, lists, structs, JSON |
 | **Tables** | Delta, Iceberg, and Hudi with transactional writes, time travel, change feeds, schema evolution, compaction |
 | **Stream** | Unbounded sources, triggers, watermarks, stateful windows, stream joins, checkpointing, exactly-once sinks |
-| **Model** | GPU batch inference, LLM scoring, embeddings and vector search, RAG, tabular models, preprocessors, zero-copy PyTorch loaders |
+| **Model** | GPU batch inference, LLM scoring, embeddings and vector search, RAG, tabular models, preprocessors, PyTorch loaders (zero-copy for read-only inference) |
 | **Operate** | Out-of-core spill, caching, explain plans, a live progress UI, metrics, data-quality contracts, column masking and row-level security |
 
 ## What makes it different
@@ -245,16 +256,18 @@ times the rows for less than ten times the time. The four that are not (q5, q9, 
 join-tree shapes whose intermediate results grow faster than the scan, and they are most of the
 sf10 gap.
 
-Batcher leads DuckDB's own store at sf1 and sf10 and DuckDB leads at sf100, and the crossover
-has three structural causes, none of them a tuning knob: DuckDB
+Batcher leads DuckDB's own store at sf1 and sf10 and DuckDB leads at sf100, and two structural
+causes favour DuckDB as rows grow, neither of them a tuning knob: DuckDB
 **decompresses its native store on the fly** (fewer bytes off memory — Batcher's Arrow-only
-contract has no compressed form to read), its **vector-at-a-time engine with selection vectors**
-edges Batcher's batch-at-a-time kernels as rows grow, and it **streams** where Batcher's model
-materializes each operator's output — which is what OOMs the largest single-node sf100 joins.
+contract has no compressed form to read), and its **vector-at-a-time engine with selection
+vectors** edges Batcher's batch-at-a-time kernels as rows grow. A third cause is gone: Batcher's
+executor used to materialize every operator's output, which OOM-killed q3/q4/q5 at sf100, and
+it now streams by default, materializing only at pipeline breakers. The last recorded sf100 run
+still did not finish, so that row stays a loss.
 Batcher's answer at that scale is **distribution**: the same mergeable operators shard across a
 cluster (one partition per node, bounded per-node memory), which is the regime it is built for.
 Closing the single-node scale gap to DuckDB is honest, open work — a compressed or
-dictionary-encoded scan path, dictionary-aware grouping, and streaming between operators. The
+dictionary-encoded scan path, dictionary-aware grouping, and selection vectors. The
 first of those is also what the H2O.ai `groupby` loss is: on the identical Arrow input Batcher
 wins that task 10 of 10 by **9×**, and loses it 4 of 10 once DuckDB reads its own dictionary
 encoding instead.
@@ -310,9 +323,10 @@ runs it — so you get Python's ergonomics with native speed. The same engine po
 one core and a whole cluster, so a result is the same whether it ran on your laptop or a
 hundred machines, apart from four cases where the query itself leaves the answer open:
 floating-point summation order, tie-breaking in `row_number()`, which rows a `LIMIT` keeps
-over unordered input, and the element order of an unordered `array_agg`. The full design (and the math behind the
-optimizer) is in the
-[documentation](https://stephenoffer.github.io/batcher/) and `architecture.txt`.
+over unordered input, and the element order of an unordered `array_agg`. The full design is in the
+[documentation](https://stephenoffer.github.io/batcher/). The original design paper, with the
+math behind the optimizer, is `docs/architecture/internals/mathematical_foundations.md`; it
+predates the current engine, so where it and the code disagree, the code wins.
 
 > **Status:** young but working, not yet 1.0. Batcher runs SQL and DataFrame
 > workloads, single-node and distributed, and is benchmarked for correctness and
@@ -348,7 +362,7 @@ source tools/bootstrap_env.sh
 
 - `python/batcher/` — the Python API
 - `crates/` — the Rust engine
-- `docs/`, `architecture.txt` — design and documentation
+- `docs/` — design and documentation
 - `MAP.md` — the file-level index: what every module and crate file is for, and
   where new code goes. Generated by `just map` from the code's own docstrings, so
   it stays true. Start here when finding your way around.

@@ -27,7 +27,7 @@ import warnings
 
 from batcher.plan.logical import LogicalPlan
 
-__all__ = ["warn_if_state_is_unbounded"]
+__all__ = ["warn_if_emits_only_at_end", "warn_if_state_is_unbounded"]
 
 #: How each leaking operator is bounded, keyed by node type name. The fix is the whole
 #: value of the warning: "this leaks" without "and here is the operator that does not" is a
@@ -101,6 +101,49 @@ def warn_if_state_is_unbounded(plan: LogicalPlan, sources: list) -> None:
         "correct and will keep running until the retained state reaches "
         "memory.streaming_state_max_bytes, at which point it raises. Nothing about that is "
         "visible in a bounded test, because a bounded input releases the state when it ends.",
+        PerformanceWarning,
+        stacklevel=3,
+    )
+
+
+def warn_if_emits_only_at_end(plan: LogicalPlan, sources: list) -> None:
+    """Warn when `iter_batches()` over a stream will yield nothing until the input ends.
+
+    An unwatermarked ``group_by(...).agg(...)``, an uncapped ``distinct()`` and a top-N
+    (``sort(...).limit(n)``) fold their input and finalize once, at end of input. That is
+    right for a source that drains, and over one that never ends it consumes forever with
+    no output and no error. The shape is fixed by the plan, so it is said before the first
+    read, with the ways to get output while rows arrive.
+
+    Args:
+        plan: The plan `iter_batches()` is about to drive.
+        sources: Its bound sources, to tell a stream from a bounded relation.
+    """
+    from batcher.io.source import is_bounded
+    from batcher.plan.logical import Aggregate, Distinct, Limit, Sort, is_partition_independent
+
+    if all(is_bounded(s) for s in sources):
+        return
+    root = plan
+    while is_partition_independent(root):
+        root = root.input
+    if isinstance(root, Aggregate) and root.watermark is None:
+        shape = "an aggregate with no watermark"
+    elif isinstance(root, Distinct) and getattr(root, "limit", None) is None:
+        shape = "an uncapped distinct()"
+    elif isinstance(root, Limit) and isinstance(root.input, Sort):
+        shape = "a top-N (sort(...).limit(n))"
+    else:
+        return
+    from batcher._internal.errors import PerformanceWarning
+
+    warnings.warn(
+        f"iter_batches() over an unbounded source: {shape} emits once, at end of input, so "
+        "over a stream that never ends it will consume without yielding. To get output as "
+        "rows arrive, group by an event-time window after .with_watermark(...), cap a "
+        "distinct() with .limit(n), or write the query with a trigger "
+        "(ds.write.memory(name, trigger=..., output_mode='complete')) to emit the running "
+        "result every micro-batch.",
         PerformanceWarning,
         stacklevel=3,
     )

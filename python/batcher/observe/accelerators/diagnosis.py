@@ -132,6 +132,7 @@ def window_snapshot(window: TelemetrySampler | None = None) -> dict:
             "throttled_fraction": round(window.summary(index, "throttled").mean, 4),
             "verdict": verdict.verdict if verdict else "",
             "advice": verdict.advice if verdict else "",
+            "unmeasured": list(verdict.unmeasured) if verdict else [],
         }
     return {"sampled": bool(devices), "devices": devices}
 
@@ -195,6 +196,8 @@ def format_bottleneck_report(window: TelemetrySampler | None = None) -> str:
         for verdict in verdicts:
             lines.append(f"{verdict.index:<3}  {verdict.verdict:<17}  {verdict.advice}")
             lines.append(f"     {'':17}  ({verdict.detail})")
+            if verdict.unmeasured:
+                lines.append(f"     {'':17}  unmeasured: {', '.join(verdict.unmeasured)}")
 
     from batcher._internal.hardware.telemetry.bottleneck import fleet_verdict
 

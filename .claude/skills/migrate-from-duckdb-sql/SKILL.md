@@ -12,7 +12,7 @@ unchanged. This skill covers what survives that paste, what does not, and how to
 the port is correct.
 
 DuckDB is also this repo's **differential correctness oracle**
-(`tests/differential/conftest.py::assert_same`), which makes equivalence checking
+(`tests/_harness.py::assert_same`), which makes equivalence checking
 unusually easy: run both, compare multisets.
 
 ## Writing new SQL (not just porting)
@@ -119,8 +119,8 @@ rather than returning a wrong answer.
 | `MERGE INTO` | unsupported DML | `ds.write.delta(uri, merge_on=["id"])` — one transactional call |
 | `array_agg(DISTINCT x)`, `string_agg(DISTINCT x)` | rejected — the list aggregates have no dedup form | pre-aggregate the distinct values in a subquery |
 | `SUM(DISTINCT x)` beside `AVG`/`STDDEV`/`VAR`/a quantile/a second `COUNT(DISTINCT y)` | rejected — those have no single-column mergeable partial to survive the dedup | compute them in a separate subquery and join (`SUM/AVG/MIN/MAX(DISTINCT x)` alone, or beside `COUNT`/`SUM`/`MIN`/`MAX`/`BOOL_*`/`BIT_*`/`PRODUCT`/`ANY_VALUE`, is fine) |
-| Frame `EXCLUDE (TIES/GROUP/CURRENT ROW)` | rejected — honouring the frame while dropping `EXCLUDE` would be a wrong answer | rewrite the exclusion as a predicate, or use a `GROUPS` frame |
-| `x > ANY (subquery)`, `x >= ALL (subquery)` | rejected — `> ALL` over a NULL is UNKNOWN, and the `max()` rewrite says TRUE | `x > (SELECT min(c) …)` for `ANY`; for `ALL` add `AND NOT EXISTS (SELECT 1 … WHERE c IS NULL)`. `= ANY`/`= SOME`/`<> ALL` need no rewrite — they are `IN`/`NOT IN` |
+| Frame `EXCLUDE CURRENT ROW/GROUP/TIES` | **supported** for `sum`/`count`/`avg`/`min`/`max`/`bool_and`/`bool_or` over a `ROWS` (CURRENT ROW) or `GROUPS` frame; rejected under a bounded `ROWS` frame for GROUP/TIES and under a value-offset `RANGE` | use a `GROUPS` frame; never subtract the current row (wrong on NULL, empty remainder, inf) |
+| `x > ANY (subquery)`, `x >= ALL (subquery)` | **supported** — lowered to the exact three-valued answer (empty set, NULLs included), correlated or not | nothing; a row-valued `(a, b) > ALL (...)` is rejected — compare one column at a time |
 | `IN (subquery)` under `OR` | rejected — a semi-join drops the rows the `OR` keeps | write it as `EXISTS (SELECT 1 FROM s WHERE s.c = t.x)`, qualifying the outer column |
 | Non-column `PARTITION BY`/window `ORDER BY` | **supported** — a computed key is hoisted into a hidden column | nothing; `PARTITION BY date_trunc('month', ts)` works |
 | `INSERT … ON CONFLICT` / `RETURNING` | unsupported | `write.delta(..., merge_on=...)` |
@@ -184,7 +184,7 @@ rather than returning a wrong answer.
    assert batcher_rows == duck_rows
    ```
 
-   In-repo, mirror `tests/differential/conftest.py::assert_same` — a multiset comparison
+   In-repo, mirror `tests/_harness.py::assert_same` — a multiset comparison
    tolerant of int↔float, Decimal→float, and float rounding. Use `assert_same_ordered`
    when order is part of the contract.
 8. **Check the plan, then the clock.** `print(ported.explain())` to confirm predicates and

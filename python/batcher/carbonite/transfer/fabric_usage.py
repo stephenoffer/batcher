@@ -70,7 +70,7 @@ def fabric_usage(baseline: tuple, started_at: float) -> dict[str, float]:
         elapsed = time.monotonic() - started_at
         observed = sum(throughput_delta(baseline, port_counters(), elapsed).values())
         capable = fabric_bandwidth_gbps()
-    except Exception as exc:  # pragma: no cover - a diagnostic must never fail a shuffle
+    except Exception as exc:  # a diagnostic must never fail a shuffle
         note_suppressed("carbonite", "sample the fabric counters", exc)
         return {}
     out = {"fabric_gbps_observed": round(observed, 2), "fabric_gbps_capable": capable}
@@ -104,7 +104,7 @@ def rail_usage(baseline: tuple, started_at: float) -> dict:
     try:
         elapsed = time.monotonic() - started_at
         per_port = throughput_delta(baseline, port_counters(), elapsed)
-    except Exception as exc:  # pragma: no cover - a diagnostic must never fail a shuffle
+    except Exception as exc:  # a diagnostic must never fail a shuffle
         note_suppressed("carbonite", "sample the fabric counters per rail", exc)
         return {}
     # The rail set comes from the *baseline*, which lists every active port, not from the

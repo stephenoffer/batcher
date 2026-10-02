@@ -576,9 +576,12 @@ def test_bloom_present_key_does_not_empty_the_join():
 
 
 def test_bloom_absent_key_does_not_empty_a_left_join():
+    # The fact's `k = 7` may be mirrored onto the dimension, whose bloom then empties it --
+    # the null-extended input, which provably matches nothing. The join itself, which must
+    # return every fact row, is what may never be emptied (see `_result_is_empty`).
     ds = _fact().filter(col("k") == 7).join(_dim(), on="k", how="left")
     dim = _kstat(bloom=_bloom_bytes([1, 2, 9]), **_DIM_RANGE)
-    assert not _is_empty(_rewrite(ds, [None, dim]))
+    assert not _result_is_empty(_rewrite(ds, [None, dim]))
 
 
 # --- dedup_source_predicates -----------------------------------------------------

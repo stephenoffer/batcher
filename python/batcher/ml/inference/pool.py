@@ -6,11 +6,10 @@ GPU context) loaded **once per worker** and reused across batches. `InferencePoo
 does that — a fixed pool of workers, each built once from a factory, fed
 dynamically-sized batches and run concurrently while preserving input order.
 
-This is the control-plane orchestration twin of the native-pipeline primitives in
-the Rust `bc-udf` crate (`OpaqueOperator`/`Rebatcher`/`BatchSizeController`): the
-same dynamic-batching idea, applied here over whole Arrow batches for the
-actor-pool path. Workers receive whole `pyarrow.RecordBatch`es — never per-row
-Python — so the control plane never touches a tuple in the hot path.
+Batching is dynamic: a latency PID retunes the batch size between calls, applied
+over whole Arrow batches for the actor-pool path. Workers receive whole
+`pyarrow.RecordBatch`es — never per-row Python — so the control plane never touches
+a tuple in the hot path.
 """
 
 from __future__ import annotations
@@ -266,15 +265,17 @@ class _DynamicBatcher:
 
 
 class _LatencyController:
-    """PID over relative latency error → target batch rows (port of bc-udf's
-    `BatchSizeController`; scale-free, anti-windup, bounds-clamped)."""
+    """PID over relative latency error → target batch rows.
+
+    Scale-free, anti-windup, and bounds-clamped.
+    """
 
     def __init__(self, target_ms: float, min_rows: int, max_rows: int, initial: int) -> None:
         self._target = target_ms
         self._min = max(1, min_rows)
         self._max = max(self._min, max_rows)
         self._cur = float(min(max(initial, self._min), self._max))
-        self._pid = active_config().pid  # gains/clamps shared with bc-udf
+        self._pid = active_config().pid  # gains/clamps from the shared PIDConfig
         self._integral = 0.0
         self._prev = 0.0
 

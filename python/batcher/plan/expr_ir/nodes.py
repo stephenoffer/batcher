@@ -126,10 +126,16 @@ class CaseBuilder:
         if not self._branches:
             raise PlanError("a CASE needs at least one when(...).then(...) branch")
         otherwise = None if self._otherwise is None else _wrap(self._otherwise)
-        values = [v for _c, v in self._branches] + [otherwise]
+        # An *untyped* NULL (`lit(None)`, SQL's bare `NULL`) is Int64 in the IR, which made
+        # `CASE WHEN c THEN NULL ELSE TRUE END` an Int64 column of 1/0, and a string or date
+        # sibling a type error. It is read as "no value" here, so it takes the type of the
+        # other branches exactly as `then(None)` does.
+        otherwise = None if _is_untyped_null(otherwise) else otherwise
+        branch_values = [(c, None if _is_untyped_null(v) else v) for c, v in self._branches]
+        values = [v for _c, v in branch_values] + [otherwise]
         witness = next((v for v in values if v is not None), None)
         null = NullIf(witness, witness) if witness is not None else NullIf(Lit(1), Lit(1))
-        branches = [(c, null if v is None else v) for c, v in self._branches]
+        branches = [(c, null if v is None else v) for c, v in branch_values]
         return Case(branches, null if otherwise is None else otherwise)
 
     def to_ir(self) -> dict[str, Any]:
@@ -141,6 +147,18 @@ class CaseBuilder:
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self._finish(), name)
+
+
+def _is_untyped_null(value: Expr | None) -> bool:
+    """Whether `value` is the IR's untyped NULL, ``nullif(1, 1)`` as `constructors.null` builds.
+
+    A NULL the caller typed (``lit(None, dtype=...)``, ``CAST(NULL AS ...)``) is a `Cast`
+    around it and is left alone.
+    """
+    if not isinstance(value, NullIf):
+        return False
+    sides = (value.left, value.right)
+    return all(isinstance(s, Lit) and type(s.value) is int and s.value == 1 for s in sides)
 
 
 def _forward_to_case(name: str) -> Callable[..., Any]:

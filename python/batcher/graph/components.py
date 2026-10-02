@@ -87,7 +87,10 @@ def connected_components(g: Graph, *, max_iterations: int | None = None) -> Data
     def step(labels: Dataset) -> Dataset:
         # Every node offers its label to its neighbours; each node takes the smallest of
         # what it is offered and what it already holds.
-        offered = (
+        # Materialized, like `hooked` below: each is one row per node, as the labels are,
+        # and an aggregate beneath the join that merges them is a breaker under a breaker,
+        # which a cluster cannot run as one plan.
+        offered = checkpoint(
             undirected.edges.join(
                 labels.select(**{SRC: bt.col(NODE), "_l": bt.col("component")}),
                 on=SRC,
@@ -97,16 +100,33 @@ def connected_components(g: Graph, *, max_iterations: int | None = None) -> Data
             .group_by(NODE)
             .agg(_l=bt.min("_l"))
         )
+        # Hooking: the node that *is* u's label is offered the smallest label among u's
+        # neighbours. Without it a label improves only by walking one hop per round, so
+        # the round count tracks how the ids happen to be laid out along the graph (a
+        # shuffled 300-node path took 79 to 134 rounds against 11 in order). The offer is
+        # safe for the same reason the jump is: u's label names a node in u's component,
+        # and so does every neighbour's label.
+        hooked = checkpoint(
+            labels.join(offered, on=NODE, how="inner")
+            .filter(bt.col("_l") < bt.col("component"))
+            .select(**{NODE: bt.col("component"), "_h": bt.col("_l")})
+            .group_by(NODE)
+            .agg(_h=bt.min("_h"))
+        )
         jumped = labels.select(component=bt.col(NODE), _j=bt.col("component"))
         own = bt.col("component")
         return (
             labels.join(offered, on=NODE, how="left")
             .join(jumped, on="component", how="left")
+            .join(hooked, on=NODE, how="left")
             .select(
                 **{
                     NODE: bt.col(NODE),
                     "component": bt.least(
-                        own, bt.coalesce(bt.col("_l"), own), bt.coalesce(bt.col("_j"), own)
+                        own,
+                        bt.coalesce(bt.col("_l"), own),
+                        bt.coalesce(bt.col("_j"), own),
+                        bt.coalesce(bt.col("_h"), own),
                     ),
                 }
             )

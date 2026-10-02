@@ -1,13 +1,12 @@
 """Output types for the multimodal expressions, where the shape is in the arguments.
 
-Split from `infer` on a responsibility seam that file was about to cross: the scalar
-inference there answers "what type does this arithmetic produce", while these answer "how
-big is a decoded frame", which is a *sizing* question that happens to be phrased as a type.
+Kept apart from `infer` on a responsibility seam: the scalar inference there answers "what
+type does this arithmetic produce", while these answer "how big is a decoded frame", which is
+a *sizing* question that happens to be phrased as a type.
 
-Every image expression used to infer as `None`. That reads as harmless, since `None` means
-"fall back" -- but the fallback for a width is a flat 64-byte prior, and these are the widest
-columns the engine ever holds. A decode pipeline lives entirely in derived columns, so the
-fallback applied to all of it.
+Returning `None` here is not harmless even though `None` means "fall back": the fallback for
+a width is a flat 64-byte prior, and these are the widest columns the engine ever holds. A
+decode pipeline lives entirely in derived columns, so the fallback would apply to all of it.
 """
 
 from __future__ import annotations
@@ -94,19 +93,11 @@ _IMAGE_MEAN_COLOR = _header(("r", pa.float64()), ("g", pa.float64()), ("b", pa.f
 def imagefunc_type(expr: ImageFunc) -> pa.DataType | None:
     """The Arrow type an `.image.*` expression produces, or `None` when not certain.
 
-    Every image expression previously inferred as `None`, which sounds harmless -- `None`
-    means "fall back" -- but the fallback for a *width* is a flat 64-byte prior, and these
-    are the widest columns the engine ever holds. Measured on a real decode pipeline:
-    `select("id", "img")` after `.image.to_tensor(224, 224)` was costed at **16 bytes per
-    row against a true 150,536**, and `select("img")` at 64 against 150,528. That is the
-    ordinary shape of every image workload -- decode, then drop the compressed bytes -- and
-    it was mis-sized by four orders of magnitude, in the direction that under-provisions the
-    memory envelope and makes a build side look broadcastable.
-
-    This is the same blind spot as an extension type hiding its storage from
-    `plan.types.widths`, one step further down the plan: there the *source* column's type
-    was unreadable, here the *derived* column's is, and a decode pipeline lives entirely in
-    derived columns.
+    An untyped result falls back to a flat 64-byte width prior, while `select("img")` after
+    `.image.to_tensor(224, 224)` is 150,528 bytes per row -- the ordinary shape of every image
+    workload (decode, then drop the compressed bytes). Mis-sizing it by four orders of
+    magnitude under-provisions the memory envelope and makes a build side look broadcastable,
+    so every mapping that is certain is stated here.
 
     Nothing here is inferred from a name. Each mapping was read off the engine's actual
     output: `to_tensor(w, h)` yields `fixed_shape_tensor(uint8, [h, w, 3])`, `to_tensor_f32`
@@ -119,11 +110,10 @@ def imagefunc_type(expr: ImageFunc) -> pa.DataType | None:
     `resize`/`crop`/`encode`/`convert`/`auto_orient` a still-encoded `binary`, and `decode`
     the header struct the kernel declares.
 
-    `decode` used to be left `None` on the grounds that a handful of header bytes is not
-    worth typing. That reasoning measured the wrong cost: a projection's
-    `available_schema` is all-or-nothing, so a single untyped column discards the resolved
-    type of *every column beside it*. One `.image.decode()` was enough to throw away the
-    `fixed_shape_tensor` width this function exists to compute.
+    `decode` is typed although its header struct is only a handful of bytes, because a
+    projection's `available_schema` is all-or-nothing: a single untyped column discards the
+    resolved type of *every column beside it*, including the `fixed_shape_tensor` width this
+    function exists to compute.
 
     Args:
         expr: The `ImageFunc` node to type.

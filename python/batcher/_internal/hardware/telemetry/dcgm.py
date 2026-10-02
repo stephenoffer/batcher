@@ -43,10 +43,8 @@ from dataclasses import dataclass
 __all__ = [
     "PROFILING_FIELDS",
     "DcgmProfile",
-    "dcgm_available",
     "device_profiles",
     "reset_dcgm_probe",
-    "tensor_cores_idle",
 ]
 
 #: The profiling fields worth collecting, as `(dcgm_fields attribute name, record field)`. Read
@@ -71,12 +69,6 @@ PROFILING_FIELDS: tuple[tuple[str, str], ...] = (
 #: more resolution, it gets the same resolution with more overhead on every process using the
 #: device.
 _UPDATE_US = 1_000_000
-
-#: Tensor-pipe activity below which a half-precision stage is treated as not using the tensor
-#: cores at all. Deliberately very low: any real tensor-core kernel is orders of magnitude above
-#: this, so the threshold separates "not using them" from "using them poorly" rather than
-#: grading how well.
-_TENSOR_IDLE = 0.01
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,16 +125,6 @@ class DcgmProfile:
         """
         return self.sm_active > 0.5 and self.sm_occupancy < 0.3
 
-    @property
-    def compute_pipe_active(self) -> float:
-        """The busiest arithmetic pipe's activity, in [0, 1].
-
-        Taken as the maximum rather than the sum because the pipes are alternative issue paths
-        for the same scheduler: a kernel is FP32 or tensor, and adding the two would report a
-        device above 100% for doing exactly one thing.
-        """
-        return max(self.tensor_active, self.fp32_active, self.fp64_active)
-
 
 @functools.lru_cache(maxsize=1)
 def _dcgm():
@@ -194,16 +176,6 @@ def _watched():
         return (handle, group, field_group, tuple(names), tuple(ids))
     except Exception:
         return None
-
-
-def dcgm_available() -> bool:
-    """Whether hardware performance counters can be read on this host.
-
-    Returns:
-        True when the DCGM bindings imported and the embedded engine started. False in every
-        runtime container that did not install DCGM, which is the common case and not a fault.
-    """
-    return _watched() is not None
 
 
 def reset_dcgm_probe() -> None:
@@ -288,27 +260,3 @@ def device_profiles() -> tuple[DcgmProfile, ...]:
             )
         )
     return tuple(out)
-
-
-def tensor_cores_idle(
-    profiles: tuple[DcgmProfile, ...] | None = None,
-) -> tuple[DcgmProfile, ...]:
-    """Devices doing arithmetic without touching their tensor cores, in device order.
-
-    The check to run once after selecting a half-precision dtype, because selecting one and
-    getting one are different events. A model loaded in BF16 whose kernels never reach the
-    tensor pipes is paying the precision cost of half and getting none of the throughput, and
-    nothing else reports it: utilization is high, memory is right, and the run is simply slower
-    than it should be by a factor no timing explains.
-
-    Args:
-        profiles: Records to inspect, or `None` to read them live.
-
-    Returns:
-        Devices with meaningful SM activity and effectively no tensor-pipe activity. Empty when
-        DCGM is unavailable, so this is evidence of a problem only where `dcgm_available` holds.
-    """
-    records = device_profiles() if profiles is None else profiles
-    return tuple(
-        p for p in records if p.readable and p.sm_active > 0.2 and p.tensor_active < _TENSOR_IDLE
-    )

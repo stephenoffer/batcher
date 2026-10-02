@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import batcher as bt
+from _ray_cluster import local_ray_resources
 from batcher import col
 
 pytestmark = pytest.mark.integration
@@ -59,6 +60,14 @@ def cluster(tmp_path_factory):
     # tests never ran once. Registering by value makes the worker deserialize the function
     # body instead of importing it.
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
+    # An earlier module's `collect(distributed=True)` connects this driver to Ray and leaves
+    # it connected, and a second `ray.init` then raises "called ray.init twice". Releasing
+    # that connection first is what makes the module order-independent: `shutdown` only
+    # detaches this driver (and stops a local instance it started), never a shared cluster.
+    if ray.is_initialized():
+        ray.shutdown()
+    resources = local_ray_resources()
+    resources.__enter__()
     ray.init(
         address="local",
         num_cpus=4,
@@ -89,6 +98,7 @@ def cluster(tmp_path_factory):
     finally:
         cloudpickle.unregister_pickle_by_value(sys.modules[__name__])
         ray.shutdown()
+        resources.__exit__(None, None, None)
         if prior_address is not None:
             os.environ["RAY_ADDRESS"] = prior_address
 

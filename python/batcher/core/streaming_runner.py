@@ -31,6 +31,8 @@ import pyarrow as pa
 if TYPE_CHECKING:
     from batcher.core.streaming_query import MicroBatchProcessor
     from batcher.io.source import Source
+    from batcher.plan.streaming import StateOperatorProgress
+    from batcher.plan.streaming.driver_stats import DriverStats
 
 __all__ = ["DriverRunner", "LocalRunner", "MicroBatchRunner"]
 
@@ -220,7 +222,12 @@ class LocalRunner:
 
         Concatenating first is also the cheaper spelling: one table, one write, one commit.
         """
-        rows = [b for b in self._processor.process(staged) if b.num_rows]
+        out = self._processor.process(staged)
+        rows = [b for b in out if b.num_rows]
+        if not rows and out and getattr(self._processor, "replaces_output", False):
+            # An emptied `complete` snapshot is still the answer: write it, typed, so the
+            # sink replaces what it held rather than keeping the previous trigger's rows.
+            rows = out[:1]
         emitted = sum(b.num_rows for b in rows)
         self._last_token = None
         if rows:
@@ -355,12 +362,17 @@ class DriverRunner:
     `checkpoint=` rather than accepting one that would silently restart from scratch.
     """
 
-    __slots__ = ("_batches", "_last_token", "_sink")
+    __slots__ = ("_batches", "_last_token", "_sink", "_stats")
 
-    def __init__(self, batches: Iterator[pa.RecordBatch], sink: Any) -> None:
+    def __init__(
+        self, batches: Iterator[pa.RecordBatch], sink: Any, stats: DriverStats | None = None
+    ) -> None:
         self._batches = batches
         self._sink = sink
         self._last_token: str | None = None
+        # What the driver read and holds, reported through the source read path and each
+        # driver operator (`plan.streaming.driver_stats`). None reports emitted rows only.
+        self._stats = stats
 
     def stage(self, batch_id: int) -> pa.RecordBatch | None:  # noqa: ARG002
         """The driver's next output batch, or None once it has finished.
@@ -375,13 +387,19 @@ class DriverRunner:
         return {}
 
     def publish(self, batch_id: int, staged: pa.RecordBatch) -> tuple[int, int]:
-        """Write the driver's batch to the sink.
+        """Write the driver's batch to the sink; report rows read and rows written.
 
-        Input and output rows are the same number: the driver consumed its inputs
-        internally, so the count the runner can honestly report is what it emitted.
+        The rows read are what the driver pulled from its unbounded sources since the last
+        publish. It used to report its *output* as its input, so a join that matched one
+        row in ten thousand said it had read one.
         """
         self._last_token = self._sink.write_batch(batch_id, pa.Table.from_batches([staged]))
-        return staged.num_rows, staged.num_rows
+        read = staged.num_rows if self._stats is None else self._stats.take_source_rows()
+        return read, staged.num_rows
+
+    def state_metrics(self) -> tuple[StateOperatorProgress, ...]:
+        """The driver operators' retained state: join buffers, open sessions, seen keys."""
+        return () if self._stats is None else self._stats.operators()
 
     def last_sink_token(self) -> str | None:
         """What the sink reported writing for the epoch just published."""

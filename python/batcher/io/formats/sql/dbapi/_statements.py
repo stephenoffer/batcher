@@ -65,8 +65,6 @@ __all__ = [
 #: not a PEP 249 driver, and is refused rather than guessed at.
 PARAMSTYLES = frozenset({"qmark", "numeric", "format", "pyformat", "named"})
 
-#: Styles that bind a *sequence* per row; the rest bind a mapping.
-_POSITIONAL_STYLES = frozenset({"qmark", "numeric", "format"})
 
 #: Dialects spelling an upsert ``INSERT … ON CONFLICT (key) DO UPDATE SET …``.
 #:

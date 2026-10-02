@@ -20,6 +20,7 @@ import os
 
 import pyarrow as pa
 
+from batcher.io.formats.streaming.checkpoint.identity import CheckpointOwner
 from batcher.io.formats.streaming.checkpoint.location import is_local_location
 from batcher.io.formats.streaming.checkpoint.state_store import StateStore
 
@@ -33,7 +34,7 @@ _PRUNE_EVERY = 64
 class CheckpointStore:
     """Bundles the three checkpoint logs for one streaming query."""
 
-    __slots__ = ("_dir", "_pruned_through", "commits", "offsets", "state")
+    __slots__ = ("_dir", "_owner", "_pruned_through", "commits", "offsets", "state")
 
     def __init__(self, location: str) -> None:
         self._dir = location
@@ -57,13 +58,39 @@ class CheckpointStore:
             self.commits = FileCommitLog(f"{root}/commits")
             self.state = StateStore(f"{root}/state")
         self._pruned_through = 0
+        self._owner: CheckpointOwner | None = None
 
     @property
     def location(self) -> str:
         return self._dir
 
+    def claim(self, fingerprint: str | None, *, stateful: bool) -> None:
+        """Take this checkpoint for one running query, bound to the plan that runs it.
+
+        A launcher calls this once, before recovery. It is separate from construction so a
+        store opened only to *read* a checkpoint (recovery tooling, a test) takes no lease.
+        See `identity.CheckpointOwner` for the lease, the fence, and the plan check.
+
+        Args:
+            fingerprint: The plan's content fingerprint (``None`` when not computable).
+            stateful: Whether the query restores running state from this checkpoint.
+        """
+        owner = CheckpointOwner(self._dir)
+        try:
+            owner.bind_plan(
+                fingerprint,
+                stateful=stateful,
+                has_history=self.commits.last_committed() is not None,
+            )
+        except BaseException:
+            owner.release()
+            raise
+        self._owner = owner
+
     def record_offsets(self, batch_id: int, positions: dict[int, dict]) -> None:
         """Write-ahead: record each source's position for `batch_id`."""
+        if self._owner is not None:
+            self._owner.verify()
         for source_id, position in positions.items():
             self.offsets.record(batch_id, source_id, position)
 
@@ -79,6 +106,8 @@ class CheckpointStore:
 
     def commit(self, batch_id: int, sink_token: str | None = None) -> None:
         """Mark `batch_id` durably done (the last step of the micro-batch)."""
+        if self._owner is not None:
+            self._owner.verify()
         self.commits.commit(batch_id, sink_token)
 
     def prune_state(self, keep_through: int) -> None:
@@ -115,3 +144,6 @@ class CheckpointStore:
     def close(self) -> None:
         self.offsets.close()
         self.commits.close()
+        if self._owner is not None:
+            self._owner.release()
+            self._owner = None

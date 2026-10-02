@@ -28,8 +28,9 @@ same-day pair.
 * **TPC-H sf10 (60M-row `lineitem`) is no longer a loss.** 1.087x → **0.963x**, suite total
   2,938 → 2,323 ms, carried per query rather than by a geomean: q9 456 → 233 ms, q13 325 → 174,
   q5 189 → 122, q3 116 → 87, q4 117 → 96, q10 158 → 139. The `≥100M rows` row keeps its **L**
-  on the sf100 evidence — 600M rows still OOMs q3/q4/q5 and that is untested here — but the
-  sentence locating the boundary *at sf10* is retired.
+  on the sf100 evidence — 1.75x DuckDB at 600M rows as of 2026-09-25 (the q3/q4/q5 OOM this
+  sentence used to cite is retired; see `TPCH_FINDINGS.md`) — but the sentence locating the
+  boundary *at sf10* is retired.
 
 * **JOB moves further than any other suite: 1.265x → 1.112x, and Batcher's total drops below
   DuckDB's** (8,131 ms against 8,885). The geomean stays above 1 because it wins the large
@@ -107,8 +108,9 @@ day and 1.51x a week before), ClickBench (0.62x, 30 of 43), JSON (0.25x), the op
 is confirmed:
 
 * **Single-node ≤10M rows (vs DuckDB): W** — confirmed, and by more than recorded.
-* **Single-node ≥100M rows (vs DuckDB): L** — still L on the sf100 evidence (600M rows, where
-  q3/q4/q5 OOM), but **the sf10 half of this row is retired**: TPC-H at sf10 (60M-row
+* **Single-node ≥100M rows (vs DuckDB): L** — still L on the sf100 evidence (600M rows, 1.75x
+  DuckDB's geomean on 2026-09-25; the q3/q4/q5 OOM once cited here is retired), but **the sf10
+  half of this row is retired**: TPC-H at sf10 (60M-row
   `lineitem`) is a **win** as of 2026-08-25, 0.963x against 1.087x on the same day's `HEAD`.
   The sentence below recorded it as a loss and is kept for the history of the number.
   Nine of thirteen shapes still scale *sublinearly* from sf1 to sf10; four do not (q5 14.9x,
@@ -284,7 +286,7 @@ Legend: **W** Batcher wins architecturally · **=** parity · **L** Batcher lose
 |---|---|---|---|---|---|---|
 | Small-query latency | **= on a repeated shape** (2x faster), **L on a first-seen one** (2.8x slower — 8 ms of optimizer, twice; ceiling 8) | = | **W** | — | **W** | **W** |
 | Single-node ≤10M rows | **W** | **W** | **W** | — | **W** | — |
-| Single-node ≥100M rows | **L** (2–11×, **OOM** on q3/q4/q5 at sf100) — but the boundary is **above sf10** as of 2026-08-25: 60M-row TPC-H is **0.963x, a win** | **L** on 6 shapes | — | — | **W** | — |
+| Single-node ≥100M rows | **L** — TPC-H sf100 is **1.75x** DuckDB's geomean (1.08x–4.03x per query, every query completing; 64 vCPU, 2026-09-25, from 3.53x the same morning), and the boundary is **above sf10** as of 2026-08-25: 60M-row TPC-H is **0.963x, a win** | **L** on 6 shapes | — | — | **W** | — |
 | Distributed batch | **W** | **W** | = | — | **W** (50–450×) | L |
 | Optimizer breadth | = (722 rules, bushy DP join order) | **W** | **W** | — | **W** | L |
 | Range / inequality joins | **W below 1M** (2.6–3.0x at 10K–100K, 1.5x at 500K), **= at 1M**, **L above** (0.73x at 2M, 0.44x at 5M); **W against a right side under 32 rows at any left size** (6M x 6: 1.12x) — ceiling 7 | — | — | — | — | — |
@@ -630,10 +632,12 @@ then "exactly one caller"; both are out of date):
   exactly the small clusters it was testable on. The regeneration is now skipped when a copy
   survives on a live peer (at most once per source, so an unreachable replica still falls
   through to a recompute rather than exhausting the attempt budget).
-- `DistributedConfig.shuffle_replication` still defaults to **1**, rising to 2 under the
-  `spot` resilience profile — an on-demand cluster pays no copy.
+- `DistributedConfig.shuffle_replication` defaults to **1**, and no profile raises it any
+  more: above 1, a worker loss can drop that worker's share of the rows rather than fail
+  (`tests/integration/test_shuffle_replication.py`, reproduced on a 3-node cluster
+  2026-09-23), while replication off recovers exactly. The `spot` profile used to set 2.
 
-So on a spot cluster you now get re-fetch recovery for every shuffle. What is still missing
+So re-fetch recovery exists but is not safe to turn on; a spot cluster recomputes. What is still missing
 is the rest of the durability half: there is no external shuffle service, so a bucket cannot
 outlive its worker except by replication, and inside the combiner tree only the leaf partials
 are copied — an interior combiner's output lives on one node, so a loss there still costs a
@@ -1176,9 +1180,12 @@ These are asserted in the repo and contradicted by its own code.
    Same mechanism, same granularity as AQE. It is also **off below a size floor**
    (`_ADAPTIVE_MIN_ROWS_PER_STAGE`, 5M input rows for each pipeline breaker the loop would
    cut at — about 10M for the simplest joined shape), so most queries never touch it.
-   *Defensible replacement:* "stage-boundary re-optimization like Spark AQE, but available
-   single-node too, **plus** a sketch-backed cross-query learned-stats and bandit loop that
-   neither DuckDB nor Spark has." That is true, and still interesting.
+   *Defensible replacement:* "stage-boundary re-optimization like Spark AQE, **plus** a
+   sketch-backed cross-query learned-stats and bandit loop that neither DuckDB nor Spark has."
+   An earlier version said "but available single-node too", which does not separate the two:
+   AQE is on by default since Spark 3.2 and re-plans at shuffle-exchange stages in `local[*]`
+   mode as well. What single-node adds for Batcher is that the loop runs in-process, not in a
+   JVM beside it.
 2. **`BENCHMARK_RESULTS.md`: "beats DuckDB's execution engine on every TPC-H query" (21/21).**
    True only against `duckdb_arrow` — DuckDB forced through an Arrow scan, which strips its zone
    maps, compression *and* dictionary encoding, and the scan cost lands inside the timed region.

@@ -17,6 +17,7 @@ manifest count (exact — may answer `count()`) and an estimate such as Postgres
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import threading
 import uuid
@@ -31,6 +32,7 @@ __all__ = [
     "SourceStatistics",
     "content_version",
     "declared",
+    "derivation_key",
     "source_identity",
     "source_stats_key",
     "stable_source_key",
@@ -60,7 +62,7 @@ def declared(source: object, fact: str) -> Any | None:
         return None
     try:
         return method()
-    except Exception:  # pragma: no cover - a source that cannot answer for itself
+    except Exception:  # a source that cannot answer for itself
         return None
 
 
@@ -191,6 +193,42 @@ def stable_source_key(source: object) -> str:
     return source_stats_key(source) or ""
 
 
+def derivation_key(target: Any, sources: list[Any]) -> str | None:
+    """A name for *how* an engine-derived intermediate was derived, or `None` if it has none.
+
+    The relation lives for one execution, so it is `ephemeral` — but the next execution of the
+    same query derives the identical relation from the identical inputs, and this string says
+    so: the subplan's own content key over the data-stable keys of the sources it reads. That
+    is what lets `kyber.plan_cache` memoize a plan built *over* the intermediate, which is
+    otherwise the one optimize a repeated query can never skip. `api.subplan_reuse` names a
+    shared subplan's result with it (TPC-DS q77 re-planned its second half on every execution),
+    and `api.adaptive.staging` a stage's (TPC-H q7 at sf10 spent 30 ms of its ~110 re-planning
+    the stage above its first breaker, every run).
+
+    `None` — no caching, exactly as before — when any input cannot key itself, because then
+    two different relations could produce the same name. The safe direction is the one that
+    re-plans.
+
+    Args:
+        target: The logical subplan whose result the intermediate holds.
+        sources: The sources the subplan's scans index into.
+
+    Returns:
+        A stable digest naming the derivation, or `None`.
+    """
+    from batcher.plan.visitor import scanned_source_ids
+
+    parts = [target.content_key()]
+    for sid in sorted(scanned_source_ids(target)):
+        if sid >= len(sources):
+            return None
+        key = source_stats_key(sources[sid])
+        if key is None:
+            return None
+        parts.append(f"{sid}={key}")
+    return hashlib.blake2b("|".join(parts).encode(), digest_size=16).hexdigest()
+
+
 def source_stats_key(source: object) -> str | None:
     """The key a source's *statistics* are stored under, or `None` if it has none.
 
@@ -231,7 +269,7 @@ def source_stats_key(source: object) -> str | None:
     # A relation the engine *derived* names how it was derived. That string is data-stable in
     # the only sense that matters here — re-running the same subplan over the same inputs
     # rebuilds the same rows — so what one run measures from it, the next run reads back, and
-    # a plan built over it can be memoized. Only `api.subplan_reuse` sets it.
+    # a plan built over it can be memoized. Set from `derivation_key` only.
     derivation = getattr(source, "derivation", None)
     if derivation:
         return f"{prefix}derived:{derivation}"
@@ -336,6 +374,15 @@ class SourceStatistics:
     # rescue it: pyarrow lists `RLE_DICTIONARY` for a plain integer column too. There is no
     # cheap footer route to a materialized width — measure it (`inmemory_stats`) or leave it.
     content_byte_size: bool = False
+    # Columns whose values never decrease in storage order, each on its own -- not a
+    # lexicographic ordering, so never a proof a `Sort` may be dropped on (`sorted_by` is
+    # that). What it licenses is estimation: two such columns move together, so a predicate
+    # keeping a contiguous run of one keeps a contiguous run of the other, and the estimator
+    # narrows the second's bounds and distinct count to match (`kyber.stats.comonotone`). A
+    # date dimension is the everyday case: `d_date_sk`, `d_date`, `d_week_seq` and `d_year`
+    # all ascend together, and `d_year = 1999` keeps 52 weeks, not the 359 that treating the
+    # kept rows as a random sample of 10,436 weeks predicts.
+    ascending: tuple[str, ...] = ()
 
     def is_empty(self) -> bool:
         """True iff the source is known to contain zero rows."""
@@ -362,6 +409,7 @@ class SourceStatistics:
             provenance=prov,
             columns=self._columns_for_reasoning(),
             sorted_by=as_sort_orders(self.sorted_by),
+            ascending=frozenset(self.ascending),
         )
 
     def _columns_for_reasoning(self) -> dict[str, ColumnStat]:

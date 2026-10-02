@@ -236,3 +236,59 @@ def test_iter_batches_agrees_with_the_sink_on_every_tail_shape(case):
     assert produced, "the streaming path emitted nothing at all"
     actual = _multiset(pa.Table.from_batches(produced, schema=produced[0].schema))
     assert actual == expected
+
+
+# --- a group that leaves the HAVING set --------------------------------------
+
+_CROSSING_SCHEMA = pa.schema([("k", pa.string()), ("v", pa.int64())])
+# `a` passes `s > 5` after the first batch (10) and fails it after the second (10 - 8 = 2);
+# `b` never passes. The final answer is therefore empty.
+_CROSSING = [
+    pa.record_batch({"k": ["a", "b"], "v": [10, 5]}, schema=_CROSSING_SCHEMA),
+    pa.record_batch({"k": ["a"], "v": [-8]}, schema=_CROSSING_SCHEMA),
+]
+
+
+def _crossing_query(ds):
+    return ds.group_by("k").agg(s=bt.col("v").sum()).filter(bt.col("s") > 5)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("tail", ["filter_only", "filter_then_select"])
+def test_a_complete_sink_drops_a_group_that_stops_satisfying_having(tail):
+    """An emptied `complete` snapshot replaces the sink rather than being skipped.
+
+    The runner used to drop an emission with no rows, so once the HAVING filter left
+    nothing the memory sink kept `a`'s earlier `s = 10`, a row `collect()` over the same
+    input does not return. With a select above the filter the empty snapshot must also
+    come back with the tail's columns, not the aggregate's.
+    """
+
+    def build(ds):
+        out = _crossing_query(ds)
+        return out.select("k") if tail == "filter_then_select" else out
+
+    expected = build(bt.from_arrow(pa.Table.from_batches(_CROSSING))).collect()
+    assert expected.num_rows == 0
+
+    sink = f"tail_crossing_{tail}"
+    stream = bt.from_batches(lambda: iter(_CROSSING), _CROSSING_SCHEMA, bounded=False)
+    build(stream).write.memory(
+        sink, trigger=bt.Trigger.available_now(), output_mode="complete"
+    ).await_termination()
+
+    got = bt.read_memory(sink).collect()
+    assert got.num_rows == 0, got.to_pydict()
+    assert got.column_names == expected.column_names
+
+
+@pytest.mark.integration
+def test_a_complete_sink_keeps_a_group_that_rejoins_having():
+    """The positive control: the same query whose last snapshot is non-empty is written."""
+    batches = [*_CROSSING, pa.record_batch({"k": ["a"], "v": [7]}, schema=_CROSSING_SCHEMA)]
+    stream = bt.from_batches(lambda: iter(batches), _CROSSING_SCHEMA, bounded=False)
+    _crossing_query(stream).write.memory(
+        "tail_rejoin", trigger=bt.Trigger.available_now(), output_mode="complete"
+    ).await_termination()
+
+    assert bt.read_memory("tail_rejoin").collect().to_pydict() == {"k": ["a"], "s": [9]}

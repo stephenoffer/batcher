@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, AsArray};
+use arrow::array::{make_array, ArrayData, ArrayRef, AsArray};
 use arrow::datatypes::{DataType, Float32Type, Float64Type};
 
 /// Bits of the one canonical quiet NaN every NaN folds to.
@@ -159,6 +159,61 @@ pub fn needs_canon_f32(v: f32) -> bool {
     v.is_nan() || v.to_bits() == 0x8000_0000
 }
 
+/// [`canon_float_array`] applied at every depth of a nested array.
+///
+/// A list, struct or map compared through Arrow's `make_comparator` ranks its float leaves
+/// on the raw-bit total order, so `[-0.0] = [0.0]` came out false and a negative NaN inside
+/// a list ranked below `-inf`. DuckDB compares nested values element-wise under the same
+/// float identity as a scalar `=`, so the leaves are canonicalized first. Validity, offsets
+/// and every non-float leaf are shared, not copied; an array with no float leaf, or one
+/// whose float leaves need no rewrite, is returned as it came in.
+#[must_use]
+pub fn canon_float_nested(a: &ArrayRef) -> ArrayRef {
+    if !has_float_leaf(a.data_type()) {
+        return Arc::clone(a);
+    }
+    if !a.data_type().is_nested() {
+        return canon_float_array(a);
+    }
+    let data = a.to_data();
+    let mut changed = false;
+    let children: Vec<ArrayData> = data
+        .child_data()
+        .iter()
+        .map(|child| {
+            let child = make_array(child.clone());
+            let canon = canon_float_nested(&child);
+            changed |= !Arc::ptr_eq(&child, &canon);
+            canon.to_data()
+        })
+        .collect();
+    if !changed {
+        return Arc::clone(a);
+    }
+    // Same type, lengths, offsets and buffers; only the children's float values differ,
+    // so the rebuilt array satisfies every invariant the original did and `build` cannot
+    // refuse it. Were it ever to, the raw array is still a valid (bit-order) operand.
+    match data.into_builder().child_data(children).build() {
+        Ok(rebuilt) => make_array(rebuilt),
+        Err(_) => Arc::clone(a),
+    }
+}
+
+/// Whether a float type occurs anywhere in `dt`.
+fn has_float_leaf(dt: &DataType) -> bool {
+    match dt {
+        DataType::Float64 | DataType::Float32 => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::ListView(f)
+        | DataType::LargeListView(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => has_float_leaf(f.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| has_float_leaf(f.data_type())),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +317,60 @@ mod tests {
         for v in awkward() {
             assert_eq!(canon_f64_bits(canon_f64(v)), canon_f64_bits(v), "{v:?}");
         }
+    }
+
+    /// Float leaves are canonicalized at every depth; the shape and non-float leaves are not.
+    #[test]
+    fn nested_float_leaves_are_canonicalized() {
+        use arrow::array::{Array, Float64Array, Int64Array, ListArray, StructArray};
+        use arrow::datatypes::Field;
+
+        let neg_nan = f64::from_bits(0xfff8_0000_0000_0001);
+        let list: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(-0.0), Some(neg_nan)]),
+            None,
+        ]));
+        let out = canon_float_nested(&list);
+        let values = out
+            .as_list::<i32>()
+            .values()
+            .as_primitive::<Float64Type>()
+            .clone();
+        assert_eq!(values.value(0).to_bits(), 0);
+        assert_eq!(values.value(1).to_bits(), CANONICAL_NAN_BITS_F64);
+        assert!(out.is_null(1));
+
+        let s: ArrayRef = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("f", DataType::Float64, true)),
+                Arc::new(Float64Array::from(vec![-0.0])) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("i", DataType::Int64, true)),
+                Arc::new(Int64Array::from(vec![7])) as ArrayRef,
+            ),
+        ]));
+        let out = canon_float_nested(&s);
+        let f = out
+            .as_struct()
+            .column(0)
+            .as_primitive::<Float64Type>()
+            .value(0);
+        assert_eq!(f.to_bits(), 0);
+        assert_eq!(
+            out.as_struct()
+                .column(1)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .value(0),
+            7
+        );
+
+        // No float leaf: the very same array comes back.
+        let ints: ArrayRef = Arc::new(ListArray::from_iter_primitive::<
+            arrow::datatypes::Int64Type,
+            _,
+            _,
+        >(vec![Some(vec![Some(1)])]));
+        assert!(Arc::ptr_eq(&canon_float_nested(&ints), &ints));
     }
 }

@@ -167,12 +167,12 @@ def _null_if_empty(counts, reduced):
     an `all` is not `True`. Both dataframe libraries return the operator's identity instead,
     which reads as a real measurement.
 
-    pandas spells the fix `min_count=1`, and that is what this used to pass — but **cuDF has no
-    `min_count`**, and raises `NotImplementedError` for it on every reduction that takes one.
-    So the one parameter that made `sum` correct was also the one that made `sum` impossible on
-    a device, and since `sum` is in essentially every analytical query, the GPU backend declined
-    essentially every analytical query and fell back to the host. It cost the whole path, and it
-    was invisible from here because the verification backend is pandas, where `min_count` works.
+    pandas spells the fix `min_count=1`, but **cuDF has no `min_count`**, and raises
+    `NotImplementedError` for it on every reduction that takes one. Passing it would make `sum`
+    impossible on a device, and since `sum` is in essentially every analytical query, the GPU
+    backend would decline essentially every analytical query and fall back to the host — a
+    failure invisible from here, because the verification backend is pandas, where
+    `min_count` works.
 
     Counting and masking is the same answer through an operation both libraries have. It is
     what the boolean folds already did, for the same reason — they never had a `min_count` to
@@ -208,10 +208,10 @@ def _as_int64(reduced, be: DfBackend):
 #: The `GroupBy` methods each reduction family needs. A reduction that needs an empty group
 #: nulled needs `count` beside its own fold, which is why several map to two.
 #:
-#: This table is what makes the aggregate **one pass**. Every reduction used to be issued
-#: separately against the shared `GroupBy` — `grouped[c].sum()`, then `grouped[c].mean()`, and
-#: so on — and each of those is a full hash group-by over the shard on the device. TPC-H q1 has
-#: eight reductions plus two key labels, so a 10 M-row shard was grouped **ten times**: measured
+#: This table is what makes the aggregate **one pass**. Issuing each reduction separately
+#: against the shared `GroupBy` — `grouped[c].sum()`, then `grouped[c].mean()`, and so on — is a
+#: full hash group-by over the shard on the device per reduction. TPC-H q1 has eight reductions
+#: plus two key labels, so a 10 M-row shard would be grouped **ten times**: measured
 #: on a T4, 0.25 s of a 0.40 s shard, against 0.12 s to read the shard off storage and 0.03 s to
 #: filter it. Collected into one `agg` call they are one pass and cuDF fuses the reductions
 #: itself.
@@ -252,7 +252,7 @@ def _series_reader(grouped, fused):
             try:
                 return fused[(column, method)]
             except (KeyError, TypeError):
-                pass
+                pass  # this reduction was not in the fused frame; compute it from the group
         return _call(grouped[column], method)
 
     return read
@@ -360,9 +360,9 @@ def _materialize_inputs(df, ir: dict, be: DfBackend) -> list[str | None]:
     frame the grouping was taken over. `count_star` reads no column and gets `None`.
 
     Declines the four order statistics — `min`, `max`, `median`, `quantile` — over a
-    `NaN`-bearing column, and only those. The whole aggregate used to fall back for *any*
-    reduction over such a column, so a division by zero somewhere upstream cost the entire query
-    its device even when every reduction in it handles `NaN` exactly as the engine does.
+    `NaN`-bearing column, and only those. Falling the whole aggregate back for *any* reduction
+    over such a column would let a division by zero upstream cost the entire query its device
+    even when every reduction in it handles `NaN` exactly as the engine does.
     """
     out: list[str | None] = []
     for slot, spec in enumerate(ir["aggregates"]):

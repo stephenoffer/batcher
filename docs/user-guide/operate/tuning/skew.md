@@ -97,10 +97,7 @@ one accumulator, so a group with a billion rows costs the same state as a group 
 memory an aggregation needs scales with the number of *distinct* keys, which is what hash
 partitioning does split.
 
-The exception is an aggregate whose state is proportional to its input rather than constant:
-`array_agg` collects every value, and an exact `median` or `quantile` has to see the whole
-group. Those spill through the same grace machinery, and a single group larger than the
-envelope is the case that machinery cannot subdivide.
+The exception is an aggregate whose state is proportional to its input rather than constant. An exact `median`, `quantile` or distinct count over a group larger than the envelope is computed from an out-of-core sort of the group's values, streamed one group at a time, so no group's value list is held whole. `array_agg` is the one that stays bounded by its largest group, because its output *is* the whole list.
 
 ```python
 counts = facts.group_by("customer_id").agg(n=bt.col("amount").count()).collect()
@@ -119,17 +116,14 @@ When the left side fits the envelope, that is a single chunk and the join is the
 it has always been. Only a left side that genuinely exceeds the envelope pays for extra
 passes over the right side.
 
-The right side carries a global sort order and cannot be decomposed this way. A right side
-larger than the envelope raises `MemoryBudgetExceededError` naming the budget it needed,
-rather than letting the process be killed. Put the smaller relation on the right of a range
-join.
+A right side larger than the envelope is cut into chunks too, because a pair of rows matches on those two rows alone. Each right chunk is joined against every left chunk, and the rows an outer, semi or anti join emits unmatched are decided once, after every chunk that could have matched them. That costs one pass over the left side per right chunk, so putting the smaller relation on the right of a range join is still the cheaper shape.
 
 A right side of at most 32 rows over a large left one is cheaper still, because it needs no
 sort at all: the join compares each right row against the left key column directly. A bucket
 table, a set of price bands or a handful of date ranges is therefore the least expensive shape
 to join on, whatever the left side's size.
 
-Every operator that can't spill refuses the same way. `MemoryBudgetExceededError` is a {py:exc}`bt.ResourceError <batcher.ResourceError>`, so one `except bt.ResourceError` covers all of them:
+An operator that can't bound its memory refuses rather than risking the process. `MemoryBudgetExceededError` is a {py:exc}`bt.ResourceError <batcher.ResourceError>`, so one `except bt.ResourceError` covers all of them:
 
 ```python
 from batcher._internal.errors import MemoryBudgetExceededError
@@ -167,14 +161,9 @@ print(resolved.collect().num_rows)
 
 ## Requirements and limitations
 
-- A window function without `PARTITION BY` needs the whole relation ordered at once and
-  cannot spill. Over a configured envelope it raises rather than risking the process.
-- A single window partition larger than the envelope has the same ceiling. Partitioning by a
-  skewed key is the shape to avoid here, because re-partitioning cannot split one partition
-  and a ranking needs its partition whole.
-- An ASOF join without `by` keys needs one global order over both sides and cannot spill. With
-  `by` keys it partitions and spills like an equi join.
-- A range join holds its right side whole. Only its left side is decomposed.
+- A window without `PARTITION BY`, or a single window partition larger than the envelope, streams over an out-of-core sort when every function is `row_number`, `rank`, `dense_rank`, a running `count`, a frameless `first_value`, or `lag`/`lead` with an offset of at most 65,536 rows. Any other function in that shape, such as a running `sum` or an explicit frame, still raises `MemoryBudgetExceededError` over the envelope.
+- An ASOF join without `by` keys merges both sides from an out-of-core sort when their `on` columns share one flat type. With `by` keys it partitions and spills like an equi join.
+- A range join over the envelope makes one pass over its left side per right chunk.
 - These bounds describe the single-node engine. The distributed executor composes the same
   mergeable primitives, so the same shapes are the hard ones there.
 

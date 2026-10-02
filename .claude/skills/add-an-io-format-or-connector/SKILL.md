@@ -106,7 +106,7 @@ like a source.
   `SOURCES.get(format_name)(path, **kwargs)`. The default, and usually right.
 - `RowGroupSplit` — a contiguous run of Parquet row-groups. The finest granularity;
   `parquet_row_group_splits` also *prunes* at plan time so a ruled-out row-group never
-  becomes a task. `pack_row_groups` balances runs against `target_size`.
+  becomes a task.
 - `LineRangeSplit` — a newline-aligned byte range, so one huge NDJSON file fans out.
 - `IpcFileSplit` — Arrow IPC record-batch ranges.
 - `WholeSourceSplit(source)` — the fallback for a source that cannot subdivide. It holds
@@ -124,8 +124,8 @@ because a per-file split rebuilds a reader that knows nothing of the unified sch
 `_read_schema` must answer from metadata where the format has any. `FileSource.schema()`
 caches it and, in `schema_mode="strict"` (the default), takes file 0's schema for all.
 The `"union"`/`"latest"` modes read every file's schema concurrently and reconcile them
-through `io/schema/` (`unify_schemas`, `normalize_batch`, `reconcile_batches`,
-`schema_drift`). That is read-time only and it is shared — never solve schema drift
+through `io/schema/` (`unify_schemas`, `normalize_batch`, `reconcile_batches`).
+That is read-time only and it is shared — never solve schema drift
 inside a format.
 
 ## 5. Statistics for the optimizer

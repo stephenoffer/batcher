@@ -265,6 +265,15 @@ pub struct ExecMetrics {
     /// measurement with [`ExecMetrics::with_query`] — the executors themselves do not, because
     /// the boundary worth measuring is outside them, where the tier hand-offs have settled.
     pub query: QueryMetrics,
+    /// Operators whose input a runtime join filter reduced (`stream::runtime_filter`), by
+    /// `op_id`. Their `rows_out` is what reached the join the filter serves, not the operator's
+    /// own cardinality: whether a filter sits beneath an operator depends on the plan chosen
+    /// around it, so reading that count as the operator's size teaches the next plan a
+    /// correction the one after it contradicts. The control plane records their timing and
+    /// width as usual and keeps their counts out of the cardinality corrections. Omitted when
+    /// empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub runtime_filtered: Vec<u32>,
 }
 
 impl ExecMetrics {

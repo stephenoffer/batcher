@@ -35,14 +35,19 @@ def test_map_batches_inference_pipeline():
 
 
 def test_map_batches_rebatches_to_batch_size():
-    seen: list[int] = []
+    # The per-batch calls run on a thread pool (`core.udf.apply`), so the order they are
+    # *invoked* in is not a property of the query -- the 4-row remainder can be called
+    # before a full batch. What is promised is which rows each batch holds and that the
+    # output keeps the input order, so the spy records each batch's rows, not its arrival.
+    seen: list[list[int]] = []
 
     def spy(batch: pa.RecordBatch) -> pa.RecordBatch:
-        seen.append(batch.num_rows)
+        seen.append(batch.column("x").to_pylist())
         return batch
 
-    bt.from_pydict({"x": list(range(100))}).map_batches(spy, batch_size=32).collect()
-    assert seen == [32, 32, 32, 4]
+    out = bt.from_pydict({"x": list(range(100))}).map_batches(spy, batch_size=32).collect()
+    assert sorted(seen) == [list(range(s, min(s + 32, 100))) for s in range(0, 100, 32)]
+    assert out.column("x").to_pylist() == list(range(100))
 
 
 def test_map_batches_composes_with_aggregate():

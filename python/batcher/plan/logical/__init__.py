@@ -17,7 +17,7 @@ from batcher.plan.logical.aggregate import (
     AggregateSpec,
     Sort,
 )
-from batcher.plan.logical.base import LogicalPlan, SortKeySpec
+from batcher.plan.logical.base import LogicalPlan, SortKeySpec, content_memo_key
 from batcher.plan.logical.join import (
     AsofJoin,
     Join,
@@ -50,6 +50,7 @@ from batcher.plan.logical.transforms import (
     hoist_sort_key,
     hoist_window_keys,
     is_cartesian_key_pair,
+    is_empty_relation,
     is_partition_independent,
     is_streamable,
     passthrough_renames,
@@ -96,11 +97,13 @@ __all__ = [
     "align_join_key_types",
     "asof_tolerance",
     "constant_column_literal",
+    "content_memo_key",
     "empty_result_schema",
     "hoist_computed_keys",
     "hoist_sort_key",
     "hoist_window_keys",
     "is_cartesian_key_pair",
+    "is_empty_relation",
     "is_partition_independent",
     "is_streamable",
     "passthrough_renames",

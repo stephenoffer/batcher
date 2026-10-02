@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from batcher._internal.hardware.engine.detected import call_engine
 
-__all__ = ["allocator_stats", "release_retained_memory"]
+__all__ = ["allocator_stats", "release_retained_memory", "set_purge_delay"]
 
 
 def allocator_stats() -> dict[str, int]:
@@ -70,3 +70,21 @@ def release_retained_memory(force: bool = False) -> int:
         means there was nothing retained to give back, or that the engine cannot report.
     """
     return int(call_engine("allocator_collect", force) or 0)
+
+
+def set_purge_delay(ms: int) -> bool:
+    """Set how long the engine allocator retains freed regions, or restore its default.
+
+    The retention ceiling's lever (`carbonite.memory.reclaim.reclaim_if_retaining`). A forced
+    :func:`release_retained_memory` reaches only part of what the allocator holds, while the
+    purge delay governs every free from the moment it is set, on every thread.
+
+    Args:
+        ms: Milliseconds to retain a freed region before returning it to the OS; negative
+            restores the engine's default.
+
+    Returns:
+        Whether it was applied: false when the user pinned `MIMALLOC_PURGE_DELAY` (which then
+        wins), or the engine cannot be reached.
+    """
+    return bool(call_engine("allocator_purge_delay", ms))

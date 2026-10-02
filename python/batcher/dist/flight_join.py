@@ -14,6 +14,7 @@ import json
 
 import pyarrow as pa
 
+from batcher._internal.logging import note_suppressed
 from batcher._internal.native import engine
 from batcher.carbonite.resilience import SourcePlacement
 from batcher.dist.adaptive_sizing import row_shuffle_reducer_count
@@ -26,8 +27,9 @@ from batcher.dist.executors.partition_io import (
 from batcher.dist.executors.plan_analysis import empty_result_table
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    kill_workers,
     map_barrier,
-    map_partitions,
+    memory_bounded_map_partitions,
     shuffle_partitions,
     skew_join_salt,
 )
@@ -86,7 +88,6 @@ def execute_join_flight(
     thereafter via `ShuffleRecovery`. Object store bypassed. `_fault_inject` /
     `_fault_inject_map` are test-only hooks: worker ids to kill after / before the map
     barrier."""
-    import ray
 
     # A broadcast-marked join replicates its small build side and shuffles nothing — see
     # `flight_broadcast`. Tried first and only for the join types where it yields the same
@@ -187,7 +188,10 @@ def execute_join_flight(
         # the two lists have to be the same length — and each side's count is bounded by its
         # own splits. Pad the shorter one with no-op partitions rather than re-planning the
         # longer one's splits, which on a star-schema join is the expensive side.
-        ceiling = map_partitions(workers)
+        ceiling = memory_bounded_map_partitions(
+            workers,
+            max(_side_bytes(sources[lsid], lproj), _side_bytes(sources[rsid], rproj)),
+        )
         lparts = partition_descriptors(
             sources[lsid],
             workers,
@@ -211,8 +215,7 @@ def execute_join_flight(
 
         # Simulate worker loss BEFORE the map barrier (test hook).
         if _fault_inject_map:
-            for i in _fault_inject_map:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject_map)
 
         # MAP barrier under worker-loss recovery: a worker preempted while mapping has
         # BOTH its sides republished on one survivor under the same `src`, so the single
@@ -275,13 +278,17 @@ def execute_join_flight(
         # worker costs no re-read of either source. `None` (the default factor of 1)
         # leaves the reduce byte-identical to the unreplicated path.
         replicas = replicate_shuffle_output(
-            actors, mapper_addrs, n_buckets, workers, mapper_dead, stages=(0, 1)
+            actors,
+            mapper_addrs,
+            n_buckets,
+            workers,
+            mapper_dead,
+            stages=(stage_base, stage_base + 1),
         )
 
         # Simulate worker loss after the map barrier (test hook).
         if _fault_inject:
-            for i in _fault_inject:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject)
 
         lschema = probe(left_ir, sources[lsid])
         rschema = probe(right_ir, sources[rsid])
@@ -393,6 +400,21 @@ def _detect_hot_keys_flight(actors, left, right, fraction: float) -> tuple[list[
                 hot.add(v)
                 peak = max(peak, c / total)
     return sorted(hot), peak
+
+
+def _side_bytes(source: Source, projection: list[str] | None) -> int:
+    """A join side's projected input bytes from its declared row count, or `0` if unknown."""
+    from batcher.plan.source_stats import declared
+    from batcher.plan.types import projected_row_bytes
+
+    rows = declared(source, "row_count")
+    if not rows:
+        return 0
+    try:
+        return int(rows * projected_row_bytes(source.schema(), projection))
+    except Exception as exc:  # a source that cannot describe itself sizes nothing
+        note_suppressed("dist", "size a join side for its map partitions", exc)
+        return 0
 
 
 def _empty_fused(fused_agg: Aggregate) -> pa.Table:

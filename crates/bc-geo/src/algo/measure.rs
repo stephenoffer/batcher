@@ -201,8 +201,7 @@ pub fn nearest_distance(p: Coord, g: &Geometry) -> f64 {
 /// `[0, 2π)`. `None` when the two positions coincide, which has no direction.
 ///
 /// This is the planar azimuth PostGIS `ST_Azimuth` computes on a `geometry`: it uses
-/// the coordinate axes, so on lon/lat it is only correct near the equator. The
-/// geodesic bearing is `proj::geodesy::bearing`.
+/// the coordinate axes, so on lon/lat it is only correct near the equator.
 #[must_use]
 pub fn azimuth(a: Coord, b: Coord) -> Option<f64> {
     let (dx, dy) = (b.x - a.x, b.y - a.y);

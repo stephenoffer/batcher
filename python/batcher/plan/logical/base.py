@@ -12,8 +12,11 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import threading
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from batcher._internal.errors import ColumnNotFoundError, PlanError
 from batcher._internal.errors import suggestion as _suggestion
@@ -27,6 +30,8 @@ if TYPE_CHECKING:
 __all__ = [
     "LogicalPlan",
     "SortKeySpec",
+    "content_memo_key",
+    "memoize_by_content",
     "validate_dedup_keys",
     "validate_key_domains",
 ]
@@ -65,6 +70,54 @@ def _memoize_noarg(fn, slot: str):
 
     wrapper._memoized = True  # type: ignore[attr-defined]
     return wrapper
+
+
+_T = TypeVar("_T")
+
+# Bounded, content-keyed memo for pure analyses of a plan that live *outside* the node
+# classes. See `memoize_by_content`. 1,024 entries is two orders of magnitude past the
+# distinct plans a session re-issues, and each value is a small set of column names.
+_CONTENT_MEMO: OrderedDict[tuple[str, str], Any] = OrderedDict()
+_CONTENT_MEMO_MAX = 1024
+_CONTENT_MEMO_LOCK = threading.Lock()
+
+
+def memoize_by_content(plan: LogicalPlan, name: str, compute: Callable[[LogicalPlan], _T]) -> _T:
+    """`compute(plan)`, cached under the plan's content fingerprint rather than its identity.
+
+    The per-node `_memoize_noarg` cache dies with the node, and a re-issued query rebuilds
+    every node: `Session.sql` re-parses the text on each call, so the plan a warm `collect`
+    hands the conductor is a new tree with an old `content_key`. Pure analyses the conductor
+    runs on every execution (which columns need statistics, which need a distinct count)
+    therefore re-walked the whole tree each time. Keying on `content_key` — which the plan
+    cache computes anyway — makes the second run a dict lookup.
+
+    `compute` must be a pure function of the plan's content, and its result is shared across
+    callers, so return an immutable value (a `frozenset`, a tuple). A plan that can only be
+    keyed by identity (an opaque UDF node) still memoizes correctly: its key is then the
+    identity, and a rebuilt plan misses, which is only ever a cost.
+
+    Args:
+        plan: The plan to analyze.
+        name: A name for the analysis, unique across callers, so two analyses of one plan
+            never share an entry.
+        compute: The analysis.
+
+    Returns:
+        What `compute(plan)` returned the first time this content was analyzed.
+    """
+    key = (name, plan.content_key())
+    with _CONTENT_MEMO_LOCK:
+        hit = _CONTENT_MEMO.get(key, _UNSET)
+        if hit is not _UNSET:
+            _CONTENT_MEMO.move_to_end(key)
+            return hit
+    value = compute(plan)
+    with _CONTENT_MEMO_LOCK:
+        _CONTENT_MEMO[key] = value
+        while len(_CONTENT_MEMO) > _CONTENT_MEMO_MAX:
+            _CONTENT_MEMO.popitem(last=False)
+    return value
 
 
 def _reject_duplicate_aliases(aliases: list[str], *, what: str) -> None:
@@ -221,12 +274,17 @@ class LogicalPlan:
         # references, so building an N-node plan asked N times and each answer rebuilt a
         # list of the node's output names — O(width) per call on a wide relation, which
         # is exactly where `with_columns` already does the most work.
-        for name in ("to_ir", "available_schema", "available_columns"):
+        #
+        # `identity_suffix` too: it is `Scan`'s schema rendered as text for `content_key`,
+        # and a scan outlives every query built over it. Rendering it per fresh plan also
+        # dropped the GIL in pyarrow, which let the event-log writer take it mid-planning
+        # (profiled at ~0.2 ms of a 1.6 ms query) instead of during the engine call.
+        for name in ("to_ir", "available_schema", "available_columns", "identity_suffix"):
             fn = cls.__dict__.get(name)
             if fn is not None and not getattr(fn, "_memoized", False):
                 setattr(cls, name, _memoize_noarg(fn, f"_c_{name}"))
 
-    def to_ir(self) -> dict[str, Any]:  # pragma: no cover - overridden
+    def to_ir(self) -> dict[str, Any]:  # overridden
         raise NotImplementedError
 
     def content_key(self) -> str:
@@ -263,13 +321,30 @@ class LogicalPlan:
         cache = self.__dict__
         val = cache.get("_c_content_key", _UNSET)
         if val is _UNSET:
-            try:
-                payload = json.dumps(self.to_ir(), separators=(",", ":"), default=str)
-            except NotImplementedError:
+            payload = self.ir_json()
+            if payload is None:
                 payload = f"opaque:{id(self):x}"
             payload += "|" + self._identity_suffixes()
             val = hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
             cache["_c_content_key"] = val
+        return val
+
+    def ir_json(self) -> str | None:
+        """`to_ir()` as compact JSON text (memoized per node), or `None` for an opaque plan.
+
+        The serialization `content_key` hashes, kept rather than discarded: the per-query event
+        log embeds this same IR, and re-encoding it there was half the log's cost — 39 KB of a
+        76 KB document on TPC-H q8, `json.dumps`-ed afresh after every execution
+        (`api.terminal.event_log`). An opaque node (`map_batches`) has no IR, hence `None`.
+        """
+        cache = self.__dict__
+        val = cache.get("_c_ir_json", _UNSET)
+        if val is _UNSET:
+            try:
+                val = json.dumps(self.to_ir(), separators=(",", ":"), default=str)
+            except NotImplementedError:
+                val = None
+            cache["_c_ir_json"] = val
         return val
 
     def identity_suffix(self) -> str:
@@ -373,3 +448,28 @@ def validate_dedup_keys(node: LogicalPlan, keys, *, operation: str) -> None:
 
     names = tuple(keys) or tuple(node.available_columns())
     validate_key_domains(node, [(_col(n), n) for n in names], operation=operation)
+
+
+def content_memo_key(plan: object) -> str | None:
+    """`plan`'s `content_key` when it is a sound key for a memo by *content*, else `None`.
+
+    An answer read off a plan's structure and schemas alone -- the columns it carries, the
+    widest row it introduces -- is a function of its lowered IR plus each scan's schema, which
+    is exactly what `content_key` hashes. Keying such an answer by content lets a query that is
+    rebuilt for every run (a DataFrame pipeline is a new object each time) hit where an
+    identity memo cannot. Anything the IR does not carry (a scan's `source_key`, which names
+    *which* relation) must not be read by such an answer.
+
+    `None` for an opaque plan (a `map_batches`, which has no IR): its `content_key` is built
+    from the object's address, which is only sound while something holds the object, and a
+    value-keyed memo does not.
+
+    Args:
+        plan: A logical plan, or anything else (which has no content key).
+
+    Returns:
+        The content key, or `None` when the plan cannot be keyed by content.
+    """
+    if not isinstance(plan, LogicalPlan) or plan.ir_json() is None:
+        return None
+    return plan.content_key()

@@ -383,6 +383,17 @@ mod tests {
             QuatFromRotmatY,
             QuatFromRotmatZ,
             QuatFromRotmatW,
+            QuatFromRotmatNearestX,
+            QuatFromRotmatNearestY,
+            QuatFromRotmatNearestZ,
+            QuatFromRotmatNearestW,
+            QuatFromEulerSeqX,
+            QuatFromEulerSeqY,
+            QuatFromEulerSeqZ,
+            QuatFromEulerSeqW,
+            QuatToEulerSeqFirst,
+            QuatToEulerSeqSecond,
+            QuatToEulerSeqThird,
             QuatMultiplyX,
             QuatMultiplyY,
             QuatMultiplyZ,
@@ -405,20 +416,40 @@ mod tests {
             Se3InverseTransformY,
             Se3InverseTransformZ,
         ];
-        assert_eq!(all.len(), 42, "a variant was added without a case here");
+        assert_eq!(all.len(), 53, "a variant was added without a case here");
         let b = one_row();
         for func in all {
             // 0.5 everywhere: a valid non-zero quaternion, a valid point and a valid `t`.
             // A matrix of 0.5s is not a rotation, so the matrix functions get the
-            // identity instead.
+            // identity instead, and the Euler-sequence functions end in a sequence code
+            // (1321, intrinsic Z-Y-X) rather than a 0.5 that names no sequence.
             let rotmat = matches!(
                 func,
-                QuatFromRotmatX | QuatFromRotmatY | QuatFromRotmatZ | QuatFromRotmatW
+                QuatFromRotmatX
+                    | QuatFromRotmatY
+                    | QuatFromRotmatZ
+                    | QuatFromRotmatW
+                    | QuatFromRotmatNearestX
+                    | QuatFromRotmatNearestY
+                    | QuatFromRotmatNearestZ
+                    | QuatFromRotmatNearestW
+            );
+            let sequence = matches!(
+                func,
+                QuatFromEulerSeqX
+                    | QuatFromEulerSeqY
+                    | QuatFromEulerSeqZ
+                    | QuatFromEulerSeqW
+                    | QuatToEulerSeqFirst
+                    | QuatToEulerSeqSecond
+                    | QuatToEulerSeqThird
             );
             let args: Vec<Expr> = (0..func.arity())
                 .map(|k| {
                     if rotmat {
                         lit(if k % 4 == 0 { 1.0 } else { 0.0 })
+                    } else if sequence && k == func.arity() - 1 {
+                        lit(1321.0)
                     } else {
                         lit(0.5)
                     }

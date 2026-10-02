@@ -19,7 +19,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from typing_extensions import override
+
 from batcher._internal.optional import require
+from batcher.io.credentials import resolve_secret
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.streaming.broker import (
     BrokerMessage,
@@ -226,7 +229,9 @@ class EventHubsSource(BrokerSource):
         if self._client_obj is None:
             consumer_cls = _import_consumer()
             self._client_obj = consumer_cls.from_connection_string(
-                conn_str=self._options["connection_str"],
+                conn_str=resolve_secret(
+                    self._options["connection_str"], what="Event Hubs connection_str"
+                ),
                 consumer_group=self._options["consumer_group"],
                 eventhub_name=self.topic,
             )
@@ -283,7 +288,8 @@ class EventHubsSource(BrokerSource):
         self._buffers[partition_id] = buffer
         return consumer, buffer
 
-    def _apply_seek(self, partition: int, token: Any) -> None:  # noqa: ARG002
+    @override
+    def _apply_seek(self, partition: int, token: Any) -> None:
         """Drop this partition's cached consumer so the next poll reopens it at `token`.
 
         The base records the position in `_resume_from`; a consumer already open is still

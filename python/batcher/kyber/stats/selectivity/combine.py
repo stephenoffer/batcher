@@ -14,7 +14,9 @@ from typing import Any
 
 from batcher._internal.mathx import clamp01
 from batcher.config import CardinalityConfig
+from batcher.kyber.stats.predicate_bounds import without_implied_ranges
 from batcher.kyber.stats.selectivity.arithmetic import interval_containment
+from batcher.kyber.stats.selectivity.contradiction import provably_unsatisfiable
 from batcher.kyber.stats.selectivity.leaves import (
     _equality_selectivity,
     _in_list_selectivity,
@@ -99,7 +101,11 @@ def _raw_predicate_selectivity(
     if isinstance(expr, Binary):
         op = expr.op
         if op == "and":
-            conjuncts = _flatten_and(expr)
+            flat = _flatten_and(expr)
+            if provably_unsatisfiable(flat):
+                # A proof from the literals, not an estimate: no row satisfies every conjunct.
+                return 0.0
+            conjuncts = without_implied_ranges(flat)
             sels = _conjunct_selectivities(conjuncts, ndv, cfg, quantiles, mcv, bounds, nulls)
             return _exponential_backoff(sorted(sels))
         if op == "or":
@@ -588,10 +594,12 @@ def _exponential_backoff(sels: list[float]) -> float:
     exponents: `s₁ · s₂^(1/2) · s₃^(1/4) · …`.
 
     The most selective conjunct carries full weight; each subsequent one is
-    dampened, so the result sits between the pure independence product (a lower
-    bound, exact only when conjuncts are independent) and the most selective
-    conjunct alone (an upper bound, the perfectly-correlated case). This is the
-    standard correlation-robust estimator used by production optimizers.
+    dampened, so the result sits between the pure independence product and the
+    most selective conjunct alone (the true selectivity's upper bound, reached in
+    the perfectly-correlated case). The product is not a lower bound on the truth:
+    that is Frechet's `max(0, sum(s) - (k - 1))`, reached by mutually exclusive
+    conjuncts. So this is a heuristic that assumes positive correlation, and
+    provable exclusions are caught before it (`provably_unsatisfiable`).
     """
     combined = 1.0
     exponent = 1.0

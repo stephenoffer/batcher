@@ -249,6 +249,9 @@ def test_sem_uses_the_sample_stddev_where_duckdb_uses_the_population_one(duck, t
 
 @pytest.mark.differential
 def test_sha2_rejects_a_digest_width_it_cannot_produce(table):
-    """Only sha256 is implemented, so `sha2(s, 512)` must raise, not answer with sha256."""
+    """`sha2(s, 128)` names no SHA-2 width, so it must raise, not answer with sha256.
+
+    224, 384 and 512 are implemented (`test_diff_sql_translator_generalizations.py`).
+    """
     with pytest.raises(NotImplementedError, match="digest length"):
-        bt.sql("SELECT sha2(s, 512) r FROM t", t=table).collect()
+        bt.sql("SELECT sha2(s, 128) r FROM t", t=table).collect()

@@ -27,6 +27,7 @@ from batcher.kyber.correction import estimate_is_reliable
 from batcher.kyber.learning import (
     MeasuredColumns,
     is_material_change,
+    load_column_tables,
     load_learned_stats,
     record_column_row_bytes,
     record_column_row_bytes_batch,
@@ -42,7 +43,6 @@ from batcher.kyber.metadata_answer import (
     approx_count_distinct,
 )
 from batcher.kyber.metadata_filter_count import (
-    answer_filter_any,
     answer_filter_count,
     answer_filter_is_empty,
 )
@@ -66,7 +66,6 @@ __all__ = [
     "Optimizer",
     "answer_aggregate",
     "answer_count",
-    "answer_filter_any",
     "answer_filter_count",
     "answer_filter_is_empty",
     "answer_is_empty",
@@ -76,6 +75,7 @@ __all__ = [
     "hot_join_value_shares",
     "hot_join_values",
     "is_material_change",
+    "load_column_tables",
     "load_learned_stats",
     "optimize",
     "optimize_full",

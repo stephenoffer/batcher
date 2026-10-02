@@ -148,6 +148,41 @@ def _local_accelerator_present() -> bool | None:
     return local_accelerator_present()
 
 
+def _identity(source: Source) -> object:
+    """The table `source` reads: its `identity()`, or the object when it has none."""
+    return getattr(source, "identity", lambda: id(source))()
+
+
+def _one_per_table(sources: list[Source]) -> list[Source]:
+    """`sources` with each table once: a query that scans one table three times (TPC-H q21's
+    `lineitem`) reads it three times in place, not three tables' worth of data."""
+    seen: dict[object, Source] = {}
+    for source in sources:
+        seen.setdefault(_identity(source), source)
+    return list(seen.values())
+
+
+def _projected_input_bytes(plan: LogicalPlan, sources: list[Source]) -> int | None:
+    """Bytes of the columns `plan` reads, per the footers, each table counted once; None when
+    a source cannot say. Optimized first, so projection pushdown has pruned what is read."""
+    from batcher import core, kyber
+    from batcher.dist.executors.aligned.units import projected_bytes
+    from batcher.dist.executors.partition_io import source_pushdown
+    from batcher.plan.visitor import scanned_source_ids
+
+    opt = kyber.optimize_logical(plan, sources=sources, hub=core.default_hub())
+    by_table: dict[object, int] = {}
+    for sid in scanned_source_ids(opt):
+        if sid >= len(sources):
+            continue
+        size = projected_bytes(sources[sid], source_pushdown(opt, sid)[0])
+        if size is None:
+            return None
+        table = _identity(sources[sid])
+        by_table[table] = max(by_table.get(table, 0), size)
+    return sum(by_table.values())
+
+
 def _resolve_distributed(
     distributed: bool | str,
     plan: LogicalPlan | None = None,
@@ -224,18 +259,23 @@ def _resolve_distributed(
             return False
 
         min_rows = active_config().distributed.distribute_min_rows
-        # Prefer the *measured* size this exact shape produced on past runs over a first-run
-        # source estimate: a recurring query that proved small stays single-node (dodging the
-        # fan-out tax) even when a source can't cheaply report a row count, and one that proved
-        # large distributes. Cold (or no plan) → the source-estimate path below, unchanged.
+        # The input's row count, where the sources report one, decides: the threshold asks
+        # whether there is enough work to spread, and that is a property of what is read.
+        # The size learned from past runs is the query's *output*, which says nothing about
+        # it: TPC-H q1 returns 4 rows from 60M at SF10, so from its second run on it stayed
+        # on the 8-core driver and read S3 there -- 10.2 s against 0.47 s distributed. The
+        # learned size stands in only for a source that cannot report rows cheaply.
+        rows = total_source_rows(_one_per_table(sources)) if sources is not None else None
+        if rows is not None:
+            if rows >= min_rows:
+                return True
+            wide = _projected_input_bytes(plan, sources) if plan is not None else None
+            return wide is not None and wide >= active_config().distributed.distribute_min_bytes
         learned = _learned_size(plan)
         if learned is not None:
             return learned >= min_rows
         if sources is None:
             return True
-        rows = total_source_rows(sources)
-        if rows is not None:
-            return rows >= min_rows
         # Unknown size. The rule is "distribute, staying safe for large data" — but that is
         # a bet about *throughput*, and it is only available when the workers can reach the
         # data at all. A bare filesystem path may be this node's own disk, and shipping the

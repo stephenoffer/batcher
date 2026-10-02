@@ -120,7 +120,7 @@ Every split opens its own connection, so a hundred splits means a hundred connec
 
 A result chunk is a handle to storage that Snowflake cleans up, so a split that waits a long time in a queue can find its chunk gone. Keep the gap between planning and reading short.
 
-A Snowflake read is a query rather than a named table, so a governance policy keyed on a table name doesn't match it.
+A Snowflake read is a query rather than a named table, so a governance policy keyed on a table name can't match it on its own. Pass `governed_as="<table>"` to declare the table the query reads, and the policy on that name is applied to the result, in exactly the spelling the policy uses. Inside a {py:obj}`bt.security() <batcher.security>` block, an undeclared query whose text names a table the catalog governs is refused with {py:exc}`AccessDeniedError <batcher.AccessDeniedError>` rather than read ungoverned. The check matches names written in the query, so a view over a governed table isn't caught by it; declare the name. See {doc}`How a table is named </user-guide/trust/table-names>`.
 
 ## See also
 

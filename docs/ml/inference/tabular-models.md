@@ -473,7 +473,7 @@ print(len(LinearRegression(["flag", "z"], "y").fit(numeric).coef_))
 
 A string, boolean, date, or all-null feature raises an error naming the column, the type, and the fix. A regressor's target must also be a number. A classifier's target is unrestricted, because a class label can be a string.
 
-The feature-name guard only fires where the model recorded its training feature names. A booster fitted from a bare NumPy matrix records generic `f0` to `fN`, which match no real column. Fit from a DataFrame, or keep the feature list beside the model.
+The feature-order guard needs the model's training feature names. Where the model recorded them, `features=` must list them in training order: a reordering, or a trained name placed in a different slot, raises. A model fitted from a bare NumPy matrix records no names, or generic `f0` to `fN` that match no real column. For those, only the feature count is checked, against the width the model recorded, and generic names also raise a `UserWarning` that the order can't be verified. Fit from a DataFrame, or keep the feature list beside the model.
 
 Under `distributed=True` a preempted worker's partition is recomputed, so scoring must be idempotent. A pure prediction is. A model wrapper that also writes to an external store is not.
 

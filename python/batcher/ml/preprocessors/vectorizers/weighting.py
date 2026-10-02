@@ -72,6 +72,8 @@ class TfidfVectorizer(CountVectorizer):
         smooth_idf: Add one to every document frequency, as if a document containing every
             term existed.
         sublinear_tf: Replace a term frequency ``n`` with ``1 + log(n)``.
+        null_documents: ``"empty"`` reads a null document as one with no terms; ``"null"``
+            leaves it out of the fit, so it does not dilute the IDF, and nulls its outputs.
     """
 
     __slots__ = ("norm", "smooth_idf", "sublinear_tf", "use_idf")
@@ -95,6 +97,7 @@ class TfidfVectorizer(CountVectorizer):
         use_idf: bool = True,
         smooth_idf: bool = True,
         sublinear_tf: bool = False,
+        null_documents: str = "empty",
     ) -> None:
         super().__init__(
             column,
@@ -109,6 +112,7 @@ class TfidfVectorizer(CountVectorizer):
             binary=binary,
             dense=dense,
             max_vocabulary=max_vocabulary,
+            null_documents=null_documents,
         )
         if norm not in _NORMS:
             raise PlanError(

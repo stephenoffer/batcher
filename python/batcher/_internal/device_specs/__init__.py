@@ -52,6 +52,7 @@ from batcher._internal.device_specs.accessors import (
     host_transfer_seconds,
     known_device_names,
     rank_devices_by_efficiency,
+    register_device_spec,
     resolve_device_name,
 )
 from batcher._internal.device_specs.table import DeviceSpec
@@ -74,5 +75,6 @@ __all__ = [
     "host_transfer_seconds",
     "known_device_names",
     "rank_devices_by_efficiency",
+    "register_device_spec",
     "resolve_device_name",
 ]

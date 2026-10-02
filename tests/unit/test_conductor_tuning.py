@@ -201,7 +201,7 @@ def test_learned_num_workers_cold_and_warm():
 # --- 5 + 6 + 7. join-outcome recording closes the bandit / crossover loops -------------------
 def test_record_join_outcomes_feeds_the_bandit():
     from batcher.api.tuning import record_join_outcomes
-    from batcher.kyber.learned_tuning import learned_build_sides, learned_join_strategy
+    from batcher.kyber.learned_tuning import learned_join_strategy
     from batcher.kyber.rules.selection import BuildSideDecision
 
     left = bt.from_arrow(pa.table({"k": [1, 2, 3], "v": [1, 2, 3]}))
@@ -220,7 +220,6 @@ def test_record_join_outcomes_feeds_the_bandit():
     for _ in range(4):
         record_join_outcomes(hub, joined._plan, [dec], wall_ms=12.0)
     assert learned_join_strategy(hub, sig) is not None  # the bandit now has an arm
-    assert learned_build_sides(hub, sig) == (3.0, 2.0)  # measured sides recorded
 
 
 def test_record_join_outcomes_skips_multi_join_ambiguity():
@@ -286,3 +285,40 @@ def test_spill_compression_scope_applies_learned_codec():
         assert active_config().memory.spill_compression is None
     with spill_compression_scope(_StubRM(None), None):
         assert active_config().memory.spill_compression == base  # un-sized → default kept
+
+
+def test_a_one_shot_run_that_derived_a_plan_teaches_the_route_bandit_nothing():
+    """Only a one-shot run that replayed every plan it asked for is a steady-state sample.
+
+    While a plan is still converging its runs time the learning: TPC-H q10 at sf10 ran one-shot
+    at 183, 149, 143 ms before settling at 105, against 125 staged, and a bandit fed those
+    settled on staging in roughly half its processes. The control is the recorded case: the
+    same call with no plan derived in between does reach the bandit's arm state.
+    """
+    from batcher.api.adaptive import gating
+    from batcher.kyber import learned_tuning as lt
+    from batcher.kyber import plan_cache
+
+    ds = bt.from_pydict({"k": [1, 2]}).join(bt.from_pydict({"k": [1, 2]}), on="k")
+    hub = _hub()
+    sig = plan_signature(ds._plan)
+    arms = []
+    real = lt.record_adaptive_route
+    try:
+        lt.record_adaptive_route = lambda h, s, route, ms: arms.append((s, route, ms))
+        before = plan_cache.misses()
+        plan_cache.lookup("L0:|an-exact-key-nothing-stored")  # a derived plan, mid-run
+        gating.record_adaptive_route(hub, ds._plan, False, 150.0, before)
+        assert arms == [], "a run that derived a plan reached the route bandit"
+
+        gating.record_adaptive_route(hub, ds._plan, False, 105.0, plan_cache.misses())
+        assert arms == [(sig, "one_shot", 105.0)]
+
+        # The staged arm is the explored one, and is recorded whatever the run cost: held to
+        # the one-shot rule, its converging stage plans kept exploration going for four runs.
+        before = plan_cache.misses()
+        plan_cache.lookup("L0:|another-exact-key-nothing-stored")
+        gating.record_adaptive_route(hub, ds._plan, True, 280.0, before)
+        assert arms[-1] == (sig, "staged", 280.0)
+    finally:
+        lt.record_adaptive_route = real

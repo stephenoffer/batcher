@@ -21,7 +21,7 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
-from _ray_cluster import init_test_ray, shutdown_test_ray
+from _ray_cluster import ray_session_fixture
 from batcher import col, count
 from batcher.carbonite.resilience import SourcePlacement
 from batcher.config import (
@@ -41,11 +41,7 @@ WORKERS = 4
 CPUS = 6
 
 
-@pytest.fixture(scope="module", autouse=True)
-def _ray_session():
-    started = init_test_ray(CPUS)
-    yield
-    shutdown_test_ray(started)
+_ray_session = ray_session_fixture(CPUS)
 
 
 @pytest.fixture(scope="module")

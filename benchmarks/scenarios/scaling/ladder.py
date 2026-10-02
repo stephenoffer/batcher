@@ -299,7 +299,7 @@ def run_case(name, build, rungs, runs, want_driver):
             reference = out
             times[_rung(w)] = ms
             continue
-        ok, msg = results_match(reference, out)
+        ok, msg = results_match(reference, out, strict_types=True)
         disorder = order_violation(out, ORDERED.get(name, []))
         if ok and disorder:
             ok, msg = False, f"rows match but the result is not ordered: {disorder}"

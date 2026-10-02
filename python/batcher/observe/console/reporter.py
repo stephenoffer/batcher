@@ -439,7 +439,7 @@ class ConsoleReporter:
         try:
             self._stream.write(text)
             self._stream.flush()
-        except (ValueError, OSError):  # pragma: no cover - closed/broken stream
+        except (ValueError, OSError):  # closed/broken stream
             self._live = False
 
 

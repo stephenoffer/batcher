@@ -74,8 +74,9 @@ source so the picture cannot drift away from the audit:
   Batcher re-optimizes more finely than Spark AQE. It does not: the within-query loop is
   stage-boundary adaptation at the same granularity, gated off below the thresholds in
   `python/batcher/api/adaptive/gating.py`. The differentiator those diagrams draw is that
-  the loop runs single-node as well as distributed, and that what it measured survives into
-  the next run. `adaptive_positioning` is a capability matrix rather than a timeline for
+  the loop runs inside the Python process rather than in a JVM beside it, and that what it
+  measured survives into the next run. They do not claim AQE is cluster-only: it is on by
+  default since Spark 3.2 and re-plans in local mode (`local[*]`) too. `adaptive_positioning` is a capability matrix rather than a timeline for
   precisely this reason: a timeline invites the "more marks means better" reading the
   retired claim was made of.
 - `execution_tiers` draws the JIT fallback edge explicitly, because "falls back rather than

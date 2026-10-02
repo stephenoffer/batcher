@@ -296,6 +296,77 @@ fn a_streamed_left_join_matches_the_oracle_in_order() {
     assert_ordered(&join("left"), &[facts(), dim()]);
 }
 
+/// A small probe (30,000 rows) against a build side over six times larger, both with null keys,
+/// duplicate keys and unmatched rows on each side — the shape where a `Full` join builds on the
+/// probe side instead when nothing can see the order (`join_par::order_free_swap_pays`).
+fn lopsided_full_join_sources() -> Vec<Vec<RecordBatch>> {
+    let left_k: ArrayRef = Arc::new(Int64Array::from(
+        (0..30_000i64)
+            .map(|i| (i % 50 != 7).then_some(i * 3))
+            .collect::<Vec<_>>(),
+    ));
+    let left_v: ArrayRef = Arc::new(Int64Array::from((0..30_000i64).collect::<Vec<_>>()));
+    let right_k: ArrayRef = Arc::new(Int64Array::from(
+        (0..200_000i64)
+            .map(|i| (i % 70 != 3).then_some(i % 60_000))
+            .collect::<Vec<_>>(),
+    ));
+    let right_d: ArrayRef = Arc::new(Int64Array::from((0..200_000i64).collect::<Vec<_>>()));
+    vec![
+        vec![RecordBatch::try_from_iter(vec![("k", left_k), ("v", left_v)]).unwrap()],
+        vec![RecordBatch::try_from_iter(vec![("k", right_k), ("d", right_d)]).unwrap()],
+    ]
+}
+
+fn lopsided_full_join() -> String {
+    r#"{"op":"hash_join","left":{"op":"scan","source_id":0},"right":{"op":"scan","source_id":1},
+        "left_keys":["k"],"right_keys":["k"],"join_type":"full",
+        "output":[{"side":"left","name":"k","alias":"lk"},
+                  {"side":"left","name":"v","alias":"v"},
+                  {"side":"right","name":"k","alias":"rk"},
+                  {"side":"right","name":"d","alias":"d"}],
+        "strategy":"hash"}"#
+        .to_string()
+}
+
+/// An aggregate over the lopsided full join cannot see its order, so the join may build on the
+/// smaller side — and must still count every matched pair and every unmatched row of *both*
+/// sides on the side it came from. Per-side counts and sums are what a swap that forgot to flip
+/// the output would get wrong.
+#[test]
+fn an_order_free_full_join_on_a_lopsided_build_matches_the_oracle() {
+    let join = lopsided_full_join();
+    let global = format!(
+        r#"{{"op":"aggregate","input":{join},"group_keys":[],
+            "aggregates":[{{"func":"count_star","alias":"n"}},
+                          {{"func":"count","input":{},"alias":"nl"}},
+                          {{"func":"count","input":{},"alias":"nr"}},
+                          {{"func":"sum","input":{},"alias":"sv"}},
+                          {{"func":"sum","input":{},"alias":"sd"}}]}}"#,
+        col("lk"),
+        col("rk"),
+        col("v"),
+        col("d")
+    );
+    assert_multiset(&global, &lopsided_full_join_sources());
+    let grouped = format!(
+        r#"{{"op":"aggregate","input":{join},
+            "group_keys":[{{"expr":{},"alias":"rk"}}],
+            "aggregates":[{{"func":"count_star","alias":"n"}},
+                          {{"func":"sum","input":{},"alias":"sv"}}]}}"#,
+        col("rk"),
+        col("v")
+    );
+    assert_multiset(&grouped, &lopsided_full_join_sources());
+}
+
+/// The same join at the root, where its order *is* the result: it must not be swapped, and
+/// comes out row for row in the oracle's order.
+#[test]
+fn a_root_full_join_on_a_lopsided_build_keeps_the_oracle_order() {
+    assert_ordered(&lopsided_full_join(), &lopsided_full_join_sources());
+}
+
 #[test]
 fn right_and_full_joins_fall_back_and_still_match_the_oracle() {
     // `Right`/`Full` must reconcile build-side rows nothing matched, which no single morsel can

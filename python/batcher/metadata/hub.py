@@ -24,12 +24,12 @@ is O(1), and the backend is scanned exactly once per view per process.
 
 from __future__ import annotations
 
+import heapq
 import json
 import threading
 import time
 from typing import Any
 
-from batcher._internal.errors import ConfigError
 from batcher._internal.logging import get_logger
 from batcher.metadata.hardware_scope import local_or_planned_fingerprint
 from batcher.metadata.params import LearnedParams
@@ -71,6 +71,11 @@ _FEEDBACK_FIELDS: tuple[str, ...] = tuple(OperatorFeedback.__dataclass_fields__)
 def _row_of(feedback: OperatorFeedback) -> dict[str, Any]:
     """One feedback row as the flat JSON-shaped dict both the store and the views hold."""
     return {name: getattr(feedback, name) for name in _FEEDBACK_FIELDS}
+
+
+def _op_stats_seq(key: Any) -> int:
+    """An `op_stats` key's sequence number; `-1` (oldest) for a key of any other shape."""
+    return key[1] if len(key) > 1 and isinstance(key[1], int) else -1
 
 
 class MetadataHub:
@@ -210,14 +215,22 @@ class MetadataHub:
         if delete is None:
             return
         if keys is None:
-            keys = [key for key, _value in self._backend.scan(_OP_STATS, ())]
-        if len(keys) <= _OP_STATS_MAX:
+            # Keys alone when the backend can say them without reading the values: a `scan`
+            # decodes (or, in process, encodes) every row just for this loop to drop it.
+            list_keys = getattr(self._backend, "keys", None)
+            keys = (
+                list(list_keys(_OP_STATS, ()))
+                if callable(list_keys)
+                else [key for key, _value in self._backend.scan(_OP_STATS, ())]
+            )
+        excess = len(keys) - _OP_STATS_MAX
+        if excess <= 0:
             return
         # `(op_id, seq)`, oldest sequence first. A key written by a build with a different
         # shape sorts as if it were the oldest, so it is dropped first — which is the right
-        # answer for a row nothing can read anyway.
-        keys = sorted(keys, key=lambda k: k[1] if len(k) > 1 and isinstance(k[1], int) else -1)
-        delete(_OP_STATS, keys[: len(keys) - _OP_STATS_MAX])
+        # answer for a row nothing can read anyway. Only the `excess` oldest are needed, not
+        # a full sort of the whole store.
+        delete(_OP_STATS, heapq.nsmallest(excess, keys, key=_op_stats_seq))
 
     @property
     def signed_appends(self) -> int:
@@ -239,27 +252,6 @@ class MetadataHub:
         re-scanning the whole history. Resets only when a fresh hub is constructed.
         """
         return self._seq
-
-    def operator_history(self, op_id: int) -> list[dict[str, Any]]:
-        """All recorded feedback for an operator id, oldest first.
-
-        Args:
-            op_id: The operator's plan-local id.
-
-        Returns:
-            The recorded rows, oldest first. Empty when nothing was recorded.
-
-        Raises:
-            ConfigError: If `op_id` is not an integer. The store's keys are typed, so a
-                string id matches nothing and would otherwise read as "never recorded".
-        """
-        if not isinstance(op_id, int) or isinstance(op_id, bool):
-            raise ConfigError(
-                f"operator_history needs an integer op_id, but got "
-                f"{type(op_id).__name__} {op_id!r}.",
-                hint="Operator ids are the plan-local integers on a PhysicalPlan's ops.",
-            )
-        return [json.loads(value) for _key, value in self._backend.scan(_OP_STATS, (op_id,))]
 
     def op_stats_by_kind(self, hw_fingerprint: str | None = None) -> dict[str, list[dict]]:
         """Operator feedback measured on **one machine class**, bucketed by operator `kind`.
@@ -313,10 +305,8 @@ class MetadataHub:
             `{kind: rows}` for that machine class, empty when it has measured nothing.
 
         Best-effort; a malformed row is skipped, not raised."""
-        if self._by_fp is None:
-            self._load_views()
-        assert self._by_fp is not None
-        return self._by_fp.get(hw_fingerprint or local_or_planned_fingerprint(), {})
+        by_fp = self._by_fp if self._by_fp is not None else self._load_views()[0]
+        return by_fp.get(hw_fingerprint or local_or_planned_fingerprint(), {})
 
     def op_stats_with_signature(self) -> list[dict[str, Any]]:
         """Signature-carrying operator feedback, **oldest first**.
@@ -340,12 +330,11 @@ class MetadataHub:
 
         Best-effort; a malformed row is skipped, not raised.
         """
-        if self._signed is None:
-            self._load_views()
-        assert self._signed is not None
-        return self._signed
+        return self._signed if self._signed is not None else self._load_views()[1]
 
-    def _load_views(self) -> None:
+    def _load_views(
+        self,
+    ) -> tuple[dict[str, dict[str, list[dict[str, Any]]]], list[dict[str, Any]]]:
         """Materialize both derived views from a **single** scan of the backend.
 
         The first read of either view builds both. They are read together on every optimize —
@@ -364,7 +353,8 @@ class MetadataHub:
         """
         with self._lock:
             if self._by_fp is not None and self._signed is not None:
-                return  # another thread finished the load while this one waited
+                # another thread finished the load while this one waited
+                return self._by_fp, self._signed
             scanned = list(self._backend.scan(_OP_STATS, ()))
             by_fp, signed = build_views(scanned)
             if self._by_fp is None:
@@ -381,6 +371,7 @@ class MetadataHub:
             # hand costs no extra scan.
             if len(scanned) > _OP_STATS_MAX:
                 self._prune_op_stats([key for key, _value in scanned])
+            return self._by_fp, self._signed
 
     # --- learned parameters ------------------------------------------------
     # Delegated to `LearnedParams`, which owns the two storage shapes and the parsed-read

@@ -1,4 +1,4 @@
-"""Generative AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT``.
+"""AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT`` / ``AI_EMBED``.
 
 `table_functions` gives SQL the *traditional* model — ``ML_PREDICT`` scores a fitted
 scikit-learn, XGBoost, LightGBM, CatBoost or ONNX model over a relation. These are the
@@ -17,8 +17,13 @@ at a time. Putting the call in ``FROM`` says that honestly. It is also why the o
 matters, `prompt_column`, is named rather than positional: the relation is the input, and
 the column is a setting on it.
 
-All three lower to the matching `Dataset.ml` call, so there is no second inference path
+All four lower to the matching `Dataset.ml` call, so there is no second inference path
 here — only a second way to ask for it, exactly as `ML_PREDICT` is for scoring.
+
+``AI_EMBED`` differs in one argument. It names a sentence-transformers model id rather than
+a registered engine, as a quoted string, because a model id is a public name with no
+endpoint or credential in it: the reason a language-model engine is kept out of query
+text does not apply.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ __all__ = ["ai_table", "is_ai_source"]
 #: matching on the type is what makes ``AI_GENERATE`` work without a dialect switch.
 _AI_NODES: dict[type, str] = {
     exp.AIGenerate: "generate",
+    exp.AIEmbed: "embed",
 }
 
 #: The rest arrive as a plain function call. ``ai_query`` and ``ai_complete`` are Databricks'
@@ -48,26 +54,32 @@ _AI_NAMES: dict[str, str] = {
     "ai_query": "generate",
     "ai_complete": "generate",
     "ai_extract": "extract",
+    # Parsed as a plain call rather than sqlglot's `AIClassify`, whose Snowflake grammar is
+    # fixed at ``(input, categories [, config])`` and cannot hold the relation, the engine
+    # and the named settings. `batcher._internal.sql_errors.parse_sql` makes that change.
+    "ai_classify": "classify",
 }
 
 #: AI calls sqlglot knows but this does not translate, and where the capability actually
 #: lives. Without these a query reaches the table lookup and fails with ``unknown table ''``
 #: — the node carries no table name — which says nothing about what went wrong.
 _AI_ELSEWHERE: dict[type, str] = {
-    # sqlglot models `AI_CLASSIFY` on Snowflake's grammar, which is fixed at
-    # ``(input, categories [, config])`` — three arguments, where a relational form needs
-    # four: the relation, the engine, the text column and the labels. Rather than fold two
-    # of them into a config object and give this one function a shape none of the others
-    # have, it is routed to the spelling that does fit.
-    exp.AIClassify: (
-        "AI_EXTRACT(t, engine, prompt_column => 'col', schema => ['label string']) for a "
-        "single labelled column, or ds.ml.classify(engine, labels=[...]) on the Dataset"
-    ),
-    exp.AIEmbed: "ds.ml.embed(model, ...), which takes an encoder rather than a text engine",
     exp.AISimilarity: "ds.ml.similarity_to(...) or ds.ml.nearest_neighbors(...) over embeddings",
     exp.AIAgg: "ds.ml.generate(...) over a grouped relation",
     exp.AISummarizeAgg: "ds.ml.generate(...) over a grouped relation",
-    exp.AIForecast: "the batcher.ml.timeseries forecasting helpers",
+}
+
+#: The same, for calls sqlglot parses as a plain `Anonymous` rather than a node of its own.
+#: sqlglot has an `AIForecast` node but no dialect builds it: ``AI_FORECAST(...)`` arrives
+#: as an ordinary call, so keying it on the node type left the entry unreachable and the
+#: query failed with "unknown table function".
+_AI_ELSEWHERE_NAMES: dict[str, str] = {
+    "ai_forecast": (
+        "a pipeline rather than a built-in, since Batcher has no forecasting model: build "
+        "lag and rolling features with batcher.ml.preprocessors LagFeaturizer / "
+        "RollingFeaturizer, fit a regressor, and judge it with "
+        "batcher.ml.timeseries.mean_absolute_scaled_error"
+    ),
 }
 
 #: How to name each kind in an error, since a native node carries no function name.
@@ -75,6 +87,7 @@ _DISPLAY: dict[str, str] = {
     "generate": "AI_GENERATE",
     "classify": "AI_CLASSIFY",
     "extract": "AI_EXTRACT",
+    "embed": "AI_EMBED",
 }
 
 #: Settings each function forwards, and nothing else. As with `ML_PREDICT`, execution choices
@@ -85,6 +98,7 @@ _KIND_OPTIONS: dict[str, frozenset[str]] = {
     "generate": _COMMON_OPTIONS,
     "classify": _COMMON_OPTIONS | {"labels"},
     "extract": (_COMMON_OPTIONS - {"output_column"}) | {"schema"},
+    "embed": frozenset({"column", "output_column"}),
 }
 
 #: Settings without which the call has no meaning, so they are required rather than defaulted.
@@ -92,6 +106,7 @@ _REQUIRED: dict[str, tuple[str, ...]] = {
     "generate": ("prompt_column",),
     "classify": ("prompt_column", "labels"),
     "extract": ("prompt_column", "schema"),
+    "embed": ("column",),
 }
 
 
@@ -108,7 +123,9 @@ def is_ai_source(node) -> bool:
     inner = node.this
     if type(inner) in _AI_NODES or type(inner) in _AI_ELSEWHERE:
         return True
-    return isinstance(inner, exp.Anonymous) and inner.name.lower() in _AI_NAMES
+    return isinstance(inner, exp.Anonymous) and (
+        inner.name.lower() in _AI_NAMES or inner.name.lower() in _AI_ELSEWHERE_NAMES
+    )
 
 
 def ai_table(tr, node) -> Dataset:
@@ -117,7 +134,8 @@ def ai_table(tr, node) -> Dataset:
     Reads ``FROM AI_CLASSIFY(t, grader, prompt_column => 'body', labels => ['a', 'b'])`` as
     the relation `t` with the label column appended, and lowers it to
     `Dataset.ml.classify`. `AI_GENERATE` and `AI_EXTRACT` are the same shape onto
-    `Dataset.ml.generate` and `Dataset.ml.extract`.
+    `Dataset.ml.generate` and `Dataset.ml.extract`, and
+    ``AI_EMBED(t, 'model-id', column => 'body')`` lowers to `Dataset.ml.embed`.
 
     Args:
         tr: The translator, holding the table and engine registries.
@@ -132,6 +150,8 @@ def ai_table(tr, node) -> Dataset:
     """
     inner = node.this
     elsewhere = _AI_ELSEWHERE.get(type(inner))
+    if elsewhere is None and isinstance(inner, exp.Anonymous):
+        elsewhere = _AI_ELSEWHERE_NAMES.get(inner.name.lower())
     if elsewhere is not None:
         raise PlanError(
             f"{_node_name(inner)} is not translated to SQL here; the capability is "
@@ -142,15 +162,27 @@ def ai_table(tr, node) -> Dataset:
     args = list(inner.expressions)
     positional = [a for a in args if not isinstance(a, exp.Kwarg)]
     if len(positional) != 2:
+        second, setting = ("model id", "column") if kind == "embed" else ("engine", "prompt_column")
         raise PlanError(
-            f"{called}(relation, engine, setting => value, ...) takes exactly two "
-            f"positional arguments — the relation and the engine — got {len(positional)}. "
-            f"The text column is a named setting: prompt_column => 'your_column'"
+            f"{called}(relation, {second}, setting => value, ...) takes exactly two "
+            f"positional arguments — the relation and the {second} — got {len(positional)}. "
+            f"The text column is a named setting: {setting} => 'your_column'"
         )
     source = relation_argument(tr, positional[0], called)
-    engine = _engine(tr, positional[1])
+    engine = _model_id(positional[1]) if kind == "embed" else _engine(tr, positional[1])
     options = _options(args, kind, called)
     return _generated(source, engine, kind, options)
+
+
+def _model_id(node) -> str:
+    """The quoted sentence-transformers model id ``AI_EMBED`` names."""
+    if isinstance(node, exp.Literal) and node.is_string and node.this:
+        return node.this
+    raise PlanError(
+        f"AI_EMBED's second argument is a quoted sentence-transformers model id, e.g. "
+        f"'sentence-transformers/all-MiniLM-L6-v2', got {node.sql()!r}. Any other encoder "
+        f"runs on the Dataset: ds.ml.embed(callable, output_columns=[...])"
+    )
 
 
 def _engine(tr, node) -> Any:
@@ -247,6 +279,8 @@ def _generated(source: Dataset, engine: Any, kind: str, options: dict[str, Any])
         return source.ml.generate(engine, **options)
     if kind == "classify":
         return source.ml.classify(engine, **options)
+    if kind == "embed":
+        return source.ml.embed(engine, **options)
     return source.ml.extract(engine, **options)
 
 

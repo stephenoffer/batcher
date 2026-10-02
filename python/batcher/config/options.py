@@ -350,4 +350,4 @@ def _apply(obj: Config, updates: dict[str, object]) -> Config:
             replaced[name] = _apply(current, value)  # type: ignore[arg-type]
         else:
             replaced[name] = value
-    return dataclasses.replace(obj, **replaced)  # type: ignore[arg-type,return-value]
+    return dataclasses.replace(obj, **replaced)  # type: ignore[arg-type]

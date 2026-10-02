@@ -134,11 +134,6 @@ class HardwareProfile:
             return 0
         return self.memory_bytes // self.logical_cpus
 
-    @property
-    def has_accelerator(self) -> bool:
-        """Whether any accelerator device is attached."""
-        return bool(self.accelerators)
-
     def label(self) -> str:
         """A short human-readable name for this machine shape, for logs and `EXPLAIN`.
 

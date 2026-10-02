@@ -128,7 +128,7 @@ Call served models, and feed training ranks a balanced, resumable stream.
 
 - The engine installs with `pip install batcher-engine`. Model frameworks are extras: `torch`, `transformers`, `st` for sentence-transformers, `vllm`, `tabular` for the gradient-boosting and scikit-learn stack, and `multimodal` for the image, audio, video and PDF readers.
 - GPU reservation with `num_gpus` and multi-worker actor pools run on a Ray cluster. Without one, the same pipeline runs on a single machine.
-- Models run from Python. SQL queries can compute vector similarity but can't call a model.
+- Models are fitted and engines are registered from Python. SQL calls them as table functions: `ML_PREDICT` scores a registered model, `AI_GENERATE`, `AI_CLASSIFY` and `AI_EXTRACT` call a registered language-model engine, and `AI_EMBED` runs a sentence-transformers encoder. {doc}`/user-guide/analyze/sql-model-functions` lists the syntax and the calls that stay DataFrame-only.
 
 ## See also
 

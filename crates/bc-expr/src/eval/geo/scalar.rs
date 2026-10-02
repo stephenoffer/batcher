@@ -17,7 +17,8 @@ use bc_geo::Geom;
 
 use crate::{ExprError, GeoFunc};
 
-use super::{caller_error, f64_at, geom_at, row_result, ScalarOut};
+use super::geodesic::nearest_geodesic;
+use super::{caller_error, f64_at, geom_at, row_result, second_geom_at, ScalarOut};
 
 /// Which typed column a function produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +152,7 @@ fn float_of(
         StLengthSpheroid => row_result(geodesy::geodesic_length_m(&g.geometry), func)?,
         StPerimeterSpheroid => row_result(geodesy::geodesic_perimeter_m(&g.geometry), func)?,
         StLineLocatePoint => {
-            let Some(p) = geom_at(&cols[1], i, func)? else {
+            let Some(p) = second_geom_at(&cols[1], i, func, g)? else {
                 return Ok(None);
             };
             let Some(c) = p.geometry.points().first().copied() else {
@@ -165,7 +166,7 @@ fn float_of(
         }
         StDistance | StMaxDistance | StHausdorffDistance | StAzimuth | StDistanceSphere
         | StDistanceSpheroid => {
-            let Some(b) = geom_at(&cols[1], i, func)? else {
+            let Some(b) = second_geom_at(&cols[1], i, func, g)? else {
                 return Ok(None);
             };
             match func {
@@ -187,44 +188,6 @@ fn float_of(
         }
         other => unreachable!("{other:?} is not a float-valued geo function"),
     })
-}
-
-/// The smallest geodesic distance between any pair of positions of two geometries.
-///
-/// Vertex-to-vertex, not the true geodesic distance between the shapes: on the globe
-/// the nearest point of a segment is not the nearest point of its chord, and computing
-/// it exactly needs an iterative geodesic solver per segment pair. For point-to-point
-/// work — which is the overwhelming majority of "how far apart are these" queries —
-/// the two coincide exactly. For polygon-to-polygon it over-reports by at most the
-/// segment length, so it is an upper bound and safe to filter with. Densify with
-/// `st_segmentize` first when the segments are long and the answer must be tight.
-///
-/// A position off the globe (NaN, a longitude of 200) nulls the row, like every other
-/// row-local failure in this family.
-fn nearest_geodesic(a: &Geom, b: &Geom, spheroid: bool) -> Result<Option<f64>, ExprError> {
-    let (ca, cb) = (a.coords(), b.coords());
-    if ca.is_empty() || cb.is_empty() {
-        return Ok(None);
-    }
-    // Intersecting shapes are zero apart, and the vertex scan cannot see that.
-    if predicate::intersects(a, b) {
-        return Ok(Some(0.0));
-    }
-    let mut best = f64::INFINITY;
-    for p in &ca {
-        for q in &cb {
-            let d = if spheroid {
-                geodesy::ellipsoidal_distance(p.x, p.y, q.x, q.y)
-            } else {
-                geodesy::haversine(p.x, p.y, q.x, q.y)
-            };
-            match d {
-                Ok(v) => best = best.min(v),
-                Err(_) => return Ok(None),
-            }
-        }
-    }
-    Ok(best.is_finite().then_some(best))
 }
 
 /// The Int64-valued functions.
@@ -287,7 +250,7 @@ fn bool_of(
         StHasZ => return Ok(Some(a.has_z)),
         _ => {}
     }
-    let Some(b) = geom_at(&cols[1], i, func)? else {
+    let Some(b) = second_geom_at(&cols[1], i, func, a)? else {
         return Ok(None);
     };
     Ok(Some(match func {

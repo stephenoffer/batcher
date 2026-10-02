@@ -1,4 +1,4 @@
-"""Quantified comparison subqueries (`= ANY` / `<> ALL`) and parenthesized predicates.
+"""Quantified comparison subqueries (`<op> ANY` / `<op> ALL`) and parenthesized predicates.
 
 Two gaps in the subquery folder, both of which refused a query DuckDB answers:
 
@@ -72,24 +72,82 @@ def test_any_over_a_multi_column_row_value(duck):
     assert_same(bt.sql(query, t=left, u=right).collect(), duck.sql(query))
 
 
-@pytest.mark.parametrize(
-    "query",
-    [
-        "SELECT g FROM t WHERE i > ANY (SELECT v FROM u)",
-        "SELECT g FROM t WHERE i <= ANY (SELECT v FROM u)",
-        "SELECT g FROM t WHERE i >= ALL (SELECT v FROM u)",
-        "SELECT g FROM t WHERE i = ALL (SELECT v FROM u)",
-        "SELECT g FROM t WHERE i <> ANY (SELECT v FROM u)",
-    ],
-)
-def test_a_quantified_form_with_no_exact_rewrite_is_refused_not_guessed(query):
-    """An inequality `ALL` over a NULL-bearing set is UNKNOWN, which min/max cannot express.
+#: Every quantified operator the `IN` rewrite does not cover. Each is lowered to a CASE over
+#: the subquery's row count, non-null count and min/max, which is the full three-valued truth
+#: table rather than the `x > (SELECT max(c) ...)` shortcut.
+_INEQUALITY_FORMS = [
+    f"i {op} {q} (SELECT v FROM u)" for op in (">", ">=", "<", "<=") for q in ("ANY", "ALL")
+] + ["i = ALL (SELECT v FROM u)", "i <> ANY (SELECT v FROM u)"]
 
-    Refusing is the contract: a wrong row in the result costs more than an error, and the
-    message carries the rewrite that does work.
+#: Right-hand sides that decide a non-equality quantified predicate. `all_null` is the case
+#: where no non-null element exists to refute or witness, and `ties` repeats the extreme.
+_ORDERED_RIGHTS = {
+    **_RIGHTS,
+    "all_null": pa.table({"v": pa.array([None], pa.int64())}),
+    "ties": pa.table({"v": pa.array([3, 3], pa.int64())}),
+}
+
+
+def _rows(table: pa.Table) -> list[tuple]:
+    return [tuple(r.values()) for r in table.to_pylist()]
+
+
+@pytest.mark.parametrize("right", list(_ORDERED_RIGHTS), ids=list(_ORDERED_RIGHTS))
+@pytest.mark.parametrize("form", _INEQUALITY_FORMS)
+def test_an_inequality_quantified_subquery_keeps_its_three_valued_answer(duck, form, right):
+    """The projected TRUE / FALSE / NULL value matches DuckDB, and so does its negation.
+
+    Read as a value, not only as a filter: an empty set makes ``x > ALL (S)`` TRUE and a NULL
+    in S makes it UNKNOWN, and a rewrite that is right under WHERE but wrong under NOT is
+    exactly what comparing the projected column (and `NOT` of it) catches. Ordered by the
+    unique `g`, so the comparison is positional and a boolean read back as an integer fails.
     """
-    with pytest.raises(NotImplementedError, match=r"(ANY|ALL)"):
-        bt.sql(query, t=_LEFT, u=_RIGHTS["ordinary"]).to_arrow()
+    u = _ORDERED_RIGHTS[right]
+    query = f"SELECT g, {form} AS b, NOT ({form}) AS nb FROM t ORDER BY g"
+    duck.register("t", _LEFT)
+    duck.register("u", u)
+    got = bt.sql(query, t=_LEFT, u=u).collect()
+    assert got.schema.field("b").type == pa.bool_()
+    assert _rows(got) == duck.sql(query).fetchall()
+
+
+@pytest.mark.parametrize("right", list(_ORDERED_RIGHTS), ids=list(_ORDERED_RIGHTS))
+@pytest.mark.parametrize("form", _INEQUALITY_FORMS)
+def test_an_inequality_quantified_subquery_filters_like_duckdb(duck, form, right):
+    """Under WHERE and WHERE NOT, over a UNION subquery (the derived-table lowering)."""
+    u = _ORDERED_RIGHTS[right]
+    union_form = form.replace("SELECT v FROM u", "SELECT v FROM u UNION ALL SELECT v FROM u")
+    duck.register("t", _LEFT)
+    duck.register("u", u)
+    for query in (
+        f"SELECT g FROM t WHERE {form}",
+        f"SELECT g FROM t WHERE NOT ({union_form})",
+    ):
+        assert_same(bt.sql(query, t=_LEFT, u=u).collect(), duck.sql(query))
+
+
+@pytest.mark.parametrize("form", _INEQUALITY_FORMS)
+def test_a_correlated_inequality_quantified_subquery_matches_duckdb(duck, form):
+    """A correlated S decorrelates through its scalar aggregates, empty groups included."""
+    right = pa.table(
+        {
+            "k": pa.array(["a", "a", "b", "c"], pa.string()),
+            "v": pa.array([1, None, 2, 9], pa.int64()),
+        }
+    )
+    correlated = form.replace("FROM u)", "FROM u WHERE u.k = t.g)")
+    query = f"SELECT g, {correlated} AS b FROM t ORDER BY g"
+    duck.register("t", _LEFT)
+    duck.register("u", right)
+    assert _rows(bt.sql(query, t=_LEFT, u=right).collect()) == duck.sql(query).fetchall()
+
+
+def test_a_row_valued_inequality_quantified_subquery_is_refused():
+    """`(a, b) > ALL (...)` has no scalar extreme to compare against, so it raises."""
+    left = pa.table({"a": pa.array([1], pa.int64()), "b": pa.array([1], pa.int64())})
+    right = pa.table({"x": pa.array([1], pa.int64()), "y": pa.array([2], pa.int64())})
+    with pytest.raises(NotImplementedError, match="row-valued"):
+        bt.sql("SELECT a FROM t WHERE (a, b) > ALL (SELECT x, y FROM u)", t=left, u=right)
 
 
 @pytest.mark.parametrize("right", sorted(_RIGHTS))

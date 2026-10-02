@@ -76,6 +76,17 @@ print(fixes.select(cell=bt.geohash_encode(col("lon"), col("lat"), 6)).to_pydict(
 # {'cell': ['9q8yyk', None, None]}
 ```
 
+A null keeps the scan alive, and it also hides the loss. Count the rows that had text but no geometry, and gate the pipeline on that count rather than on the nulls downstream:
+
+```python
+raw = bt.from_pydict({"wkt": ["POINT(1 2)", "POINT(1", None, "LINESTRING(0 0, 1 1)"]})
+unparsed = col("wkt").is_not_null() & bt.st_geom_from_text(col("wkt")).is_null()
+print(raw.agg(unparsed=unparsed.cast("int64").sum()).to_pydict())
+# {'unparsed': [1]}
+```
+
+`raw.filter(unparsed)` returns the rows themselves, and the same pattern with `st_is_valid_reason` counts the rows that parsed into an invalid shape.
+
 ## Degrees are not meters
 
 {py:func}`st_area <batcher.st_area>`, {py:func}`st_length <batcher.st_length>` and {py:func}`st_distance <batcher.st_distance>` are *planar*, and this is the most important thing on the page. They treat coordinates as points on a flat plane and answer in whatever unit the coordinates are stated in. On EPSG:4326 that unit is degrees, and a degree is not a distance:
@@ -124,7 +135,11 @@ print(projected.to_pydict())
 # {'m': [551131.0]}
 ```
 
-`st_transform` supports a deliberately small set of systems and refuses an unsupported EPSG code rather than silently returning the input: WGS 84 lon/lat (4326), Web Mercator (3857), the UTM zones (326xx and 327xx), and a cylindrical equal-area system (6933) for density comparisons across latitudes. Every one of them is on the WGS 84 datum, so converting between them loses nothing.
+`st_transform` supports a deliberately small set of systems and refuses an unsupported EPSG code rather than silently returning the input: WGS 84 lon/lat (4326), Web Mercator (3857), the UTM zones (326xx and 327xx), and a cylindrical equal-area system (6933) for density comparisons across latitudes. Every one of them is on the WGS 84 datum, so converting between them needs no datum shift. It can still lose something, in three ways:
+
+- Web Mercator is undefined at the poles, so a latitude beyond 85.0511 degrees north or south is clamped to that bound on the way in and comes back as the bound.
+- A UTM zone is meant for positions inside it. Batcher evaluates the transverse Mercator projection with Krüger's series, which round-trips to under a millimetre out to 60 degrees of longitude from the zone's central meridian and matched PROJ to nanometres at every position tested, out to 40 degrees from it. The projection's scale distortion grows with that distance, the series diverges past about 70 degrees near the equator, and 90 degrees from the central meridian on the equator is a singularity. Pick the zone with {py:func}`st_utm_epsg <batcher.st_utm_epsg>`.
+- Every conversion rounds in 64-bit floating point, so a round trip can change the last few digits of a coordinate, far below a millimetre.
 
 ## Spatial joins, and the filter that makes them affordable
 
@@ -253,6 +268,34 @@ print(
 
 The only approximation is the circle drawn as a polygon, which every implementation makes. A point's buffer is GEOS's vertex for vertex. For a chain or a polygon, GEOS starts each round join at the segment's offset point where Batcher places its vertex disc at fixed angles, so the areas differ by a fraction of a percent at the default eight segments per quadrant. When the question is only "is this within X", {py:func}`st_dwithin <batcher.st_dwithin>` answers it exactly without building the polygon.
 
+## Clipping, erasing and merging polygons
+
+{py:func}`st_intersection <batcher.st_intersection>` clips one shape to another, {py:func}`st_difference <batcher.st_difference>` erases one from another, and {py:func}`st_union <batcher.st_union>` merges two into one boundary. They run the same overlay `st_buffer` is built on, and the differential tests hold each to GEOS by the area of the symmetric difference between the two answers. Splitting parcels by how much of each falls inside a zone is one call per side:
+
+```python
+parcels = bt.from_pydict(
+    {
+        "id": [1, 2, 3],
+        "parcel": [
+            "POLYGON((0 0, 4 0, 4 4, 0 4, 0 0))",
+            "POLYGON((8 0, 12 0, 12 4, 8 4, 8 0))",
+            "POLYGON((20 0, 22 0, 22 2, 20 2, 20 0))",
+        ],
+    }
+)
+zone = "POLYGON((2 -1, 10 -1, 10 5, 2 5, 2 -1))"
+print(
+    parcels.select(
+        "id",
+        inside=bt.st_area(bt.st_intersection(col("parcel"), zone)),
+        outside=bt.st_area(bt.st_difference(col("parcel"), zone)),
+    ).to_pydict()
+)
+# {'id': [1, 2, 3], 'inside': [8.0, 8.0, 0.0], 'outside': [8.0, 8.0, 4.0]}
+```
+
+Parcel 3 misses the zone, so its intersection is `POLYGON EMPTY` with an area of 0, not a null. A null is reserved for a row the overlay refuses: a null operand, a point or line operand, or an invalid polygon, which `st_is_valid_reason` explains.
+
 ## Simplify before you shuffle
 
 Vertex count drives the cost of every predicate, every byte written and every byte shuffled. {py:func}`st_simplify <batcher.st_simplify>` is usually the single biggest win available on a large geometry column, and {py:func}`st_hausdorff_distance <batcher.st_hausdorff_distance>` measures what the tolerance cost you:
@@ -294,13 +337,14 @@ Every function on this page is a row-wise expression: it reads one row and write
 
 ## Requirements and limitations
 
-- {py:func}`st_buffer <batcher.st_buffer>` approximates a circle with `4 * quad_segs` chords, as every implementation does, and its areas for chains and polygons differ from GEOS's by a fraction of a percent. Where an eroded polygon narrows to a single point, GEOS writes one self-touching polygon and Batcher writes two polygons touching there, which is the same point set.
-- The geodesic distances are measured vertex to vertex, not between the nearest points of two shapes. For point pairs, which is most proximity work, those coincide exactly. For extended geometries they over-report by at most a segment length, so they are an upper bound. Run {py:func}`st_segmentize <batcher.st_segmentize>` first when the answer must be tight.
+- {py:func}`st_buffer <batcher.st_buffer>` approximates a circle with `4 * quad_segs` chords, as every implementation does, and its areas for chains and polygons differ from GEOS's by a fraction of a percent. Across the 31 shapes and radii in [`tests/differential/test_diff_geo_edge_semantics.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_geo_edge_semantics.py), which include concave polygons, holes, multi-part inputs and negative radii, the largest difference is 0.003% at eight segments per quadrant and 0.21% at two, and the test holds them to 1% and 5%. Where an eroded polygon narrows to a single point, GEOS writes one self-touching polygon and Batcher writes two polygons touching there, which is the same point set.
+- The geodesic distances measure between the nearest points of two shapes, taking each edge as the shorter great-circle arc between its positions, the edge model of PostGIS `geography`. Whether two shapes overlap, such as a point inside a polygon, is decided on longitude and latitude as a plane, and overlapping shapes are 0 apart. The two models differ for a long edge away from the equator, where the planar edge and the great-circle arc between the same two positions are different lines, so densify with {py:func}`st_segmentize <batcher.st_segmentize>` when the containment of a point near such an edge matters.
 - `st_transform` covers the four families of reference system listed above and rejects everything else by EPSG code. Reprojecting between datums such as NAD 27 or OSGB 36 needs a grid shift that is not built in.
-- There is no public polygon overlay. `st_intersection`, `st_union` and `st_difference` do not exist, and neither do the aggregate forms `st_extent` and `st_union_agg`. `st_buffer` computes a union internally, but only of its own pieces. {py:func}`st_collect <batcher.st_collect>` concatenates without computing one, which is what you want before a single {py:func}`st_envelope <batcher.st_envelope>` or {py:func}`st_convex_hull <batcher.st_convex_hull>`.
+- The overlay functions take two polygonal operands. They do not compute GEOS's mixed-dimension results, such as the line where two polygons only touch, and there are no aggregate forms `st_extent` or `st_union_agg`. {py:func}`st_collect <batcher.st_collect>` concatenates without an overlay, which is what you want before a single {py:func}`st_envelope <batcher.st_envelope>` or {py:func}`st_convex_hull <batcher.st_convex_hull>`.
 - {py:func}`st_exterior_ring <batcher.st_exterior_ring>` and {py:func}`st_interior_ring_n <batcher.st_interior_ring_n>` answer only for a `POLYGON`, as in PostGIS and DuckDB. A multipolygon has no single exterior ring, so write `st_exterior_ring(st_geometry_n(g, 1))` for the first member's.
 - An empty result is null in most places where DuckDB writes an empty geometry: the centroid or point on surface of an empty input, for example.
 - A geometry with a NaN coordinate is treated as unparseable and yields null, because every predicate is a chain of comparisons and NaN makes all of them false in both directions.
+- A two-operand function refuses operands whose SRIDs are both known and differ, as PostGIS does, because their coordinates are not comparable. SRID 0 means unknown and combines with anything, so a bare WKT literal never trips it. The SRID is a label, not a transform: nothing checks that a geometry's coordinates are really in the system its SRID names.
 
 ## See also
 

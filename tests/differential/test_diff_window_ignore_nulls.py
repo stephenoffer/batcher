@@ -7,8 +7,9 @@ the fill primitives (`last_value` over the default frame as a forward fill, `fir
 over ``CURRENT ROW AND UNBOUNDED FOLLOWING`` as a backward fill); both still hold, and the
 peer-group test below is what the fills got wrong.
 
-`lag`/`lead` with IGNORE NULLS need a per-row search the runtime does not have. Those must
-raise: the null-*respecting* answer is a different, wrong result, not merely a slower one.
+`lag`/`lead` with IGNORE NULLS are rewritten by the SQL front-end into `nth_value` /
+`last_value` with IGNORE NULLS over a frame starting just past the current row
+(`_sql/parser/windowing/derived.py`), so they are checked against DuckDB here too.
 """
 
 from __future__ import annotations
@@ -113,14 +114,40 @@ def test_ignore_nulls_reads_the_whole_peer_group(duck):
     assert_same(bt.sql(query, ties=table).collect(), duck.sql(query))
 
 
-@pytest.mark.parametrize(
-    "expr",
-    [
-        "lag(v) IGNORE NULLS OVER (ORDER BY i)",
-        "lead(v) IGNORE NULLS OVER (ORDER BY i)",
-    ],
-)
-def test_unsupported_ignore_nulls_shapes_reject(gaps, expr):
-    """An unsupported shape must raise, not fall back to the null-respecting answer."""
-    with pytest.raises(NotImplementedError, match=r"IGNORE NULLS|not supported"):
-        bt.sql(f"SELECT {expr} AS x FROM gaps", gaps=gaps).collect()
+#: `lag`/`lead` with IGNORE NULLS, in both spellings sqlglot reads (the standard one after
+#: the call and DuckDB's inside it), across offsets, a default, both directions of the
+#: ORDER BY and a negative offset that swaps lag for lead.
+_NAVIGATION = [
+    "lag(v) IGNORE NULLS OVER (PARTITION BY k ORDER BY i)",
+    "lead(v) IGNORE NULLS OVER (PARTITION BY k ORDER BY i)",
+    "lag(v, 2 IGNORE NULLS) OVER (PARTITION BY k ORDER BY i)",
+    "lead(v, 2 IGNORE NULLS) OVER (PARTITION BY k ORDER BY i DESC)",
+    "lag(v, 2, -1 IGNORE NULLS) OVER (PARTITION BY k ORDER BY i)",
+    "lead(v, 1, -1) IGNORE NULLS OVER (ORDER BY k, i)",
+    "lag(v, -2 IGNORE NULLS) OVER (PARTITION BY k ORDER BY i NULLS FIRST)",
+    "lag(v, 0, -1 IGNORE NULLS) OVER (PARTITION BY k ORDER BY i)",
+    "lag(v + 1, 3 IGNORE NULLS) OVER (ORDER BY k, i)",
+]
+
+
+@pytest.mark.differential
+@pytest.mark.parametrize("expr", _NAVIGATION)
+def test_lag_and_lead_ignore_nulls_match_duckdb(duck, gaps, expr):
+    """The k-th non-null neighbour, compared row by row (ordered by the unique ``(k, i)``).
+
+    DuckDB spells the clause inside the call only, so its query is the canonical spelling
+    of the same window.
+    """
+    query = f"SELECT k, i, {expr} AS x FROM gaps ORDER BY k, i"
+    canonical = query.replace(") IGNORE NULLS OVER", " IGNORE NULLS) OVER")
+    got = bt.sql(query, gaps=gaps).collect()
+    assert [tuple(r.values()) for r in got.to_pylist()] == duck.sql(canonical).fetchall()
+
+
+@pytest.mark.differential
+def test_lag_ignore_nulls_differs_from_the_null_respecting_lag(duck, gaps):
+    """Positive control: on this fixture skipping nulls changes the answer."""
+    query = "SELECT k, i, lag(v{}) OVER (PARTITION BY k ORDER BY i) AS x FROM gaps ORDER BY k, i"
+    ignoring = bt.sql(query.format(" IGNORE NULLS"), gaps=gaps).to_pydict()["x"]
+    respecting = bt.sql(query.format(""), gaps=gaps).to_pydict()["x"]
+    assert ignoring != respecting

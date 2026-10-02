@@ -13,7 +13,6 @@ import pytest
 import batcher as bt
 from batcher.dist.skew import (
     join_skew_key,
-    load_learned_hot_keys,
     load_learned_skew,
     persist_hot_keys,
     resolve_hot_keys,
@@ -43,18 +42,19 @@ def test_learned_hot_keys_round_trip_and_none_vs_empty():
     key = join_skew_key("LIR", "RIR", plan)
 
     # Never measured → None (so the caller knows to run the pre-pass).
-    assert load_learned_hot_keys(key) is None
+    assert load_learned_skew(key) is None
 
     # A measured non-empty hot set round-trips and is what later runs salt on.
     persist_hot_keys(key, ["7", "42"])
-    assert load_learned_hot_keys(key) == ["7", "42"]
+    assert load_learned_skew(key)[0] == ["7", "42"]
 
     # A measured EMPTY result ("not skewed") is distinct from never-measured, so a
     # non-skewed shape never re-runs the pre-pass.
     empty_key = join_skew_key("LIR2", "RIR2", plan)
     persist_hot_keys(empty_key, [])
-    assert load_learned_hot_keys(empty_key) == []
-    assert load_learned_hot_keys(empty_key) is not None
+    learned = load_learned_skew(empty_key)
+    assert learned is not None
+    assert learned[0] == []
 
 
 def test_the_measured_share_is_persisted_and_sizes_the_fan_out():
@@ -127,3 +127,95 @@ def test_a_negative_salt_is_accepted_by_config_validation():
 
 def _unreachable():
     raise AssertionError("the pre-pass must not run when the shape is already learned")
+
+
+# --- a "not skewed" verdict expires -------------------------------------------
+
+
+def _probe_counter():
+    calls = []
+
+    def detect():
+        calls.append(1)
+        return ["5"], 0.5
+
+    return calls, detect
+
+
+def _pin_rows(monkeypatch, rows):
+    from batcher.dist import skew
+
+    monkeypatch.setattr(skew, "_estimated_input_rows", lambda _join, _sources: rows)
+
+
+def test_a_fresh_uniform_verdict_still_skips_the_probe(monkeypatch):
+    """Positive control for the expiry tests below: a verdict inside its lifetime and at
+    the size it was measured at is trusted, so the probe does not run."""
+    _pin_rows(monkeypatch, 20_000_000)
+    plan = _join_plan()
+    key = join_skew_key("FRESH", "FRESH", plan)
+    persist_hot_keys(key, [], 0.0, 20_000_000)
+    assert resolve_hot_keys(
+        plan, [], key, fraction=0.10, partitions=8, salt=0, detect=_unreachable
+    ) == ([], 0)
+
+
+def test_an_old_uniform_verdict_is_reprobed(monkeypatch):
+    """The shape key hashes the plan, not the bytes, so a table that drifted into skew
+    under an unchanged query kept its "not skewed" verdict forever. Past its lifetime the
+    verdict reads as never-measured and a large join probes again."""
+    from batcher.core import default_hub
+    from batcher.dist import skew
+
+    _pin_rows(monkeypatch, 20_000_000)
+    plan = _join_plan()
+    key = join_skew_key("OLD", "OLD", plan)
+    stale_at = skew.time.time() - skew._UNIFORM_VERDICT_TTL_S - 60
+    default_hub().put_keyed_param(
+        "dist.skew", key, {"hot": [], "share": 0.0, "at": stale_at, "rows": 20_000_000}
+    )
+    calls, detect = _probe_counter()
+    hot, salt = resolve_hot_keys(plan, [], key, fraction=0.10, partitions=8, salt=0, detect=detect)
+    assert calls == [1]
+    assert hot == ["5"] and salt == salt_factor(0.5, 8)
+    # The new measurement is persisted, dated, so the next run trusts it again.
+    assert load_learned_skew(key) == (["5"], 0.5)
+
+
+def test_a_uniform_verdict_measured_at_another_size_is_reprobed(monkeypatch):
+    """A fresh verdict taken on a quarter of today's input does not describe today's."""
+    _pin_rows(monkeypatch, 80_000_000)
+    plan = _join_plan()
+    key = join_skew_key("GREW", "GREW", plan)
+    persist_hot_keys(key, [], 0.0, 20_000_000)
+    calls, detect = _probe_counter()
+    resolve_hot_keys(plan, [], key, fraction=0.10, partitions=8, salt=0, detect=detect)
+    assert calls == [1]
+
+
+def test_an_undated_uniform_record_is_reprobed_once(monkeypatch):
+    """A record written before verdicts were dated cannot prove it is fresh."""
+    from batcher.core import default_hub
+
+    _pin_rows(monkeypatch, 20_000_000)
+    plan = _join_plan()
+    key = join_skew_key("UNDATED", "UNDATED", plan)
+    default_hub().put_keyed_param("dist.skew", key, {"hot": [], "share": 0.0})
+    calls, detect = _probe_counter()
+    resolve_hot_keys(plan, [], key, fraction=0.10, partitions=8, salt=0, detect=detect)
+    resolve_hot_keys(plan, [], key, fraction=0.10, partitions=8, salt=0, detect=detect)
+    assert calls == [1]
+
+
+def test_an_expired_verdict_on_a_small_join_does_not_force_a_probe(monkeypatch):
+    """Expiry means "never measured", not "measure now": a join below the detection floor
+    that the user did not opt into still pays no pre-pass."""
+    from batcher.core import default_hub
+
+    _pin_rows(monkeypatch, 1_000)
+    plan = _join_plan()
+    key = join_skew_key("SMALL", "SMALL", plan)
+    default_hub().put_keyed_param("dist.skew", key, {"hot": [], "share": 0.0, "at": 0.0})
+    assert resolve_hot_keys(
+        plan, [], key, fraction=0.10, partitions=8, salt=0, detect=_unreachable
+    ) == ([], 0)

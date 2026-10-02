@@ -5,10 +5,12 @@ inert until something consults it before choosing a node, which is what this mod
 reads the regions the fleet's nodes are labelled with, asks the catalog which of them every
 input permits, and hands back the nodes that survive.
 
-Two properties keep this safe to leave on. **An unlabelled node is never filtered out**: a
+Two properties keep this safe to leave on. **An unlabelled node is kept by default**: a
 worker whose region Batcher cannot see is not evidence of a violation, and dropping it would
-take a cluster offline the day a label was missed. And **an unregistered dataset restricts
-nothing**, so a fleet with no residency rules gets exactly the placement it had.
+take a cluster offline the day a label was missed. A catalog built with
+`refuse_unlabeled=True` makes the opposite, fail-closed choice for the data it governs. And
+**an unregistered dataset restricts nothing**, so a fleet with no residency rules gets exactly
+the placement it had.
 
 The layering: `dist` may read `governance`, never the reverse. Governance decides what is
 allowed; scheduling is what acts on it.
@@ -54,14 +56,16 @@ def permitted_nodes(
 
     Returns:
         The permitted subset, order preserved. Nodes with no region label are kept, because an
-        unreadable label is not evidence of a violation. Every node is returned when the
-        catalog's mode is `off` or no input is registered.
+        unreadable label is not evidence of a violation, unless the catalog sets
+        `refuse_unlabeled`. Every node is returned when the catalog's mode is `off` or no
+        input is registered.
     """
     records = gpu_node_topology() if nodes is None else nodes
     permitted = catalog.permitted_regions(list(datasets))
     if permitted is None:
         return tuple(records)
-    return tuple(n for n in records if not n.region or n.region in permitted)
+    keep_unlabeled = not catalog.refuse_unlabeled
+    return tuple(n for n in records if (keep_unlabeled and not n.region) or n.region in permitted)
 
 
 def residency_report(

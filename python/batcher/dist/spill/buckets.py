@@ -1,13 +1,11 @@
 """Bucket mechanics every out-of-core breaker shares: write them, size them, re-split them.
 
 `scratch` answers *where* a spilling query's bytes go. This module answers what every
-breaker then does with them, which until now each one answered for itself. The aggregate,
-the join, the sort, the partitioned window and the global window each opened their own
-per-bucket writers, each restated the rule for how big a bucket is, each wrote their own
-`try/finally` around the store, and three of them wrote their own grace recursion. The
-algorithms were the same; the constants had already drifted (the join derived its own
-re-partition salt by a second formula that happens to equal `split_salt`, which is the
-kind of agreement nothing was checking).
+breaker then does with them, once, for the aggregate, the join, the sort, the partitioned
+window and the global window: the per-bucket writers, the rule for how big a bucket is, the
+`try/finally` around the store, and the grace recursion. The algorithms are the same for all
+of them, and a per-breaker copy lets the constants drift (a second formula for the join's
+re-partition salt that merely happens to equal `split_salt` is agreement nothing checks).
 
 Four things live here, and they are the four the breakers share:
 
@@ -36,6 +34,7 @@ from typing import TYPE_CHECKING
 
 from batcher.config import active_config
 from batcher.dist.spill.scratch import _make_store, _work_dir
+from batcher.plan.profile.spill import note_spill
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -85,7 +84,17 @@ def spill_scratch(prefix: str, spill_dir: str | None) -> Iterator[TieredSpillSto
     store = _make_store(work_dir)
     try:
         with store:
-            yield store
+            try:
+                yield store
+            finally:
+                # Inside the store's `with`, so it is read before `cleanup` zeroes it. This is
+                # the one place every Python out-of-core breaker writes through, which is what
+                # lets `QueryProfile.spilled` see this path at all (`plan.profile.spill`).
+                stats = store.stats()
+                note_spill(
+                    bytes_written=int(stats["bytes_written"]),
+                    buckets_written=int(stats["buckets_written"]),
+                )
     finally:
         if owns_dir:
             shutil.rmtree(work_dir, ignore_errors=True)

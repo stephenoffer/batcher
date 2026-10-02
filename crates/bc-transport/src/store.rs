@@ -162,6 +162,29 @@ pub(crate) struct PartitionStore {
     spill_dir: std::sync::OnceLock<Option<PathBuf>>,
 }
 
+/// Remove every `<pid>_<store>` directory under `root` whose process no longer exists.
+///
+/// Linux only, where `/proc/<pid>` answers the question; elsewhere nothing is removed. A pid
+/// the kernel has since reused keeps its directory, which is the safe direction to be wrong.
+fn sweep_orphaned_spill_dirs(root: &std::path::Path) {
+    let proc_fs = std::path::Path::new("/proc");
+    if !proc_fs.is_dir() {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|n| n.split('_').next()) else {
+            continue;
+        };
+        if pid.parse::<u32>().is_ok() && !proc_fs.join(pid).exists() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 impl Default for PartitionStore {
     fn default() -> Self {
         Self::with_cap(crate::shuffle_store_cap())
@@ -315,14 +338,18 @@ impl PartitionStore {
     }
 
     /// This store's spill directory, created once on first use.
+    ///
+    /// Creating it first removes the directories of stores whose process is gone. A store
+    /// removes its own spill files as their tickets are dropped, but a worker that is killed
+    /// -- a fleet teardown, a lost node -- never gets to, and each such worker left its
+    /// spilled buckets behind: on the SF1000 TPC-H suite they reached 72 GB on one node and,
+    /// with other orphaned scratch, filled a 145 GB disk until no task could start there.
     fn spill_dir(&self) -> Option<&PathBuf> {
         self.spill_dir
             .get_or_init(|| {
-                let dir = std::env::temp_dir().join(format!(
-                    "batcher_shuffle_spill/{}_{:p}",
-                    std::process::id(),
-                    self
-                ));
+                let root = std::env::temp_dir().join("batcher_shuffle_spill");
+                sweep_orphaned_spill_dirs(&root);
+                let dir = root.join(format!("{}_{:p}", std::process::id(), self));
                 crate::shared::create_private_dir(&dir).ok().map(|()| dir)
             })
             .as_ref()
@@ -408,6 +435,29 @@ impl PartitionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store whose process was killed never removes its spill directory; the next store
+    /// on the node must, and must leave a live process's alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_new_store_sweeps_only_dead_owners_spill_dirs() {
+        let root = std::env::temp_dir().join(format!("bc_sweep_test_{}", std::process::id()));
+        let dead = root.join("4294967294_0xdead");
+        let live = root.join(format!("{}_0xbeef", std::process::id()));
+        let other = root.join("not-a-store");
+        for d in [&dead, &live, &other] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("bucket.arrow"), b"x").unwrap();
+        }
+        super::sweep_orphaned_spill_dirs(&root);
+        assert!(!dead.exists(), "a dead process's spill dir must be removed");
+        assert!(live.exists(), "a live process's spill dir must survive");
+        assert!(
+            other.exists(),
+            "a directory that is not a store's must survive"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
 

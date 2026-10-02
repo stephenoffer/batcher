@@ -174,6 +174,13 @@ class OperatorFeedback:
     # already-corrected estimate instead would make a converged correction look
     # error-free and decay it back to 1.0. 0.0 means unestimated.
     n_estimated: float = 0.0
+    # Whether a runtime join filter reduced this operator's input (the engine's
+    # `ExecMetrics::runtime_filtered`). Then `n_actual`, `n_input` and `selectivity` describe
+    # the rows that survived that filter, not the operator's own relation: a predicate the
+    # join filter already implies -- a sideways-derived key range is exactly that -- measures
+    # 1.0 on the reduced input however selective it is on the table. `n_estimated` is zeroed
+    # for the same reason; this carries the fact itself to readers of the other fields.
+    runtime_filtered: bool = False
     # Per-row cost of the expressions this operator evaluated, relative to a plain
     # comparison (1.0 when it evaluates none). Cost calibration divides it out of
     # `t_op_ms`, so the fitted per-row coefficients describe the *engine* rather than

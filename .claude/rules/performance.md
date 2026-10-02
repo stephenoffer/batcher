@@ -80,21 +80,13 @@ staging costs: `_ADAPTIVE_MIN_ROWS_PER_STAGE` (5M) or `_ADAPTIVE_MIN_BYTES_PER_S
 at 20M, a six-breaker one at 30M. A plan with **no join** never qualifies at any size, which
 gates more queries than the size floor does.
 
-**That last sentence is true of the single-node ladder and false as an absolute, corrected
-2026-09-13 by reading `resolve_adaptive` rather than summarizing it.** `distributed and
-requires_staging(plan)` is checked *before* `_large_enough`, so a distributed plan takes the
-staged path at any size and with no join at all. `dist.executors.plan_analysis.requires_staging`
-qualifies two shapes, and the second is **a breaker beneath a breaker** —
-`limit(100).group_by(k).agg(...)`, `agg(agg(x))`, `window(limit(...))` — which carries no join.
-There staging is not an optimization: the one-shot dispatcher ships the inner plan to every
-worker as a map prefix, so a nested `Limit` keeps `limit` rows *per partition* and a nested
-`Aggregate` produces per-partition partial groups. Both **return wrong answers rather than
-raising**, which is why the check precedes the floor. `_stage_count` is also an upper bound
-rather than the cut count: a breaker whose output size is already exact is not cut, so the
-2/4/6-breaker table is the floor the *gate* applies, not the number of cuts taken. The flat 20,000,000-row gate this replaced, and
-the `_ADAPTIVE_MIN_INPUT_ROWS` constant that held it, are both gone. Claim the two
-things that are true — single-node availability, and cross-run learning — and nothing
-past them.
+Exception: a distributed plan that `requires_staging`
+(`dist.executors.plan_analysis.requires_staging` — e.g. a breaker beneath a breaker, such as
+`limit(100).group_by(k).agg(...)`, with no join) is staged at any size, because the one-shot
+path returns wrong answers there: a nested `Limit` keeps `limit` rows per partition and a nested
+`Aggregate` yields per-partition partial groups. `_stage_count` is an upper bound on cuts, not
+the cut count. The flat 20,000,000-row gate is retired; don't restore it. Claim the two things
+that are true — single-node availability, and cross-run learning — and nothing past them.
 
 Use these as the bar to clear, and verify the claim with `benchmarks/` before
 asserting it. Don't ship a positioning statement the benchmark doesn't support.

@@ -385,10 +385,10 @@ def _one(bt, name: str, sql: str, tables: dict) -> dict:
 
 
 def _same(left, right):
-    """Order-independent, float-tolerant multiset comparison of two Arrow tables."""
+    """Order-independent, float-tolerant multiset comparison with identical column types."""
     from harness.compare import results_match
 
-    ok, why = results_match(left, right)
+    ok, why = results_match(left, right, strict_types=True)
     return True if ok else why
 
 

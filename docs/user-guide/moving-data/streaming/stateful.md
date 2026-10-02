@@ -274,9 +274,12 @@ A union of *bounded* inputs still concatenates in order, because order is free t
 whole-relation state a stream does not have.
 
 :::{note}
-A branch parked on an idle source delays the others, because pulling from it is a blocking
-read. That is the same property {py:meth}`join_stream <batcher.Dataset.join_stream>` has,
-and for the same reason: one driver thread, and the source decides when its read returns.
+Each branch is read on its own thread, and the union emits whichever branch's batch is ready
+first. A branch parked on an idle source doesn't hold the others back, and each branch waits
+once it has one batch queued, so memory stays bounded.
+{py:meth}`join_stream <batcher.Dataset.join_stream>` reads its two sides the same way. The
+state caveat still applies there: an idle side stops its watermark, so the other side's
+buffered rows aren't evicted until it moves.
 :::
 
 ## When state outgrows memory

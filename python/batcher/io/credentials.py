@@ -31,13 +31,22 @@ failure raises `BackendError`.
 from __future__ import annotations
 
 import pathlib
+from dataclasses import dataclass, field
 from typing import Any
 
 from batcher._internal.errors import BackendError
 from batcher._internal.optional import require
 from batcher.io.secret_backends import BACKEND_SCHEMES, resolve_backend_ref
 
-__all__ = ["SECRET_COMMAND_ENV", "is_secret_ref", "resolve_secret", "vend_unity_credentials"]
+__all__ = [
+    "SECRET_COMMAND_ENV",
+    "UnityLease",
+    "is_secret_ref",
+    "resolve_client_secrets",
+    "resolve_secret",
+    "unity_lease",
+    "vend_unity_credentials",
+]
 
 #: Reference schemes resolved on the machine that opens the connection. The first three are
 #: the ones the data plane's own resolver (`bc-secrets`) answers, so one vocabulary covers a
@@ -158,6 +167,47 @@ def _from_command(name: str, *, what: str, reference: str) -> str:
     return secret
 
 
+def resolve_client_secrets(
+    options: dict[str, Any], *, what: str, hints: tuple[str, ...]
+) -> dict[str, Any]:
+    """Resolve secret references in a client-options dict's credential values.
+
+    A broker client (librdkafka, the Event Hubs SDK) takes its options verbatim, so a
+    ``sasl_password="env:KAFKA_PASSWORD"`` used to reach it as the literal string
+    ``env:KAFKA_PASSWORD`` and fail authentication -- the one credential in the engine that
+    the common secret vocabulary did not cover. Call this where the client is built, on the
+    worker, so the reference is what travels and the secret exists only there.
+
+    Args:
+        options: Client options, keyed by option name in either spelling (``_`` or ``.``).
+        what: A label for error messages, naming the connector.
+        hints: Substrings that mark an option name as a credential. Only a value under
+            such a key is resolved, so a path option that happens to start with ``file:``
+            is never read as a secret. Pass the connector family's own list, the one its
+            log redaction already uses, so the two cannot disagree.
+
+    Returns:
+        A copy of `options` with each credential-keyed secret reference resolved.
+
+    Examples:
+        .. doctest::
+
+            >>> import os
+            >>> from batcher.io.credentials import resolve_client_secrets
+            >>> os.environ["DOC_KAFKA_PW"] = "hunter2"
+            >>> resolve_client_secrets(
+            ...     {"sasl.password": "env:DOC_KAFKA_PW"}, what="kafka", hints=("password",)
+            ... )
+            {'sasl.password': 'hunter2'}
+    """
+    out = dict(options)
+    for key, value in options.items():
+        lowered = str(key).lower()
+        if is_secret_ref(value) and any(hint in lowered for hint in hints):
+            out[key] = resolve_secret(value, what=f"{what} {key}")
+    return out
+
+
 def _require_databricks_sdk() -> Any:
     """Import and return the Databricks `WorkspaceClient` class or raise."""
     return require(
@@ -205,37 +255,50 @@ def _storage_options_from_credentials(creds: Any) -> dict[str, str]:
     raise BackendError("Unity Catalog returned no recognized cloud credentials for the table")
 
 
-def vend_unity_credentials(
+@dataclass(frozen=True, slots=True)
+class UnityLease:
+    """Vended Unity Catalog storage credentials and when they stop working.
+
+    `expires_at_s` is a Unix time in seconds, or ``None`` when Unity reported no expiry, in
+    which case nothing can tell a reader when to renew and it is not attempted.
+    """
+
+    storage_url: str
+    storage_options: dict[str, str] = field(repr=False)
+    expires_at_s: float | None = None
+
+
+def unity_lease(
     table: str,
     workspace: str,
     token: str,
     *,
     operation: str = "READ",
-) -> tuple[str, dict[str, str]]:
-    """Vend short-lived storage credentials for a Unity Catalog table.
+) -> UnityLease:
+    """Vend short-lived storage credentials for a Unity Catalog table, with their expiry.
 
-    Calls the Databricks ``temporary_table_credentials`` API and returns the
-    table's physical storage location together with the cloud storage options a
-    delta-rs / object-store reader needs to read it directly.
+    `token` may be a secret reference (``env:``, ``file:``, a key store), resolved here, on
+    whichever machine is vending -- which is what lets a worker renew an expiring lease
+    without the driver shipping it a literal token.
 
     Args:
         table: The fully-qualified Unity table id (``catalog.schema.table``).
         workspace: The Databricks workspace URL (``https://<host>``).
-        token: A Databricks personal-access / OAuth token for the workspace.
-        operation: ``"READ"`` (default) or ``"READ_WRITE"`` — the access level
-            requested for the vended credentials.
+        token: A Databricks token for the workspace, or a reference to one.
+        operation: ``"READ"`` (default) or ``"READ_WRITE"``.
 
     Returns:
-        ``(storage_url, storage_options)`` — the table's storage URL and a mapping
-        suitable for ``DeltaTable(..., storage_options=...)``.
+        The table's storage URL, the storage options a delta-rs reader needs, and the
+        credentials' expiry.
 
     Raises:
-        BackendError: if the Databricks SDK is missing, the table is not found,
-            or no recognized cloud credentials are returned.
+        BackendError: If the Databricks SDK is missing, the table is not found, or no
+            recognized cloud credentials are returned.
     """
     workspace_client = _require_databricks_sdk()
+    resolved = resolve_secret(token, what="Databricks token") or ""
     try:
-        client = workspace_client(host=workspace, token=token)
+        client = workspace_client(host=workspace, token=resolved)
         info = client.tables.get(full_name=table)
         creds = client.temporary_table_credentials.generate_temporary_table_credentials(
             operation=operation,
@@ -250,4 +313,41 @@ def vend_unity_credentials(
     storage_url = getattr(creds, "url", None) or getattr(info, "storage_location", None)
     if not storage_url:
         raise BackendError(f"Unity Catalog returned no storage location for {table!r}")
-    return str(storage_url), _storage_options_from_credentials(creds)
+    # Unity reports `expiration_time` in epoch milliseconds.
+    expires_ms = getattr(creds, "expiration_time", None)
+    expires_at = float(expires_ms) / 1000.0 if isinstance(expires_ms, int | float) else None
+    return UnityLease(str(storage_url), _storage_options_from_credentials(creds), expires_at)
+
+
+def vend_unity_credentials(
+    table: str,
+    workspace: str,
+    token: str,
+    *,
+    operation: str = "READ",
+) -> tuple[str, dict[str, str]]:
+    """Vend short-lived storage credentials for a Unity Catalog table.
+
+    Calls the Databricks ``temporary_table_credentials`` API and returns the
+    table's physical storage location together with the cloud storage options a
+    delta-rs / object-store reader needs to read it directly. `unity_lease` is the same
+    call with the credentials' expiry attached.
+
+    Args:
+        table: The fully-qualified Unity table id (``catalog.schema.table``).
+        workspace: The Databricks workspace URL (``https://<host>``).
+        token: A Databricks personal-access / OAuth token for the workspace, or a
+            secret reference to one.
+        operation: ``"READ"`` (default) or ``"READ_WRITE"`` — the access level
+            requested for the vended credentials.
+
+    Returns:
+        ``(storage_url, storage_options)`` — the table's storage URL and a mapping
+        suitable for ``DeltaTable(..., storage_options=...)``.
+
+    Raises:
+        BackendError: if the Databricks SDK is missing, the table is not found,
+            or no recognized cloud credentials are returned.
+    """
+    lease = unity_lease(table, workspace, token, operation=operation)
+    return lease.storage_url, lease.storage_options

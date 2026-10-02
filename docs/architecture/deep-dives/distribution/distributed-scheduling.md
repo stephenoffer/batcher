@@ -100,13 +100,13 @@ That window **slides**: one completion launches one new task, exactly as `map_ba
 
 Two separate mechanisms handle skew, one for the read and one for the join.
 
-Scan splits are balanced up front. Parquet `splits()` returns one split per row group, and `dist/executors/partition_io/assignment.py::_balance` greedily bin-packs them by row count. That evens the *read*.
+Scan splits are balanced up front. Parquet `splits()` returns one split per run of row groups, and `dist/executors/partition_io/assignment.py::_balance` greedily bin-packs them. When every split carries its uncompressed size, as a Parquet row-group split does from its footer, it packs by bytes, because a row of a wide table costs more to decode than a row of a narrow one. Otherwise it packs by row count. That evens the *read*. It doesn't see codec cost or a slow remote store, which are properties of where the bytes live rather than how many there are.
 
 Join skew is different, because it's a property of the key distribution and you can't see it in the file layout. `dist/executors/join.py::_detect_hot_keys` runs a Misra-Gries heavy-hitters pass per partition using `nat.heavy_hitters`, which is backed by `bc-sketches`, and a value is hot when its summed count clears `distributed.skew_join_fraction` (0.10) of the rows. Hot keys are then salted. `nat.salted_partition_batches` fans the probe-side hot rows across `salt` reducers and *replicates* the build-side hot rows to all of them. Cold keys hash exactly as before, so the joined relation is unchanged.
 
 The detection pass costs a scan, so `dist/skew.py::resolve_hot_keys` asks the cheap sources first: the set learned for this join shape on a previous run, then the column statistics Kyber already holds, and only then the pre-pass. It runs the pre-pass on its own once the join's estimated input clears about 8.4M rows, because past that size one pass costs around 4% on a join that turns out uniform while an undetected 40% hot key costs 5.8x. `distributed.skew_join_salt` is the fan-out rather than a switch: 0, the default, leaves both the decision and the fan-out to the measurement; a positive value forces the pre-pass and pins the fan-out; a negative value never salts.
 
-What makes the pass pay for itself is that its result is learned. `dist/skew.py` fingerprints the join shape with `join_skew_key`, a hash of both side IRs, the keys, and the join type, and persists the hot-key list in the `MetadataHub`. A shape with learned hot keys salts with no pre-pass at all on the next run. An empty learned list means "measured, not skewed", which is distinct from never-measured, so a non-skewed shape never re-runs the probe.
+What makes the pass pay for itself is that its result is learned. `dist/skew.py` fingerprints the join shape with `join_skew_key`, a hash of both side IRs, the keys, and the join type, and persists the hot-key list in the `MetadataHub`. A shape with learned hot keys salts with no pre-pass at all on the next run. An empty learned list means "measured, not skewed", which is distinct from never-measured, so a non-skewed shape skips the probe while that verdict is fresh. The shape key hashes the plan rather than the bytes under it, so a table can drift into skew under an unchanged query. The verdict therefore expires: after a week (`_UNIFORM_VERDICT_TTL_S`), or once the join's estimated input has moved 4x from the size it was measured at (`_UNIFORM_VERDICT_DRIFT`), it reads as never-measured again. A learned *hot* list doesn't expire, because salting on a key that has since cooled costs some replication and never an answer.
 
 :::{warning}
 Salting is result-preserving only when each reducer's output is concatenated. `salting_is_safe` refuses it for a fused join-plus-aggregate, where the reducer finalizes its bucket locally. Salted reducers would each finalize a *partial* group and the union would carry several half-summed rows for the hot key. Nothing raises. The query returns a wrong answer.
@@ -128,7 +128,7 @@ A `map_batches` pipeline is opaque. It runs in Python, it has no engine IR, and 
 
 The staging follows the plan's operands rather than a single chain, and that is what makes it cover the shape most inference jobs actually have. Embedding a table and then joining the embeddings to something bottoms out at a node with two operands, and so does a union of two inference branches. Each operand that contains a UDF is staged on its own; operands with no UDF are left exactly as they are, so a join of an inference branch against a plain Parquet table stages only the branch. `map_batches(...).join(other).group_by(...)` then reaches the fused join-aggregate reducer, the same one a join over two tables reaches.
 
-An operand whose staged output turns out empty is declined rather than folded away. A breaker is not uniformly empty-preserving. An outer join with an empty right side still emits every left row, so "empty" there would be a wrong answer rather than a missing route.
+An operand whose staged output turns out empty is never folded away, because a breaker is not uniformly empty-preserving. An outer join with an empty right side still emits every left row, so "empty" there would be a wrong answer. Instead, every writing shard reports the UDF's output schema even when it wrote no file, and the empty operand is staged as a zero-row input of that type, so the breaker applies its own empty-input semantics. The operand is declined only when no shard ran the UDF at all and there is no schema to give it.
 
 ## What never reaches the driver
 
@@ -152,7 +152,7 @@ Whether the buckets can stay put is a property of the operator's result, not of 
 
 The sort is the one where the ordering is carried by the layout itself. Its buckets are *ranges* of the leading key, globally ordered against one another, which is what lets the ordinary path concatenate them with no merge step. Keeping them in place preserves the same fact: the handles are listed in range order (reversed for a descending sort), and reading them in sequence is the sorted relation. Nothing re-sorts and nothing merges.
 
-Two shapes decline and collect instead, both for the same reason. There is no partitioned form of what they are being asked for. An operator stacked above the breaker (`sort(...).filter(...)` that Kyber could not push down) has to be applied to something, and a sort carrying a `limit` has to slice an assembled result to select among the rows tied at the cut.
+A `Filter` or a `Project` stacked above a sort, such as the projection that drops a hoisted computed sort key, runs inside every reducer over its range bucket, so the buckets still stay put: a filter or projection of each range, read in range order, is that operator over the sorted relation. Two shapes decline and collect instead, because there is no partitioned form of what they are being asked for. Any other operator stacked above a breaker, and a `Filter` or `Project` above an aggregate, a join, a `distinct` or a window, is applied to the assembled result on the driver. A sort carrying a `limit` too large for the shuffle-free top-N, which takes a `limit` of up to 1,000,000 rows, has to cut an assembled result to select among the rows tied at the cut, although the disk transport reads only the leading range buckets that hold the first `limit` rows rather than every bucket.
 
 ## Cost, and when not to use it
 
@@ -164,7 +164,7 @@ Distribution is for scale-out and for larger-than-memory data. It isn't free, an
 TPC-H sf1 (6M rows), the udf-map workload:   86 ms
 
 no actor startup, no network shuffle, no serialization boundary
-this is what distributed.distribute_min_rows (1M) protects
+this is what distributed.distribute_min_rows (20M) protects
 ```
 :::
 

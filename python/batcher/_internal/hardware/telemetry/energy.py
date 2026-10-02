@@ -41,7 +41,6 @@ __all__ = [
     "capped_below_default",
     "device_energy",
     "energy_counter_available",
-    "fleet_energy_joules",
     "interval_energy_joules",
 ]
 
@@ -82,18 +81,6 @@ class DeviceEnergy:
         say so, and when True it must not, because the sampled figure is strictly worse.
         """
         return self.total_energy_joules > 0.0
-
-    @property
-    def limit_headroom_watts(self) -> float:
-        """Watts between the enforced limit and the highest the driver would accept.
-
-        `0.0` when either figure is unknown or the device is already at its ceiling. Non-zero
-        headroom is the precondition for a power-aware policy raising a cap; without it, the
-        only lever left is placing work elsewhere.
-        """
-        if self.enforced_limit_watts <= 0 or self.max_limit_watts <= 0:
-            return 0.0
-        return max(0.0, self.max_limit_watts - self.enforced_limit_watts)
 
     @property
     def derated_fraction(self) -> float:
@@ -180,19 +167,6 @@ def energy_counter_available(readings: tuple[DeviceEnergy, ...] | None = None) -
     """
     records = device_energy() if readings is None else readings
     return bool(records) and all(r.counted for r in records)
-
-
-def fleet_energy_joules(readings: tuple[DeviceEnergy, ...] | None = None) -> float:
-    """Total energy every local device has consumed since the driver loaded.
-
-    Args:
-        readings: Records to inspect, or `None` to read them live.
-
-    Returns:
-        Joules across the fleet, `0.0` when no device exposes the counter.
-    """
-    records = device_energy() if readings is None else readings
-    return sum(r.total_energy_joules for r in records)
 
 
 def interval_energy_joules(

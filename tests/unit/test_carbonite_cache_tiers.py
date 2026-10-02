@@ -347,3 +347,29 @@ def test_a_newer_put_is_not_overwritten_by_an_in_flight_demotion(monkeypatch):
         assert got.column("v")[0].as_py() == 99, "the demotion served the value it replaced"
     finally:
         store.clear()
+
+
+def test_disk_tier_removes_its_directory_when_the_process_exits(tmp_path):
+    """A tier's scratch directory is named per process, so it must not outlive the process.
+
+    It was removed only by `clear`, so every process that demoted a result left one behind:
+    a day of test runs on one box left 60 of them, 1 GB. The child exits normally without
+    clearing; the control is that the directory existed and held a result before exit.
+    """
+    import subprocess
+    import sys
+
+    script = (
+        "import pathlib, sys, pyarrow as pa\n"
+        "from batcher.carbonite.cache_disk import DiskCacheTier\n"
+        "t = DiskCacheTier(8 << 20)\n"
+        "assert t.put('k', pa.table({'v': list(range(1000))})) > 0\n"
+        "d = pathlib.Path(t._work_dir)\n"
+        "assert d.is_dir() and any(d.iterdir())\n"
+        "print(d)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    assert out, "the child did not report its directory"
+    assert not __import__("pathlib").Path(out).exists(), f"{out} outlived its process"

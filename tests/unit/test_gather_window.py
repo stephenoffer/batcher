@@ -112,24 +112,34 @@ def test_window_survives_and_bounds_a_preemption(monkeypatch):
 
 def test_window_derives_from_cluster_cores(monkeypatch):
     from batcher.dist.executors.ray_runtime import policies
+    from batcher.dist.executors.ray_runtime.policies import _barrier
 
-    # 8 cores x default factor 4 = 32; n above that -> the window engages at 32.
+    # 8 worker-eligible cores x default factor 4 = 32; n above that -> the window engages at 32.
+    monkeypatch.setattr(_barrier, "cluster_topology", lambda: {"cpus": 8.0})
+    assert policies._pending_window() == 32
+
+
+def test_window_counts_worker_eligible_cores_not_raw_cluster_resources(monkeypatch):
+    """The head's cores are in `ray.cluster_resources()` but run none of the stage's tasks."""
+    from batcher.dist.executors.ray_runtime import policies, scaling
+
     fake_ray = types.ModuleType("ray")
-    fake_ray.cluster_resources = lambda: {"CPU": 8.0}
+    fake_ray.cluster_resources = lambda: {"CPU": 64.0}
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    head = {"NodeID": "h", "Alive": True, "Resources": {"CPU": 56.0, "node:__internal_head__": 1}}
+    worker = {"NodeID": "w", "Alive": True, "Resources": {"CPU": 8.0}}
+    monkeypatch.setattr(scaling, "_live_alive_nodes", lambda: [head, worker])
     assert policies._pending_window() == 32
 
 
 def test_window_falls_back_when_topology_unreadable(monkeypatch):
     from batcher.dist.executors.ray_runtime import policies
-
-    fake_ray = types.ModuleType("ray")
+    from batcher.dist.executors.ray_runtime.policies import _barrier
 
     def _boom():
         raise RuntimeError("ray down")
 
-    fake_ray.cluster_resources = _boom
-    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(_barrier, "cluster_topology", _boom)
     assert policies._pending_window() == policies._DEFAULT_PENDING_WINDOW
 
 

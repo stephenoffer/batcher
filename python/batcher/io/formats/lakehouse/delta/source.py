@@ -224,10 +224,6 @@ class DeltaSource:
         # a filter on a timezone-aware timestamp column raises rather than prunes.
         return to_pyarrow_expression(predicate, self._snapshot().schema())
 
-    def _has_deletion_vectors(self) -> bool:
-        """Whether the table uses deletion vectors (delta-rs's pyarrow reader raises)."""
-        return self._snapshot().has_deletion_vectors()
-
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
     ) -> list[pa.RecordBatch]:
@@ -296,24 +292,6 @@ class DeltaSource:
         if not deleted:
             return stats
         return _demote_bounds(stats, rows=(stats.row_count or 0) - deleted)
-
-    def read_cdf(self, starting_version: int, ending_version: int | None = None) -> pa.Table:
-        """Read the Change-Data-Feed between two versions as an Arrow table.
-
-        Requires the table to have ``delta.enableChangeDataFeed = true``. The
-        returned table carries the CDF metadata columns (``_change_type``,
-        ``_commit_version``, ``_commit_timestamp``).
-        """
-        table = self._table()
-        try:
-            reader = table.load_cdf(
-                starting_version=starting_version,
-                ending_version=ending_version,
-            )
-            # delta-rs returns an Arrow C-stream (arro3) reader; adapt it to pyarrow.
-            return pa.RecordBatchReader.from_stream(reader).read_all()
-        except Exception as exc:
-            raise BackendError(f"failed to read Delta CDF for {self._table_uri!r}: {exc}") from exc
 
     def identity(self) -> str:
         """What makes this source *this* source — including **which version** it reads.

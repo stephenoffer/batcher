@@ -2,6 +2,14 @@
 
 **Algorithms for Adaptive Optimization and Resource Management in Dynamic Data Systems**
 
+> **Historical document. It does not describe the current engine.**
+>
+> This is the design paper from Batcher's first version. It describes a Ray-based framework that selected among Polars, DuckDB, and Arrow compute backends, and it explicitly excluded SQL, catalogs, DDL/DML, and stateful streaming. The current engine is a different system: a Python control plane over a native Rust data plane on Apache Arrow, with its own SQL front end, lakehouse table support, and stateful streaming. The mechanisms, constants, measurements, and speedups below are v1-era statements. None of them is reproduced by the current benchmarks, and several describe components that no longer exist. Where this paper and the code disagree, the code and `docs/architecture/internals/competitive_architecture.md` decide.
+>
+> **Errata.** A review against the literature found mathematical statements here that were false, and they have been corrected in place rather than left standing: the AIMD fairness proof and stability claim (Theorems 1 and 5), the distinct-count lower bound and the sketch space-accuracy table (Theorem 6), the HyperLogLog merge and skew claims, the join-ordering and scheduling guarantees (Statement 7, Theorem 8, and the approximation table), the correlated-selectivity error factors, the multi-stage error composition, the PAC sample count (Theorem 3), the adversarial-regret bound (Theorem 9), and the OOM, warm-start, and regression-convergence claims in the positioning section. Each corrected passage says what was wrong. Statements not listed there were not re-derived, so treat the rest of the analysis as the v1 authors' claims, not as verified results.
+>
+> **Numbering.** Theorems are numbered 1 to 9 by where they appear: Theorem 1 is AIMD fairness, 2 the UCB regret bound, 3 the PAC sample complexity, 4 EMA convergence, 5 AIMD boundedness, 6 the distinct-count lower bound, 7 join ordering (a statement rather than a theorem, because its approximation guarantee was withdrawn), 8 list scheduling, and 9 bounded regret under adversarial workloads. The `§` section numbers in the text come from an earlier draft whose numbered headings no longer exist, so read a `§` reference as a pointer to the topic, not to a heading.
+
 ---
 
 ## Abstract
@@ -12,7 +20,7 @@
 
 **Approach.** We introduce a three-layer architecture that unifies optimization, resource management, and adaptive execution under shared mathematical contracts. **Kyber** (query optimizer) generates initial plans using probabilistic sketches (HyperLogLog++ for cardinality, 1.04/√m relative error), cost models (DP join ordering, O(n²2ⁿ) complexity for n tables), and learned patterns from execution history (Thompson Sampling for algorithm selection, O(√KT log T) regret for K algorithms, T executions). **Carbonite** (resource manager) enforces stability through credit-based flow control (one credit = one RecordBatch buffer slot), AIMD backpressure (α=1 credit/RTT increase, β=0.5 on congestion), and memory envelopes (soft limits triggering throttling at 85% threshold), preventing resource exhaustion. **Batcher Core** (adaptive executor) monitors per-operator metrics (row counts, execution time ms, memory peak MB) at ~100ms granularity and refines decisions via multi-armed bandits for algorithm selection, PID controllers for rate adaptation (Kp=0.4, Ki=0.1, Kd=0.05 tuned for 100ms feedback latency), and distributed metadata aggregation for statistics correction (correlation-adjusted selectivity using Gaussian copula with measured ρ).
 
-**Results.** Evaluated on ML embedding workloads (10M-100M rows, sentence-transformer 384-dim embeddings), TPC-H-style analytics (SF=100, 8 benchmark queries), and real-world production pipelines on Ray clusters (AWS r5.4xlarge: 16 vCPUs, 128GB RAM; 4-8 node clusters), Batcher achieves: (1) 4.6× end-to-end speedup over baseline Ray Data on embedding pipelines (median across 5 runs with different random seeds, IQR [4.1×, 5.2×], speedup primarily from format-aware backend selection reducing Arrow→Pandas→PyTorch conversion overhead from 35% to 8% of total runtime), (2) 2.1× improvement from topology-aware scheduling (median [1.8×, 2.4×], measured on multi-node Ray cluster with network latency 10-50ms RTT, benefit from locality-aware task placement reducing shuffle bytes by 47%), (3) convergence to within 15% of best-observed configuration within 50 iterations of Thompson Sampling (measured on join workload with 5 algorithm choices: broadcast, hash, sort-merge, grace-hash, radix-hash; 50 iterations = 12 minutes wall-clock on test workload). We establish theoretical bounds: $O(\sqrt{KT \log T})$ regret for algorithm selection under Thompson Sampling, $1.04/\sqrt{m}$ relative error for HyperLogLog++ cardinality estimation with $m$ registers, asymptotic fairness for AIMD flow control under synchronized feedback (Theorem 1, §7.1.2), and Lyapunov stability for PID rate control (Theorem 3, §8.1.3). Ablations (§11): Kyber alone +18% vs static, Carbonite alone +12% vs no backpressure, learning alone +9% vs static bandit, combined +46% (super-additive due to feedback loops).
+**Results.** Evaluated on ML embedding workloads (10M-100M rows, sentence-transformer 384-dim embeddings), TPC-H-style analytics (SF=100, 8 benchmark queries), and real-world production pipelines on Ray clusters (AWS r5.4xlarge: 16 vCPUs, 128GB RAM; 4-8 node clusters), Batcher achieves: (1) 4.6× end-to-end speedup over baseline Ray Data on embedding pipelines (median across 5 runs with different random seeds, IQR [4.1×, 5.2×], speedup primarily from format-aware backend selection reducing Arrow→Pandas→PyTorch conversion overhead from 35% to 8% of total runtime), (2) 2.1× improvement from topology-aware scheduling (median [1.8×, 2.4×], measured on multi-node Ray cluster with network latency 10-50ms RTT, benefit from locality-aware task placement reducing shuffle bytes by 47%), (3) convergence to within 15% of best-observed configuration within 50 iterations of Thompson Sampling (measured on join workload with 5 algorithm choices: broadcast, hash, sort-merge, grace-hash, radix-hash; 50 iterations = 12 minutes wall-clock on test workload). We establish theoretical bounds: $O(\sqrt{KT \log T})$ regret for algorithm selection under Thompson Sampling, $1.04/\sqrt{m}$ relative error for HyperLogLog++ cardinality estimation with $m$ registers, asymptotic fairness for AIMD flow control under synchronized feedback (Theorem 1), and a Lyapunov argument for PID rate control (under "Why Control Theory Instead of Pure Heuristics?"; it is a sketch rather than a numbered theorem, and it assumes continuous-time dynamics the discrete-time controller does not have). Ablations (§11): Kyber alone +18% vs static, Carbonite alone +12% vs no backpressure, learning alone +9% vs static bandit, combined +46% (super-additive due to feedback loops).
 
 **Why it matters.** This work demonstrates that rigorous mathematical foundations - probabilistic data structures with provable accuracy bounds, combinatorial optimization with complexity analysis, control theory with stability guarantees, and online learning with regret bounds - can be unified into practical systems that outperform static and rule-based approaches by 2-5× on representative workloads. Our contributions benefit: (1) **database systems researchers** studying adaptive query processing and learned optimizers, (2) **distributed systems researchers** exploring learning-based resource management and flow control, (3) **ML systems researchers** building inference pipelines with dynamic batch sizing and heterogeneous accelerators, and (4) **practitioners** deploying data-parallel workloads in dynamic cloud environments requiring cost-performance trade-offs.
 
@@ -102,7 +110,7 @@ Traditional systems separate optimizer, scheduler, and executor but lack formal 
 2. **Carbonite → Batcher Core:** Allocation primitives `reserve(M)`, `acquire_credit()`, `release(M)` with blocking semantics.
 3. **Batcher Core → Kyber:** Execution feedback $(n_{\text{actual}}, t_{\text{op}}, M_{\text{peak}})$ for cardinality $n$, time $t$, memory $M$.
 
-**Safety property (Theorem 5, §12.3):** If Carbonite enforces envelopes, then $\Pr[\text{OOM}] \leq \delta$ for configured $\delta$ (typically 0.01). Proof: Memory envelope triggers backpressure at 85% threshold; spilling begins at 90%; OOM only if spill rate < allocation rate, bounded by $\delta$ via admission control.
+**Safety goal (not a theorem):** Carbonite's envelopes are designed to make an OOM rare: the memory envelope triggers backpressure at an 85% threshold and spilling begins at 90%, so an OOM needs allocation to outrun spilling. *Erratum:* an earlier version stated this as $\Pr[\text{OOM}] \leq \delta$ for a configured $\delta$. No such bound follows from thresholds and admission control alone. A probability bound needs a model of the allocation and spill rates, such as a tail bound on allocation bursts relative to spill bandwidth, and this paper supplies none, so no numerical OOM probability is claimed.
 
 **Innovation 2: Safe Adaptive Envelopes (Control + Learning)**
 
@@ -117,15 +125,15 @@ Adaptive systems face exploration-exploitation trade-offs: aggressive exploratio
 **Why control + learning?**
 - Control alone: stable but suboptimal (PID converges to local optimum, e.g., batch_size=512, but 1024 might be better).
 - Learning alone: optimal but unstable (bandit explores batch_size=4096, triggers OOM).
-- Combined: learning explores within envelope; control prevents violations. Regret bound degrades gracefully: $O(\sqrt{KT})$ → $O(\sqrt{KT} + \epsilon T)$ where $\epsilon$ = constraint violation rate (Theorem 4, §8.2.3).
+- Combined: learning explores within envelope; control prevents violations. The intended trade-off is that regret grows from $O(\sqrt{KT})$ to $O(\sqrt{KT} + \epsilon T)$ where $\epsilon$ = constraint violation rate. This is stated without proof. No numbered theorem covers it; an earlier version cited Theorem 4, which is the EMA convergence result.
 
 **Innovation 3: Cross-Execution Learning via Metadata Repository**
 
 Traditional optimizers treat each query independently. Batcher accumulates metadata across executions:
 
-- **Cost model calibration (§9.4):** First join: model predicts 10s (actual: 15s, error 50%). After 10 executions: model predicts 14.8s (error 1.3%). Prediction error $\epsilon_t$ decays as $O(1/\sqrt{t})$ under Bayesian linear regression (§9.4.2).
+- **Cost model calibration (§9.4):** First join: model predicts 10s (actual: 15s, error 50%). After 10 executions: model predicts 14.8s (error 1.3%). *Erratum:* an earlier version said prediction error decays as $O(1/\sqrt{t})$ under Bayesian linear regression. That holds only for the *reducible* part of the error, the gap between the fitted and the true coefficients, and only when the linear model is correctly specified, its features are identifiable, and the observed executions keep covering the feature space so the information matrix grows linearly in $t$. Under those assumptions the coefficient error, and the fitted prediction's error at a fixed input, shrink as $O(\sigma/\sqrt{t})$ for observation noise $\sigma$. The error against an observed runtime also contains that noise, which does not decay, and a query whose features lie outside the observed range gets no guarantee at all. The 50% and 1.3% figures above are the v1 authors' example, not a measurement.
 - **Correlation mining (§9.2):** Detect column correlations (e.g., `product_id` ↔ `category` have Pearson $\rho=0.82$) from actual data. Refine selectivity: naive estimate $\sigma(A \land B) = \sigma(A) \cdot \sigma(B)$ overestimates by 3× when $\rho \neq 0$; adjusted estimate $\sigma(A \land B) = \Phi_2(\Phi^{-1}(\sigma(A)), \Phi^{-1}(\sigma(B)); \rho)$ using Gaussian copula reduces error to <10% (§9.2.3).
-- **Workload fingerprinting (§9.6):** Cluster similar queries (k-means on operator DAG + data size features, k=20 clusters) to transfer learned policies. If new query matches cluster centroid (cosine similarity >0.8), initialize bandit priors from cluster history. Cold-start regret: $O(\sqrt{KT})$ → warm-start regret: $O(\sqrt{K} + \log T)$ (§9.6.4).
+- **Workload fingerprinting (§9.6):** Cluster similar queries (k-means on operator DAG + data size features, k=20 clusters) to transfer learned policies. If new query matches cluster centroid (cosine similarity >0.8), initialize bandit priors from cluster history. *Erratum:* an earlier version claimed warm starting reduces regret from $O(\sqrt{KT})$ to $O(\sqrt{K} + \log T)$. Matching a fingerprint does not establish that. A transferred prior helps only when it is concentrated near the new workload's true arm means, and a confident prior centred on the wrong arm makes regret worse until the data overturns it. A bound of that shape needs stated assumptions on prior quality, the reward model, and how fast a misleading prior is discounted, followed by a theorem under them. This paper has neither, so warm starting is a heuristic here.
 
 **Comparison:**
 - **OtterTune:** Tunes global DBMS knobs (shared_buffers, work_mem) offline via Gaussian Process optimization. Does not handle per-query decisions or runtime adaptation.
@@ -282,7 +290,7 @@ We use RL (PPO) for adaptive batch sizing (state = [queue depth, GPU util, memor
 - **Rule-based:** If GPU util = 78%, increase batch_size from 512 to 563 (+10%). Next iteration: util = 92%, decrease to 506 (-10%). Next: 76%, increase to 557. Oscillates forever (observed in prototype).
 - **PID-based:** Proportional term $K_p(80 - \text{util})$ provides immediate correction. Derivative term $K_d \frac{d(\text{util})}{dt}$ dampens oscillations. Integral term $K_i \int (\text{target} - \text{util}) dt$ eliminates steady-state error. Converges in 5 iterations (§11.2.2).
 
-**Lyapunov stability (Theorem 3, §8.1.3):**
+**Lyapunov argument (a sketch, not a theorem):**
 For state $x = [\text{util}, \dot{\text{util}}]$ and control $u = K_p e + K_i \int e + K_d \dot{e}$ where $e = \text{target} - \text{util}$:
 $$V(x) = \frac{1}{2}(e^2 + \dot{e}^2)$$
 $$\frac{dV}{dt} = -K_p e^2 - K_d \dot{e}^2 < 0$$
@@ -2445,9 +2453,9 @@ $$
 T_{converge} = \frac{N_{converge}}{f}
 $$
 
-*Proof sketch*: After each congestion event, multiplicative decrease scales both rates by $\beta$, preserving their ratio. The subsequent additive increase phase adds $\delta$ to each, reducing the absolute difference. The ratio $R_1/R_2$ converges geometrically toward 1 with rate $(1 + \beta)/2$ per cycle.
+*Proof*: Let $d = R_1 - R_2$. A congestion event multiplies both rates by $\beta$, so it multiplies $d$ by $\beta$ and preserves the ratio $R_1/R_2$. The additive-increase phase that follows adds the same total increase to each flow, so it leaves $d$ unchanged and moves the ratio toward 1. The contraction therefore comes entirely from the decrease: after $N$ synchronized events $|d_N| = \beta^N |d_0|$, and $|d_N| < \epsilon$ once $N > \log(|d_0|/\epsilon) / \log(1/\beta)$, which is the bound above. *Erratum:* an earlier version credited the additive phase with reducing the difference and gave a per-cycle ratio rate of $(1+\beta)/2$. Neither follows from the update rules.
 
-**Assumptions**: Synchronized congestion feedback; $0 < \beta < 1$; $\delta > 0$.
+**Assumptions**: Synchronized congestion feedback, so both flows see every congestion event; the same additive increase for both flows between events; $0 < \beta < 1$; $\delta > 0$.
 
 ### Memory Allocation Theory
 
@@ -5194,20 +5202,28 @@ where $K$ is the number of algorithms.
 
 **Definition (Sample Complexity)**: The number of samples required to identify the best algorithm with probability $1 - \delta$.
 
-**Theorem 3 (PAC Bounds)**: To identify the best algorithm within error $\epsilon$ with probability $1 - \delta$, the sample complexity is:
+**Theorem 3 (PAC Bounds)**: Let each of $K$ algorithms have $\sigma$-sub-Gaussian rewards (Assumption A2), and sample every algorithm $n$ times, independently. If
 
 $$
-n \geq \frac{K}{\epsilon^2} \log\left(\frac{K}{\delta}\right)
+n \geq \frac{8\sigma^2}{\epsilon^2} \ln\left(\frac{2K}{\delta}\right)
 $$
+
+then with probability at least $1 - \delta$ the algorithm with the highest sample mean is within $\epsilon$ of the best, using $Kn$ samples in total.
+
+*Proof*: For one algorithm, the sub-Gaussian tail bound gives $\Pr[|\hat{\mu}_a - \mu_a| \geq \epsilon/2] \leq 2\exp(-n\epsilon^2 / (8\sigma^2))$, which is at most $\delta/K$ under the condition on $n$. A union bound over the $K$ algorithms puts every estimate within $\epsilon/2$ of its mean with probability at least $1 - \delta$. Then the empirical winner $\hat{a}$ satisfies $\mu_{\hat{a}} \geq \hat{\mu}_{\hat{a}} - \epsilon/2 \geq \hat{\mu}_{a^*} - \epsilon/2 \geq \mu_{a^*} - \epsilon$.
+
+The count scales with $\sigma^2$: doubling the reward noise's standard deviation quadruples the samples needed, and the bound means nothing until rewards are normalized to a known $\sigma$. Adaptive elimination schemes such as median elimination (Even-Dar, Mannor and Mansour, 2002) remove the $\ln K$ factor from the total, but keep the $\sigma^2/\epsilon^2$ dependence. *Erratum:* an earlier version stated $n \geq (K/\epsilon^2)\log(K/\delta)$ with no dependence on $\sigma$, which A2 does not permit.
 
 **Sample Complexity by Task**:
 
-| Task | Sample Complexity | Parameters |
-|------|-------------------|------------|
-| Backend Selection | $O(K \log K / \epsilon^2)$ | $K$ = 3 backends |
-| Join Algorithm | $O(K \log K / \epsilon^2)$ | $K$ = 4 algorithms |
-| Parallelism | $O(\log P / \epsilon^2)$ | $P$ = max parallelism |
-| Fusion Decision | $O(\log N / \epsilon^2)$ | $N$ = pattern count |
+| Task | Sample Complexity | Parameters | Structure it needs |
+|------|-------------------|------------|--------------------|
+| Backend Selection | $O(K \sigma^2 \epsilon^{-2} \log(K/\delta))$ | $K$ = 3 backends | None, Theorem 3 as stated |
+| Join Algorithm | $O(K \sigma^2 \epsilon^{-2} \log(K/\delta))$ | $K$ = 4 algorithms | None, Theorem 3 as stated |
+| Parallelism | $O(P \sigma^2 \epsilon^{-2} \log(P/\delta))$ in general; $O(\sigma^2 \epsilon^{-2} \log P \cdot \log(\log P/\delta))$ with structure | $P$ = candidate parallelism levels | The logarithmic form needs performance to be unimodal (or monotone) in the parallelism level, so a ternary search takes $O(\log P)$ comparisons, and needs each compared pair to differ by at least $\epsilon$. Neither holds for arbitrary workloads, and this paper does not validate either. |
+| Fusion Decision | $O(\sigma^2 \epsilon^{-2} \log(N/\delta))$ per pattern | $N$ = pattern count | Each pattern is an independent two-way decision, union-bounded over the $N$ patterns |
+
+*Erratum:* an earlier version of this table gave $O(\log P / \epsilon^2)$ for parallelism with no structural assumption. Choosing among $P$ arbitrary options costs at least as much as a $P$-armed bandit, which is linear in $P$.
 
 ### Convergence Analysis
 
@@ -5238,21 +5254,11 @@ where $\sigma$ is the noise standard deviation.
 
 ### Stability Analysis
 
-**Theorem 5 (AIMD Stability)**: The AIMD control loop is globally stable if:
+**Theorem 5 (AIMD Boundedness)**: Consider one flow with capacity $C > 0$, additive increase $\delta > 0$, and decrease factor $0 < \beta < 1$, updated once per round: $R_{t+1} = \beta R_t$ if $R_t > C$ (congestion), and $R_{t+1} = R_t + \delta$ otherwise. From any $R_0 > 0$, the rate enters the interval $(\beta C,\ C + \delta]$ within finitely many rounds and never leaves it.
 
-$$
-\beta < \frac{2}{1 + \delta/R_{max}}
-$$
+*Proof*: If $R_0 > C$, the rate is multiplied by $\beta$ until it first falls to $C$ or below, which takes at most $\lceil \log(R_0/C) / \log(1/\beta) \rceil$ rounds. The last decrease starts from a rate above $C$, so it lands above $\beta C$. If the rate is at most $C$, it climbs by $\delta$ per round until it first exceeds $C$, which lands it in $(C, C + \delta]$. From there one decrease lands in $(\beta C, \beta(C + \delta)]$, which lies below $C + \delta$, and the climb resumes. Every round therefore maps the interval into itself.
 
-where $\beta$ is the multiplicative decrease factor and $\delta$ is the additive increase.
-
-**Lyapunov Function**: Define $V(R) = (R - R^*)^2$ where $R^*$ is the equilibrium rate. Under AIMD:
-
-$$
-\dot{V} < 0 \quad \forall R \neq R^*
-$$
-
-proving asymptotic stability.
+AIMD does not converge to a fixed point. It settles into a sawtooth cycle between about $\beta C$ and $C + \delta$, and the useful properties are this boundedness, the resulting utilization of at least $\beta$ in the long run, and the fairness of Theorem 1 between flows. *Erratum:* an earlier version claimed global asymptotic stability under the condition $\beta < 2/(1 + \delta/R_{max})$, with $V(R) = (R - R^*)^2$ strictly decreasing away from $R^*$. The condition holds for every $\beta < 1$ once $\delta < R_{max}$, so it constrains nothing, and $V$ is not decreasing: an additive step from $R^* - \delta/4$ to $R^* + 3\delta/4$ multiplies $V$ by nine.
 
 **Phase Portrait**:
 
@@ -5264,29 +5270,40 @@ proving asymptotic stability.
 
 ### Information-Theoretic Bounds
 
-**Theorem 6 (Cardinality Estimation Lower Bound)**: Any streaming algorithm using $m$ bits of space has expected relative error at least:
+**Theorem 6 (Cardinality Estimation Lower Bound)**: Consider one-pass algorithms over a stream of items from a universe of size $U$ that must output a $(1 \pm \epsilon)$-approximation of the number of distinct items with probability at least $2/3$. Every such algorithm uses
 
 $$
-\epsilon \geq \Omega\left(\frac{1}{\sqrt{m}}\right)
+b = \Omega\left(\frac{1}{\epsilon^2} + \log U\right)
 $$
 
-for distinct element counting.
+bits in the worst case over streams, for $\epsilon$ in the range where $1/\epsilon^2$ is at most a constant times $U$ (Alon, Matias and Szegedy, 1996, for the $\log U$ term; Indyk and Woodruff, 2003, for the $1/\epsilon^2$ term). Equivalently, with a budget of $b$ bits well below $U$, the achievable relative error is $\Omega(1/\sqrt{b})$.
 
-*Implication*: HyperLogLog++'s $O(1.04/\sqrt{m})$ error is optimal up to constant factors.
+The universe restriction is essential. With $b \geq U$ bits, a bitmap indexed by value counts exactly, so no positive error bound can hold there. *Erratum:* an earlier version stated the bound for every algorithm using $m$ bits with no universe, regime, or success-probability condition, which that bitmap contradicts.
+
+*Implication*: HyperLogLog's error is stated per *register*, not per bit. With $m$ registers of 6 bits, $b = 6m$, so its relative standard error of $1.04/\sqrt{m}$ is about $2.55/\sqrt{b}$ in bits. HyperLogLog therefore uses $O(\epsilon^{-2} \log\log U)$ bits, within a $\log\log U$ factor of the lower bound. Kane, Nelson and Woodruff (2010) close that gap with an $O(\epsilon^{-2} + \log U)$-bit algorithm.
 
 **Space-Accuracy Trade-off**:
 
-| Algorithm | Space | Relative Error | Optimal? |
-|-----------|-------|----------------|----------|
-| HyperLogLog++ | $m$ bits | $1.04/\sqrt{m}$ | Yes (constant factor) |
-| Linear Counting | $O(n)$ | 0 | N/A (exact) |
-| Probabilistic Counting | $O(\log \log n)$ | $O(1/\sqrt{\log n})$ | Suboptimal |
+In this table $m$ counts registers or bitmaps, never bits, and the space column converts to bits.
+
+| Algorithm | Space in bits | Relative standard error | Exact? |
+|-----------|---------------|-------------------------|--------|
+| HyperLogLog++ (dense) | $6m$, for $m$ registers of 6 bits | $1.04/\sqrt{m}$ | No |
+| LogLog | $m \cdot O(\log\log U)$ | about $1.30/\sqrt{m}$ | No |
+| Probabilistic counting (PCSA) | $m \cdot O(\log U)$, for $m$ bitmaps | about $0.78/\sqrt{m}$ | No |
+| Linear Counting | $m$, one hashed bitmap | $\sqrt{m(e^t - t - 1)}/n$ with load $t = n/m$ | No. Hash collisions and the occupancy estimate make it approximate, and it saturates once $n \gg m$ |
+| Exact bitmap over the universe | $U$ | 0 | Yes, and only for a universe small enough to index |
+| Exact hash set | $\Theta(n \log U)$ | 0 | Yes |
+
+*Erratum:* an earlier version of this table listed HyperLogLog++'s space as $m$ bits while applying the per-register error formula, listed hashed Linear Counting as exact, and gave probabilistic counting an error of $O(1/\sqrt{\log n})$.
 
 ### Approximation Guarantees
 
-**Theorem 7 (Join Ordering Approximation)**: The greedy join ordering algorithm achieves an $O(n)$-approximation to optimal for $n$ tables in the worst case. However, for common query patterns (FK-PK joins, chain queries), it typically achieves within 1.5× of optimal. The IK-KBZ algorithm achieves optimality in $O(n \log n)$ time for chain queries specifically.
+**Statement 7 (Join Ordering, no approximation guarantee)**: The greedy join ordering heuristic has no worst-case approximation ratio established here. Finding an optimal join order is NP-hard for general query graphs under standard cost models (Ibaraki and Kameda, 1984), and a greedy choice of the cheapest next join can be arbitrarily far from optimal when an early cheap join forces expensive later ones. How close greedy comes on this engine's queries is an empirical question, answered by measurement, not by this statement.
 
-**Note**: Earlier versions of this document incorrectly claimed $O(\log n)$ approximation based on submodularity. Join cardinality is not generally submodular; the corrected bound is $O(n)$.
+IK-KBZ is exact under narrower conditions than a bare "optimal for chain queries". It finds the cheapest *left-deep, cross-product-free* order for an *acyclic* query graph in polynomial time, when the cost function has the adjacent sequence interchange property, such as the sum of intermediate result sizes under independent per-edge selectivities. It makes no claim about bushy trees, cyclic query graphs, cost functions without that property, or runtime with misestimated cardinalities.
+
+*Erratum:* an earlier version called this Theorem 7 and asserted an $O(n)$ worst-case approximation ratio for greedy, and before that an $O(\log n)$ ratio from submodularity, with no cost class or proof for either. It also claimed greedy is "typically within 1.5x of optimal" with no measurement behind it. Both claims are withdrawn.
 
 **Theorem 8 (List Scheduling)**: Graham's list scheduling achieves makespan $T$ satisfying:
 
@@ -5296,15 +5313,21 @@ $$
 
 where $T^*$ is optimal and $p$ is the number of processors.
 
+*Model*: $p$ identical processors, non-preemptive jobs with fixed processing times, optional precedence constraints, and zero communication or data-movement cost between processors (Graham, 1966). The bound does not hold for heterogeneous processors, and a shuffle or a remote read that costs time is outside the model. Batcher's morsel scheduling across one node's cores is the closest fit. Placing tasks across a cluster, where moving data costs time, is not covered.
+
 **Approximation Ratio Comparison**:
 
-| Algorithm | Problem | Approximation Ratio |
-|-----------|---------|---------------------|
-| DPccp | Join Ordering | 1.0 (exact) |
-| Greedy Join | Join Ordering | $O(n)$ worst-case, ~1.5× typical |
-| List Scheduling | Makespan | $2 - 1/p$ |
-| Work Stealing | Makespan | Expected 2.0 |
-| Bin Packing (FFD) | Memory Allocation | 11/9 |
+Every row is a guarantee *within its model*, and the last column says what that model is.
+
+| Algorithm | Problem | Guarantee | Holds under |
+|-----------|---------|-----------|-------------|
+| DPccp | Join Ordering | Optimal, ratio 1.0 | The bushy, cross-product-free plans over a connected query graph that it enumerates, measured by the cost model on *estimated* cardinalities. It is not the fastest executed plan when those estimates are wrong. |
+| Greedy Join | Join Ordering | None established | See Statement 7 |
+| List Scheduling | Makespan | $T \leq (2 - 1/p)\,T^*$ | Identical processors, no communication cost (Theorem 8) |
+| Work Stealing | Makespan | Expected $T_1/p + O(T_\infty)$, for total work $T_1$ and critical-path length $T_\infty$ | Fully strict multithreaded computations on identical processors, with the steal-cost model of Blumofe and Leiserson (1999). Because $T^* \geq \max(T_1/p, T_\infty)$ this is a constant-factor bound, not a ratio of exactly 2. |
+| Bin Packing (FFD) | One-dimensional bin packing | $\text{FFD}(I) \leq \tfrac{11}{9}\,\text{OPT}(I) + \tfrac{6}{9}$, tight (Dosa, 2007) | Offline items of known size sorted largest first, one capacity dimension, no fragmentation. Memory allocation that is online, multi-dimensional, or fragmenting does not meet this model. |
+
+*Erratum:* an earlier version of this table gave greedy join an $O(n)$ ratio, work stealing an "expected 2.0" ratio, and FFD an unconditional 11/9 ratio, without the additive term or the models above.
 
 ---
 
@@ -5326,16 +5349,11 @@ Errors in Batcher arise from three sources:
 
 #### Error Under Different Data Distributions
 
-HyperLogLog++ error depends on data characteristics:
+HyperLogLog++ error does *not* depend on how often each value repeats. A register holds the maximum over every item hashed to it, and a maximum is idempotent, so inserting a value a second time changes nothing. For a fixed set of distinct values and a fixed hash function, a uniform stream and a Zipf-skewed stream over that set leave identical registers and return identical estimates. Frequency skew is not an error source.
 
-| Distribution | Theoretical Error | Observed Error | Notes |
-|--------------|-------------------|----------------|-------|
-| Uniform | $1.04/\sqrt{m}$ | $1.02/\sqrt{m}$ | Matches theory |
-| Zipf ($\alpha = 1.0$) | $1.04/\sqrt{m}$ | $1.08/\sqrt{m}$ | Slight increase from collisions |
-| Zipf ($\alpha = 2.0$) | $1.04/\sqrt{m}$ | $1.15/\sqrt{m}$ | Heavy skew increases error |
-| Clustered | $1.04/\sqrt{m}$ | $1.20/\sqrt{m}$ | Locality affects hash distribution |
+What does move the error is the number of distinct values, through the small-range and bias corrections HyperLogLog++ applies, and the quality of the hash, through Assumption A5. Values that are clustered, such as consecutive integers, stay uniform after a good 64-bit hash and matter only for a weak one. An experiment that means to measure either effect has to hold the distinct set and the hash fixed while it varies the frequencies, or it measures the distinct count instead.
 
-**Recommendation**: For highly skewed data (Zipf $\alpha > 1.5$), increase precision bits by 2 ($m \times 4$) to maintain target error.
+*Erratum:* an earlier version tabulated "observed" errors of $1.08/\sqrt{m}$ and $1.15/\sqrt{m}$ for Zipf skew and $1.20/\sqrt{m}$ for clustered data, and recommended two extra precision bits for skewed data. By the argument above the skew rows cannot be a property of HyperLogLog, and no experiment behind any of the four rows is recorded, so the table and the recommendation are withdrawn.
 
 #### Independence Assumption Violation
 
@@ -5345,11 +5363,25 @@ $$
 \text{Error}_{\text{correlation}} = \frac{\sigma_{\text{actual}}}{\sigma_{\text{estimated}}} = \frac{\sigma_{\text{actual}}}{\sigma_A \cdot \sigma_B}
 $$
 
-| Correlation Type | Error Factor | Example |
-|------------------|--------------|---------|
-| Positive ($\rho > 0$) | $1/(1 - \rho)$ | Country-currency |
-| Negative ($\rho < 0$) | $1/(1 + |\rho|)$ | Age-isStudent |
-| Functional dependency | $\infty$ | SSN-PersonID |
+The error factor depends on the predicates' own selectivities, not on a correlation coefficient alone. Write $p = \sigma_A$ and $q = \sigma_B$ for the two marginal selectivities and $\rho$ for the Pearson correlation between the predicates' 0/1 indicators. Then $\sigma_{\text{actual}} = P(A \wedge B) = pq + \rho\sqrt{p(1-p)q(1-q)}$, so
+
+$$
+\frac{\sigma_{\text{actual}}}{\sigma_A \sigma_B} = 1 + \rho\sqrt{\frac{(1-p)(1-q)}{pq}}
+$$
+
+and the Frechet-Hoeffding bounds $\max(0, p + q - 1) \leq P(A \wedge B) \leq \min(p, q)$ limit it to
+
+$$
+\frac{\max(0,\ p + q - 1)}{pq} \ \leq\ \frac{\sigma_{\text{actual}}}{\sigma_A \sigma_B} \ \leq\ \frac{1}{\max(p, q)}.
+$$
+
+| Dependence | Error factor | Worked case |
+|------------|--------------|-------------|
+| Positive ($\rho > 0$) | $1 + \rho\sqrt{(1-p)(1-q)/(pq)}$, at most $1/\max(p, q)$ | Identical predicates with $p = q = 0.5$ have $\rho = 1$ and a factor of 2 |
+| Negative ($\rho < 0$) | $1 - |\rho|\sqrt{(1-p)(1-q)/(pq)}$, at least $\max(0, p + q - 1)/(pq)$ | Complementary predicates with $p = q = 0.5$ have $\rho = -1$ and a factor of 0, because the conjunction is empty |
+| Implication ($A \Rightarrow B$) | $1/q$ | Identical predicates with selectivity $p$ give $1/p$, which is finite for every $p > 0$. With $q = 0$ both the estimate and the truth are 0, and the ratio is undefined rather than infinite. |
+
+*Erratum:* an earlier version gave the factors as $1/(1 - \rho)$, $1/(1 + |\rho|)$, and $\infty$ for a functional dependency. The worked cases contradict each one: the first predicts an infinite factor where the truth is 2, the second 0.5 where the truth is 0, and the third infinity where the truth is $1/p$. Estimating the factor needs the joint distribution or a fitted dependence model, such as the joint histograms and copulas below, not a universal function of $\rho$.
 
 **Mitigation Strategies**:
 
@@ -5360,17 +5392,15 @@ $$
 
 ### Error Propagation in Multi-Stage Pipelines
 
-Errors compound through pipeline stages. For a pipeline with $k$ stages and per-stage error $\epsilon_i$:
+Errors compound through pipeline stages, and they compound multiplicatively. Define the signed relative error of stage $i$ by $\hat{c}_i = (1 + e_i)\,c_i$, where $e_i > 0$ is an overestimate and $-1 < e_i < 0$ an underestimate. When the final cardinality is a product of $k$ independently estimated factors, such as a scan size times a filter selectivity times a join fan-out, the estimate is the truth times $\prod_i (1 + e_i)$, so
 
 $$
-\epsilon_{total} = 1 - \prod_{i=1}^{k} (1 - \epsilon_i) \approx \sum_{i=1}^{k} \epsilon_i \quad \text{(for small } \epsilon_i \text{)}
+e_{total} = \prod_{i=1}^{k} (1 + e_i) - 1 \approx \sum_{i=1}^{k} e_i \quad \text{(first order, small } |e_i| \text{)}.
 $$
 
-**Example**: A 5-stage pipeline (scan → filter → join → aggregate → sort) with 10% error per stage:
+**Example**: A 5-stage pipeline (scan → filter → join → aggregate → sort) whose first four stages each overestimate by 10% gives $1.1^4 - 1 = 46.4\%$. A sort does not change cardinality and adds no estimation error of its own. If all five estimated factors overestimate by 10%, the result is $1.1^5 - 1 = 61.051\%$, and five 10% underestimates give $0.9^5 - 1 = -40.951\%$. Errors of opposite sign partly cancel. The first-order sum, 50%, understates the compounding. In q-error terms, where $q_i = \max(1 + e_i,\ 1/(1 + e_i)) \geq 1$, the worst case is $q_{total} \leq \prod_i q_i$.
 
-$$
-\epsilon_{total} \approx 5 \times 0.10 = 0.50 \quad \text{(50\% cumulative error)}
-$$
+The product rule assumes each factor's error is independent of the others and that every factor enters the output multiplicatively. An aggregate's output cardinality is a distinct count over its input, which depends on the input's error through the key distribution rather than linearly. A careful propagation uses each operator's actual sensitivity to its input, or carries interval bounds through the plan. *Erratum:* an earlier version composed the errors as $1 - \prod_i (1 - \epsilon_i)$, which is the formula for five 10% *underestimates* (40.951%), not a general cardinality-error rule.
 
 **Batcher's Mitigation**:
 - Intermediate checkpoints with actual cardinality measurement
@@ -5590,12 +5620,14 @@ $$
 
 where:
 - $E_{max}$ is the exploration budget (100 by default)
-- $\Delta_{max}$ is the maximum suboptimality gap
-- $R_{safe}(T)$ is the regret of the safe configuration (at most $2 \cdot T$)
+- $\Delta_{max}$ is the largest per-round loss of an exploratory choice relative to the safe configuration
+- $R_{safe}(T) = T \cdot \Delta_{safe}$ is the regret of running the safe configuration every round, with $\Delta_{safe}$ its per-round gap to the best configuration *for this workload*
 
-*Proof Sketch*: After $E_{max}$ explorations, the system uses safe defaults, bounding further exploration regret. The safe configuration is designed to be at most 2× suboptimal for any workload.
+*Proof Sketch*: At most $E_{max}$ rounds explore, and each costs at most $\Delta_{max}$ more than the safe configuration would. Every other round runs the safe configuration.
 
-**Corollary**: An adversary can cause at most $O(E_{max})$ additional regret beyond what safe defaults would incur.
+This bounds the regret *relative to the safe configuration*, not relative to the best one. $R_{safe}(T)$ grows linearly in $T$ unless the safe configuration happens to be optimal, and nothing bounds $\Delta_{safe}$ in general, because a fixed configuration can be arbitrarily poor on some workload. A bound in absolute terms needs a proved competitive ratio for the safe configuration on a stated workload class, or a measured fallback baseline reported as such. *Erratum:* an earlier version asserted that the safe configuration "is at most 2x suboptimal for any workload" and wrote $R_{safe}(T) \leq 2T$, which no argument here supports.
+
+**Corollary**: An adversary can cause at most $E_{max} \cdot \Delta_{max}$ additional regret beyond what the safe defaults would incur on the same workload.
 
 ### Defense Summary
 
@@ -5603,7 +5635,7 @@ where:
 |--------|---------|----------|-----------|
 | Regret maximization | Bounded exploration, churn detection | ~1% latency | $R(T) \leq O(E_{max} \cdot \Delta_{max})$ |
 | Distribution shift | CUSUM detection, adaptive $\alpha$ | ~0.5% CPU | Detection within 10 observations |
-| Resource exhaustion | Hard limits, memory-aware bounds | None | No OOM from learning |
+| Resource exhaustion | Hard limits, memory-aware bounds | None | Learned batch sizes stay under $B_{max}$; no OOM probability is proved |
 | Oscillation | Damping, rate limiting | ~2% latency | Bounded oscillation amplitude |
 
 ### Security Recommendations
@@ -5663,13 +5695,13 @@ This section provides a candid technical assessment of what Batcher does **not**
 ### 12.3 Theoretical Gaps (Where Theory Doesn't Apply)
 
 **Regret bound assumptions violated:**
-- **Thompson Sampling regret** $O(\sqrt{KT \log T})$ assumes (Theorem 2, §8.2):
+- **Thompson Sampling regret** $O(\sqrt{KT \log T})$ (the regret comparison table after Theorem 2, which itself states the UCB bound) assumes:
   1. **Stationary rewards**: Algorithm A's latency is constant. Violated by: cluster load fluctuations (±30% observed in §11.4.6), data distribution shifts (workload A → A' with different cardinality).
   2. **Independent trials**: Execution $t$ doesn't affect $t+1$. Violated by: cache warm-up (first execution slow, second fast), learning overhead (exploration in iteration 5 slows iteration 6 if it triggers OOM).
 - **Impact**: Empirical regret in non-stationary settings (§11.8.2) is $O(T^{2/3})$, worse than theoretical $O(\sqrt{T})$. We report this honestly but lack formal analysis for non-stationary bandits.
 
 **Lyapunov stability proof gaps:**
-- **Theorem 3 (§8.1.3)** assumes continuous-time dynamics ($\dot{x} = f(x, u)$). Actual implementation is discrete-time (100ms sampling). Discretization can cause instability if sampling period $\Delta t$ violates Nyquist criterion.
+- **The PID Lyapunov argument** (under "Why Control Theory Instead of Pure Heuristics?", not a numbered theorem) assumes continuous-time dynamics ($\dot{x} = f(x, u)$). Actual implementation is discrete-time (100ms sampling). Discretization can cause instability if sampling period $\Delta t$ violates Nyquist criterion.
 - **Missing analysis**: We do not prove discrete-time stability. Empirical tuning (Kp=0.4, Ki=0.1, Kd=0.05) ensures stability in tested workloads, but no guarantee for untested conditions.
 
 **AIMD fairness proof limitations:**
@@ -5677,8 +5709,8 @@ This section provides a candid technical assessment of what Batcher does **not**
 - **Measured unfairness**: Gini coefficient 0.15 (§11.3.2, fair=0, unfair=1). Better than no control (Gini=0.35), but not perfect fairness.
 
 **Sketch error compounding:**
-- **HyperLogLog++ error** 1.04/√m is for a single sketch. When merging K sketches (distributed cardinality), error becomes $\approx 1.04\sqrt{K}/\sqrt{m}$ (not formally proven in HLL++ paper, but observed empirically).
-- **Impact**: 8-node cluster merging 8 sketches: error 1.04√8/√16384 ≈ 2.9%. We do not propagate this through cost models (current cost model uses 1.04/√m regardless of merge count). This causes underestimation of plan uncertainty.
+- **HyperLogLog++ error** 1.04/√m does not grow with the number of merged sketches. The union of $K$ compatible sketches, with the same precision and the same hash function, is the register-wise maximum, which is exactly the sketch a single pass over the union of the inputs would build. Its error is therefore $1.04/\sqrt{m}$ for the union's cardinality whatever $K$ is. *Erratum:* an earlier version claimed a merged error of about $1.04\sqrt{K}/\sqrt{m}$ (2.9% for 8 sketches at $m = 16384$) as an empirical observation. Register-wise maximum makes that impossible for compatible sketches.
+- **Where merging does cost accuracy**: sketches built at different precisions merge only at the lower precision, so the union carries the coarser sketch's error. An intersection or difference computed by inclusion-exclusion from union estimates has an absolute error on the order of the *union's* cardinality, so its relative error grows without bound as the intersection shrinks. Those are the cases a cost model should widen its uncertainty for.
 
 ### 12.4 Threats to Validity
 
@@ -6227,7 +6259,7 @@ This section provides a comprehensive reference for all mathematical notation us
 
 - **Capitalization**: "Batcher Core" (title case for modules), "batch" (lowercase for data unit), "ScaleCoordinator" (CamelCase for classes).
 - **Acronyms**: Always define on first use: "HyperLogLog++ (HLL)", "Additive Increase Multiplicative Decrease (AIMD)".
-- **Theorem References**: "Theorem 3.1" refers to the first theorem in Section 3.
+- **Theorem References**: Theorems are numbered 1 to 9 in order of appearance, with no section prefix. See the numbering note at the top of the document.
 - **Figure References**: "Figure 5" refers to the fifth numbered figure.
 
 ---

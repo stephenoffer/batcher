@@ -6,7 +6,7 @@ import pyarrow as pa
 import pytest
 
 from batcher._internal.errors import SchemaError
-from batcher.io.schema import normalize_batch, reconcile_batches, schema_drift, unify_schemas
+from batcher.io.schema import normalize_batch, reconcile_batches, unify_schemas
 
 
 def test_unify_union_promotes_and_unions_columns():
@@ -58,16 +58,6 @@ def test_normalize_batch_adds_nulls_and_casts():
     assert out.schema == target
     assert out.column("a").to_pylist() == [1.0, 2.0]
     assert out.column("b").to_pylist() == [None, None]
-
-
-def test_schema_drift_reports_changes():
-    expected = pa.schema([pa.field("a", pa.int64()), pa.field("b", pa.string())])
-    inferred = pa.schema([pa.field("a", pa.float64()), pa.field("c", pa.bool_())])
-    drift = schema_drift(inferred, expected)
-    assert drift.has_drift
-    assert drift.added == ("c",)
-    assert drift.removed == ("b",)
-    assert drift.type_changed == (("a", "int64", "double"),)
 
 
 def test_reconcile_batches_unions_drifting_schemas():

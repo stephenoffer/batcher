@@ -1,6 +1,6 @@
 # Model and AI functions in SQL
 
-This page covers calling a model from Batcher SQL. Two kinds of table function do it: `ML_PREDICT` scores a fitted traditional model, and `AI_GENERATE` and `AI_EXTRACT` call a language model. Both keep inference inside the query plan, so a prediction or a generated field is one more column the statement can filter, join, and aggregate. For the rest of the SQL surface, see {doc}`sql`.
+This page covers calling a model from Batcher SQL. Three kinds of table function do it: `ML_PREDICT` scores a fitted traditional model, `AI_GENERATE`, `AI_CLASSIFY` and `AI_EXTRACT` call a language model, and `AI_EMBED` runs a sentence-transformers encoder. Both keep inference inside the query plan, so a prediction or a generated field is one more column the statement can filter, join, and aggregate. For the rest of the SQL surface, see {doc}`sql`.
 
 Every example here runs against a {py:obj}`bt.Session <batcher.Session>`, which holds the catalog a query resolves names against:
 
@@ -84,13 +84,45 @@ print(
 
 The generated column is an ordinary column, so the rest of the statement groups, filters and joins over it without leaving SQL.
 
+`AI_CLASSIFY` labels each row with exactly one of a fixed set. It takes `prompt_column`, a required `labels` list, and the optional `template` and `output_column`, and lowers to {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>`. The label column is named `label` unless you rename it:
+
+```python
+s.register_engine(
+    "labeller", lambda: lambda prompts: ["positive" if "love" in p else "negative" for p in prompts]
+)
+
+print(
+    s.sql(
+        "SELECT id, label FROM AI_CLASSIFY(reviews, labeller,"
+        " prompt_column => 'body', labels => ['positive', 'negative']) ORDER BY id"
+    ).to_pydict()
+)
+# {'id': [1, 2, 3], 'label': ['positive', 'negative', 'negative']}
+```
+
+Snowflake writes `AI_CLASSIFY(input, categories)` in the `SELECT` list. That form names no relation and no engine, so it is refused with a message pointing at the table-function form.
+
+## Embeddings
+
+`AI_EMBED` appends an embedding column computed by a sentence-transformers model, and lowers to {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`. Its second argument is the model id as a quoted string rather than a registered engine, because a model id is a public name that carries no endpoint or credential. It takes `column`, the text column, which is required, and an optional `output_column` that defaults to `embedding`. It needs the `st` extra, `pip install 'batcher-engine[st]'`, and the model loads once per worker the first time the query runs:
+
+```python
+# docs: skip
+s.sql(
+    "SELECT id, embedding FROM AI_EMBED(reviews, 'sentence-transformers/all-MiniLM-L6-v2',"
+    " column => 'body')"
+)
+```
+
+An encoder that isn't a sentence-transformers model id runs on the `Dataset` with `ds.ml.embed(callable, output_columns=[...])`.
+
 ## Why these are table functions
 
 Every warehouse writes its AI call in the `SELECT` list and this does not, for the reason that also makes `ML_PREDICT` a table function. A Batcher scalar function lowers to an expression evaluated per row in Rust, and a language-model call is neither expressible there nor wanted per row. The whole point of the inference path is that an engine loads once per worker and sees a batch at a time. Writing the call in `FROM` says that rather than hiding it.
 
 ## What SQL does not translate
 
-`AI_CLASSIFY` is not. Its grammar is fixed at three arguments, and a relational form needs four: the relation, the engine, the text column and the labels. Use `AI_EXTRACT` with a one-field schema, or {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>` on the `Dataset`. `AI_EMBED`, `AI_SIMILARITY`, `AI_AGG` and `AI_FORECAST` are likewise DataFrame-side. Each reports where its capability lives rather than failing as an unknown table.
+`AI_SIMILARITY`, `AI_AGG` and `AI_SUMMARIZE_AGG` stay DataFrame-side, and each reports where its capability lives rather than failing as an unknown table. Similarity between embedding columns needs no model call, so it is written with the scalar vector functions SQL already has. An aggregate that asks a model to summarize a group runs as {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>` over the grouped relation, and forecasting uses the `batcher.ml.timeseries` helpers.
 
 The full set is always available on the `Dataset`, where these lower to anyway: {py:meth}`ds.ml.generate <batcher.api.dataset.ml.DatasetML.generate>`, {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>`, {py:meth}`ds.ml.extract <batcher.api.dataset.ml.DatasetML.extract>` and {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>`. See {doc}`the LLM engines page </ml/retrieval/llm/engines>` for the engines they take, and {doc}`batch inference </ml/inference/index>` for batching, GPU sizing and error handling.
 

@@ -16,7 +16,8 @@ own; earlier revisions of this docstring said otherwise.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
@@ -32,7 +33,18 @@ from batcher.plan.feedback import FeedbackSink, OperatorFeedback, cpu_utilizatio
 from batcher.plan.ids import OpId
 from batcher.plan.physical import PhysicalOp, PhysicalPlan
 
-__all__ = ["LocalExecutor", "execute_local", "execute_local_metered", "record_exec_metrics"]
+if TYPE_CHECKING:
+    from batcher.io.formats.structured.parquet.units import ParquetUnitRead
+
+__all__ = [
+    "LocalExecutor",
+    "execute_local",
+    "execute_local_chunked",
+    "execute_local_metered",
+    "execute_local_parquet",
+    "plan_chunkable",
+    "record_exec_metrics",
+]
 
 _log = get_logger("core")
 
@@ -61,10 +73,30 @@ def record_exec_metrics(
         return
     if not isinstance(doc, dict):
         return  # a document of the wrong shape is not an error, it is nothing to record
-    ops = doc.get("ops") or []
-    if not isinstance(ops, list):
+    ops = _ops_of(doc)
+    if not ops:
         return
     _record_op_feedback(sink, ops, batch_size, planned)
+
+
+def _ops_of(doc: dict) -> list[dict]:
+    """The document's ``ops``, each marked ``runtime_filtered`` when the engine listed it so.
+
+    The engine lists by `op_id` the operators whose input a runtime join filter reduced
+    (`ExecMetrics::runtime_filtered`): their `rows_out` is what reached the join the filter
+    serves, which depends on the plan around them, so it is not their cardinality. Marking
+    the op itself keeps that fact next to the count it qualifies, for every reader.
+    """
+    ops = doc.get("ops") or []
+    if not isinstance(ops, list):
+        return []
+    filtered = doc.get("runtime_filtered") or ()
+    if filtered:
+        marked = set(filtered)
+        for op in ops:
+            if isinstance(op, dict) and op.get("op_id") in marked:
+                op["runtime_filtered"] = True
+    return ops
 
 
 _tracing_started = False
@@ -130,7 +162,7 @@ def _record_op_feedback(
             _record_one(
                 sink, op, batch_size, planned, local_fingerprint, local_throttled, local_thermal
             )
-        except Exception:  # pragma: no cover - measurement must never break a query
+        except Exception:  # measurement must never break a query
             _log.warning("skipped an unreadable operator metrics entry", exc_info=True)
 
 
@@ -145,12 +177,20 @@ def _num(op: dict, key: str, default: float = 0.0) -> float:
     `or 0`; the ones feeding `cpu_utilization` and the elapsed time did not.
     """
     value = op.get(key)
+    # The common case first: the engine reports a plain int or float. `type(...) in` rather
+    # than `isinstance`, because `bool` subclasses `int` and must still read as `default`.
+    if type(value) in _PLAIN_NUMBERS:
+        return float(value)
     if value is None or isinstance(value, bool):
         return default
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+#: The types `_num` converts without the general path. Exactly these: `bool` is excluded.
+_PLAIN_NUMBERS = (int, float)
 
 
 def _record_one(
@@ -165,6 +205,7 @@ def _record_one(
     """Transcribe one metrics entry into an `OperatorFeedback` and record it."""
     rows_in = _num(op, "rows_in")
     rows_out = _num(op, "rows_out")
+    runtime_filtered = bool(op.get("runtime_filtered"))
     op_id = int(_num(op, "op_id"))
     annotated = planned[op_id] if 0 <= op_id < len(planned) else None
     sink.record(
@@ -191,7 +232,12 @@ def _record_one(
             n_build=int(_num(op, "rows_build")),
             result_bytes=int(_num(op, "result_bytes") or _num(op, "peak_bytes")),
             signature=_signature_of(annotated),
-            n_estimated=_raw_estimate_of(annotated),
+            # `0` is the correction loop's "nothing to learn from" (`kyber.learning`): a count a
+            # runtime join filter reduced is not this operator's cardinality, so its q-error
+            # would teach the next plan a correction that plan's own filters contradict. TPC-H
+            # q7 at sf10 re-planned every few runs that way, between a 76 ms plan and a 95 ms one.
+            n_estimated=0.0 if runtime_filtered else _raw_estimate_of(annotated),
+            runtime_filtered=runtime_filtered,
             expr_factor=annotated.properties.expr_factor if annotated else 1.0,
             # The engine flattens its hardware counters into the same document, so they
             # read as ordinary keys. `or 0` covers both an older engine that omits the key
@@ -246,6 +292,7 @@ class LocalExecutor:
         engine_cfg = cfg.engine_config_json_with(
             plan.op_budgets(),
             prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+            prefer_sideways=plan.prefer_sideways,
         )
         # Collect per-operator metrics only when there is a sink to consume them;
         # the plain entry point avoids the (tiny) JSON serialization otherwise.
@@ -271,6 +318,100 @@ def execute_local(
 ) -> list[pa.RecordBatch]:
     """Convenience wrapper around `LocalExecutor.execute`."""
     return LocalExecutor(feedback).execute(plan, sources)
+
+
+def plan_chunkable(plan: PhysicalPlan, driving: int) -> bool:
+    """Whether the engine can run `plan` with source `driving` streamed in chunks."""
+    return bool(engine().plan_chunkable(plan.to_json(), driving))
+
+
+def execute_local_chunked(
+    plan: PhysicalPlan,
+    sources: list[list[pa.RecordBatch]],
+    driving: int,
+    chunks: Iterator[list[pa.RecordBatch]],
+    memory_budget: int,
+) -> list[pa.RecordBatch]:
+    """Execute `plan` in-process with `sources[driving]` pulled from `chunks`.
+
+    `sources[driving]` holds only a zero-row batch carrying the driving relation's schema. The
+    engine prepares every build side once, then folds each chunk as it arrives, so the driving
+    relation is never resident in full (`bc_interp::stream::chunked`). Raises the engine's
+    `MemoryBudgetExceededError` when what the path holds (aggregate state, or the collected rows
+    of a plan with no aggregate) outgrows `memory_budget` bytes.
+
+    Per-operator metrics are not collected on this path: its operators run once per chunk, and
+    a count taken from one chunk would teach Kyber a fraction of the real cardinality.
+    """
+    cfg = active_config()
+    engine_cfg = cfg.engine_config_json_with(
+        plan.op_budgets(),
+        prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+        prefer_sideways=plan.prefer_sideways,
+    )
+    native = engine()
+    _ensure_native_tracing(native)
+    return native.execute_plan_chunked(
+        plan.to_json(),
+        sources,
+        driving,
+        chunks,
+        engine_cfg,
+        current_query_id() or None,
+        memory_budget,
+    )
+
+
+def execute_local_parquet(
+    plan: PhysicalPlan,
+    sources: list[list[pa.RecordBatch]],
+    driving: int,
+    read: ParquetUnitRead,
+    memory_budget: int,
+    feedback: FeedbackSink | None = None,
+) -> tuple[list[pa.RecordBatch], list[dict], dict]:
+    """Execute `plan` in-process with `sources[driving]` read from Parquet by the engine's workers.
+
+    Each worker decodes its own row groups and pushes them straight through its pipeline
+    (`bc_interp::stream::chunked::execute_units`), so decoding overlaps computing and the driving
+    relation is never resident. `sources[driving]` is the zero-row schema carrier; the budget is
+    `execute_local_chunked`'s. Unlike that path every driving row passes through the operators
+    once, so their measured counts are real and are recorded into `feedback` as the resident
+    executor records its own. Returns ``(batches, ops, usage)`` as `execute_local_metered` does.
+    """
+    cfg = active_config()
+    engine_cfg = cfg.engine_config_json_with(
+        plan.op_budgets(),
+        prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+        prefer_sideways=plan.prefer_sideways,
+    )
+    native = engine()
+    _ensure_native_tracing(native)
+    out, metrics_json = native.execute_plan_parquet(
+        plan.to_json(),
+        sources,
+        driving,
+        read.uris,
+        read.columns,
+        read.predicate,
+        read.batch_size,
+        engine_cfg,
+        current_query_id() or None,
+        memory_budget,
+    )
+    ops, usage = _parse_metrics(metrics_json)
+    if feedback is not None and ops:
+        _record_op_feedback(feedback, ops, cfg.execution.morsel_rows, plan.ops)
+    return out, ops, usage
+
+
+def _parse_metrics(metrics_json: str) -> tuple[list[dict], dict]:
+    """The ``ops`` list and ``query`` block of a metrics document; empty when it is malformed."""
+    try:
+        doc = json.loads(metrics_json)
+        return _ops_of(doc), doc.get("query") or {}
+    except (ValueError, TypeError, AttributeError):
+        return [], {}
 
 
 def execute_local_metered(
@@ -317,15 +458,11 @@ def execute_local_metered(
         cfg.engine_config_json_with(
             plan.op_budgets(),
             prefer_materializing_aggregate=plan.prefer_materializing_aggregate,
+            prefer_sideways=plan.prefer_sideways,
         ),
         current_query_id() or None,
     )
-    try:
-        doc = json.loads(metrics_json)
-        ops = doc.get("ops", [])
-        usage = doc.get("query") or {}
-    except (ValueError, TypeError):
-        ops, usage = [], {}
+    ops, usage = _parse_metrics(metrics_json)
     if feedback is not None and ops:
         _record_op_feedback(feedback, ops, cfg.execution.morsel_rows, plan.ops)
     return out, ops, usage

@@ -16,9 +16,9 @@ from batcher.carbonite import ResourceManager
 from batcher.carbonite.memory import (
     BufferPool,
     PressureMonitor,
-    peak_operator_bytes,
     process_pool,
 )
+from batcher.carbonite.memory.estimator import learned_plan_peak
 from batcher.carbonite.memory.pressure import PressureLevel
 from batcher.config import Config, MemoryConfig, config_context
 
@@ -88,8 +88,8 @@ def test_process_pool_is_a_singleton_with_reconciled_limit():
 
 def test_peak_is_the_dominant_operator():
     # The linear pipeline's footprint is its largest breaker, not the sum.
-    assert peak_operator_bytes(_plan_with_peak(100, 5000, 200)) == 5000
-    assert peak_operator_bytes(_plan_with_peak()) == 0
+    assert learned_plan_peak(_plan_with_peak(100, 5000, 200), None) == 5000
+    assert learned_plan_peak(_plan_with_peak(), None) == 0
 
 
 # --- Spill decision ----------------------------------------------------------

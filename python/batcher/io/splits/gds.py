@@ -14,6 +14,9 @@ Three things have to hold, and none of them can be assumed:
 * **The path has to be a local file.** An object-store URI is fetched by the client library
   into host memory first, whatever reader is nominally in front of it, so the device-direct
   argument does not apply and the second Parquet implementation is being taken on for nothing.
+* **The reading library has to be doing DMA, not emulating it.** KvikIO's compat mode reads
+  through a host bounce buffer behind the GDS API and says nothing; `kvikio.kvikio_status`
+  tells the two apart, and a compat-mode host is reported ineligible.
 * **The filesystem has to be one that supports the DMA path.** A block-backed local filesystem
   does; an overlay, a tmpfs, or a FUSE mount does not, and those are exactly what a container's
   root and a mounted object-store cache are.
@@ -28,6 +31,8 @@ from __future__ import annotations
 import functools
 import os
 from dataclasses import dataclass
+
+from batcher.io.splits.kvikio import kvikio_status
 
 __all__ = [
     "GDS_FILESYSTEMS",
@@ -72,9 +77,9 @@ class GdsEligibility:
     Attributes:
         eligible: Whether the DMA path applies.
         reason: A short machine-readable code when it does not (`"no_cufile"`, `"remote"`,
-            `"filesystem"`, `"missing"`), `""` when it does. Carried because "the GPU read was
-            not used" is otherwise indistinguishable from "the GPU read was not tried", and
-            those have different fixes.
+            `"compat"`, `"filesystem"`, `"missing"`), `""` when it does. Carried because "the
+            GPU read was not used" is otherwise indistinguishable from "the GPU read was not
+            tried", and those have different fixes.
         filesystem: The filesystem type behind the path, `""` when it could not be resolved.
     """
 
@@ -170,6 +175,8 @@ def gds_eligible(path: str) -> GdsEligibility:
         return GdsEligibility(False, "remote")
     if not cufile_available():
         return GdsEligibility(False, "no_cufile")
+    if not kvikio_status().direct:
+        return GdsEligibility(False, "compat")
     local = local_path(path)
     kind = filesystem_type(local)
     if not kind:
@@ -186,17 +193,21 @@ def gds_summary(paths: tuple[str, ...]) -> dict:
         paths: The files a read is about to touch.
 
     Returns:
-        Whether cuFile is present, how many paths are eligible, and the reasons the rest were
-        not, counted. A reader of a slow GPU scan can tell from this whether the bytes reached
-        the device directly or were bounced through the host, which is otherwise invisible.
+        Whether cuFile is present, whether KvikIO reads by DMA (and why not), how many paths
+        are eligible, and the reasons the rest were not, counted. A reader of a slow GPU
+        scan can tell from this whether the bytes reached the device directly or were bounced
+        through the host, which is otherwise invisible.
     """
     verdicts = [gds_eligible(p) for p in paths]
     reasons: dict[str, int] = {}
     for verdict in verdicts:
         if not verdict.eligible:
             reasons[verdict.reason] = reasons.get(verdict.reason, 0) + 1
+    status = kvikio_status()
     return {
         "cufile": cufile_available(),
+        "kvikio_direct": status.direct,
+        "kvikio_reason": status.reason,
         "paths": len(paths),
         "eligible": sum(1 for v in verdicts if v.eligible),
         "reasons": reasons,

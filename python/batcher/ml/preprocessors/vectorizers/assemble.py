@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import numpy as np
 
-__all__ = ["bag_of_words", "set_columns"]
+__all__ = ["bag_of_words", "null_document_policy", "set_columns"]
+
+#: Where a null document goes: ``"empty"`` reads it as a document with no terms, ``"null"``
+#: keeps it missing — out of the fitted document count and null in every output column.
+_NULL_DOCUMENTS = ("empty", "null")
 
 
 def set_columns(batch: Any, columns: dict[str, Any]) -> Any:
@@ -44,6 +48,28 @@ def set_columns(batch: Any, columns: dict[str, Any]) -> Any:
     return append_columns(batch, columns)
 
 
+def null_document_policy(policy: str, *, what: str) -> str:
+    """Validate a vectorizer's `null_documents` argument, returning it.
+
+    Args:
+        policy: ``"empty"`` or ``"null"``.
+        what: The vectorizer's name, for the error.
+
+    Returns:
+        `policy`, unchanged.
+
+    Raises:
+        PlanError: If `policy` is neither.
+    """
+    if policy not in _NULL_DOCUMENTS:
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(
+            f"{what}: null_documents must be one of {list(_NULL_DOCUMENTS)}, got {policy!r}"
+        )
+    return policy
+
+
 def _row_segments(list_array: Any) -> tuple[Any, np.ndarray]:
     """The flattened values of a list column and each row's element count.
 
@@ -60,12 +86,13 @@ def _row_segments(list_array: Any) -> tuple[Any, np.ndarray]:
 
 
 def _counts_per_row(
-    rows: np.ndarray, codes: np.ndarray, n_rows: int
+    rows: np.ndarray, codes: np.ndarray, n_rows: int, signs: np.ndarray | None = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Group ``(row, code)`` pairs into per-row runs, returning ``(offsets, codes, counts)``.
 
     Packing the pair into one integer key lets a single sort do the grouping, which is the
-    whole reason this is O(tokens) rather than a dictionary per document.
+    whole reason this is O(tokens) rather than a dictionary per document. With `signs`, each
+    token contributes its ``±1`` rather than 1, so the "count" is the signed sum.
     """
     import numpy as np
 
@@ -73,7 +100,11 @@ def _counts_per_row(
         return np.zeros(n_rows + 1, dtype=np.int64), np.empty(0, np.int64), np.empty(0, np.int64)
     width = int(codes.max()) + 1 if codes.size else 1
     keys = rows.astype(np.int64) * width + codes.astype(np.int64)
-    unique, counts = np.unique(keys, return_counts=True)
+    if signs is None:
+        unique, counts = np.unique(keys, return_counts=True)
+    else:
+        unique, inverse = np.unique(keys, return_inverse=True)
+        counts = np.bincount(inverse, weights=signs, minlength=unique.size)
     out_rows, out_codes = np.divmod(unique, width)
     # `unique` is sorted, so rows are already grouped and ascending: the boundary of each
     # row's run is a search for its first key.
@@ -109,6 +140,8 @@ def bag_of_words(
     weights: np.ndarray | None = None,
     norm: str | None = None,
     dense: bool = False,
+    signed_codes: bool = False,
+    null_rows: Any = None,
 ) -> dict[str, Any]:
     """Vectorize one batch's term lists into aligned sparse (or dense) Arrow columns.
 
@@ -124,24 +157,34 @@ def bag_of_words(
         norm: ``"l1"``, ``"l2"``, or ``None`` for no per-row normalization.
         dense: Return one fixed-width ``List<Float64>`` column instead of the index/value
             pair. Only sane for a small `n_features`.
+        signed_codes: The codes are ``±(index + 1)``, the sign being the token's
+            contribution (the hashing trick's alternate sign), so a feature's value is the
+            signed sum of its tokens rather than their count.
+        null_rows: A boolean array marking the rows whose output is null rather than an
+            empty bag (a null document under ``null_documents="null"``), or ``None``.
 
     Returns:
         ``{"indices": array, "values": array}``, or ``{"values": array}`` when `dense`.
     """
     import numpy as np
-    import pyarrow as pa
     import pyarrow.compute as pc
 
     n_rows = len(list_array)
     flat, lengths = _row_segments(list_array)
     codes_array = flat if vocabulary is None else pc.index_in(flat, value_set=vocabulary)
     codes = pc.fill_null(codes_array, -1).to_numpy(zero_copy_only=False).astype(np.int64)
+    signs = None
+    if signed_codes:
+        signs = np.sign(codes).astype(np.float64)
+        codes = np.abs(codes) - 1
     rows = np.repeat(np.arange(n_rows, dtype=np.int64), lengths)
     # An out-of-vocabulary term, and a hashed code outside the feature space, are both
     # dropped rather than folded into a bucket: scikit-learn ignores unseen terms, and a
     # catch-all bucket would quietly make one feature mean "everything I have not seen".
     keep = (codes >= 0) & (codes < n_features)
-    offsets, out_codes, counts = _counts_per_row(rows[keep], codes[keep], n_rows)
+    offsets, out_codes, counts = _counts_per_row(
+        rows[keep], codes[keep], n_rows, None if signs is None else signs[keep]
+    )
 
     values = np.ones(counts.shape, dtype=np.float64) if binary else counts.astype(np.float64)
     if sublinear_tf and not binary:
@@ -155,10 +198,16 @@ def bag_of_words(
         if out_codes.size:
             matrix[np.repeat(np.arange(n_rows), np.diff(offsets)), out_codes] = values
         dense_offsets = np.arange(n_rows + 1, dtype=np.int64) * n_features
-        return {
-            "values": pa.ListArray.from_arrays(pa.array(dense_offsets), pa.array(matrix.ravel()))
-        }
+        return {"values": _lists(dense_offsets, matrix.ravel(), null_rows)}
     return {
-        "indices": pa.ListArray.from_arrays(pa.array(offsets), pa.array(out_codes)),
-        "values": pa.ListArray.from_arrays(pa.array(offsets), pa.array(values)),
+        "indices": _lists(offsets, out_codes, null_rows),
+        "values": _lists(offsets, values, null_rows),
     }
+
+
+def _lists(offsets: np.ndarray, values: np.ndarray, null_rows: Any) -> Any:
+    """A `ListArray` over `values` split at `offsets`, null where `null_rows` is set."""
+    import pyarrow as pa
+
+    mask = None if null_rows is None else pa.array(null_rows, type=pa.bool_())
+    return pa.ListArray.from_arrays(pa.array(offsets), pa.array(values), mask=mask)

@@ -10,7 +10,6 @@ with the lakehouse connectors, whose tables are Parquet datasets underneath.
 
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -19,10 +18,18 @@ from typing import Any
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
+from batcher.config.env import env_int
 from batcher.io.splits.base import Split
 from batcher.io.stats.file_identity import FileMetaCache, file_identity
 
-__all__ = ["RowGroupSplit", "fragment_index", "pack_row_groups", "parquet_row_group_splits"]
+__all__ = [
+    "FileKeyBounds",
+    "RowGroupSplit",
+    "file_key_bounds",
+    "footer_column_bytes",
+    "fragment_index",
+    "parquet_row_group_splits",
+]
 
 
 # Per-process LRU of ``key -> (dataset, {fragment_path: fragment})``. A worker
@@ -104,7 +111,7 @@ def _parquet_footer(path: str, fs: Any | None = None):
 #: a million single-row-group files cost what a few thousand wide ones do. It was 1,024
 #: *entries*, an order of magnitude below the one pass guaranteed to fill it.
 #: Env-overridable for a process reading unusually wide files.
-_MAX_CACHED_ROW_GROUPS = max(1, int(os.environ.get("BATCHER_FOOTER_CACHE_ROW_GROUPS", "262144")))
+_MAX_CACHED_ROW_GROUPS = env_int("BATCHER_FOOTER_CACHE_ROW_GROUPS", 262144, floor=1)
 
 _FOOTERS = FileMetaCache(_MAX_CACHED_ROW_GROUPS)
 
@@ -124,6 +131,88 @@ def _read_footer(path: str, fs: Any | None = None):
         fs = resolve_filesystem(path)
     with fs.open(path) as fh:
         return pq.ParquetFile(fh).metadata
+
+
+@dataclass(frozen=True, slots=True)
+class FileKeyBounds:
+    """One file's footer extent in one column: the key range a key-range split relies on."""
+
+    path: str
+    lo: Any
+    hi: Any
+    rows: int
+    nbytes: int
+    #: NULLs in the column, or None when a footer did not record the count.
+    nulls: int | None = 0
+
+
+def file_key_bounds(files: list[str], column: str, fs: Any) -> list[FileKeyBounds] | None:
+    """Each file's min/max of `column` from its footer, in file order, or None if unknown.
+
+    Read from the same footer cache split planning fills, concurrently for a remote store,
+    so on a table the query is about to read this costs no round trip at all. None when any
+    file lacks the column or a row group lacks a recorded statistic for it: a range the
+    footer does not bound cannot be used to decide which rows a file might hold.
+    """
+    from batcher.io._concurrent import read_each_file
+
+    def _one(filesystem: Any, path: str) -> FileKeyBounds | None:
+        meta = _parquet_footer(path, filesystem)
+        names = meta.schema.names
+        if column not in names:
+            return None
+        ci = names.index(column)
+        lo = hi = None
+        nbytes = 0
+        nulls: int | None = 0
+        for rg in range(meta.num_row_groups):
+            group = meta.row_group(rg)
+            nbytes += group.total_byte_size
+            stats = group.column(ci).statistics
+            if group.num_rows == 0:
+                continue
+            if stats is None or not stats.has_min_max:
+                return None
+            lo = stats.min if lo is None else min(lo, stats.min)
+            hi = stats.max if hi is None else max(hi, stats.max)
+            count = stats.null_count if stats.has_null_count else None
+            nulls = None if nulls is None or count is None else nulls + count
+        return FileKeyBounds(path, lo, hi, meta.num_rows, nbytes, nulls)
+
+    try:
+        bounds = read_each_file(fs, list(files), _one)
+    except Exception as exc:
+        note_suppressed("io", "read parquet footers for key bounds", exc)
+        return None
+    return None if any(b is None for b in bounds) else bounds
+
+
+def footer_column_bytes(files: list[str], fs: Any, sample: int = 4) -> dict[str, int] | None:
+    """Estimated uncompressed bytes per column across `files`, from a sample of footers.
+
+    A column's share of a table is nothing like its share of the columns: TPC-H
+    `customer`'s comment is a third of its bytes and its segment a twentieth. Reads at most
+    `sample` footers (cached ones cost nothing) and scales their per-column totals by the
+    file count, which is exact for files written by one writer and close for any other.
+    """
+    if not files:
+        return None
+    picked = files[:: max(1, len(files) // sample)][:sample]
+    totals: dict[str, int] = {}
+    try:
+        for path in picked:
+            meta = _parquet_footer(path, fs)
+            names = meta.schema.names
+            for rg in range(meta.num_row_groups):
+                group = meta.row_group(rg)
+                for ci in range(group.num_columns):
+                    name = names[ci] if ci < len(names) else group.column(ci).path_in_schema
+                    totals[name] = totals.get(name, 0) + group.column(ci).total_uncompressed_size
+    except Exception as exc:
+        note_suppressed("io", "read parquet footers for column sizes", exc)
+        return None
+    scale = len(files) / len(picked)
+    return {name: int(total * scale) for name, total in totals.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +236,10 @@ class RowGroupSplit:
     path: str
     row_groups: tuple[int, ...]
     rows: int | None = None
+    #: The run's uncompressed bytes from the footer (`total_byte_size`), captured with
+    #: `rows` so assignment can balance decode work rather than row counts: a row of a wide
+    #: table costs more to read than a row of a narrow one. `None` when not known.
+    nbytes: int | None = None
 
     def _file(self) -> Any:
         import pyarrow.parquet as pq
@@ -271,31 +364,6 @@ class RowGroupSplit:
         return f"parquet:{self.path}:rg{','.join(map(str, self.row_groups))}"
 
 
-def pack_row_groups(
-    num_row_groups: int, sizes: list[int], target_bytes: int | None
-) -> list[tuple[int, ...]]:
-    """Group row-group indices into contiguous runs of roughly `target_bytes`.
-
-    With no target (or unknown sizes) each row-group is its own split — maximum
-    parallelism. Otherwise adjacent row-groups are packed until their compressed
-    size reaches the target, balancing task count against per-task overhead.
-    """
-    if target_bytes is None or not sizes:
-        return [(i,) for i in range(num_row_groups)]
-    runs: list[tuple[int, ...]] = []
-    current: list[int] = []
-    acc = 0
-    for i in range(num_row_groups):
-        current.append(i)
-        acc += sizes[i] if i < len(sizes) else 0
-        if acc >= target_bytes:
-            runs.append(tuple(current))
-            current, acc = [], 0
-    if current:
-        runs.append(tuple(current))
-    return runs
-
-
 def parquet_row_group_splits(
     path: str, target_size: int | None, predicate: dict | None = None, fs: Any | None = None
 ) -> list[Split]:
@@ -347,8 +415,11 @@ def parquet_row_group_splits(
     sizes = [meta.row_group(i).total_byte_size for i in range(meta.num_row_groups)]
     rows = [meta.row_group(i).num_rows for i in range(meta.num_row_groups)]
     runs = _pack(targets, sizes, target_size)
-    # Carry the footer-derived row count so balancing never re-opens the file.
-    splits = [RowGroupSplit(path, run, sum(rows[i] for i in run)) for run in runs]
+    # Carry the footer-derived row count and byte size so balancing never re-opens the file.
+    splits = [
+        RowGroupSplit(path, run, sum(rows[i] for i in run), sum(sizes[i] for i in run))
+        for run in runs
+    ]
     if key is not None:
         _SPLITS.put(key, tuple(splits), weight=max(1, len(splits)))
     return splits

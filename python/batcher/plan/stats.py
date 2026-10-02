@@ -613,12 +613,16 @@ class RelStats:
     carry, letting a redundant `Sort` be elided. It is a prefix of `SortOrder`
     keys, each naming a column, a direction, and its null placement, so a
     descending or nulls-first ordering is carried as faithfully as an ascending one.
+    `ascending` names the columns that each never decrease in row order (see
+    `SourceStatistics.ascending`): an estimation hint an order-preserving operator carries,
+    never a proof an ordering holds.
     """
 
     rows: float
     provenance: Provenance
     columns: Mapping[str, ColumnStat] = field(default_factory=dict)
     sorted_by: tuple[SortOrder, ...] = ()
+    ascending: frozenset[str] = frozenset()
 
     def non_null_columns(self) -> frozenset[str]:
         """Columns this relation proves hold no nulls — the `non_nullable` set for ordering.

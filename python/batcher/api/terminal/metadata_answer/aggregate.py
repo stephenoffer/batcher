@@ -182,30 +182,75 @@ def metadata_aggregate_table(
         return None
     if not _metadata_answerable(plan, sources):
         return None
-    from batcher import core, kyber
+    from batcher import core
 
     try:
         stats = _source_stats(sources, source_stats)
-        # A keyless `COUNT(*)` over a `Filter` (`WHERE col = v` / `col <> v`, …): the filter
-        # defeats the whole-relation row-count shortcut, but the EXACT-gated filter-count
-        # layer can still derive the surviving count from a learned per-value count. Try it
-        # before the in-memory gate rejects the plan for carrying a filter.
-        filtered = _answer_filtered_count_star(plan, sources, stats)
-        if filtered is not None:
-            return filtered
-        if _unanswerable_over_memory(plan, sources):
-            return None
-        stats = _enrich_count_distinct_ndv(plan, sources, stats)
-        answer = kyber.answer_aggregate(plan, sources, stats, core.default_hub())
-        if answer is None:
-            # `answer_aggregate` estimates the *rewritten* plan, where `count_distinct` has
-            # been lowered to a `count` over a distinct sub-plan it can't derive. Retry on the
-            # ORIGINAL node, whose `count_distinct(col)` derives directly from the (enriched)
-            # EXACT ndv — the min/max/count path is unchanged, this only adds count-distinct.
-            answer = _answer_keyless_aggregate_direct(plan, sources, stats)
+        key = _verdict_key(plan, sources, stats, core.default_hub())
+        if key is not None and key in _VERDICTS:
+            return _VERDICTS[key]
+        answer_table = _metadata_aggregate(plan, sources, stats)
     except Exception as exc:  # the metadata shortcut must never break a runnable query
         note_suppressed("api", "answer aggregate from metadata", exc)
         return None
+    if key is not None:
+        _VERDICTS[key] = answer_table
+        while len(_VERDICTS) > _VERDICTS_MAX:
+            _VERDICTS.pop(next(iter(_VERDICTS)))
+    return answer_table
+
+
+# Verdicts of `metadata_aggregate_table`, keyed by everything an EXACT answer reads (see
+# `_verdict_key`). A warm `collect()` of a join + keyless aggregate rebuilt two fresh estimators
+# and re-estimated the whole join tree on every execution only to decline again (~0.25 ms of a
+# ~2.3 ms query). A value is a one-row table or None; trimmed oldest-first.
+_VERDICTS: dict[str, pa.Table | None] = {}
+_VERDICTS_MAX = 512
+
+
+def _verdict_key(plan: LogicalPlan, sources: list[Source], stats: list, hub) -> str | None:
+    """The plan cache's key for this question, or None when it cannot be keyed.
+
+    Reusing `kyber.plan_cache.cache_key` (with its own `kind`) rather than a second key
+    definition: it already folds in the plan's content, each source's data-stable identity,
+    the config, the hub and its learning generation, and a digest of the collected source
+    statistics the answer is derived from — and it declines (None) exactly when any of those
+    cannot be keyed safely, which here means "do not memoize".
+    """
+    from batcher.config import active_config
+    from batcher.kyber import plan_cache
+
+    return plan_cache.cache_key(
+        plan.content_key(),
+        sources,
+        active_config(),
+        hub,
+        kind="metadata_aggregate",
+        source_stats=stats,
+    )
+
+
+def _metadata_aggregate(plan: LogicalPlan, sources: list[Source], stats: list):
+    """`metadata_aggregate_table`'s answer for already-collected `stats` (uncached)."""
+    from batcher import core, kyber
+
+    # A keyless `COUNT(*)` over a `Filter` (`WHERE col = v` / `col <> v`, …): the filter
+    # defeats the whole-relation row-count shortcut, but the EXACT-gated filter-count
+    # layer can still derive the surviving count from a learned per-value count. Try it
+    # before the in-memory gate rejects the plan for carrying a filter.
+    filtered = _answer_filtered_count_star(plan, sources, stats)
+    if filtered is not None:
+        return filtered
+    if _unanswerable_over_memory(plan, sources):
+        return None
+    stats = _enrich_count_distinct_ndv(plan, sources, stats)
+    answer = kyber.answer_aggregate(plan, sources, stats, core.default_hub())
+    if answer is None:
+        # `answer_aggregate` estimates the *rewritten* plan, where `count_distinct` has
+        # been lowered to a `count` over a distinct sub-plan it can't derive. Retry on the
+        # ORIGINAL node, whose `count_distinct(col)` derives directly from the (enriched)
+        # EXACT ndv — the min/max/count path is unchanged, this only adds count-distinct.
+        answer = _answer_keyless_aggregate_direct(plan, sources, stats)
     if answer is None:
         return None
     return _typed_answer(plan, answer)

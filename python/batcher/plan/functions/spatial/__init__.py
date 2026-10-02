@@ -10,8 +10,9 @@ Grouped by module: `quaternion` reads a rotation apart and builds one from Euler
 or a matrix, `rotate` composes and interpolates rotations and applies one to a vector,
 `pose` applies a full rigid transform to a point, `frames` wraps all of those as
 whole-rotation and whole-pose helpers that return a mapping of column name to
-expression, and `vectors` measures the distances and directions a point cloud is
-filtered by.
+expression, `vectors` measures the distances and directions a point cloud is
+filtered by, `sequences` reads and writes Euler angles in any axis sequence, and `repair`
+measures and repairs a drifted rotation matrix and gives each rotation one sign.
 
 The conventions — quaternions in ``(x, y, z, w)`` order with the scalar last, intrinsic
 Z-Y-X Euler angles, right-handed active rotations, poses that rotate and then translate
@@ -19,17 +20,27 @@ Z-Y-X Euler angles, right-handed active rotations, poses that rotate and then tr
 in :doc:`/user-guide/analyze/robotics`.
 
 Each submodule's own ``__all__`` is the single curated list for its group, and this
-façade splices them rather than restating fifty-seven names a fourth time (the two
+façade splices them rather than restating seventy-five names a fourth time (the two
 higher façades, `plan/functions/__init__.py` and `api/functions.py`, splice this one).
 """
 
 from __future__ import annotations
 
-from batcher.plan.functions.spatial import frames, pose, quaternion, rotate, vectors
+from batcher.plan.functions.spatial import (
+    frames,
+    pose,
+    quaternion,
+    repair,
+    rotate,
+    sequences,
+    vectors,
+)
 from batcher.plan.functions.spatial.frames import *  # noqa: F403
 from batcher.plan.functions.spatial.pose import *  # noqa: F403
 from batcher.plan.functions.spatial.quaternion import *  # noqa: F403
+from batcher.plan.functions.spatial.repair import *  # noqa: F403
 from batcher.plan.functions.spatial.rotate import *  # noqa: F403
+from batcher.plan.functions.spatial.sequences import *  # noqa: F403
 from batcher.plan.functions.spatial.vectors import *  # noqa: F403
 
 __all__ = sorted(
@@ -37,7 +48,9 @@ __all__ = sorted(
         *frames.__all__,
         *pose.__all__,
         *quaternion.__all__,
+        *repair.__all__,
         *rotate.__all__,
+        *sequences.__all__,
         *vectors.__all__,
     ]
 )

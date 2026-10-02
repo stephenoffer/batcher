@@ -47,8 +47,8 @@ def _to_array(result: Any, result_type: pa.DataType | None) -> pa.Array:
     return pa.array(result, type=result_type)
 
 
-class _SqlUdfBatch:
-    """Vectorized scalar UDF: ``fn(array, ...) -> array``, appended as one column."""
+class _SqlUdf:
+    """A registered scalar UDF bound to its argument columns, constants and output column."""
 
     __slots__ = ("arg_cols", "const_args", "fn", "out_col", "result_type")
 
@@ -59,23 +59,22 @@ class _SqlUdfBatch:
         self.out_col = out_col
         self.result_type = result_type
 
+
+class _SqlUdfBatch(_SqlUdf):
+    """Vectorized scalar UDF: ``fn(array, ...) -> array``, appended as one column."""
+
+    __slots__ = ()
+
     def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         args = _ordered_args(batch, self.arg_cols, self.const_args)
         col = _to_array(self.fn(*args), self.result_type)
         return batch.append_column(self.out_col, col)
 
 
-class _SqlUdfRow:
+class _SqlUdfRow(_SqlUdf):
     """Per-row scalar UDF: ``fn(*scalars) -> scalar``, appended as one column."""
 
-    __slots__ = ("arg_cols", "const_args", "fn", "out_col", "result_type")
-
-    def __init__(self, fn, arg_cols, const_args, out_col, result_type) -> None:
-        self.fn = fn
-        self.arg_cols = arg_cols
-        self.const_args = const_args
-        self.out_col = out_col
-        self.result_type = result_type
+    __slots__ = ()
 
     def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         n = len(self.arg_cols) + len(self.const_args)

@@ -100,33 +100,15 @@ def _shuffled_blocks(
 ) -> Iterator[pa.RecordBatch]:
     """Permute the rows within successive blocks of about `buffer_rows` rows.
 
-    A block is also cut at the byte ceiling the training loaders use, so a row count that is
-    cheap over narrow rows cannot become an unbounded allocation over decoded images. Cutting
-    a block early only narrows the shuffle window; no row is dropped or repeated.
+    The blocks are the training loader's (`permuted_blocks`), including its byte ceiling, so
+    a row count that is cheap over narrow rows cannot become an unbounded allocation over
+    decoded images. Cutting a block early only narrows the shuffle window; no row is dropped
+    or repeated.
     """
-    import numpy as np
+    from batcher.ml.loader.lazy import permuted_blocks
 
-    from batcher.ml.loader.lazy import _SHUFFLE_BLOCK_MAX_BYTES
-
-    rng = np.random.RandomState(seed)
-    block: list[pa.RecordBatch] = []
-    rows = nbytes = 0
-
-    def _emit() -> Iterator[pa.RecordBatch]:
-        table = pa.Table.from_batches(block)
-        yield from table.take(pa.array(rng.permutation(table.num_rows))).to_batches()
-
-    for batch in batches:
-        if batch.num_rows == 0:
-            continue
-        block.append(batch)
-        rows += batch.num_rows
-        nbytes += retained_bytes(batch)
-        if rows >= buffer_rows or nbytes >= _SHUFFLE_BLOCK_MAX_BYTES:
-            yield from _emit()
-            block, rows, nbytes = [], 0, 0
-    if block:
-        yield from _emit()
+    for table, perm in permuted_blocks(batches, buffer_rows, seed):
+        yield from table.take(pa.array(perm)).to_batches()
 
 
 def to_jax(ds: Dataset, columns: list[str] | None) -> dict[str, Any]:

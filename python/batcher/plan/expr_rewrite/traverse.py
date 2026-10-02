@@ -99,19 +99,13 @@ def _make_struct_rebuild(e: MakeStruct, kids: tuple[Expr, ...]) -> Expr:
 #
 # Every node already declares which of its fields hold sub-expressions (`child`/
 # `children`) and which hold parameters (`scalar`/`literal`), and `expr_ir.walk` reads
-# that declaration rather than repeating it. These two tables used to repeat it, as a
-# hand-written lambda pair per node type -- and the repetition drifted. Three of the
-# multimodal nodes rebuilt themselves without their own parameters, so a rewrite turned
-# `.image.encode("jpeg")` into an `encode` with no format (a hard engine error),
-# stripped `.image.to_tensor_f32`'s `mean`/`std` normalization and
-# `.audio.mel_spectrogram`'s filterbank sizes (right shapes, silently wrong numbers),
-# and hid `.video.frame_at`'s per-row timestamp from column pruning. An ordinary
-# two-step projection was enough to trigger all of it, and the three tests guarding
-# these tables all passed throughout, because each checks that a node type is *present*
-# and none checked that a rebuilt node still carries its own fields.
-#
-# So the plan is derived from the same field metadata. A rebuild that drops a parameter
-# is now unrepresentable rather than merely tested for.
+# that declaration rather than repeating it. These tables are derived from the same field
+# metadata instead of hand-written per node type, because a hand-written rebuild drifts
+# silently: a node rebuilt without its own parameters still has the right shape, so a
+# rewrite can drop `.image.encode`'s format, `.image.to_tensor_f32`'s normalization or
+# `.audio.mel_spectrogram`'s filterbank sizes, and hide `.video.frame_at`'s per-row
+# timestamp from column pruning, while a test that checks a node type is *present* still
+# passes. Derived, a rebuild that drops a parameter is unrepresentable.
 
 
 def _optional_children(cls: type, names: tuple[str, ...]) -> frozenset[str]:

@@ -232,52 +232,13 @@ class PowerEnvelope:
             return -1
         return max_concurrent_devices(self.usable_watts, accelerator_type, utilization)
 
-    def clamp_devices(
-        self,
-        requested: int,
-        accelerator_type: str | None,
-        utilization: float = 1.0,
-    ) -> int:
-        """Clamp a requested device count to what this envelope can power.
-
-        The one place the clamp is computed, so a plan is never refused for one fan-out and
-        then scheduled at another: Kyber's sizing and Carbonite's grant both call this.
-
-        Args:
-            requested: Devices the caller wants.
-            accelerator_type: The device model those devices are.
-            utilization: Utilization they are expected to run at.
-
-        Returns:
-            `requested` unchanged when the envelope is unbounded or the device is
-            unrecognized, and at least 1 otherwise — a budget too small for a single device is
-            a misconfiguration to surface with a verdict, not a silent zero-device plan.
-        """
-        if requested <= 0:
-            return requested
-        allowed = self.devices_that_fit(accelerator_type, utilization)
-        return requested if allowed < 0 else max(1, min(requested, allowed))
-
-    def scale_to_fit(self, device_watts: float) -> int:
-        """Devices of a given draw that fit in the usable budget.
-
-        Args:
-            device_watts: Draw of one device, as reported by `device_power_watts`.
-
-        Returns:
-            The device count that fits, or `-1` when unbounded or the draw is unknown.
-        """
-        if self.unbounded or device_watts <= 0:
-            return -1
-        return int(self.usable_watts // device_watts)
-
 
 def configured_power_envelope(expected_watts: float = 0.0) -> PowerEnvelope:
     """The deployment's power envelope, read from the active configuration.
 
-    Neutral on purpose: Kyber sizes against this and Carbonite admits against it, and the two
-    subsystems cannot import each other, so the alternative to one accessor here is the same
-    arithmetic pasted into both — which is exactly how a grant and a verdict come to disagree.
+    Neutral on purpose: Carbonite admits against it, and any other subsystem that needs the
+    budget reads the same accessor rather than pasting the arithmetic, which is how a grant and
+    a verdict come to disagree.
 
     Args:
         expected_watts: A draw the caller has already estimated, `0.0` when unknown.

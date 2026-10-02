@@ -13,6 +13,10 @@ Each release publishes two images to the GitHub Container Registry. Both are mul
 
 `latest` and `latest-ray` track the newest release. Pin a version tag in production, so a new release can't change a running job underneath you.
 
+:::{important}
+The images are pushed only by a tagged release, and no release has been tagged, so none of these tags exist on the registry. Build the image from a clone of the repository instead, as {ref}`the Dockerfile section below <containers-build-from-source>` shows.
+:::
+
 Both images start from the official `python:3.12-slim-bookworm` image, install the same wheel that PyPI serves, and run as a non-root user named `batcher` with UID 1000. The default command is `python`. The images carry no CUDA libraries, so GPU work needs its own image, as {ref}`install-build-your-own-image` describes.
 
 ## Run a query with Docker
@@ -77,6 +81,7 @@ RUN pip install --no-cache-dir batcher-engine
 
 For GPU work, start from a CUDA base image that carries the Python version you need, then install the extras for your framework, such as `torch` or `vllm`. {doc}`/ml/index` describes what each ML extra requires.
 
+(containers-build-from-source)=
 To build the engine inside the image instead of installing a published wheel, use the Dockerfile in the Batcher repository. It compiles the engine from the checkout, so it works for an unreleased revision or a network that can't reach PyPI's wheels, and it takes the extras as a build argument. From the root of a clone, run the following:
 
 ```bash

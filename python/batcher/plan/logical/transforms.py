@@ -46,6 +46,7 @@ __all__ = [
     "hoist_sort_key",
     "hoist_window_keys",
     "is_cartesian_key_pair",
+    "is_empty_relation",
     "is_partition_independent",
     "is_streamable",
     "passthrough_renames",
@@ -57,6 +58,22 @@ __all__ = [
     "split_streaming_tail",
     "streaming_fold_target",
 ]
+
+
+def is_empty_relation(node: LogicalPlan) -> bool:
+    """Whether `node` is the canonical empty relation, a `Limit` capped at zero rows.
+
+    Deliberately structural: only a syntactic `Limit(_, 0)` counts, never an estimate, so a
+    caller that drops or short-circuits on it does so only when the relation *provably*
+    contributes nothing.
+
+    Args:
+        node: Any plan node.
+
+    Returns:
+        True when `node` is a `Limit` with `n == 0`.
+    """
+    return isinstance(node, Limit) and node.n == 0
 
 
 def passthrough_renames(items: tuple) -> dict[str, str]:
@@ -249,6 +266,35 @@ def share_sources(
     return plans, merged
 
 
+#: A `Scan`'s per-node memos that are functions of its `schema` alone (see
+#: `LogicalPlan.__init_subclass__`). `to_ir` is not one: it carries the `source_id` a move changes.
+_SCHEMA_MEMOS = (
+    "_c_available_schema",
+    "_c_available_columns",
+    "_c_available_column_set",
+    "_c_identity_suffix",
+)
+
+
+def _carry_schema_memos(old: Scan, new: Scan) -> None:
+    """Hand `old`'s schema-only memos to `new`, a copy differing only in `source_id`.
+
+    Every join renumbers its right side's scans, and the fresh `Scan` then re-derived its
+    widened `available_schema` -- an Arrow schema rebuilt field by field -- for the same
+    schema object the original had already derived it from. The values are read-only and
+    shared exactly as the memo on the original already shares them.
+    """
+    if old.schema is not new.schema:
+        return
+    # Derived on the original first, so it is paid once per scan rather than once per join
+    # built over it: the original `Dataset` keeps its scan, and every join renumbers a copy.
+    old.available_schema()
+    src, dst = old.__dict__, new.__dict__
+    for slot in _SCHEMA_MEMOS:
+        if slot in src and slot not in dst:
+            dst[slot] = src[slot]
+
+
 def _rewrite_source_ids(plan: LogicalPlan, renumber: Callable[[int], int]) -> LogicalPlan:
     """Return a copy of `plan` with every `Scan.source_id` passed through `renumber`.
 
@@ -262,7 +308,9 @@ def _rewrite_source_ids(plan: LogicalPlan, renumber: Callable[[int], int]) -> Lo
         if isinstance(node, Scan):
             # `replace`, not a fresh `Scan`: the source key is this scan's identity and
             # rebuilding without it would silently return the plan to the collided key.
-            return dataclasses.replace(node, source_id=renumber(node.source_id))
+            moved = dataclasses.replace(node, source_id=renumber(node.source_id))
+            _carry_schema_memos(node, moved)
+            return moved
         return node
 
     return transform_up(plan, move)
@@ -424,16 +472,23 @@ def hoist_sort_key(sort: Sort) -> tuple[Sort, tuple[str, ...]] | None:
 
 
 def hoist_window_keys(window):
-    """Rewrite `PARTITION BY <expr>, ...` so every partition key is a plain column.
+    """Rewrite a window so every key its partitioner cuts on is a plain column.
 
     Returns `(window', keep)` — the window over a `Project` that materializes each computed
-    partition key as a hidden column, plus the column names the result should carry — or
-    `None` when every partition key is already a column.
+    cut key as a hidden column, plus the column names the result should carry — or `None`
+    when every such key is already a column.
 
-    Every path that cuts a window into per-partition pieces reads the partition keys by
-    column *position*, so a computed key such as `partition_by=[col("v") % 4]` has no such
-    path unless it is materialized first. `keep` is the window's ORIGINAL output — its input
-    columns plus the function aliases — so the hidden keys vanish and nothing else does.
+    Which keys are cut on depends on the shape. A `PARTITION BY` window is cut by its
+    partition keys, read by column *position*, so a computed key such as
+    `partition_by=[col("v") % 4]` has no per-partition path unless it is materialized
+    first. A *global* window (no `PARTITION BY`) is cut by the range partitioner on its
+    **leading** `ORDER BY` key, which reads values from a column exactly as the sort's does
+    (`hoist_sort_key`), so `order_by=[col("a") + col("b")]` is hoisted the same way. Only the
+    leading order key is: the trailing keys are evaluated by each bucket's own window kernel,
+    and a partitioned window's order keys are never cut on at all, so both stay untouched.
+
+    `keep` is the window's ORIGINAL output — its input columns plus the function aliases —
+    so the hidden keys vanish and nothing else does.
 
     Args:
         window: The `Window` node to rewrite.
@@ -441,12 +496,22 @@ def hoist_window_keys(window):
     Returns:
         `(window', keep)`, or `None` when no hoist is needed.
     """
-    hoisted = hoist_computed_keys(window.input, window.partition_keys, prefix="__win_key")
+    keep = tuple(window.available_columns())
+    if window.partition_keys:
+        hoisted = hoist_computed_keys(window.input, window.partition_keys, prefix="__win_key")
+        if hoisted is None:
+            return None
+        with_keys, keys = hoisted
+        return dataclasses.replace(window, input=with_keys, partition_keys=keys), keep
+    if not window.order_keys:
+        return None
+    lead = window.order_keys[0]
+    hoisted = hoist_computed_keys(window.input, [lead.expr], prefix="__win_order")
     if hoisted is None:
         return None
-    with_keys, keys = hoisted
-    keep = tuple(window.available_columns())
-    return dataclasses.replace(window, input=with_keys, partition_keys=keys), keep
+    with_key, (hidden,) = hoisted
+    order_keys = (dataclasses.replace(lead, expr=hidden), *window.order_keys[1:])
+    return dataclasses.replace(window, input=with_key, order_keys=order_keys), keep
 
 
 def hoist_computed_keys(

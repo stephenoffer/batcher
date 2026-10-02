@@ -277,8 +277,14 @@ impl Expr {
             // the dictionary-native path pays it per *dictionary entry*, not per row,
             // which is why this is capped rather than linear.
             Expr::InList { input, set } => {
-                let width = (set.len() as u32).min(32);
-                (4 + width).saturating_add(input.eval_cost())
+                // A small or narrow integer/date set is a scan or a bitmap test per row, not a
+                // probe -- see `in_list::is_direct` -- and costs about what a comparison does.
+                let own = if crate::eval::in_list::is_direct(set) {
+                    3
+                } else {
+                    4 + (set.len() as u32).min(32)
+                };
+                own.saturating_add(input.eval_cost())
             }
             Expr::Cast { input, .. } => 8u32.saturating_add(input.eval_cost()),
             // A regex or `LIKE` walks an automaton per row; a media decode is orders

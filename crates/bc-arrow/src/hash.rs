@@ -50,7 +50,8 @@ use std::hash::{BuildHasher, Hasher};
 
 /// SplitMix64's finalizer — an avalanching 64-bit integer hash.
 ///
-/// The same function as `bc_expr::eval::hash::mix64`, and deliberately so: both exist to
+/// The one copy the engine uses: `bc-expr`'s row hash, MinHash and SimHash and
+/// `bc-sketches`' reservoir seeding all call this. It exists to
 /// make a weak accumulator's high and low bits equally usable, which matters here because
 /// `bucket_of` extracts the *low* bits for a power-of-two partition count and the *high*
 /// bits for the multiply-shift path. A hash that only avalanches one end silently skews

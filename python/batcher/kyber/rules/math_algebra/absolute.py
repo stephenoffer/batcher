@@ -35,6 +35,7 @@ from collections.abc import Callable
 
 from batcher.kyber.rules.exprs.guards import is_integer, register_schema_leaf_rule
 from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
+from batcher.kyber.rules.literals import INT64_MAX
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.core import MathExpr
 from batcher.plan.ir_tags import COMPARISON_FLIP
@@ -42,7 +43,6 @@ from batcher.plan.schema import SchemaRef
 
 __all__ = ["ABS_RANGE_RULES", "SIGN_INTEGER_RULES"]
 
-_INT64_MAX = 2**63 - 1
 
 #: Comparisons whose operands may be swapped by flipping the operator, so each rule below
 #: matches `abs(x) OP c` and `c OP' abs(x)` alike without a second table.
@@ -104,7 +104,7 @@ def _abs_leaf(op_wanted: str) -> Callable[[Expr], Expr]:
         if found is None:
             return expr
         op, arg, bound = found
-        if op != op_wanted or not 0 < bound < _INT64_MAX:
+        if op != op_wanted or not 0 < bound < INT64_MAX:
             return expr
         rewritten = _abs_interval(op, arg, bound)
         return expr if rewritten is None else rewritten

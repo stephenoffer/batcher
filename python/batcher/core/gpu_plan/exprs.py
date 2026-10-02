@@ -173,10 +173,12 @@ def _case(ir, df, be):
     otherwise = ir.get("otherwise")
     if otherwise is None:
         raise Unsupported("CASE without ELSE")  # the null-typed default has no column dtype
-    out = be.column(eval_expr(otherwise, df, be), df)
+    out = be.require_flat(be.column(eval_expr(otherwise, df, be), df), "CASE")
     for branch in reversed(ir["branches"]):
         cond = be.column(eval_expr(branch["when"], df, be), df).fillna(False)
-        out = be.column(eval_expr(branch["then"], df, be), df).where(cond, out)
+        out = be.require_flat(be.column(eval_expr(branch["then"], df, be), df), "CASE").where(
+            cond, out
+        )
     return out
 
 
@@ -189,8 +191,8 @@ def _coalesce(ir, df, be):
 
 
 def _nullif(ir, df, be):
-    left = be.column(eval_expr(ir["left"], df, be), df)
-    right = be.column(eval_expr(ir["right"], df, be), df)
+    left = be.require_flat(be.column(eval_expr(ir["left"], df, be), df), "NULLIF")
+    right = be.require_flat(be.column(eval_expr(ir["right"], df, be), df), "NULLIF")
     return left.where((left != right).fillna(True), None)
 
 
@@ -287,8 +289,8 @@ def _struct_field(ir, df, be: DfBackend):
     """`struct.field(name)` — one field of a struct column.
 
     The one struct operation both libraries spell the same way, and the one worth having: a
-    struct column is how every semi-structured source arrives, so a plan that reads one field
-    of one used to send its whole chain to the host.
+    struct column is how every semi-structured source arrives, and without it a plan that
+    reads one field of one would send its whole chain to the host.
     """
     from batcher.core.gpu_plan.backend import call_or_decline
 

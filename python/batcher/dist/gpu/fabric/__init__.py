@@ -3,14 +3,13 @@
 Ray places work by counting devices. Two decisions it therefore leaves open decide what a
 multi-device stage actually achieves, and both are made here:
 
-* `placement` — *which* devices a stage gets (the tightest coherent group the node has, bounded
-  to one fabric island when the stage exchanges) and how its shards are dealt across them
-  (weighted by measured throughput, so a fast device does not wait on a slow one).
+* `placement` — how a fan-out's shards are sized and dealt across devices (weighted by
+  measured throughput, so a fast device does not wait on a slow one).
 * `collective_env` — what the collective library is told about the node: which NIC each device
   is rail-aligned with, which interfaces carry the fabric, and whether peer-to-peer can help
   here, instead of leaving it to re-derive all three by probing.
 
-Both degrade to the pre-existing behavior on a node whose topology cannot be read: no group, no
+Both degrade to the pre-existing behavior on a node whose topology cannot be read: no
 reweighting, an empty environment block. A placement hint that fires on missing data moves work
 for a reason that is not there.
 
@@ -34,8 +33,6 @@ from batcher.dist.gpu.fabric.collective_env import (
 from batcher.dist.gpu.fabric.placement import (
     adaptive_shard_factor,
     device_shard_counts,
-    local_device_group,
-    shard_device_assignment,
 )
 
 __all__ = [
@@ -45,11 +42,9 @@ __all__ = [
     "device_shard_counts",
     "gdr_level",
     "ib_hca_list",
-    "local_device_group",
     "merge_env",
     "node_collective_env",
     "p2p_disabled",
     "reset_node_collective_env",
-    "shard_device_assignment",
     "socket_ifnames",
 ]

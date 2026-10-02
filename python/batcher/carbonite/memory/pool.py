@@ -48,7 +48,8 @@ def engine_pool_stats() -> dict[str, int | float | str] | None:
 
     Returns:
         The engine pool's accounting — `limit_bytes`, `used_bytes`, `available_bytes`,
-        `peak_used_bytes`, `denied`, `spill_requests`, `utilization`, and the data plane's own
+        `peak_used_bytes`, `denied`, `spill_requests`, `over_released_bytes`, `utilization`,
+        and the data plane's own
         `soft_limit_bytes` / `pressure` — or `None` when no query has run under a memory budget
         in this process (or the extension is not built). `None` is distinct from a dict of
         zeros, which would assert something about a pool that has never existed.
@@ -112,6 +113,7 @@ class _FallbackPool:
         self._used = 0
         self._peak_used = 0
         self._denied = 0
+        self._over_released = 0
         self._lock = threading.Lock()
 
     def try_reserve(self, n_bytes: int) -> bool:
@@ -125,7 +127,9 @@ class _FallbackPool:
 
     def release(self, n_bytes: int) -> None:
         with self._lock:
-            self._used -= min(self._used, n_bytes)
+            freed = min(self._used, n_bytes)
+            self._used -= freed
+            self._over_released += n_bytes - freed
 
     def set_limit(self, limit_bytes: int) -> None:
         with self._lock:
@@ -150,6 +154,10 @@ class _FallbackPool:
     @property
     def denied(self) -> int:
         return self._denied
+
+    @property
+    def over_released(self) -> int:
+        return self._over_released
 
 
 def _make_native_pool(limit_bytes: int):
@@ -293,6 +301,9 @@ class BufferPool:
             "peak_used_bytes": peak,
             "denied": self.denied,
             "spill_requests": self.spill_requests,
+            # Bytes released past what was held: the underflow clamp keeps `used` sane and
+            # would otherwise hide the mismatched pair that leaves it optimistically low.
+            "over_released_bytes": int(getattr(self._pool, "over_released", 0) or 0),
             "utilization": self.utilization,
             "peak_utilization": min(1.0, peak / limit) if limit > 0 else 1.0,
         }
@@ -339,11 +350,11 @@ def process_pool(limit_bytes: int) -> BufferPool:
     spurious spilling, or failing a reservation for work Carbonite had correctly admitted.
     Growth always applies at once (capacity the autoscaler just added must not wait).
 
-    A deferred shrink is **remembered**. It used to be discarded outright, so the smaller
-    budget only ever landed if some later call happened to ask for that same figure while
-    the pool was idle — which for a shrink caused by an autoscaler taking RAM away is not
-    something that happens at all. The envelope then stayed at the larger limit for the
-    life of the process and admitted against memory the box no longer had. The pending
+    A deferred shrink is **remembered**. Discarding it would land the smaller budget only if
+    some later call happened to ask for that same figure while the pool was idle — which for
+    a shrink caused by an autoscaler taking RAM away does not happen at all — so the envelope
+    would stay at the larger limit for the life of the process and admit against memory the
+    box no longer has. The pending
     figure is applied on the first subsequent call that finds the pool idle, and is
     superseded by any later reconcile so it can never resurrect a stale budget.
 

@@ -124,16 +124,22 @@ def test_learned_sort_merge_recovers_the_crossover():
     assert abs(got - true_xover) / true_xover < 0.15
 
 
-# --- learned build-side prior -----------------------------------------------------------------
-def test_learned_build_sides_cold_is_none():
-    assert lt.learned_build_sides(_hub(), "j1") is None
+def test_a_failing_crossover_read_is_traced_not_silent(monkeypatch):
+    """A store that refuses reads must leave a trace, not silently pin the default."""
+    from batcher.kyber.learned_tuning import crossover
 
-
-def test_learned_build_sides_returns_measured_sizes():
     hub = _hub()
-    lt.record_join_sides(hub, "j1", 6_000_000.0, 1_500_000.0)
-    left, right = lt.learned_build_sides(hub, "j1")
-    assert (round(left), round(right)) == (6_000_000, 1_500_000)
+
+    def refuse(*_a, **_k):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(hub, "get_keyed_param", refuse)
+    noted: list[str] = []
+    monkeypatch.setattr(
+        crossover, "note_suppressed", lambda layer, what, exc: noted.append(f"{layer}:{what}")
+    )
+    assert lt.learned_sort_merge_min_rows(hub, default=50_000_000.0) is None
+    assert noted == ["kyber:read the learned crossover buckets"]
 
 
 # --- learned partition/parallelism prior ------------------------------------------------------
@@ -148,6 +154,18 @@ def test_learned_partition_count_from_measured_rows():
 
 
 # --- learned partial-aggregation decision -----------------------------------------------------
+def test_a_non_finite_observation_does_not_poison_a_prior():
+    """One NaN or infinity must be dropped, not folded into the stored prior forever."""
+    hub = _hub()
+    for _ in range(4):
+        lt.record_partition_rows(hub, "b-nan", 8_000_000.0)
+    before = lt.learned_partition_count(hub, "b-nan", target_rows=1_000_000)
+    assert before == 8
+    lt.record_partition_rows(hub, "b-nan", float("nan"))
+    lt.record_partition_rows(hub, "b-nan", float("inf"))
+    assert lt.learned_partition_count(hub, "b-nan", target_rows=1_000_000) == before
+
+
 def test_learned_partial_agg_cold_is_none():
     assert lt.learned_partial_agg(_hub(), "a1") is None
 
@@ -479,7 +497,6 @@ def test_none_hub_is_safe_everywhere():
     assert lt.learned_join_strategy(None, "x") is None
     assert lt.learned_broadcast_max_bytes(None) is None
     assert lt.learned_sort_merge_min_rows(None, 1.0) is None
-    assert lt.learned_build_sides(None, "x") is None
     assert lt.learned_partition_count(None, "x", 1) is None
     assert lt.learned_partial_agg(None, "x") is None
     assert lt.learned_signature_rows(None, "x") is None
@@ -488,7 +505,6 @@ def test_none_hub_is_safe_everywhere():
     lt.record_join_strategy(None, "x", "hash", 1.0)
     lt.record_broadcast_timing(None, "broadcast", 1.0, 1.0)
     lt.record_sort_merge_timing(None, "hash", 1.0, 1.0)
-    lt.record_join_sides(None, "x", 1.0, 1.0)
     lt.record_partition_rows(None, "x", 1.0)
     lt.record_group_reduction(None, "x", 1.0, 1.0)
     lt.record_adaptive_route(None, "x", "staged", 1.0)

@@ -114,7 +114,9 @@ def write_backend(mode: str, opts: dict[str, Any]) -> str:
             >>> write_backend("upsert", {"uri": "postgresql://h/db"})
             'dbapi'
     """
-    if mode not in _INGEST_MODES:
+    # `sequence_by` and `staged` are statement-path options. ADBC ingests in bulk with no
+    # staging protocol, so either one routes here, where it is honored or refused by name.
+    if mode not in _INGEST_MODES or "sequence_by" in opts or "staged" in opts:
         return "dbapi"
     if any(key in opts for key in _DBAPI_KEYWORDS):
         return "dbapi"

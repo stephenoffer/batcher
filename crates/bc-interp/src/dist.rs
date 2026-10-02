@@ -69,11 +69,11 @@ pub fn partial_aggregate(
     if non_empty.is_empty() {
         let combined = ops::materialize(batches).map_err(|_| InterpError::EmptyAggregateInput)?;
         let partial = ops::eval_partial(&combined, group_keys, aggregates)?;
-        return partial_to_batch(group_keys, &partial);
+        return partial_to_batch(group_keys, aggregates, &partial);
     }
     if non_empty.len() == 1 {
         let partial = ops::eval_partial(non_empty[0], group_keys, aggregates)?;
-        return partial_to_batch(group_keys, &partial);
+        return partial_to_batch(group_keys, aggregates, &partial);
     }
     let funcs = ops::agg_funcs(aggregates);
     let agg_jit = ops::compile_agg(group_keys, aggregates, non_empty[0]);
@@ -124,7 +124,7 @@ pub fn partial_aggregate(
             );
             agg::combine(&partials, &funcs)?
         };
-        partial_to_batch(group_keys, &merged)
+        partial_to_batch(group_keys, aggregates, &merged)
     })
 }
 
@@ -142,10 +142,20 @@ fn agg_widths(aggregates: &[AggregateItem]) -> Vec<usize> {
 
 /// Serialize a `Partial` into the wire batch `partial_aggregate` emits:
 /// `[group_key_columns..., state_columns...]` with synthetic state names.
-fn partial_to_batch(
+///
+/// **An integer `SUM`'s state always leaves in its 128-bit form.** In-process it stays a bare
+/// `Int64` while its total fits and goes 128-bit only on overflow (`bc_runtime::agg::int_sum`),
+/// so two partials of one query can differ in type. That is harmless to `combine`, which
+/// unifies them, and fatal to anything that pools the batches this returns under one schema
+/// -- a shuffle file, a checkpoint that writes a spilled and a resident state as one IPC
+/// file. So the batch that crosses the process boundary is widened, once per group.
+pub(crate) fn partial_to_batch(
     group_keys: &[ProjectionItem],
+    aggregates: &[AggregateItem],
     partial: &agg::Partial,
 ) -> Result<RecordBatch, InterpError> {
+    let widened = agg::widen_int_sum_states(partial, &ops::agg_funcs(aggregates))?;
+    let partial = widened.as_ref().unwrap_or(partial);
     // Exact wire width: one column per group key plus every aggregate's state columns.
     let ncols = group_keys.len() + partial.states.iter().map(|s| s.len()).sum::<usize>();
     let mut fields = Vec::with_capacity(ncols);
@@ -226,7 +236,7 @@ pub fn combine(
     }
     let funcs = ops::agg_funcs(aggregates);
     let merged = in_worker_pool(|| agg::combine(&partials, &funcs))??;
-    partial_to_batch(group_keys, &merged)
+    partial_to_batch(group_keys, aggregates, &merged)
 }
 
 /// Reduce step: merge the partial-state batches routed to one reducer and
@@ -1474,5 +1484,107 @@ mod tests {
         write_ipc_stream(&path, &[partial]);
         let out = combine_finalize_spilling(&g, &aggs, &[path], 1, &scratch.0, None).unwrap();
         assert_eq!(out.num_rows(), 0, "an all-empty reducer yields zero rows");
+    }
+
+    /// `(k, v)` Int64 map partitions for the integer-`SUM` tests.
+    fn int_partitions(parts: &[IntChunk]) -> Vec<Vec<RecordBatch>> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("v", DataType::Int64, true),
+        ]));
+        parts
+            .iter()
+            .map(|(k, v)| {
+                vec![RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(k.clone())) as ArrayRef,
+                        Arc::new(Int64Array::from(v.clone())) as ArrayRef,
+                    ],
+                )
+                .unwrap()]
+            })
+            .collect()
+    }
+
+    /// F212, composed through the real distributed primitives: a map task holding
+    /// `{i64::MAX, 1}` for a group and another holding `{-2}` total `i64::MAX - 1`, which
+    /// fits. The map-side partial of the first does not fit an `i64`, and before the 128-bit
+    /// partial state `partial_aggregate` raised there -- so the query failed distributed and
+    /// succeeded single-node. Every reducer count, the in-memory and the spilling reduce,
+    /// grouped (with a null-holding and an all-null group) and global, must give the
+    /// single-node answer, and the answer column must be `Int64`.
+    #[test]
+    fn an_int_sum_whose_map_partial_overflows_matches_single_node() {
+        let parts: Vec<IntChunk> = vec![
+            (
+                vec![Some(1), Some(2), Some(3), Some(1)],
+                vec![Some(i64::MAX), Some(-7), None, Some(1)],
+            ),
+            (vec![Some(1), Some(2), Some(3)], vec![Some(-2), None, None]),
+        ];
+        let partitions = int_partitions(&parts);
+        let whole: Vec<RecordBatch> = partitions.iter().flatten().cloned().collect();
+        let aggs = vec![agg(AggFunc::Sum, Some("v"), None, None, "s")];
+        // A global aggregate has one reducer by construction; a keyed one is tried at several.
+        for (g, reducers) in [(gk("k"), 3), (Vec::new(), 1)] {
+            let want = result_map(&[single_node(&g, &aggs, &whole)]);
+            for n in 1..=reducers {
+                let got = distributed(&g, &aggs, &partitions, n);
+                for b in &got {
+                    assert_eq!(b.column(b.num_columns() - 1).data_type(), &DataType::Int64);
+                }
+                assert_eq!(result_map(&got), want, "in-memory reduce, {n} reducers");
+                let scratch = ScratchDir::new();
+                let got = distributed_spilling(&g, &aggs, &partitions, n, 1, &scratch.0);
+                assert_eq!(result_map(&got), want, "spilling reduce, {n} reducers");
+            }
+        }
+        let grouped = result_map(&[single_node(&gk("k"), &aggs, &whole)]);
+        assert_eq!(grouped["1"], vec![(i64::MAX - 1).to_string()]);
+        assert_eq!(grouped["2"], vec!["-7".to_string()]);
+        assert_eq!(
+            grouped["3"],
+            vec![String::new()],
+            "an all-null group is NULL"
+        );
+    }
+
+    /// And the converse: a true total past `i64` raises on the distributed path too -- at
+    /// the reducer's finalize, where the total is first known, even though every map
+    /// partial on its own fits.
+    #[test]
+    fn an_int_sum_whose_true_total_overflows_raises_distributed() {
+        let parts: Vec<IntChunk> = vec![
+            (vec![Some(1)], vec![Some(i64::MAX)]),
+            (vec![Some(1)], vec![Some(1)]),
+        ];
+        let partitions = int_partitions(&parts);
+        let aggs = vec![agg(AggFunc::Sum, Some("v"), None, None, "s")];
+        for g in [gk("k"), Vec::new()] {
+            let map: Vec<RecordBatch> = partitions
+                .iter()
+                .map(|p| partial_aggregate(&g, &aggs, p).expect("each map partial fits"))
+                .collect();
+            // Every map partial fits, so in-process it is a bare `Int64`; on the wire it is
+            // always the marked 128-bit form, so batches from different mappers share a schema.
+            for m in &map {
+                let DataType::Struct(f) = m.column(m.num_columns() - 1).data_type() else {
+                    panic!(
+                        "a SUM state crosses the boundary marked, got {:?}",
+                        m.schema()
+                    );
+                };
+                assert_eq!(f[0].name(), "__bc_int64_sum_i128");
+            }
+            let r = combine_finalize(&g, &aggs, &map);
+            assert!(
+                matches!(
+                    r,
+                    Err(InterpError::Runtime(bc_runtime::RuntimeError::SumOverflow))
+                ),
+                "got {r:?}"
+            );
+        }
     }
 }

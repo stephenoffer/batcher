@@ -348,8 +348,7 @@ class ResourceManager:
         if parallelism is not None:
             changes["parallelism"] = parallelism
             _report_reduced_parallelism()
-        execution = dataclasses.replace(self._config.execution, **changes)
-        return dataclasses.replace(self._config, execution=execution)
+        return _adapted(self._config, tuple(sorted(changes.items())))
 
     def estimated_bytes(self, plan: PhysicalPlan) -> int:
         """Estimated peak in-memory bytes for `plan` — its learned-blended dominant breaker.
@@ -419,6 +418,7 @@ class ResourceManager:
         from batcher._internal.hardware import swap_configured
         from batcher.carbonite.cache import current_result_cache
         from batcher.carbonite.memory.kernel import kernel_stats
+        from batcher.carbonite.memory.ledger import memory_ledger
         from batcher.carbonite.memory.pool import current_process_pool, engine_pool_stats
         from batcher.carbonite.memory.reclaim import reclaim_stats
         from batcher.carbonite.policies.concurrency import process_limiter
@@ -458,6 +458,9 @@ class ResourceManager:
             # reads it; it is here so a person tuning `memory.soft_limit` can see which node
             # they are on.
             "swap": swap_configured(),
+            # What the pressure level's `max` collapses: each pool's reservation, the
+            # resident set, and the resident bytes no pool was asked for (pyarrow, UDFs).
+            "memory_ledger": memory_ledger(),
         }
         pool = current_process_pool()
         if pool is not None:
@@ -519,13 +522,15 @@ class ResourceManager:
         """
         return self._spill.input_exceeds_budget(input_bytes)
 
-    def resident_total_exceeds_budget(self, input_bytes: int, plan: PhysicalPlan) -> bool:
+    def resident_total_exceeds_budget(
+        self, input_bytes: int, plan: PhysicalPlan, *, held_bytes: int = 0
+    ) -> bool:
         """Whether the resident input plus the plan's peak state overflows the envelope.
 
         The two terms coexist on the in-memory path and were only ever compared to the budget
         separately. See `policies.spill_advice.SpillAdvisor.resident_total_exceeds_budget`.
         """
-        return self._spill.resident_total_exceeds_budget(input_bytes, plan)
+        return self._spill.resident_total_exceeds_budget(input_bytes, plan, held_bytes=held_bytes)
 
     def recommend_spill_partitions(self, plan: PhysicalPlan) -> int | None:
         """Out-of-core buckets to shard `plan`'s spilled state into, or `None` to keep the
@@ -607,6 +612,12 @@ class ResourceManager:
             yield grant
         finally:
             limiter.release()
+            # The query is done, so whatever the allocator still holds beyond the retention
+            # ceiling is pages no running query is using. See `memory.reclaim`. Against the
+            # process's reach, not `_envelope`, which shrinks by everything the process holds.
+            from batcher.carbonite.memory.reclaim import reclaim_if_retaining
+
+            reclaim_if_retaining(self._pressure.reach_bytes())
 
     @contextmanager
     def reserve(self, m_bytes: int) -> Iterator[bool]:
@@ -650,6 +661,28 @@ class ResourceManager:
             yield granted
 
 
+#: The last adaptation `recommended_config` built: `(base, changes, adapted)`.
+#:
+#: Under sustained pressure or contention every query asks for the same adaptation of the
+#: same base config, and handing back the *same* adapted object is what lets
+#: `config_context` find it already resolved (its memo is by identity) instead of
+#: re-validating an identical config on every query. Exact: the base is matched by identity
+#: and is frozen, and the changes by value.
+_ADAPTED: tuple[Config, tuple, Config] | None = None
+
+
+def _adapted(base: Config, changes: tuple) -> Config:
+    """`base` with `changes` applied to its execution section, reusing the last such object."""
+    global _ADAPTED
+    memo = _ADAPTED
+    if memo is not None and memo[0] is base and memo[1] == changes:
+        return memo[2]
+    execution = dataclasses.replace(base.execution, **dict(changes))
+    adapted = dataclasses.replace(base, execution=execution)
+    _ADAPTED = (base, changes, adapted)
+    return adapted
+
+
 def _report_reduced_parallelism() -> None:
     """Say on the bus that contention, not the plan, narrowed the fan-out.
 
@@ -668,6 +701,10 @@ def _report_reduced_parallelism() -> None:
         from batcher._internal import events
         from batcher.plan.profile import Decision
 
+        # `publish` drops the event with nobody listening, so building the note -- a second
+        # full CPU probe -- for it was the cost of a contended query with no consumer.
+        if not events.listening():
+            return
         note = oversubscription_note()
         if not note:
             return

@@ -23,6 +23,7 @@ from batcher.carbonite import ResourceManager
 from batcher.carbonite.base import ResourceContext
 from batcher.carbonite.memory.learned import (
     LearnedMemoryModel,
+    _attributable_peak,
     _canonical_kind,
     _fit,
     _memory_basis_rows,
@@ -396,10 +397,7 @@ def _from_scratch(hub: MetadataHub, cfg) -> tuple[dict[str, float], dict[str, fl
         footprints: list[float] = []
         spills: list[float] = []
         for r in rows:
-            peak = max(
-                float(r.get("m_peak_bytes", 0) or 0.0),
-                float(r.get("peak_rss_bytes", 0) or 0.0),
-            )
+            peak = _attributable_peak(r)
             basis = _memory_basis_rows(r)
             if peak > 0.0 and basis > 0.0:
                 footprints.append(peak / basis)
@@ -573,3 +571,28 @@ def test_blend_peak_uses_the_input_row_basis_when_the_plan_supplies_it():
     assert model.blend_peak("Aggregate", planned, width, input_rows=in_rows) == int(256.0 * in_rows)
     # Without the basis the older recovery stands, and it reads the output count.
     assert model.blend_peak("Aggregate", planned, width) == int(256.0 * out_rows)
+
+
+def test_rss_growth_is_charged_only_up_to_a_multiple_of_the_operators_own_working_set():
+    """RSS is a process high-water, so its growth during a small operator is mostly not its own.
+
+    A 12-row scan running beside a join that built a gigabyte table was charged that gigabyte,
+    which read as tens of megabytes a row and cut every later morsel to a few dozen rows.
+    """
+    hub = _hub()
+    for _ in range(30):
+        hub.record(
+            OperatorFeedback(
+                op_id=OpId(1),
+                kind="scan",
+                n_actual=12,
+                t_op_ms=1.0,
+                m_peak_bytes=12 * 100,  # 100 B/row of its own
+                peak_rss_bytes=1 << 30,  # a concurrent join's growth
+                selectivity=1.0,
+                batch_size=16384,
+                n_input=12,
+            )
+        )
+    width = learned_memory_model(hub).bytes_per_row("Scan")
+    assert width is not None and 100.0 <= width <= 400.0, width

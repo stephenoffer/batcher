@@ -63,6 +63,29 @@ def supports_spilling_window(window: Window) -> bool:
     return _single_source(window.input)
 
 
+def supports_bounded_window(window: Window) -> bool:
+    """Whether a window has any bounded-memory route: grace by key, or ordered buckets.
+
+    The two routes cut on different keys -- a `PARTITION BY` window by its partition keys
+    (`supports_spilling_window`), a global one by the range partitioner on its leading
+    `ORDER BY` key (`dist.global_window.supports_ordered_bucket_offsets`) -- and a caller
+    deciding whether a hoisted rewrite (`plan.logical.hoist_window_keys`) is worth keeping
+    needs the union, not either half. Asking only the first half is how a computed global
+    order key was hoisted, declined, and then materialized from `iter_batches()`.
+
+    Args:
+        window: The window operator to classify.
+
+    Returns:
+        True when one of the two bounded routes accepts `window` as it stands.
+    """
+    if supports_spilling_window(window):
+        return True
+    from batcher.dist.global_window import supports_ordered_bucket_offsets
+
+    return not window.partition_keys and supports_ordered_bucket_offsets(window)
+
+
 def stream_spilling_window(
     window: Window,
     sources: list[Source],

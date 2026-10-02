@@ -194,7 +194,7 @@ def test_preprocessor_sklearn_vocab(num: bt.Dataset) -> None:
     fitted = scaler.fit(num)
     assert fitted.is_fitted is True
     assert isinstance(scaler.get_params(), dict)
-    assert set(scaler.get_params()) == {"columns", "with_mean", "with_std"}
+    assert set(scaler.get_params()) == {"columns", "output_columns", "with_mean", "with_std"}
 
 
 def test_preprocessor_repr_reflects_fit(num: bt.Dataset) -> None:

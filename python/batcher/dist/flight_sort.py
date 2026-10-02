@@ -34,9 +34,14 @@ from batcher.dist.executors.partition_io import (
     sample_probs,
     stage_pushdown,
 )
-from batcher.dist.executors.plan_analysis import empty_result_table
+from batcher.dist.executors.plan_analysis import (
+    empty_result_table,
+    stack_above_ir,
+    stackable_on_buckets,
+)
 from batcher.dist.executors.ray_runtime import (
     engine_config_json,
+    kill_workers,
     map_barrier,
     map_partitions,
     shuffle_partitions,
@@ -67,9 +72,9 @@ _log = get_logger("dist.sort")
 def _phase(name: str, seconds: float, **fields: object) -> None:
     """Record one distributed-sort phase timing on the central logger.
 
-    These timings used to be `print`s behind a `BATCHER_SORT_PROFILE` env var: invisible to
-    the log file, unfilterable, on stdout in the middle of a user's results, and unknown to
-    the dashboard. As DEBUG records on `batcher.dist.sort` they answer to the same
+    Log records rather than `print`s, which would be invisible to the log file,
+    unfilterable, on stdout in the middle of a user's results, and unknown to the
+    dashboard. As DEBUG records on `batcher.dist.sort` they answer to the same
     `log_level` as everything else, and the phase name and duration are structured fields
     rather than a sentence — so "which phase dominates this sort" is a query, not a grep.
 
@@ -209,8 +214,6 @@ def execute_sort_flight(
     result, so the caller has to handle either type."""
     import time as _tt0
 
-    import ray
-
     _enter = _tt0.perf_counter()
     _ensure_ray(workers)
     _phase("ensure_ray", _tt0.perf_counter() - _enter)
@@ -221,17 +224,20 @@ def execute_sort_flight(
     desc, nulls_first = key.descending, key.nulls_first
     map_plan, sid = _relabel_single_source(sort.input)
     map_ir = json.dumps(map_plan.to_ir())
-    sort_ir = json.dumps(
-        {
-            **sort.shape_ir(),
-            "input": task_scan_ir(),
-        }
-    )
+    # Row-local work above an unlimited sort runs inside each reducer over its range bucket,
+    # exactly as in `executors/sort.py`: the buckets stay on the actors instead of every row
+    # crossing the driver for a filter or a projection (`plan_analysis.stackable_on_buckets`).
+    fold_above = sort.limit is None and stackable_on_buckets(above)
+    reduce_ir = {**sort.shape_ir(), "input": task_scan_ir()}
+    sort_ir = json.dumps(stack_above_ir(above, reduce_ir) if fold_above else reduce_ir)
     credits = _shuffle_credits()
 
-    # A `limit` slices the assembled result and `above` has nothing to apply itself to
-    # without one, so both keep the collect. Everything else stays on the workers.
-    publish = materialize is False and not above and sort.limit is None
+    # A `limit` slices the assembled result, so it keeps the collect; the rest stays put.
+    publish = materialize is False and (fold_above or not above) and sort.limit is None
+    top = above[0] if fold_above else sort  # the node whose columns the result carries
+    stage_above = above  # the read is narrowed against the whole stage either way
+    if fold_above:
+        above = []  # applied by every reducer; nothing is left to apply on the driver
     keep_actors = False  # set when a FlightMaterializedSource takes ownership of them
 
     import time as _tt
@@ -256,7 +262,7 @@ def execute_sort_flight(
         # source's original index: a staged plan whose input is an intermediate (source id >
         # 0) missed the lookup and silently read every column.
         # Asked of the whole stage (`above` over the sort), keyed by the source's own id.
-        projection, predicate = stage_pushdown(above, sort, sid)
+        projection, predicate = stage_pushdown(stage_above, sort, sid)
         # More map partitions than workers where the source has splits to fill them, so a
         # straggler holds a fraction of a node's share rather than all of it (see
         # `map_partitions`). `len(parts)` is the source count from here on — for the sample
@@ -281,8 +287,7 @@ def execute_sort_flight(
 
         # Simulate worker loss BEFORE the sample/map barriers (test hook).
         if _fault_inject_map:
-            for i in _fault_inject_map:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject_map)
 
         # Both barriers run under worker-loss recovery, sharing one `dead` view of the
         # fleet: a worker preempted while sampling or range-partitioning has its split
@@ -291,10 +296,10 @@ def execute_sort_flight(
         # buckets keep the ticket the reducers dial.
         dead: set[int] = set()
 
-        # One ticket stage for THIS sort's shuffle. The stage used to be the literal 0, so
-        # two sorts in one query (or a sort beside a window) published byte-identical
-        # tickets on the same worker and the second overwrote the first — the collision
-        # that made a join read another join's buckets. See `fleet.plan_id.next_stage_base`.
+        # One ticket stage for THIS sort's shuffle, never a literal: two sorts in one query
+        # (or a sort beside a window) would otherwise publish byte-identical tickets on the
+        # same worker and the second would overwrite the first, so a join could read another
+        # join's buckets. See `fleet.plan_id.next_stage_base`.
         stage_base = next_stage_base(1)
 
         # SAMPLE: each worker samples its own split's leading-key distribution.
@@ -390,11 +395,12 @@ def execute_sort_flight(
         # aggregate's; it is still cheaper than re-reading the source and re-running the
         # sample + range partition. `None` (the default factor of 1) leaves the reduce
         # byte-identical to the unreplicated path.
-        replicas = replicate_shuffle_output(actors, mapper_addrs, n_physical, workers, dead)
+        replicas = replicate_shuffle_output(
+            actors, mapper_addrs, n_physical, workers, dead, stages=(stage_base,)
+        )
 
         if _fault_inject:
-            for i in _fault_inject:
-                ray.kill(actors[i])
+            kill_workers(actors, _fault_inject)
 
         _s = _t.perf_counter()
         results = _sort_reduce_with_recovery(
@@ -431,7 +437,7 @@ def execute_sort_flight(
             schema = (
                 published[0][3]
                 if published
-                else empty_result_table(sort, sort.available_columns()).schema
+                else empty_result_table(top, top.available_columns()).schema
             )
             keep_actors = True  # the source holds the buckets; the fleet must outlive us
             # A borrowed fleet is the query's (freed once by the adaptive loop), so the
@@ -465,9 +471,7 @@ def execute_sort_flight(
     out: list[pa.RecordBatch] = []
     for r in order:
         out.extend(b for b in results.get(r, []) if b.num_rows > 0)
-    table = (
-        pa.Table.from_batches(out) if out else empty_result_table(sort, sort.available_columns())
-    )
+    table = pa.Table.from_batches(out) if out else empty_result_table(top, top.available_columns())
     _phase("driver_concat", _tt.perf_counter() - _pc, rows=table.num_rows)
     if sort.limit is not None:
         table = table.slice(0, sort.limit)
