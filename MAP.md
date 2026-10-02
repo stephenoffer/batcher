@@ -3382,7 +3382,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `lib.rs` | 120 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 409 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 412 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
-| `store.rs` | 434 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
+| `store.rs` | 440 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 93 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 207 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |
