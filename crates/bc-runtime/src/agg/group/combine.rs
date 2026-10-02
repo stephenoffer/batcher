@@ -14,7 +14,7 @@ use arrow::datatypes::{
 use rayon::prelude::*;
 
 use super::assign::assign_groups;
-use super::hash::hash_partial_keys;
+use super::hash::{hash_partial_keys, range_buckets};
 use crate::agg::{
     accumulate, merge_approx_distinct, merge_approx_quantile, merge_arg_extreme, merge_counted,
     merge_covar, merge_distinct, merge_median, merge_moments, merge_ordered_list, merge_welford,
@@ -218,7 +218,13 @@ pub(crate) fn combine_radix_parts(
     // reads it as one array — the gather below addresses rows as `(partial, row)` anyway.
     // At a high group count the copy is the merge's largest term, and its single multi-tens-of-
     // MB allocation pays for its own page faults on top of the bytes it moves.
-    let hashes = hash_partial_keys(parts, total_rows)?;
+    //
+    // A dense integer key is bucketed by value range instead (`range_buckets`), which may cut
+    // more buckets than asked so each one direct-maps; everything below reads `partitions`.
+    let (hashes, partitions) = match range_buckets(parts, total_rows, partitions) {
+        Some(ranged) => ranged,
+        None => (hash_partial_keys(parts, total_rows)?, partitions),
+    };
     // Global row `i` lives in partial `owner[i]` at `i - starts[owner[i]]` — the map back from
     // the flattened numbering the bucketing uses to the arrays the gather reads.
     let mut starts: Vec<u32> = Vec::with_capacity(parts.len() + 1);

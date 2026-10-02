@@ -12,6 +12,7 @@
 //! from that rather than restating the rules.
 
 use arrow::array::{Array, ArrayRef, AsArray};
+use arrow::datatypes::ArrowNativeType;
 use arrow::datatypes::{
     ArrowPrimitiveType, BinaryType, DataType, Int16Type, Int32Type, Int64Type, Int8Type,
     LargeBinaryType, LargeUtf8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type, Utf8Type,
@@ -23,6 +24,119 @@ use super::{NULL_HASH, SEED};
 use crate::agg::Partial;
 use crate::error::RuntimeError;
 use crate::keys::canon_f64;
+
+/// Most range buckets [`range_buckets`] will cut: bounds the per-chunk offset arrays the
+/// counting sort allocates, the way `RADIX_PARTITIONS_MAX` bounds the hash width.
+const RANGE_PARTITIONS_MAX: usize = 1 << 14;
+
+/// Bucket ids by **value range** instead of hash, for a single null-free integer key dense
+/// enough to direct-map: `(bucket per row, bucket count)`, or `None` to hash as before.
+///
+/// The radix combine only needs equal keys in one bucket, and a contiguous slice of the value
+/// range gives that as surely as a hash does. What it adds is that each bucket's keys then span
+/// `span / buckets` values, so `assign_groups` takes its dense direct map inside every bucket
+/// (`assign::int_group_ids`) instead of a hash table holding a hash-scattered `1 / buckets` of
+/// the groups. That table is what a near-unique integer key paid for: one partition per core
+/// over TPC-H Q13's 15M `o_custkey` groups at sf100 is ~1.9M groups a table, each probe a
+/// cache miss, and `int_group_ids` was a quarter of the query.
+///
+/// Taken only when the whole key range is dense against the rows (`DENSE_SPAN_ROW_FACTOR`),
+/// so a uniform key fills its buckets; the bucket count is raised until a bucket's span fits
+/// the dense map, so a bucket a skewed key overfills only falls back to hashing, inside that
+/// bucket. Never fewer buckets than `partitions`, so the parallelism the caller sized is kept.
+pub(super) fn range_buckets(
+    parts: &[Partial],
+    total_rows: usize,
+    partitions: usize,
+) -> Option<(Vec<u64>, usize)> {
+    let first = parts.first()?.group_columns.first()?;
+    if parts.iter().any(|p| p.group_columns.len() != 1) {
+        return None;
+    }
+    macro_rules! by_type {
+        ($($t:ty),*) => {
+            match first.data_type() {
+                $(d if d == &<$t>::DATA_TYPE => range_buckets_typed::<$t>(parts, total_rows, partitions),)*
+                _ => None,
+            }
+        };
+    }
+    by_type!(Int64Type, Int32Type, Int16Type, Int8Type, UInt32Type, UInt16Type, UInt8Type)
+}
+
+fn range_buckets_typed<T>(
+    parts: &[Partial],
+    total_rows: usize,
+    partitions: usize,
+) -> Option<(Vec<u64>, usize)>
+where
+    T: ArrowPrimitiveType,
+    T::Native: PartialOrd,
+{
+    let arrays: Vec<&arrow::array::PrimitiveArray<T>> = parts
+        .iter()
+        .map(|p| p.group_columns[0].as_primitive_opt::<T>())
+        .collect::<Option<_>>()?;
+    if arrays
+        .iter()
+        .any(|a| a.null_count() > 0 || a.data_type() != &T::DATA_TYPE)
+    {
+        return None;
+    }
+    let (lo, hi) = arrays
+        .par_iter()
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            let (mut lo, mut hi) = (a.value(0), a.value(0));
+            for &v in a.values().iter() {
+                if v < lo {
+                    lo = v;
+                }
+                if v > hi {
+                    hi = v;
+                }
+            }
+            (lo, hi)
+        })
+        .reduce_with(|x, y| {
+            let lo = if y.0 < x.0 { y.0 } else { x.0 };
+            let hi = if y.1 > x.1 { y.1 } else { x.1 };
+            (lo, hi)
+        })?;
+    // `to_isize` and the checked arithmetic refuse a range that overflows, as `dense_span` does.
+    let lo_i = lo.to_isize()?;
+    let span = hi.to_isize()?.checked_sub(lo_i)?.checked_add(1)? as usize;
+    if span > total_rows.saturating_mul(super::assign::DENSE_SPAN_ROW_FACTOR) {
+        return None;
+    }
+    let threads = rayon::current_num_threads().max(1);
+    let buckets = span
+        .div_ceil(super::assign::DENSE_SPAN_MAX)
+        .max(partitions)
+        .div_ceil(threads)
+        .saturating_mul(threads)
+        .min(RANGE_PARTITIONS_MAX);
+    let width = span.div_ceil(buckets) as u64;
+    let mut out = vec![0u64; total_rows];
+    let mut rest = out.as_mut_slice();
+    let mut slices = Vec::with_capacity(arrays.len());
+    for a in &arrays {
+        let (head, tail) = rest.split_at_mut(a.len());
+        slices.push(head);
+        rest = tail;
+    }
+    // The same wrapping offset `int_group_ids` indexes its map with: every value lies in
+    // `[lo, hi]`, so `v - lo` is in `[0, span)` modulo 2^64 for signed and unsigned keys alike.
+    slices
+        .into_par_iter()
+        .zip(arrays.par_iter())
+        .for_each(|(dst, a)| {
+            for (d, v) in dst.iter_mut().zip(a.values().iter()) {
+                *d = (v.as_usize().wrapping_sub(lo_i as usize) as u64) / width;
+            }
+        });
+    Some((out, buckets))
+}
 
 /// [`hash_keys_gated`] over the partials' key columns, flattened in partial order.
 ///
@@ -343,4 +457,104 @@ where
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Array, Int64Array};
+
+    use super::*;
+    use crate::agg::{combine_partitioned, finalize, partial, AggCall, AggFunc};
+
+    const FUNCS: [AggFunc; 4] = [AggFunc::Sum, AggFunc::CountStar, AggFunc::Min, AggFunc::Max];
+
+    fn calls(v: &ArrayRef) -> Vec<AggCall> {
+        vec![
+            AggCall::new(AggFunc::Sum, Some(v.clone())),
+            AggCall::new(AggFunc::CountStar, None),
+            AggCall::new(AggFunc::Min, Some(v.clone())),
+            AggCall::new(AggFunc::Max, Some(v.clone())),
+        ]
+    }
+
+    fn cell(a: &ArrayRef, i: usize) -> String {
+        if let Some(x) = a.as_any().downcast_ref::<Int64Array>() {
+            return x.value(i).to_string();
+        }
+        let x = a.as_any().downcast_ref::<Float64Array>().unwrap();
+        format!("{:.6}", x.value(i))
+    }
+
+    fn rows(keys: &ArrayRef, aggs: &[ArrayRef]) -> BTreeMap<i64, Vec<String>> {
+        let keys = keys.as_primitive::<Int64Type>();
+        (0..keys.len())
+            .map(|i| (keys.value(i), aggs.iter().map(|a| cell(a, i)).collect()))
+            .collect()
+    }
+
+    fn partials_of(keys: &ArrayRef, vals: &ArrayRef, chunk: usize) -> Vec<Partial> {
+        (0..keys.len() / chunk)
+            .map(|c| {
+                let (k, v) = (keys.slice(c * chunk, chunk), vals.slice(c * chunk, chunk));
+                partial(std::slice::from_ref(&k), &calls(&v), chunk).unwrap()
+            })
+            .collect()
+    }
+
+    /// Range bucketing must give the relation one whole-input aggregate gives, split into
+    /// key-disjoint partitions. Keys are dense, negative as well as positive, and scattered so
+    /// that every group spans many partials; the whole-input reference groups once and never
+    /// reaches the combine, so it cannot share a defect with the path under test.
+    #[test]
+    fn range_bucketed_combine_is_the_whole_input_aggregate() {
+        let n = 40_000usize;
+        let keys: ArrayRef = Arc::new(Int64Array::from(
+            (0..n as i64)
+                .map(|i| (i * 7_919) % 5_000 - 2_500)
+                .collect::<Vec<_>>(),
+        ));
+        let vals: ArrayRef = Arc::new(Int64Array::from(
+            (0..n as i64).map(|i| i % 13 - 6).collect::<Vec<_>>(),
+        ));
+        let partials = partials_of(&keys, &vals, 500);
+        let total: usize = partials.iter().map(|p| p.group_columns[0].len()).sum();
+        let (buckets, count) = range_buckets(&partials, total, 2).expect("a dense key ranges");
+        assert!(count >= 2 && buckets.iter().all(|&b| (b as usize) < count));
+
+        let whole = partial(std::slice::from_ref(&keys), &calls(&vals), n).unwrap();
+        let want = rows(&whole.group_columns[0], &finalize(&FUNCS, &whole).unwrap());
+        let parts = combine_partitioned(&partials, &FUNCS, 1).unwrap();
+        assert!(parts.len() > 1, "the partitioned path did not engage");
+        let mut got = BTreeMap::new();
+        for p in &parts {
+            for (k, row) in rows(&p.group_columns[0], &finalize(&FUNCS, p).unwrap()) {
+                assert!(
+                    got.insert(k, row).is_none(),
+                    "group {k} is in two partitions"
+                );
+            }
+        }
+        assert_eq!(got, want);
+    }
+
+    /// A null key, or a range too sparse to direct-map, keeps the hash bucketing.
+    #[test]
+    fn a_null_or_sparse_key_is_not_range_bucketed() {
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![1i64; 1_000]));
+        let nullable: ArrayRef = Arc::new(Int64Array::from(
+            (0..1_000i64)
+                .map(|i| (i % 10 != 0).then_some(i))
+                .collect::<Vec<_>>(),
+        ));
+        let sparse: ArrayRef = Arc::new(Int64Array::from(
+            (0..1_000i64).map(|i| i * 1_000_003).collect::<Vec<_>>(),
+        ));
+        for keys in [nullable, sparse] {
+            let partials = partials_of(&keys, &vals, 100);
+            assert!(range_buckets(&partials, 1_000, 2).is_none());
+        }
+    }
 }
