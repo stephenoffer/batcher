@@ -1183,7 +1183,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `properties.py` | 305 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 282 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 262 | The Kyber rule abstraction — one small, pure unit of optimization. |
-| `signature.py` | 230 | Structural plan signatures. |
+| `signature.py` | 244 | Structural plan signatures. |
 | `spill_rates.py` | 203 | What the spill device *measured*, against what its class claimed. |
 | `storage_cost.py` | 76 | What spilling costs on *this* machine's storage. |
 | `streaming.py` | 336 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
