@@ -87,6 +87,14 @@ def resolve_adaptive(
     # signature may decide a question about size.
     if not _large_enough(plan, sources, hub):
         return False
+    # Memory before cost. The one-shot path streams one input and reads every other one whole
+    # before the engine starts, and a plan that scans a fact table twice holds the second copy:
+    # TPC-H q18 at sf100 reads 600M `lineitem` rows into memory as a hash build, and was killed
+    # at 22 GB on a 30 GiB box. Staging cuts at the `HAVING` aggregate, measures its 6,398 rows,
+    # and re-plans with them as the build -- 19.8 s, where DuckDB takes 22.0 s. No learned
+    # route can override this: a route that dies has no time to learn from.
+    if _holds_too_much(plan, sources, hub):
+        return True
     # A plan that can stream its largest input whole needs no stage boundary to bound its
     # memory, and a boundary is exactly what makes it expensive: the loop cuts at every join,
     # so TPC-H sf100 q9 materialized `lineitem JOIN orders` — 600M rows — as its first stage,
@@ -128,6 +136,40 @@ def resolve_adaptive(
     # settled sample, so a shape where staging wins (q7, 76 against 90 ms) still finds it.
     route = _learned_adaptive_route(plan, hub)
     return route == "staged"
+
+
+#: How much of the per-operator memory budget the one-shot path may hold in the inputs it does
+#: not stream before `resolve_adaptive` stages a query for memory rather than for cost.
+#:
+#: Half, because a held input costs about twice its projected bytes while it is read: decoded
+#: chunks and their concatenation coexist. TPC-H q18 at sf100 projects 9.6 GB of `lineitem` and
+#: was at 18 GB resident, still reading, against a 17.8 GB budget on a 30 GiB box.
+_HELD_BUDGET_SHARE = 0.5
+
+
+def _holds_too_much(plan: LogicalPlan, sources: list[Source], hub) -> bool:
+    """Whether the one-shot path would hold more than the memory budget in non-streamed inputs.
+
+    Sized the way the executor reads them (`projected_input_bytes` over the optimized plan's
+    pushed projections): every scanned input but the largest, which is the one it streams. Asks
+    the memoized `kyber.optimize`, the plan `collect` runs, so it plans nothing twice. An input
+    with no row count at all is not evidence either way, and leaves the decision to cost.
+    """
+    from batcher import kyber
+    from batcher.api.orchestration.sizing import projected_input_bytes
+    from batcher.config import active_config
+
+    budget = active_config().spill_budget_bytes()
+    if budget <= 0:
+        return False
+    opt = kyber.optimize(plan, sources=sources, hub=hub)
+    ids = sorted(opt.scanned_source_ids())
+    if len(ids) < 2:
+        return False
+    sizes = [projected_input_bytes(sources, opt.source_projections, [i]) for i in ids]
+    if 0 in sizes:
+        return False
+    return sum(sizes) - max(sizes) > budget * _HELD_BUDGET_SHARE
 
 
 def _large_enough(plan: LogicalPlan, sources: list[Source], hub) -> bool:
