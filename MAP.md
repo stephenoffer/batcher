@@ -1280,7 +1280,7 @@ Kyber rule modules.
 | `literals.py` | 56 | Literal-value predicates shared by the expression rules: the i64 range and boolean literals. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 909 | Projection rewrites — collapse stacked projections and prune unread columns. |
-| `pushdown.py` | 711 | Predicate pushdown — evaluate filters as early as possible. |
+| `pushdown.py` | 716 | Predicate pushdown — evaluate filters as early as possible. |
 | `selection.py` | 574 | SELECTION-phase rules — cost-based physical algorithm choice. |
 | `source_limits.py` | 154 | How many rows each source may stop after — the row-cap half of source pushdown. |
 | `zonemap_pruning.py` | 580 | Zone-map predicate pruning — eliminate filters provably empty or always-true. |
@@ -1449,7 +1449,7 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | `order_goo.py` | 133 | Greedy operator ordering: the bushy fallback when the join-order DP cannot afford a graph. |
 | `order_residual.py` | 178 | Non-equi predicates inside a join region: hoist them, then re-attach where they fit. |
 | `order_search.py` | 538 | Join-order search: pick a tree over an extracted join graph, and build it. |
-| `outer_float.py` | 211 | Float a left/semi/anti join above the inner joins that only read its preserved side. |
+| `outer_float.py` | 247 | Float a left/semi/anti join above the inner joins that only read its preserved side. |
 | `projection.py` | 191 | Push a derived projection through a join onto the side it reads, so the join |
 | `range_join.py` | 365 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
 | `rewrites.py` | 520 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |

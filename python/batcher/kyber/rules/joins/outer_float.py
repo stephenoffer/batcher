@@ -19,6 +19,14 @@ reorderer can order as a whole.
 `semi` and `anti` float by the same argument: whether an `a` has a match in `B` is a property of
 `a` alone, so filtering by it before or after pairing `a` with `C` keeps the same pairs.
 
+For those two the rewrite has an inverse, `pushdown.push_semijoin_through_join`, which sinks a
+membership filter below an inner join, and the two used to undo each other on every fixpoint
+iteration, leaving whichever ran last. Both now ask `semijoin_goes_first`: two filters over the
+same `A`, so the one that keeps the smaller fraction of it runs first. TPC-DS q78's anti join to
+the returns keeps ~90% of `store_sales` and its `date_dim` join ~19%, so the date join goes
+below; TPC-H Q18's semijoin keeps a handful of orders against an inner join that fans every
+order out to its lines, so the semijoin does.
+
 Refused, each for a reason:
 
 - **A key on the null-supplying side.** A predicate on `b` sees NULLs for unmatched rows
@@ -37,7 +45,7 @@ from batcher.kyber.rule import Phase, RuleCategory
 from batcher.plan.expr_ir import Col
 from batcher.plan.logical import Join, JoinOutputCol, LogicalPlan, Project, Projection
 
-__all__ = ["float_outer_join_above_inner"]
+__all__ = ["float_outer_join_above_inner", "semijoin_goes_first"]
 
 # The join types whose left input is preserved row-for-row (or filtered by membership alone).
 _FLOATABLE = frozenset({"left", "semi", "anti"})
@@ -109,6 +117,8 @@ def _float(node: Join, outer_side: str, ctx: OptimizerContext) -> LogicalPlan | 
         node.strategy,
     )
     if not _does_not_fan_out(inner, a, ctx):
+        return None
+    if outer.join_type != "left" and semijoin_goes_first(ctx, a, outer, inner):
         return None
 
     # The new outer join renames nothing: each column keeps its name from the input it comes
@@ -209,3 +219,29 @@ def _does_not_fan_out(inner: Join, a: LogicalPlan, ctx: OptimizerContext) -> boo
     if a_rows <= 0:
         return False
     return ctx.estimator.estimate(inner).rows <= a_rows * _MAX_FANOUT
+
+
+def semijoin_goes_first(
+    ctx: OptimizerContext, a: LogicalPlan, membership: LogicalPlan, inner: LogicalPlan
+) -> bool:
+    """Whether a semi/anti join over `a` should run below an inner join over `a`.
+
+    Both are filters on `a` when the inner join does not fan out, and running the one that keeps
+    the smaller fraction first hands the other fewer rows. A tie, or an unknown size, keeps the
+    membership filter first: the sinking rule's long-standing answer.
+
+    Args:
+        ctx: The optimizer context whose estimator sizes the three plans.
+        a: The input both joins filter.
+        membership: The semi/anti join applied directly to `a`.
+        inner: The inner join applied directly to `a`.
+
+    Returns:
+        True to sink the membership filter, False to float it above the inner join.
+    """
+    a_rows = ctx.estimator.estimate(a).rows
+    if a_rows <= 0:
+        return True
+    kept_by_membership = ctx.estimator.estimate(membership).rows / a_rows
+    kept_by_inner = ctx.estimator.estimate(inner).rows / a_rows
+    return kept_by_membership <= kept_by_inner

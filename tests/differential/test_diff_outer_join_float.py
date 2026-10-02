@@ -57,6 +57,12 @@ _LEFT = (
     "WHERE f_date = d_sk AND f_item = i_sk AND d_year = 2001 AND i_price > 5"
 )
 
+_ANTI_THEN_DATE = (
+    "SELECT d_year, f_item, sum(f_amt) AS s, count(*) AS n FROM fact "
+    "LEFT JOIN returns ON f_item = r_item AND f_ticket = r_ticket "
+    "JOIN dates ON f_date = d_sk WHERE r_ticket IS NULL AND d_year = 2001 GROUP BY d_year, f_item"
+)
+
 _QUERIES = [
     "SELECT i_sk, sum(f_amt) AS s, sum(coalesce(r_amt, 0)) AS r, count(r_amt) AS nr, "
     f"count(*) AS n {_LEFT} GROUP BY i_sk",
@@ -73,6 +79,9 @@ _QUERIES = [
     "SELECT count(*) AS n, sum(f_amt) AS s FROM fact, dates, items "
     "WHERE f_date = d_sk AND f_item = i_sk AND d_year = 2003 "
     "AND NOT EXISTS (SELECT 1 FROM returns WHERE r_item = f_item AND r_ticket = f_ticket)",
+    # TPC-DS q78's channel subquery: the `IS NULL` makes the left join an anti join, which must
+    # end up above the selective date join rather than be sunk back below it.
+    _ANTI_THEN_DATE,
 ]
 
 _TABLES = {
@@ -142,3 +151,25 @@ def test_a_key_on_the_null_side_does_not_float():
     joins: list[tuple[str, list[str]]] = []
     _joins_under(json.loads(optimize(ds._plan, sources=ds._sources).to_json()), joins)
     assert any(kind == "inner" and "left" in below for kind, below in joins), joins
+
+
+def test_an_anti_join_stays_above_a_more_selective_inner_join():
+    """`push_semijoin_through_join` and the float used to undo each other; the cheaper order wins.
+
+    Once a run has measured the date column, the date join is known to keep a fifth of the fact
+    rows and the anti join most of them, so the anti join runs second. Before the two rules
+    shared `semijoin_goes_first`, the sink ran last and put the anti join under the date join,
+    over every fact row. Read from `explain()`: the plan the session runs, statistics and all.
+    """
+    ds = _session().sql(_ANTI_THEN_DATE)
+    for _ in range(2):
+        ds.collect(distributed=False)
+    lines = ds.explain().splitlines()
+    anti = next(i for i, ln in enumerate(lines) if "hash_join  [anti" in ln)
+    inner = next(i for i, ln in enumerate(lines) if "hash_join  [inner" in ln)
+    assert anti < inner and _depth(lines[inner]) > _depth(lines[anti]), ds.explain()
+
+
+def _depth(line: str) -> int:
+    """How deep an `explain()` line sits: the width of its tree-drawing prefix."""
+    return len(line) - len(line.lstrip("│├└─ ⋯"))

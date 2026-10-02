@@ -27,6 +27,7 @@ from batcher.kyber.rules.equi_expr_keys import (
     drop_cross_keys,
     expr_key_pair,
 )
+from batcher.kyber.rules.joins.outer_float import semijoin_goes_first
 from batcher.kyber.rules.zonemap_pruning import implied_by_bounds
 from batcher.kyber.stats.constants import constant_value
 from batcher.kyber.stats.selectivity import comparison_col_side
@@ -402,7 +403,7 @@ def infer_join_predicate_from_constant_key(node: Join, ctx: OptimizerContext) ->
 
 
 @rule(name="push_semijoin_through_join", phase=Phase.PUSHDOWN, matches=(Join,))
-def push_semijoin_through_join(node: Join, _ctx: OptimizerContext) -> LogicalPlan | None:
+def push_semijoin_through_join(node: Join, ctx: OptimizerContext) -> LogicalPlan | None:
     """Sink a semi/anti join below an inner join, onto the child its keys come from.
 
     `SemiJoin(InnerJoin(A, B) ON k, S) ON A.col` == `InnerJoin(SemiJoin(A, S) ON A.col, B) ON k`
@@ -417,6 +418,8 @@ def push_semijoin_through_join(node: Join, _ctx: OptimizerContext) -> LogicalPla
     Restricted to an inner join below (an outer join's null-extended side would change
     key membership), and only when the semijoin's keys all attribute to one child —
     via the inner join's output map, so a renamed key resolves to its source column.
+    And only when the semijoin is the more selective of the two filters on that child
+    (`outer_float.semijoin_goes_first`, shared with the rule that floats it back up).
     """
     if node.join_type not in ("semi", "anti"):
         return None
@@ -453,6 +456,8 @@ def push_semijoin_through_join(node: Join, _ctx: OptimizerContext) -> LogicalPla
     on_left = sides.pop() == "left"
     target = inner.left if on_left else inner.right
     pushed = _semijoin_onto(target, node, tuple(src_keys))
+    if not semijoin_goes_first(ctx, target, pushed, inner):
+        return None
     result: LogicalPlan = Join(
         pushed if on_left else inner.left,
         inner.right if on_left else pushed,
