@@ -1135,7 +1135,7 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 
 | module | lines | what it is |
 |---|---|---|
-| `join.py` | 443 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
+| `join.py` | 449 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
 | `sort.py` | 374 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
 | `window.py` | 176 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 

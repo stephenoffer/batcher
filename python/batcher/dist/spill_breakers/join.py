@@ -31,7 +31,6 @@ from batcher.dist.executor import _relabel_single_source
 from batcher.dist.executors.plan_analysis import _single_source
 from batcher.dist.spill import (
     _fd_safe,
-    _iter_spill_morsels,
     map_predicate,
     map_projection,
 )
@@ -46,6 +45,7 @@ from batcher.dist.spill.buckets import (
     spill_scratch,
     split_salt,
 )
+from batcher.dist.spill.scratch import iter_spill_chunks, spill_chunk_bytes
 from batcher.io.source import Source
 from batcher.plan.ir_specs import task_scan_ir
 from batcher.plan.logical import AsofJoin, Join
@@ -361,8 +361,14 @@ def _spill_side(
     writers = BucketWriters(store, f"{tag}_bucket")
     key_idx: list[int] | None = None
 
-    for batch in _iter_spill_morsels(source, projection, predicate):
-        rows = nat.execute_plan(sub_ir, [[batch]], engine_config)
+    # Chunks of `spill_chunk_bytes`, not the 8 MiB morsel: `partition_batches` returns one
+    # batch per bucket for whatever it is given, so the morsel made every spill write about
+    # 8 MiB / `n_buckets` -- a few KB at the 1,024-bucket ceiling -- and the phase ran at the
+    # IPC writer's per-batch overhead. TPC-H sf1000 q9 sat in exactly this loop for four hours,
+    # reading and writing ~26 MB/s each on NVMe at a load of ~2 on 64 cores, where DuckDB
+    # answers in 50 s. The aggregate's partition phase reads this way for the same reason.
+    for chunk in iter_spill_chunks(source, projection, predicate, spill_chunk_bytes()):
+        rows = nat.execute_plan(sub_ir, [chunk], engine_config)
         if not rows:
             continue
         if key_idx is None:
