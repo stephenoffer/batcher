@@ -1112,22 +1112,24 @@ try:
 
             The join-skew detection pre-pass: each worker runs Misra-Gries over its **own**
             split (the data is never read on the driver) and the driver sums the local counts
-            to decide which values clear `fraction` of the side globally. Approximate in the
-            usual Misra-Gries direction — it can over-report — which is safe here because
-            salting a value that is not actually hot costs a little fan-out and never a row.
+            to decide which values clear `fraction` of the side globally. Approximate: a
+            Misra-Gries count is a lower bound, over a bounded sample of the split
+            (`skew.sample_heavy_hitters`), and salting is result-preserving either way, so a
+            miss costs a hot reducer and an extra key a little fan-out, never a row.
             """
             _use_plan(None)
-            nat = engine()
-            from batcher.dist.executors.partition_io import read_partition_descriptor
+            from batcher.dist.executors.partition_io import iter_partition_descriptor
+            from batcher.dist.skew import sample_heavy_hitters
 
-            rows = nat.execute_plan(
-                sub_ir, [read_partition_descriptor(partition)], self._engine_config
+            # A bounded, streamed sample, never the whole split held at once.
+            return sample_heavy_hitters(
+                engine(),
+                sub_ir,
+                key_name,
+                iter_partition_descriptor(partition),
+                fraction,
+                self._engine_config,
             )
-            n = sum(b.num_rows for b in rows)
-            if not n:
-                return [], 0
-            hh = nat.heavy_hitters([key_name], rows, fraction)
-            return [(v, int(c)) for v, c in hh.get(key_name, [])], n
 
         def map_publish_join(
             self,

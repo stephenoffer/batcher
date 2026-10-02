@@ -732,15 +732,13 @@ def _detect_hot_keys(parts, subplan_ir, key_name, fraction, cfg_json) -> tuple[s
 
 
 def _join_detect_task(subplan_ir, key_name, part_path, fraction, engine_config):
-    nat = engine()
     from batcher.dist.executors.partition_io import read_partition
+    from batcher.dist.skew import sample_heavy_hitters
 
-    rows = nat.execute_plan(subplan_ir, [read_partition(part_path)], engine_config)
-    n = sum(b.num_rows for b in rows)
-    if n == 0:
-        return [], 0
-    hh = nat.heavy_hitters([key_name], rows, fraction)
-    return [(v, int(c)) for v, c in hh.get(key_name, [])], n
+    # The same bounded sample the Flight transport takes, so the two agree on what is hot.
+    return sample_heavy_hitters(
+        engine(), subplan_ir, key_name, iter(read_partition(part_path)), fraction, engine_config
+    )
 
 
 def _join_map_task(

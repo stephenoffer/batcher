@@ -26,6 +26,7 @@ __all__ = [
     "resolve_hot_keys",
     "salt_factor",
     "salting_preserves_result",
+    "sample_heavy_hitters",
 ]
 
 # Learned-skew namespace + the salt fan-out used when learned hot keys engage salting
@@ -381,3 +382,65 @@ def _estimated_input_rows(join: Join, sources) -> int | None:
     except Exception as exc:  # estimation must never break a join
         note_suppressed("dist", "size the skew detection pre-pass", exc)
         return None
+
+
+#: Rows of one split's join side the detection pre-pass reads before it stops. A value that
+#: holds `fraction` of the side holds about that share of any sample this size.
+_SAMPLE_ROWS = 2_000_000
+
+#: Rows the pre-pass runs the side's sub-plan over at once, so it never holds a whole split.
+_SAMPLE_CHUNK_ROWS = 250_000
+
+
+def sample_heavy_hitters(
+    nat, sub_ir: str, key_name: str, batches, fraction: float, engine_config: str
+) -> tuple[list[tuple[str, int]], int]:
+    """Heavy-hitter counts of `key_name` over a bounded, streamed sample of one join side.
+
+    The detection pre-pass used to read its whole split and run the side's sub-plan over all of
+    it in memory, to count keys. On 3 x m5.4xlarge at TPC-H SF1000 that held each worker's share
+    of `orders` -- `o_comment` included -- four calls to a node, and q13 and q10 lost workers to
+    the out-of-memory killer before the join began; on every first run of a large join shape it
+    also read both sides a second time. Here the side runs over chunks of `_SAMPLE_CHUNK_ROWS`
+    input rows, their Misra-Gries counts are summed, and the read stops after `_SAMPLE_ROWS`
+    output rows. A Misra-Gries count is a lower bound short of the truth by at most rows over
+    counters, and a sum of per-chunk counts keeps that bound over the sample, so a key well past
+    `fraction` is found exactly as a single pass would find it; salting is result-preserving
+    either way, so a miss costs a hot reducer and an extra key costs fan-out, never a row.
+
+    Args:
+        nat: The engine handle.
+        sub_ir: The join side's sub-plan IR, run over each chunk.
+        key_name: The join key column.
+        batches: The split's input batches, as an iterator that reads lazily.
+        fraction: The share of rows a value must hold to count as hot.
+        engine_config: The engine config JSON.
+
+    Returns:
+        `(value, count)` pairs and the sampled output row count they are counts out of.
+    """
+    counts: dict[str, int] = {}
+    seen = 0
+    chunk: list = []
+    chunk_rows = 0
+
+    def flush() -> None:
+        nonlocal seen, chunk, chunk_rows
+        if chunk:
+            rows = nat.execute_plan(sub_ir, [chunk], engine_config)
+            n = sum(b.num_rows for b in rows)
+            if n:
+                seen += n
+                for v, c in nat.heavy_hitters([key_name], rows, fraction).get(key_name, []):
+                    counts[v] = counts.get(v, 0) + int(c)
+        chunk, chunk_rows = [], 0
+
+    for batch in batches:
+        chunk.append(batch)
+        chunk_rows += batch.num_rows
+        if chunk_rows >= _SAMPLE_CHUNK_ROWS:
+            flush()
+            if seen >= _SAMPLE_ROWS:
+                break
+    flush()
+    return list(counts.items()), seen
