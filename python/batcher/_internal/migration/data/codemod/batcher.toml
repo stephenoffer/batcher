@@ -1555,7 +1555,7 @@
 "SinkProgress" = ["description", "num_output_rows=", "token="]
 "SourceProgress" = ["description", "num_input_rows=", "start_offset=", "end_offset="]
 "StateOperatorProgress" = ["operator_name", "num_rows_total=", "num_rows_updated=", "num_rows_removed=", "memory_used_bytes=", "num_late_inputs_dropped=", "watermark_micros="]
-"StorageLevel" = ["*values"]
+"StorageLevel" = ["value"]
 "StreamingConfig" = ["idle_poll_seconds=", "max_window_latency_seconds=", "progress_history=", "watermark_idle_timeout_seconds=", "backpressure_enabled=", "backpressure_pid_proportional=", "backpressure_pid_integral=", "backpressure_pid_derivative=", "backpressure_min_rate=", "backpressure_max_rows_per_trigger=", "checkpoint_delta_interval="]
 "StreamingQueryListener" = []
 "StreamingQueryProgress" = ["batch_id", "num_input_rows", "num_output_rows", "duration_ms", "timestamp", "behind_by_ms=", "name=", "state_operators=", "sources=", "sink=", "duration_breakdown_ms="]

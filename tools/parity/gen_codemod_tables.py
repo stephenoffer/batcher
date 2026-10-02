@@ -27,6 +27,7 @@ drift, skipping an engine that is not installed. Run:
 
 from __future__ import annotations
 
+import enum
 import importlib
 import inspect
 import re
@@ -138,6 +139,13 @@ def _returned(fn: Any, owner: str | None, classes: dict[type, str]) -> str | Non
 
 
 def _params(fn: Any, engine: str) -> list[str] | None:
+    if inspect.isclass(fn) and issubclass(fn, enum.Enum):
+        # Calling an enum class looks a member up by value; that is the one call a pipeline
+        # makes. What `inspect.signature` reports for it is CPython's own constructor, which
+        # changed between the versions this project supports -- `(value, names=, *, module=,
+        # ...)` on 3.11, `(*values)` on 3.13 -- so recording it made the committed tables
+        # depend on which interpreter regenerated them, and the freshness test fail on the other.
+        return ["value"]
     try:
         sig = inspect.signature(fn)
     except (TypeError, ValueError):
