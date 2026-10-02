@@ -2125,7 +2125,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 
 | module | lines | what it is |
 |---|---|---|
-| `_csv_diagnostics.py` | 169 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
+| `_csv_diagnostics.py` | 173 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
 | `_csv_ranges.py` | 110 | Where a CSV file may be cut into byte ranges without cutting a record in half. |
 | `_parquet_native.py` | 225 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
 | `arrow_ipc.py` | 280 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
