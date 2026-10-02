@@ -176,7 +176,7 @@ The public, fluent, lazy, expression-first API surface.
 | `groupby.py` | 1159 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 259 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `multi_group.py` | 431 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
-| `source_stats.py` | 737 | Per-source statistics collection for the conductor. |
+| `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 | `subplan_reuse.py` | 669 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
@@ -428,7 +428,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `_metadata.py` | 735 | Post-execution column-statistics learning (Core measures, Kyber persists). |
+| `_metadata.py` | 736 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 1517 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
@@ -2399,7 +2399,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `schema.py` | 174 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 442 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 650 | `plan.stats` — the neutral statistics algebra shared across every layer. |
-| `visitor.py` | 356 | Shared traversal for `LogicalPlan` trees. |
+| `visitor.py` | 374 | Shared traversal for `LogicalPlan` trees. |
 
 ### `batcher/plan/distribution/` — 1 · contract
 
