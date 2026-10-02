@@ -1,5 +1,108 @@
 # Batcher CPU benchmark results
 
+## Serial spines over finished breakers, runtime filters tested during the decode, and one learned entry per in-memory relation (2026-10-02)
+
+**Conditions.** Boards are Anyscale jobs on one `m6id.16xlarge` each (64 vCPU, 247 GiB, local
+NVMe), image `anyscale/ray:2.58.0-py311`, DuckDB 1.5.6, Polars 1.40.0, pyarrow 23.0.1, Daft
+from PyPI, `benchmarks/run.py` with every result checked against DuckDB before it was timed.
+TPC-H sf10 and sf100 read `tpch_zstd` Parquet copied to the NVMe, in `--scan --isolate` mode;
+TPC-DS sf10 is in-memory Arrow. The before board is `d5ebcc8b`, the after board `612c9aa0`.
+Every speed claim per change is an **interleaved A/B** on one such node: the same Python tree,
+two prebuilt engines (or the same engine and two Python trees), arms alternated in fresh
+processes over three rounds, best of three runs per query per round.
+
+### What changed, and what each change measured
+
+- **The spine above a materialized breaker ran on one thread** (`bc_interp::stream::parallel`).
+  The parallel streaming executor evaluates a spine breaker once over the unsharded sources and
+  caches it as a leaf, but it sharded only scans, so a spine that bottomed out at the leaf had
+  no driving source and every join above it ran sequentially. `perf stat -I 10` on TPC-DS sf10
+  q78: ~140 ms at 10-40 CPUs, then ~570 ms at exactly 1.0, inside a 1,160 ms query. A finished
+  relation is now cut across the workers as a scan's batches are (`Driving::Leaf`). A/B, TPC-DS
+  sf10 99-query sum **18,412 -> 17,322 ms**: q61 217 -> 43, q78 1,233 -> 718, q99 106 -> 64,
+  q23 962 -> 592, q11 367 -> 282. TPC-H sf10 1.012x and sf100 0.996x, i.e. neutral.
+- **A runtime join filter was applied only after the Parquet decode** (`UnitSource::read_keyed`,
+  `bc-py` `chunked/late.rs`). The executor now hands the filters placed on its lazily-read scan
+  to the reader, which installs them as late-materialization stages ahead of the plan's own
+  `Filter`: the key is decoded and tested first, the remaining columns only for rows the digest
+  does not refute. `LateFilter`'s byte gate and timing decide per scan whether it pays, the
+  post-scan filter still runs, and the scan is marked `runtime_filtered`. A/B, TPC-H sum sf10
+  4,106 -> 3,993 ms, sf100 31,507 -> 30,926 ms; sf100 q19 **1,461 -> 1,220 ms** (CPU 70.6 ->
+  57.5 s); no query slower by more than 7%.
+- **A left join survived an inner join keyed on its null-supplied side**
+  (`kyber.rules.joins.rewrites.outer_to_inner_under_join`). TPC-DS q93's `WHERE sr_reason_sk =
+  r_reason_sk` becomes the inner join's key during pushdown, so `outer_to_inner_join`, which
+  matches a `Filter`, never saw it, and the plan materialized all 28.8M `store_sales` rows to
+  keep 61,752. A/B, sf10 q93 **118 -> 66 ms** (CPU 2.7 -> 1.1 s), the 99-query sum otherwise
+  neutral (1.004x sf1, 0.995x sf10).
+- **Every in-memory relation shared one learned entry per predicate shape**
+  (`kyber.signature`). The scan token was `""` for any relation without a durable key, so a
+  measurement over one in-memory relation answered for the same filter over any other. Inside one
+  TPC-DS session, `d_year = 1999` over `date_dim` (365 rows) learned 41,649 from an earlier
+  query's materialized intermediate, and q72 joined `inventory` to `catalog_sales` first: 939M
+  estimated rows, **7.3 s and 240 s of CPU at sf1 against ~240 ms**, and 22 GB RSS on an 8-core
+  box. A bisection over q1..q71 found no single culprit -- either half alone left q72 fast --
+  which is what an accumulated shared entry looks like. The token now falls back to the
+  relation's column names. A/B over all 99 queries at sf1, one process per arm per round: q72
+  slow in 2 of 3 sessions before (7,348, 7,206 ms), in 0 of 3 after (231-241 ms); q40 57 -> 7,
+  q99 71 -> 10, q26 58 -> 10, q48 80 -> 15, q21 47 -> 14, q23 304 -> 164 ms. **The cost is
+  one extra slow run while a query converges**: with its own entries a query re-plans once more
+  on its third run. q52 runs 48, 41, 9, 8 ms before and 47, 39, **68**, 9, 8 ms after; q77
+  871, 234, 28 before and 878, 220, **178**, 32 after; settled times are equal or better. A
+  best-of-three comparison reads that as q77 7.9x and q52 5.3x slower, which is why it is
+  stated here.
+- **Three fixes the gate found.** `cargo clippy -D warnings` failed the workspace on Rust 1.99
+  (`AtomicI64::fetch_update` is deprecated; replaced with a CAS loop that keeps the 1.89 MSRV).
+  A ragged CSV line was reported as a type mismatch whenever pyarrow named the row (`Row #3:
+  Expected 2 columns`). `test_batcher_table_is_fresh` failed on Python 3.11, the CI version: the
+  codemod tables recorded CPython's own enum constructor signature, which differs between 3.11
+  and 3.13, and now record `["value"]`.
+
+### The board, before and after
+
+Per-suite geomean of Batcher against its own before time, and of Batcher against the fastest
+competitor that ran the case (below 1.0 is a win):
+
+| suite | cases | after / before | vs best rival, before -> after | losses > 5%, before -> after |
+|---|---:|---:|---:|---:|
+| TPC-H sf1 | 22 | 0.990 | 0.720 -> 0.715 | 4 -> 3 |
+| TPC-H sf10 (scan) | 22 | 0.953 | 1.169 -> 1.134 | 13 -> 11 |
+| TPC-H sf100 (scan, vs DuckDB/Polars) | 22 | 0.973 | 1.165 -> 1.130 | -- |
+| TPC-DS sf10 (vs DuckDB) | 99 | 0.989 | 0.946 -> 0.938 | -- |
+| operator mix | 58 | 0.986 | 0.642 -> 0.634 | 15 -> 14 |
+| H2O groupby | 10 | 0.991 | 0.840 -> 0.844 | 5 -> 5 |
+| H2O join, JSON | 10 | -- | -- | 0 -> 0 |
+
+The after board predates the signature fix. TPC-DS sf10 moved as the A/Bs predicted: q93
+0.44x, q78 0.52x, q23 0.55x, q11 and q74 0.77x. Its one alarming row, q64 at 169 -> 1,017 ms, is
+the best-of reading of a bimodal query: the **median** is 1,576 ms before and 1,508 ms after,
+and one fast run set the before figure. That makes q64 a loss the best-of hides on both boards
+(~1.5 s typical against DuckDB's 160 ms), not a regression.
+
+### Found and not fixed
+
+- **Only one Parquet scan streams; every other one is read whole first.** `chunked.py` drives
+  the scan with the most projected bytes through the engine and reads the rest resident with
+  `read_scanned`. A query that reads the same large table twice holds the second copy in memory
+  -- TPC-H q18's second `lineitem` is 600M rows at sf100 -- and an sf1000 run at `730cc071`
+  SIGKILLed q9, q13, q17 and q18 on a 240 GiB node.
+- **The Parquet decode zero-fills its value buffers.** On 64 cores TPC-H sf10 q6/q12/q1 spend
+  6-8% in `memset` and 13-16% in `memmove` inside arrow-rs `PrimitiveArrayReader`. Batcher's own
+  per-row cost equals pyarrow decoding the same four columns; closing the rest of the gap means
+  changing the decoder, not the engine.
+- **Cold planning costs seconds on large TPC-DS plans.** First run at sf1 (in-memory, 64 cores):
+  q64 4.7 s, q4 3.1 s, q14 2.4 s, against warm runs of 0.16-0.95 s and DuckDB's 50-80 ms. Locally
+  q64's 12 s cold is 7.7 s of Kyber: `common_subplans` normalizes three candidates through the
+  full logical optimizer (5.7 s), and every rebuilt `Join` re-derives its children's schemas to
+  validate key types (1.1 s over 3,408 constructions). Best-of boards never show it.
+- **TPC-DS q95's shared CTE is a 74.8M-row self-join** (`ws_wh`) that only semi joins on
+  `ws_order_number` read; q39's learned CTE row filter engages at sf1 (379 -> 60 ms) but its
+  sf10 materialization stayed at ~400 ms per run; q21, q37 and q82 mask 11.7M-133M `inventory`
+  keys a morsel at a time where DuckDB skips row groups by zone map.
+- **Harness.** A row is `FAILED` whenever any engine disagrees with the reference, which on this
+  board is Daft on 14 TPC-DS queries, TPC-H q15 and ClickBench q3 (column naming and wrong values);
+  Batcher's own ratio is then withheld although Batcher matched DuckDB on every one of them.
+
 ## Sideways restriction on every executor, a join-order search priced by its best cheap order, and learned statistics that stop poisoning other queries (2026-09-27)
 
 **Conditions.** Two kinds of measurement, kept apart on purpose. Every speed claim below is an
