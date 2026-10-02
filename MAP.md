@@ -1292,9 +1292,9 @@ Aggregate-through-join pushdown: pre-aggregate a join side to shrink its input.
 | module | lines | what it is |
 |---|---|---|
 | `conditional.py` | 74 | A dimension-conditional aggregate input, split so its measure can be pre-aggregated. |
-| `gates.py` | 322 | The cost gates the aggregate-through-join pushdown rules consult. |
+| `gates.py` | 342 | The cost gates the aggregate-through-join pushdown rules consult. |
 | `reassociate.py` | 544 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
-| `rules.py` | 573 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
+| `rules.py` | 597 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
 
@@ -3135,8 +3135,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/distinct_on.rs` | 321 | `DISTINCT ON` — keep one whole row per distinct key, mergeably. |
 | `agg/fused.rs` | 726 | Fused multi-aggregate accumulation — read `group_ids` once for all simple scalar aggregates instead of once per aggregate. |
 | `agg/group/assign.rs` | 1756 | Assign each row of a batch a dense group id — the per-morsel hot path of every hash aggregate, `DISTINCT`, and partitioned window. |
-| `agg/group/combine.rs` | 694 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
-| `agg/group/hash.rs` | 346 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
+| `agg/group/combine.rs` | 700 | Parallel hash-radix `combine` regroup for a high-cardinality aggregate. |
+| `agg/group/hash.rs` | 461 | Hashing a set of group-key columns to the `u64` the radix combine buckets on. |
 | `agg/group/mod.rs` | 35 | Group-key assignment and the parallel `combine` regroup. |
 | `agg/group/runs.rs` | 259 | Group assignment for a key that arrives in sorted order — runs instead of a hash table. |
 | `agg/group/short_key.rs` | 199 | Short byte-string keys (≤ 7 bytes) as one `u64` each, and the small table that groups them. |

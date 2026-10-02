@@ -122,6 +122,26 @@ def _conditional_reduces(ctx: OptimizerContext, join: Join, pushed: Aggregate) -
     return groups * _CONDITIONAL_MIN_REDUCTION <= side.rows
 
 
+def _provably_reduces(ctx: OptimizerContext, pushed: Aggregate, source: LogicalPlan) -> bool:
+    """Whether `pushed`'s groups provably number an eighth of `source`'s rows or fewer.
+
+    `_reduces_enough` needs the aggregate's own estimate to be measured, which a first run over
+    a Parquet scan never has. A group key's footer range bounds its distinct count all the same
+    (`_measured_ndv_bound`), and the product of those bounds bounds the groups. TPC-H Q13's
+    `o_custkey` spans 1..15M against 142M orders at sf100: at least a 9x reduction, provable
+    before anything ran, where the unpushed plan builds a 142M-row hash table and spills it.
+    """
+    groups = 1.0
+    for key in pushed.group_keys:
+        if not isinstance(key.expr, Col):
+            return False
+        bound = _measured_ndv_bound(ctx, pushed.input, key.expr.name)
+        if bound is None:
+            return False
+        groups *= max(1.0, bound)
+    return groups * _CONDITIONAL_MIN_REDUCTION <= ctx.estimator.estimate(source).rows
+
+
 def _measured_ndv_bound(ctx: OptimizerContext, plan: LogicalPlan, col: str) -> float | None:
     """An upper bound on `col`'s distinct count in `plan`, from measured counts only, or None.
 

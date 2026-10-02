@@ -34,6 +34,7 @@ from batcher.kyber.rules.agg_pushdown.gates import (
     _measured_as_non_reducing,
     _moves_string_keys,
     _outer_aggregate_collapses,
+    _provably_reduces,
 )
 from batcher.kyber.rules.joins import _right_unique_on_keys
 from batcher.plan.expr_ir import (
@@ -111,6 +112,28 @@ def _already_grouped_by(plan: LogicalPlan, keys: set[str]) -> bool:
     not a `count`), turning a fully-unmatched group's answer from 0 into NULL.
     """
     return isinstance(plan, Aggregate) and {k.alias for k in plan.group_keys} <= keys
+
+
+def _fold_bare_projection(node: Aggregate) -> Aggregate:
+    """`node` with a column-selecting projection between it and its join folded into the join.
+
+    Column pruning puts a `Project` of bare columns over a join during REWRITE, and the
+    projection only reaches the join's own output after this phase has run: TPC-H Q13's
+    `COUNT(o_orderkey) ... GROUP BY c_custkey` meets the join through one and was never pushed.
+    A projection that only selects and renames is exactly a join output list, so it folds.
+    """
+    project = node.input
+    if not isinstance(project, Project) or not isinstance(project.input, Join):
+        return node
+    join = project.input
+    by_alias = {o.alias: o for o in join.output}
+    output: list[JoinOutputCol] = []
+    for item in project.items:
+        if not isinstance(item.expr, Col) or item.expr.name not in by_alias:
+            return node
+        source = by_alias[item.expr.name]
+        output.append(JoinOutputCol(source.side, source.name, item.alias))
+    return dataclasses.replace(node, input=dataclasses.replace(join, output=tuple(output)))
 
 
 def _reduces_enough(ctx: OptimizerContext, pushed: LogicalPlan, source: LogicalPlan) -> bool:
@@ -468,6 +491,7 @@ def pre_aggregate_join_measures(node: Aggregate, ctx: OptimizerContext) -> Logic
     columns of the group side; single equi-key; cost-gated on a measured row reduction
     (also what makes it idempotent — a second push finds the measure side already unique).
     """
+    node = _fold_bare_projection(node)
     join = node.input
     if not isinstance(join, Join) or join.join_type not in {"inner", "left"} or not node.aggregates:
         return None
@@ -530,7 +554,7 @@ def pre_aggregate_join_measures(node: Aggregate, ctx: OptimizerContext) -> Logic
     # Cost gate: fire only on a *measured* reduction of the measure side (a learned `ndv`,
     # not the estimator's default), so a stats-less plan never pushes a pointless
     # group-by and a second push (measure side already unique) is a no-op.
-    if not _reduces_enough(ctx, pushed, m_input):
+    if not (_reduces_enough(ctx, pushed, m_input) or _provably_reduces(ctx, pushed, m_input)):
         return None
     if _join_out_reduces_more(ctx, pushed, join):
         return None
