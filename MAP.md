@@ -1444,7 +1444,7 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | module | lines | what it is |
 |---|---|---|
 | `agg_semijoin.py` | 227 | Sideways information passing into a decorrelated aggregate's input. |
-| `order.py` | 363 | Cost-based join reordering — the JOIN_REORDER phase. |
+| `order.py` | 322 | Cost-based join reordering — the JOIN_REORDER phase. |
 | `order_budget.py` | 191 | How much join-order search a query is worth — the budget the DP search spends against. |
 | `order_goo.py` | 133 | Greedy operator ordering: the bushy fallback when the join-order DP cannot afford a graph. |
 | `order_residual.py` | 178 | Non-equi predicates inside a join region: hoist them, then re-attach where they fit. |

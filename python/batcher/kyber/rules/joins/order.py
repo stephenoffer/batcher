@@ -109,7 +109,6 @@ def _try_reorder(top: Join, ctx: OptimizerContext, visit) -> LogicalPlan | None:
     residuals = bind_residuals(hoisted or [], lambda n, c: _resolve(n, c, hoist), index)
     if edges is None or required is None or residuals is None:
         return None
-    edges = _with_implied_edges(edges)
 
     # Reorder nested subtrees inside each leaf first, then prune each leaf to just the
     # columns the rebuilt subtree needs (its keys + the required output). Seeing through
@@ -164,46 +163,6 @@ def _try_reorder(top: Join, ctx: OptimizerContext, visit) -> LogicalPlan | None:
     # left-deep greedy is at the mercy of which leaf is smallest, and GOO keeps a forest so a
     # second fact table's selective side can be built before the two meet (`order_goo`).
     return cheapest
-
-
-def _with_implied_edges(edges: list[tuple[ColRef, ColRef]]) -> list[tuple[ColRef, ColRef]]:
-    """`edges` plus one edge between every two leaves that share a class of equal key columns.
-
-    The search can only join two sub-plans an edge connects, and it read the edges as written.
-    TPC-H q9 writes `p_partkey = l_partkey` and `ps_partkey = l_partkey` but never
-    `p_partkey = ps_partkey`, so `part` and `partsupp` were not neighbours and the one cheap
-    order -- the ~5% of parts the name filter keeps, joined to their `partsupp` rows first --
-    was never priced: at sf1000 the plan hashed all 800M `partsupp` rows to probe 300M joined
-    `lineitem` rows. In this region (inner equi-joins) a NULL key fails the written edge, so
-    every row that survives holds equal non-null values across the class, and the implied
-    edge is exact. A join between two sub-plans keeps only a spanning forest of the edges that
-    cross it (`order_search._crossing_keys`), so an implied edge never adds a key column.
-    """
-    parent: dict[ColRef, ColRef] = {}
-
-    def find(ref: ColRef) -> ColRef:
-        while parent.get(ref, ref) != ref:
-            ref = parent[ref]
-        return ref
-
-    for a, b in edges:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-    linked = {frozenset((a[0], b[0])) for a, b in edges}
-    classes: dict[ColRef, dict[int, ColRef]] = {}
-    for ref in sorted({ref for edge in edges for ref in edge}):
-        classes.setdefault(find(ref), {}).setdefault(ref[0], ref)
-    out = list(edges)
-    for by_leaf in classes.values():
-        members = sorted(by_leaf)
-        for i, left in enumerate(members):
-            for right in members[i + 1 :]:
-                pair = frozenset((left, right))
-                if pair not in linked:
-                    out.append((by_leaf[left], by_leaf[right]))
-                    linked.add(pair)
-    return out
 
 
 def _is_transparent(node: LogicalPlan) -> bool:
