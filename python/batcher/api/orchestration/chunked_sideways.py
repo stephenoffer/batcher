@@ -25,8 +25,22 @@ side lacks can only form a group the join discards whole — the argument
 `join_par::sideways` makes, applied to the same plans. The outer input's rows are computed once
 and read back unchanged, so the query's other operators see exactly what they saw before.
 
-Layer: api (orchestration). It decides nothing Kyber has not: it acts only on the plan's
-`prefer_sideways` verdict, and declines, returning `None`, on any shape it cannot prove.
+## The second staged form: an aggregate over a held input
+
+The chunked path streams one relation and reads every other one whole, so a plan that scans a
+fact table twice holds the second copy. TPC-H q18 at sf1000 is the shape: one `lineitem` scan
+streams into the final join, and the other -- 6 billion rows, under the `HAVING sum > 300`
+aggregate -- is read into memory before the engine starts, and the query is SIGKILLed on a
+247 GiB node. `run_staged_held` runs that aggregate's subtree first, on the chunked path, where
+its scan is the largest and therefore the one that streams, and the rest of the plan reads its
+result: a few thousand rows where it held billions. It acts only when the held input is large
+against the memory the chunked path may hold, and declines when another subtree over the same
+source computes the same thing -- TPC-H q15 compares a view's `sum` for equality with a `max` of
+the same sums, and two executors summing in different orders disagree in the last bit.
+
+Layer: api (orchestration). It decides nothing Kyber has not: the sideways form acts only on the
+plan's `prefer_sideways` verdict, the held form only on measured input sizes, and both decline,
+returning `None`, on any shape they cannot prove.
 """
 
 from __future__ import annotations
@@ -43,7 +57,7 @@ if TYPE_CHECKING:
     from batcher.io.source import Source
     from batcher.plan.physical import PhysicalPlan
 
-__all__ = ["run_staged_sideways"]
+__all__ = ["run_staged_held", "run_staged_sideways"]
 
 #: Join types whose unmatched right rows are never emitted, so the right side may be restricted.
 _RESTRICTABLE = frozenset({"inner", "left", "semi", "anti"})
@@ -110,6 +124,98 @@ def run_staged_sideways(
             "aggregates": [],
         }
     return run_stage(staged, _stage(opt, ir))
+
+
+def run_staged_held(
+    sources: list[Source],
+    opt: PhysicalPlan,
+    input_bytes_of: Callable[[int], int],
+    run_stage: Callable[[list[Source], PhysicalPlan], list[pa.RecordBatch] | None],
+    held_limit: int,
+) -> list[pa.RecordBatch] | None:
+    """The plan's result with each oversized held input's aggregate run first, or `None`.
+
+    Args:
+        sources: The plan's bound sources.
+        opt: The optimized physical plan.
+        input_bytes_of: Maps a source id to its projected input bytes; picks the driving scan.
+        run_stage: Runs one stage on the chunked path (`chunked.execute_chunked`).
+        held_limit: Projected bytes above which a scan the chunks do not drive is staged.
+
+    Returns:
+        The result batches, or `None` when no held input qualifies or a stage declined; the
+        caller then takes the path it would have taken anyway.
+    """
+    scanned = _scans(opt.ir)
+    if len(set(scanned)) < 2:
+        return None
+    driving = max(set(scanned), key=input_bytes_of)
+    ir = copy.deepcopy(opt.ir)
+    staged = list(sources)
+    for scan_id in sorted(set(scanned) - {driving}):
+        if input_bytes_of(scan_id) <= held_limit:
+            continue
+        path = _held_subtree(ir, scan_id)
+        if path is None or _computed_twice(ir, path, staged):
+            continue
+        out = run_stage(staged, _stage(opt, copy.deepcopy(_at(ir, path))))
+        if not out:
+            return None
+        from batcher.io.source import InMemorySource
+
+        staged.append(InMemorySource(out, zone_maps=False, ephemeral=True))
+        _at(ir, path[:-1])[path[-1]] = {"op": "scan", "source_id": len(staged) - 1}
+    if len(staged) == len(sources):
+        return None
+    return run_stage(staged, _stage(opt, ir))
+
+
+#: Operators a held input's staged subtree may contain: row-wise, plus the breakers whose
+#: output does not grow with their input the way a join's can.
+_HELD_OPS = frozenset({"filter", "project", "aggregate", "sort", "limit", "distinct"})
+
+
+def _held_subtree(ir: dict[str, Any], scan_id: int) -> tuple | None:
+    """The path to the topmost join-free subtree over only `scan_id` holding an aggregate."""
+    for path, node in _walk(ir):
+        if not path or "e" in node or node.get("op") == "scan":
+            continue
+        # Relations only: a binary expression carries an `op` too (`gt`), but also an `e`.
+        nodes = [n for _, n in _walk(node) if "e" not in n]
+        if any(n.get("op") not in _HELD_OPS | {"scan"} for n in nodes):
+            continue
+        if [n["source_id"] for n in nodes if n.get("op") == "scan"] != [scan_id]:
+            continue
+        if any(n.get("op") in ("aggregate", "distinct") for n in nodes):
+            return path
+    return None
+
+
+def _computed_twice(ir: dict[str, Any], path: tuple, sources: list[Source]) -> bool:
+    """Whether another subtree computes what `path` does, over a scan of the same source."""
+    target = _normalized(_at(ir, path), sources)
+    for other_path, node in _walk(ir):
+        if "e" in node or other_path[: len(path)] == path or path[: len(other_path)] == other_path:
+            continue
+        if _normalized(node, sources) == target:
+            return True
+    return False
+
+
+def _normalized(node: dict[str, Any], sources: list[Source]) -> str:
+    """`node`'s IR with each scan naming its source *object*, not its binding id."""
+    import json
+
+    def norm(v):
+        if isinstance(v, dict):
+            if v.get("op") == "scan":
+                return {"op": "scan", "source": id(sources[v["source_id"]])}
+            return {k: norm(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [norm(x) for x in v]
+        return v
+
+    return json.dumps(norm(node), sort_keys=True, default=str)
 
 
 def _stage(opt: PhysicalPlan, ir: dict[str, Any]) -> PhysicalPlan:

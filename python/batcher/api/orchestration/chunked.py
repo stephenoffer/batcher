@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 
 from batcher import core
-from batcher.api.orchestration.chunked_sideways import run_staged_sideways
+from batcher.api.orchestration.chunked_sideways import run_staged_held, run_staged_sideways
 from batcher.api.orchestration.sizing import projected_input_bytes
 from batcher.api.orchestration.stages import read_scanned
 
@@ -157,6 +157,22 @@ def execute_chunked(
         )
         if staged is not None:
             return staged
+    # An aggregate over an input too large to hold whole runs first, streaming that input, and
+    # the rest reads its result (`chunked_sideways.run_staged_held`; TPC-H q18 at sf1000).
+    held = run_staged_held(
+        sources,
+        opt,
+        input_bytes_of,
+        lambda srcs, stage: execute_chunked(
+            srcs,
+            stage,
+            lambda i: projected_input_bytes(srcs, stage.source_projections, [i]),
+            python_chunks=python_chunks,
+        ),
+        _held_limit(),
+    )
+    if held is not None:
+        return held
     driving = _driving_source(sources, opt, input_bytes_of)
     if driving is None or not core.plan_chunkable(opt, driving):
         return None
@@ -230,6 +246,17 @@ def _held_budget() -> int:
     from batcher.config import active_config
 
     return (active_config().memory.max_memory_bytes or machine_memory_bytes()) // 2
+
+
+def _held_limit() -> int:
+    """Projected bytes above which an input the chunks do not drive is staged rather than held.
+
+    A quarter of what the chunked path may hold: the input is read whole and decoded chunks and
+    their concatenation coexist, so a held input costs about twice its projected bytes, and the
+    builds and in-flight chunks beside it need the rest. On a 247 GiB node that is ~30 GB, which
+    TPC-H sf1000 `lineitem` passes and sf100 does not.
+    """
+    return _held_budget() // 4
 
 
 def _driving_source(sources: list[Source], opt: PhysicalPlan, input_bytes_of) -> int | None:
