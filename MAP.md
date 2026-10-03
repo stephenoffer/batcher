@@ -1276,7 +1276,7 @@ Kyber rule modules.
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
 | `equi_expr_keys.py` | 202 | Equi-join keys over *expressions*: `a.x = b.y - 52` as a hash key, not a post-join filter. |
 | `fusion.py` | 396 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
-| `leaf_rewrite.py` | 318 | The shared machinery every leaf-level expression rule is built from. |
+| `leaf_rewrite.py` | 293 | The shared machinery every leaf-level expression rule is built from. |
 | `literals.py` | 56 | Literal-value predicates shared by the expression rules: the i64 range and boolean literals. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 909 | Projection rewrites — collapse stacked projections and prune unread columns. |
@@ -1392,8 +1392,8 @@ Extended Kyber rule families.
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 482 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
 | `temporal_date_cast.py` | 186 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
-| `temporal_extra.py` | 462 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
-| `temporal_folds.py` | 185 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
+| `temporal_extra.py` | 465 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
+| `temporal_folds.py` | 187 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
 | `temporal_sargable.py` | 279 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
 | `topn_limit.py` | 213 | LIMIT / OFFSET rewrites that the base limit rules don't already cover. |
 | `window_extra.py` | 375 | Window rewrites — prune keys, frames and functions a window does not actually need. |
