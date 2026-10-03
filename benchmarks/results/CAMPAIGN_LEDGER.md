@@ -21,6 +21,14 @@ chronological log follows the "Resume here" section. A mirror lives at
 
 **Open problems, in priority order:**
 
+0. **sf1000 single-node q9 still does not finish in the benchmark harness.** c98-sf1000-part
+   at `78526d79`: q9 KILLED at the 2400 s per-case timeout (q18 40.1 s, q21 73.4 s, q12 56.8 s
+   all OK). A standalone q9 at sf1000 on older code (route trace job) took the chunked route
+   and finished in **92 s**, so the harness's repeated runs (first + best-of) or state carried
+   between runs is the difference. Reproduce with `routespy.py`/`routeq.py` running q9 several
+   times in one process and watch which route each run takes (the partitioned-build fallback
+   may not engage at that scale, or a later run may fall to the spill route).
+
 1. **Distributed sf1000 OOM, root cause confirmed.** On 4x m6id.4xlarge (64 GB), distributed
    q9 kills workers: Ray's OOM report shows two `ray::_aligned_units_task` per node at **28 GB
    each**. The aligned executor (`dist/executors/aligned/run.py`) gives unit tasks no memory
