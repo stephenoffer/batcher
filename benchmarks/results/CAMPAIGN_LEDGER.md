@@ -40,6 +40,14 @@ chronological log follows the "Resume here" section. A mirror lives at
    sizes and reruns q9 at `BATCHER_ALIGNED_UNIT_BYTES=1073741824`; read
    `bench_results/claude98/c98-diag-q9-78526d79/diag.log` and `nodemem.log` before choosing.
    q1-q8 ran without OOM at sf1000 distributed.
+   **Diagnostic result (default config):** q9 makes two aligned cuts of **39 units** each
+   (`unit_bytes` 6 GiB, `min_units` 48, `streams` 12); held broadcasts are tiny (one table,
+   10.9M rows, **82 MiB**). So the ~28 GB per unit task is unit input (current + prefetched)
+   plus engine join/aggregate state, not broadcasts. The default run timed out at 1800 s with
+   repeated `_aligned_units_task` OOM kills (nodes at 55-58 of 60 GB). The 1 GiB-unit rerun was
+   still running at the stop; its outcome is in `c98-diag-q9-78526d79/diag.log` (`=== 1073741824
+   q9` onward) and `nodemem.log`. If 1 GiB units stay under memory, the fix is to derive
+   `unit_bytes` from per-slot node memory (and pass `memory_bytes` to the unit engine config).
 2. **sf1000 single node (m6id.16xlarge) loses most queries to DuckDB** (old code f5765cbb):
    Batcher wins only q1, q6, q11, q19, q22. Worst: q12 6.5x, q16 2.6x, q10 1.85x, q5 1.8x,
    q8 1.7x, q3/q4/q20/q21 ~1.5-1.7x. Profiles (frame pointers) for q12, q13, q17 are in
