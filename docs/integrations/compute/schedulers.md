@@ -7,26 +7,22 @@ Azure ML or SkyPilot.
 
 There's nothing to configure. Batcher reads what the scheduler already exported into the process and sizes itself against the allocation you were granted rather than the machine it landed on. Thread pools, GPU stages, memory admission, spill placement, and shuffle draining all follow the grant, so a job uses what it paid for and leaves its co-tenants alone.
 
-## Why the allocation is not the machine
+## Sized to the allocation, not the machine
 
-A local probe answers "what hardware is attached to this node". A scheduler answers "what
-hardware is this job allowed to use". They are the same number only when the job owns the whole
-node, and they diverge silently:
+A local probe reports what hardware is attached to the node. A scheduler reports what the job may use. Batcher reads the grant:
 
-A Grid Engine job granted 8 of a node's 128 cores sees all 128 in its CPU affinity mask, because most sites don't enable cgroup confinement. Sizing thread pools to the mask oversubscribes the node sixteen-fold. A Kubernetes pod granted 2 of a node's 8 GPUs sees 8 through the driver, and sizing an inference stage to 8 puts four times the working set on two devices. A Slurm allocation of 64 nodes whose job step published no node list reads as one node, which turns off every cross-node decision.
+- **Cores** are the smallest of the affinity mask, the cgroup CPU quota, and the scheduler's grant.
+- **Devices** are the allocation's count, not the node's.
+- **Width** comes from the scheduler's node list or node count.
+- **Memory** is the smallest of host RAM less reserved hugepages, every cgroup cap including `memory.high`, the scheduler's memory grant, and `RLIMIT_AS`.
 
-Batcher reads the grant instead. The core bound is the smallest of the affinity mask, the cgroup CPU quota, and the scheduler's own grant. The device count is the allocation's, not the node's. The width of the job comes from the scheduler's node list or node count.
+The planner and the admission controller read that one memory ceiling, so a query Batcher predicts will fit is one the node can hold.
 
-Memory works the same way and matters more, because exceeding it is fatal rather than merely
-rude. The ceiling is the smallest of the host's RAM less any reserved hugepages, every cgroup
-cap in the ancestry (including the `memory.high` throttle threshold, not just `memory.max`),
-the scheduler's memory grant, and `RLIMIT_AS`. That last one is how Grid Engine enforces
-`h_vmem`, LSF `-M` and PBS `pvmem`, and it binds hardest of all: overshooting a cgroup gets the
-process OOM-killed, while overshooting an address-space limit makes the allocator return NULL
-and the query die of `MemoryError` inside a kernel that had no chance to spill instead.
+::::{dropdown} Why the grant and the machine differ
+They are the same number only when the job owns the whole node. A Grid Engine job granted 8 of a node's 128 cores sees all 128 in its affinity mask when the site doesn't enable cgroup confinement. A Kubernetes pod granted 2 of a node's 8 GPUs sees 8 through the driver. A Slurm allocation of 64 nodes whose job step published no node list reads as one node.
 
-The planner and the admission controller read that one ceiling, so a query that Batcher
-predicted would fit is a query the node can actually hold.
+`RLIMIT_AS` is how Grid Engine enforces `h_vmem`, LSF `-M` and PBS `pvmem`. Overshooting it makes the allocator return NULL, so Batcher plans against it to keep spill in reach.
+::::
 
 ## What Batcher reads
 
@@ -36,10 +32,13 @@ Ask, on any node:
 import batcher as bt
 
 report = bt.accelerators()
-print(sorted(report.get("site", {})))
+print("devices" in report)
+# True
+print(report.get("site", {}).get("scheduler", "none"))
+# none
 ```
 
-The `site` block names the platform, the scheduler, and the shape the scheduler gave the job. It's absent when every field would be empty, as on a laptop or in CI. Within it, a key is present only when the scheduler published it, so an absent `nodes` key means nobody said, not one node.
+Outside a scheduler, as here, `scheduler` is `none`. The `site` block names the platform, the scheduler, and the shape the scheduler gave the job. It's absent when every field would be empty, as on a laptop or in CI. Within it, a key is present only when the scheduler published it, so an absent `nodes` key means nobody said, not one node.
 
 The following table lists the keys:
 
@@ -62,9 +61,7 @@ started the processes, so Batcher reads the launcher's vocabulary instead: `RANK
 `WORLD_SIZE` / `LOCAL_RANK` / `LOCAL_WORLD_SIZE` from `torchrun`, `OMPI_COMM_WORLD_*` from Open
 MPI, and `PMI_RANK` / `PMI_SIZE` from the PMI family.
 
-Without a rank, every worker in a four-node job believes it is
-worker zero, and anything that shards by rank does the same quarter of the work four times
-while three quarters is never touched.
+That rank is what lets each worker in a multi-node job shard its own slice of the work.
 
 ## Accelerator grants are read per vendor
 

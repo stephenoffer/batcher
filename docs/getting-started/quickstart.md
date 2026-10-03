@@ -1,12 +1,12 @@
 # Quickstart
 
-In the next five minutes you'll build a complete pipeline: filter rows, derive columns, aggregate, join, switch to SQL, inspect the plan, and write Parquet. The data is five rows so every example runs anywhere. The API is the one you'd point at a terabyte of Parquet or a Ray cluster, and none of the code below would change.
+This page builds a complete pipeline in five minutes. You'll filter and derive columns, aggregate, join, switch to SQL, read the plan and write Parquet. The data is five rows. The same code runs unchanged on a terabyte of Parquet or on a Ray cluster.
 
 You need Batcher installed. If `import batcher` fails, follow {doc}`install/packages-and-extras` first.
 
 ## Build a dataset
 
-The conventional alias is `bt`. {py:func}`from_pydict <batcher.from_pydict>` builds an in-memory dataset from a dictionary of columns.
+Import Batcher as `bt`. {py:func}`from_pydict <batcher.from_pydict>` builds an in-memory dataset from a dictionary of columns.
 
 ```python
 import batcher as bt
@@ -25,15 +25,24 @@ print(ds.columns)
 # ['id', 'name', 'category', 'price', 'qty']
 ```
 
-A {py:class}`Dataset <batcher.Dataset>` is *lazy*. Each operation returns a new `Dataset` that describes a plan, and no work runs until you ask for a result with a call such as `to_pydict` or `collect`. Because Batcher sees the whole plan before it runs anything, it can push filters into the scan, prune unused columns, and pick join strategies for you. {doc}`concepts/lazy` explains the model in a page.
+The schema is known before anything runs:
 
-Every example below has two halves. The steps you chain only describe a plan, and one terminal call optimizes that plan and runs it:
+```python
+print(ds.schema)
+# id: int64
+# name: string
+# category: string
+# price: double
+# qty: int64
+```
+
+A {py:class}`Dataset <batcher.Dataset>` is *lazy*. Each step returns a new plan, and nothing runs until a terminal call such as `to_pydict` or `collect`. Because Batcher sees the whole plan first, it can push filters into the scan, drop columns you never use and pick join strategies for you. {doc}`concepts/lazy` has the details.
 
 ![Two stacked panels. In the top panel, labeled lazy, a chain of calls (read.parquet, filter, with_columns, group_by then agg) describes a query plan made of scan, filter, project, and aggregate, and nothing runs because each step returns a new Dataset. An amber arrow labeled collect, to_pydict, or write leads into the bottom panel, where the plan runs once: the optimizer pushes filters and prunes columns, hands the plan to the Rust engine, which works over whole Arrow batches, and the rows come back as a Table, a dict, or files.](/_static/diagrams/quickstart_lazy_plan.svg)
 
 ## Filter rows and derive columns
 
-Filters are expressions built from {py:obj}`bt.col(...) <batcher.col>`. Combine conditions with `&` for and, `|` for or, and `~` for not.
+Build filters from {py:obj}`bt.col(...) <batcher.col>` and combine them with `&` (and), `|` (or) and `~` (not).
 
 ```python
 filtered = ds.filter((bt.col("price") >= 30.0) & (bt.col("category") == "a"))
@@ -41,7 +50,14 @@ print(filtered.to_pydict())
 # {'id': [3, 5], 'name': ['cy', 'eve'], 'category': ['a', 'a'], 'price': [30.0, 50.0], 'qty': [3, 5]}
 ```
 
-`select` chooses or derives the full output. `with_columns` adds or replaces columns and keeps the rest. Derived columns are keyword arguments.
+Membership tests read like Python:
+
+```python
+print(ds.filter(bt.col("name").is_in(["ann", "eve"])).select("id").to_pydict())
+# {'id': [1, 5]}
+```
+
+`select` picks or derives the full output. `with_columns` adds or replaces columns and keeps the rest. Either way, a derived column is a keyword argument.
 
 ```python
 projected = ds.select("name", total=bt.col("price") * bt.col("qty"))
@@ -53,11 +69,34 @@ print(enriched.columns)
 # ['id', 'name', 'category', 'price', 'qty', 'total']
 ```
 
-You never write a loop. Each expression is handed to the Rust engine, which evaluates it over whole Arrow batches, and typed accessors such as `.str`, `.dt`, and `.list` cover strings, dates, and nested data. {doc}`/user-guide/transform/rows/filtering` covers nulls, {py:meth}`is_in <batcher.plan.expr_ir.core.Expr.is_in>`, and sampling. {doc}`/user-guide/transform/rows/transformations` and {doc}`/user-guide/transform/columns/expressions` cover the rest of the column vocabulary.
+Conditional columns use `when/then/otherwise`:
+
+```python
+tier = bt.when(bt.col("price") > 25).then(bt.lit("high")).otherwise(bt.lit("low"))
+print(ds.select("name", tier=tier).to_pydict())
+# {'name': ['ann', 'bob', 'cy', 'dan', 'eve'], 'tier': ['low', 'low', 'high', 'high', 'high']}
+```
+
+Strings and dates have typed accessors such as `.str`, and so does nested data:
+
+```python
+print(ds.select(upper=bt.col("name").str.upper(), chars=bt.col("name").str.len_chars()).to_pydict())
+# {'upper': ['ANN', 'BOB', 'CY', 'DAN', 'EVE'], 'chars': [3, 3, 2, 3, 3]}
+```
+
+Nulls have their own verbs:
+
+```python
+gaps = bt.from_pydict({"v": [1, None, 3]})
+print(gaps.select(v=bt.col("v").fill_null(0)).to_pydict())
+# {'v': [1, 0, 3]}
+```
+
+You never write a loop. Every expression runs in Rust over whole Arrow batches. More in {doc}`/user-guide/transform/rows/filtering`, {doc}`/user-guide/transform/rows/transformations`, and {doc}`/user-guide/transform/columns/expressions`.
 
 ## Aggregate
 
-Group with `group_by` and finish with `agg`. Each aggregate is a keyword whose value is an aggregate expression, and {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`.
+Group with `group_by`, then name each aggregate as a keyword in `agg`. {py:obj}`bt.count() <batcher.count>` is `COUNT(*)`.
 
 ```python
 summary = (
@@ -69,7 +108,22 @@ print(summary.to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0], 'orders': [3, 2]}
 ```
 
-{doc}`/user-guide/analyze/aggregations` lists every aggregate, plus pivots and rollups. {doc}`/user-guide/analyze/window-functions` covers ranking and running totals, which aggregate without collapsing rows.
+Window functions aggregate without collapsing rows. This one keeps a running total per category:
+
+```python
+running = bt.col("price").sum().over(partition_by="category", order_by="id")
+print(ds.select("id", "category", running=running).sort("id").to_pydict())
+# {'id': [1, 2, 3, 4, 5], 'category': ['a', 'b', 'a', 'b', 'a'], 'running': [10.0, 20.0, 40.0, 60.0, 90.0]}
+```
+
+Top-N is a sort and a limit:
+
+```python
+print(ds.sort("price", descending=True).limit(2).select("name", "price").to_pydict())
+# {'name': ['eve', 'dan'], 'price': [50.0, 40.0]}
+```
+
+See {doc}`/user-guide/analyze/aggregations` and {doc}`/user-guide/analyze/window-functions`.
 
 ## Join
 
@@ -82,11 +136,11 @@ print(joined.to_pydict())
 # {'id': [1, 2, 3, 4, 5], 'category': ['a', 'b', 'a', 'b', 'a'], 'region': ['west', 'east', 'west', 'east', 'west']}
 ```
 
-Left, outer, semi, anti, and as-of joins take the same shape. See {doc}`/user-guide/analyze/joins`.
+Left, outer, semi, anti and as-of joins all take the same shape ({doc}`/user-guide/analyze/joins`).
 
 ## Switch to SQL whenever you like
 
-SQL and DataFrame code build the same plan, so you can mix them in one pipeline. Pass datasets to {py:func}`bt.sql <batcher.sql>` by keyword and query them by that name.
+SQL builds the same plan the DataFrame verbs build, so one pipeline can use both. Pass datasets to {py:func}`bt.sql <batcher.sql>` by keyword, then query them by that name.
 
 ```python
 revenue = bt.sql(
@@ -97,11 +151,11 @@ print(revenue.sort("category").to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0]}
 ```
 
-{doc}`/user-guide/analyze/sql` lists the supported SQL, and {doc}`tutorials/foundations/sql-to-dataframe` translates a query into DataFrame verbs step by step.
+{doc}`/user-guide/analyze/sql` lists the supported SQL. To translate a query into DataFrame verbs step by step, see {doc}`tutorials/foundations/sql-to-dataframe`.
 
 ## Run the plan and inspect it
 
-Terminal operations run the plan. {py:meth}`to_pydict <batcher.Dataset.to_pydict>` returns columns, {py:meth}`to_pylist <batcher.Dataset.to_pylist>` returns rows, {py:meth}`count <batcher.Dataset.count>` returns the row count, and {py:meth}`collect <batcher.Dataset.collect>` returns a `pyarrow.Table`.
+Terminal operations run the plan. You get columns from {py:meth}`to_pydict <batcher.Dataset.to_pydict>` and rows from {py:meth}`to_pylist <batcher.Dataset.to_pylist>`. {py:meth}`count <batcher.Dataset.count>` gives the row count, and {py:meth}`collect <batcher.Dataset.collect>` hands back a `pyarrow.Table`.
 
 ```python
 print(ds.count())
@@ -112,19 +166,17 @@ print(table.num_rows)
 # 5
 ```
 
-{py:meth}`explain <batcher.Dataset.explain>` shows the optimized plan without running it. Look for `pushed[price > 25.0]` on the scan line: the optimizer moved the filter into the read, so on a large Parquet file the reader skips every row group whose statistics rule the predicate out instead of decoding it.
+To see the optimized plan without running it, call {py:meth}`explain <batcher.Dataset.explain>`. Look for `pushed[price > 25.0]` on the scan line. The filter moved into the read, so a Parquet reader skips any row group whose statistics rule it out.
 
 ```python
 print(ds.filter(bt.col("price") > 25.0).explain())
 ```
 
-{doc}`/user-guide/operate/tuning/explain-plans` shows how to read every column.
-
-Some questions never need a scan at all. A `count()` on a Parquet source is answered from file metadata, and {doc}`/user-guide/analyze/metadata-shortcuts` lists the other shortcuts.
+{doc}`/user-guide/operate/tuning/explain-plans` walks through the output. Some questions skip the scan entirely: a `count()` on Parquet reads only file metadata ({doc}`/user-guide/analyze/metadata-shortcuts`).
 
 ## Read and write files
 
-Readers and writers share one API, so only the source or the sink changes. This local round trip runs as written:
+Readers and writers share one API:
 
 ```python
 ds.write.parquet("sales.parquet")
@@ -133,7 +185,7 @@ print(back.count())
 # 5
 ```
 
-Object stores work the same way. The next snippet needs a real bucket, so it's shown rather than run:
+Object stores work the same way:
 
 ```python
 # docs: skip
@@ -141,17 +193,17 @@ events = bt.read("s3://<your-bucket>/events/*.parquet")
 events.filter(bt.col("status") == "active").write.parquet("s3://<your-bucket>/active.parquet")
 ```
 
-Replace `<your-bucket>` with a bucket you can read and write, and install the `cloud` extra. {doc}`/user-guide/moving-data/reading-data` and {doc}`/user-guide/moving-data/writing-data` cover every format, glob, and save mode, and {doc}`/user-guide/moving-data/cloud-storage` covers credentials.
+Replace `<your-bucket>` with your bucket and install the `cloud` extra. Formats and save modes are in {doc}`/user-guide/moving-data/reading-data` and {doc}`/user-guide/moving-data/writing-data`. Credentials are in {doc}`/user-guide/moving-data/cloud-storage`.
 
-## Next steps
+## Scale it out
 
-Every Batcher pipeline has the shape you just wrote: read, chain lazy steps, and collect once at the end. Growing it changes the source and the machine, not the code. Continue with {doc}`tutorials/foundations/first-pipeline`, which builds the same shape on a realistic dataset, or read the {doc}`concepts/index` to learn why the engine behaves the way it does. To see how far the same model stretches, {doc}`tour` runs one small example of each thing Batcher does, from streaming to media to models, on a single page.
+You've now written the shape every Batcher pipeline has. Read, chain lazy steps, collect once. Scaling out is one more argument on the terminal call:
 
-## See also
+```python
+# docs: skip
+summary.collect(distributed=True, num_workers=8)
+```
 
-- {doc}`tour`: one runnable example per capability, on one page.
-- {doc}`concepts/index`: lazy evaluation, expressions, scaling, and the adaptive loop, one short page each.
-- {doc}`migration/index`: the verb-by-verb mapping if you already know pandas, Polars, Spark, DuckDB, or Daft.
-- {doc}`/user-guide/index`: every operator, with runnable examples.
-- {doc}`/api/reference`: a cheat sheet to keep open while you work.
-- {doc}`/user-guide/operate/running/troubleshooting`: what to read when the first query misbehaves.
+Next, {doc}`tutorials/foundations/first-pipeline` builds the same shape on a realistic dataset. The {doc}`tour` runs one example of everything Batcher does, and {doc}`concepts/index` gives lazy evaluation, expressions, scaling and the adaptive loop one short page each. If you already know pandas, Polars, Spark, DuckDB or Daft, start from {doc}`migration/index` instead.
+
+For reference, {doc}`/user-guide/index` covers every operator with runnable examples, and {doc}`/api/reference` is a cheat sheet to keep open. When a first query misbehaves, read {doc}`/user-guide/operate/running/troubleshooting`.

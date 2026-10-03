@@ -2,11 +2,28 @@
 
 This page describes how Batcher decides where distributed work runs, how many pieces it runs in, and what does and doesn't travel through Ray.
 
-A cluster brings more cores and more RAM. It also brings a scheduler, a serialization boundary, and a network, none of which a single-node engine pays for. Batcher's distributed path buys the cores and the RAM without paying much for the rest, and it does that by refusing to be a second engine.
-
 :::{important}
-There is one set of operator semantics. `dist/` decides *where* work runs and *how many pieces* it runs in. It doesn't decide what an aggregate means. The mergeable algebra of `partial -> combine -> finalize`, described in {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`, already guarantees that a result assembled from partitions equals the single-node result, so distribution is a scheduling problem and nothing else.
+There is one set of operator semantics. `dist/` decides *where* work runs and *how many pieces* it runs in. It doesn't decide what an aggregate means. The mergeable algebra of `partial -> combine -> finalize`, described in {doc}`Mergeable algebra </architecture/deep-dives/operators/mergeable-algebra>`, guarantees that a result assembled from partitions equals the single-node result, so distribution is a scheduling problem and nothing else.
 :::
+
+From the user's side it's one argument. The same pipeline runs single-node or on a cluster, and `distributed="auto"`, the default, distributes only past a size floor:
+
+```python
+# docs: skip
+import batcher as bt
+
+ds = bt.from_pydict({"k": [i % 10 for i in range(100_000)], "v": list(range(100_000))})
+q = ds.group_by("k").agg(s=bt.sum("v")).sort("k")
+local = q.collect(distributed=False)
+cluster = q.collect(distributed=True, num_workers=4)
+print(local.equals(cluster))  # True
+```
+
+```python
+import batcher as bt
+
+print(bt.Config().distributed.distribute_min_rows)  # 20000000
+```
 
 ```text
    DRIVER
@@ -34,9 +51,7 @@ There is one set of operator semantics. `dist/` decides *where* work runs and *h
 
 ## What Ray does and does not carry
 
-Ray schedules tasks and actors, and it carries control-plane metadata. The bulk shuffle bytes don't go through the Ray object store. Mapper output is written to Arrow IPC files or served from a Flight endpoint, and what crosses Ray is paths, addresses, tickets, row counts, and a metrics JSON string. You can see it in the return types. The shuffle map task in [`python/batcher/dist/executors/aggregate.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/executors/aggregate.py) returns a `list[str]` of file paths, and the Flight worker in [`python/batcher/dist/flight_worker.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/flight_worker.py) returns an address, not batches.
-
-The short slogan overstates it slightly. The following table lists each kind of traffic against whether it transits the object store:
+Ray schedules tasks and actors and carries control-plane metadata. Mapper-to-reducer shuffle bytes never go through the Ray object store: the shuffle map task in [`python/batcher/dist/executors/aggregate.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/executors/aggregate.py) returns a `list[str]` of file paths, and the Flight worker in [`python/batcher/dist/flight_worker.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/dist/flight_worker.py) returns an address.
 
 | Path | Through the Ray object store? |
 |---|---|
@@ -44,45 +59,39 @@ The short slogan overstates it slightly. The following table lists each kind of 
 | a distributed `map_batches` result | yes, via `ray.get` (`dist/executors/map.py::_map_udf_task`) |
 | a non-splittable in-memory source | yes, shipped as task arguments |
 
-Both of the latter are bounded. A map result is the query's output, and a map-then-aggregate returns only the partial, whose size is the group cardinality. Neither is zero, though. The claim that holds without qualification is the one about mapper-to-reducer traffic.
+Both of the latter are bounded: a map result is the query's output, and a map-then-aggregate returns only the partial, sized by the group count.
 
 ## The fan-out decision
 
-The default worker count used to be the *driver's* `os.cpu_count()`, so a 16-core driver attached to a 128-CPU cluster fanned out to 16. Worse, when Ray was already initialized the cluster-fill was skipped entirely and queries ran on 2 of 16 workers. Both were control-plane bugs, and both are fixed.
+`dist/executor.py::_cluster_fill_workers` sizes the fan-out from cluster topology, not the driver's `os.cpu_count()`. `num_cpus` is the smallest worker node's core count, so a worker is placeable anywhere, and the worker count is the sum of `floor(node_cores / num_cpus)` across nodes, so a larger node gets proportionally more workers.
 
-`dist/executor.py::_cluster_fill_workers` sizes the fan-out from cluster topology instead. `num_cpus` is the smallest worker node's core count, so a worker is placeable on any node, and the worker count is the sum of `floor(node_cores / num_cpus)` across nodes. One worker lands per core-slice, so a heterogeneous node gets proportionally more. A 64-core node next to 32-core nodes used to run at half utilization under a uniform one-worker-per-node grant.
+`scaling.node_classes` is the single definition of "worker-eligible" every sizing path reads. It excludes the Ray head whenever another node exists, since the head runs the GCS and dashboard, and excludes nodes Ray has marked for drain, so a query sized during scale-in targets the nodes that will remain.
 
-`_worker_node_cpus` excludes the Ray head whenever at least one other node exists, because the head runs the GCS, the dashboard, and the job supervisor, and scheduling data operators there causes contention. A single-node cluster keeps the head, since it has to run the work. Many managed clusters already give the head zero schedulable CPUs, and a fan-out that counts it schedules onto nothing.
+:::{dropdown} Placement, packing and per-worker threads
+A chosen fan-out is checked against what single nodes can host, because Ray gang-schedules the fleet and an unsatisfiable placement group would hang. `capacity.placeable_workers` sums each node's own capacity, bounded by every resource a bundle reserves: cores, GPUs, the per-worker memory grant, and the node class when a relational fleet is held off accelerator nodes.
 
-It also excludes anything Ray has marked for drain, so a query running while the autoscaler scales in is sized against the nodes that will still be there. Both exclusions live in `scaling.node_classes`, which is the single definition of "worker-eligible" that every sizing path reads. That matters more than it looks: when the fan-out chooser and the capacity clamp each derived the rule themselves, they disagreed about draining nodes and produced two different answers to "how many workers fit".
+Carbonite prefers `PACK` for a small-shuffle breaker; `dist` downgrades it to `SPREAD` when no single node can hold the gang. `STRICT_PACK`, requested only by a GPU collective whose actors must be co-located, is never downgraded.
 
-A chosen fan-out is then checked against what a *single node* can host, because Ray gang-schedules the fleet and a placement group that no arrangement of nodes can satisfy hangs rather than fails. `capacity.placeable_workers` sums each node's own capacity rather than dividing the cluster total, and bounds by every resource the bundle reserves: cores, GPUs, the per-worker memory grant, and the node class when a relational fleet is held off accelerator nodes. Counting an accelerator node's cores for a fleet that may not use them, or ignoring a memory grant that binds before cores do, overstates capacity in exactly the direction that hangs.
-
-The same reconciliation applies to placement strategy. Carbonite prefers `PACK` for a small-shuffle breaker, decided against the driver's core count because Carbonite has no live topology. `dist` downgrades that to `SPREAD` when no single node can hold the gang. `STRICT_PACK` is never downgraded, because it is asked for only by a GPU collective whose actors must be co-located to run their ring at all.
-
-Each worker's rayon width is then pinned to its grant. `dist/executors/ray_runtime/lifecycle.py` fills in the engine config's `parallelism` from the worker's CPU grant when the driver left it unset, which is what stops a worker from either single-threading or oversubscribing. Any worker count is result-correct under the mergeable algebra, so all of this affects saturation and never the answer.
-
-:::{warning}
-Rayon's *global* pool is built before Ray applies the actor's cgroup affinity, so on a Ray worker it sizes itself to 1 thread. Every parallel execution therefore runs inside an explicitly-sized scoped pool (`bc_interp::par::pool_for`), never the global one. Missing that made the whole parallel executor single-threaded on every worker in the cluster, and nothing about the results looked wrong.
+Each worker's rayon width is pinned to its CPU grant by `dist/executors/ray_runtime/lifecycle.py`. Rayon's global pool is built before Ray applies the actor's cgroup affinity, so on a Ray worker it sizes itself to 1 thread. Every parallel execution therefore runs inside an explicitly-sized scoped pool (`bc_interp::par::pool_for`). Missing that once made the whole parallel executor single-threaded on every worker, with nothing wrong in the results. Any worker count is result-correct under the mergeable algebra, so all of this affects saturation, never the answer.
 :::
 
 ## Task sizing
 
-A stage's partition count comes from data volume, not from `cpu_count`. `optimizer.target_rows_per_task` (4M) and `optimizer.target_bytes_per_task` (256 MiB) set the target, and `api/tuning/decisions.py` takes the larger of the row-derived and byte-derived counts. A relation of a few very wide rows, such as video frames or embeddings, therefore still shards finely enough to fit memory. `distributed.max_shuffle_partitions` (2048) caps the result.
+A stage's partition count comes from data volume. `api/tuning/decisions.py` takes the larger of the row-derived and byte-derived counts, so a relation of a few very wide rows, such as video frames or embeddings, still shards finely enough to fit memory:
 
-Per-task CPU is adaptive rather than a flat `1.0`. `dist/executors/map.py::_adaptive_task_cpus` asks for `descriptor_rows * weight / rows_per_cpu` cores, clamped to `[_MIN_TASK_CPU, node_cores]` with `_MIN_TASK_CPU` at 0.125. `rows_per_cpu` is half `target_rows_per_task`, so a full target-sized partition asks for roughly two cores. A tiny partition gets a fraction of a core and Ray packs many onto one. A UDF stage carries `_MAP_COMPUTE_WEIGHT`, which defaults to 4.0, because a single-threaded Python UDF can only be parallelized by *more tasks*, not by more cores per task. That weight is then scaled by a measured per-core busy fraction learned for the plan family, so a family that ran CPU-underutilized reserves fewer cores next run. Because the share is per-partition, a heavier partition gets proportionally more CPU, which absorbs the residual skew that split-balancing leaves behind. Reserving more or fewer cores only changes packing, never the rows a task processes.
+```python
+cfg = bt.Config()
+print(cfg.optimizer.target_rows_per_task, cfg.optimizer.target_bytes_per_task >> 20)  # 4000000 256
+print(cfg.distributed.max_shuffle_partitions)  # 2048
+```
 
-Measured at sf10 on the project cluster, a UDF-plus-aggregate pipeline went from 1.89 s to 0.88 s, and mean cluster utilization rose from 9% to 52%.
+Per-task CPU is adaptive. `dist/executors/map.py::_adaptive_task_cpus` asks for `descriptor_rows * weight / rows_per_cpu` cores, clamped to `[0.125, node_cores]`, so a tiny partition gets a fraction of a core and Ray packs many onto one. A UDF stage carries `_MAP_COMPUTE_WEIGHT` (4.0), because a single-threaded Python UDF parallelizes only by more tasks, scaled by a per-core busy fraction learned for the plan family. Measured at sf10 on the project cluster, a UDF-plus-aggregate pipeline went from 1.89 s to 0.88 s, and mean cluster utilization rose from 9% to 52%.
 
-A Flight shuffle's *map* stage sizes itself separately, because what it is choosing is a unit of recovery as much as a unit of work. `dist/executors/ray_runtime/reducers.py::map_partitions` cuts the input into `workers x distributed.map_partition_multiplier` partitions, four times the worker count by default, and `map_barrier` hands them to actors as they go idle with exactly `workers` tasks in flight. One partition per worker, the older shape, makes the task unit a node's whole share of the input, so a worker running at half speed holds the barrier open on a full partition and a worker that dies loses a full partition for one survivor to replay. Neither cost is about data volume. Both are about the unit being indivisible.
+A Flight shuffle's map stage cuts its input into `workers x distributed.map_partition_multiplier` partitions (four per worker by default), capped at the splits the source has, and `map_barrier` deals them to actors as they go idle with exactly `workers` tasks in flight. A slow node takes fewer partitions, and a lost worker loses one small partition rather than a node's whole share.
 
-The count is a ceiling. `partition_descriptors` returns the smaller of it and the splits the source actually has, so a ten-row-group input on an eight-worker cluster gives ten partitions rather than thirty-two mostly-empty tasks, and an in-memory source stays at one per worker because its batches are already driver-resident. A join maps both sides through one barrier under a single source id, so it pads the shorter side's list with no-op partitions rather than re-planning the larger side's splits.
+### How many reducers
 
-Finer map partitions do not dilute skew, which is the usual reason given for many-tasks-per-executor. They divide the *input*, and a shuffle's imbalance lives in its hash buckets. That is the next section.
-
-How many buckets there are in the first place is a data question, not a cluster one. An aggregate exchanges *partial state*, whose size is the group count rather than the scanned input, so `adaptive_sizing/sizing.py::aggregate_reducer_count` sizes its reduce from the learned (or, on a cold signature, estimated) number of groups: `ceil(groups / optimizer.target_rows_per_task)` keeps each reducer's hash table bounded as the data grows, which is what stops a fixed cluster going superlinear.
-
-That count is floored at the worker count, because a bucket is reduced by exactly one worker and fewer buckets than workers idles the rest. The floor is then itself bounded by whether the groups can keep those workers busy: below `_MIN_GROUPS_PER_REDUCER` (50,000) groups per reducer, another reducer buys a column of the `mappers x reducers` stream matrix and no more work. Without that second bound a 64-group aggregate on a 64-worker fleet opened 4,096 Flight streams to move a few kilobytes, which is the near-empty all-to-all the cardinality sizing exists to prevent, reached through the floor instead of through the count. Measured on the project cluster, warm, median of seven, every case checked against DuckDB:
+An aggregate exchanges partial state sized by its group count, so `adaptive_sizing/sizing.py::aggregate_reducer_count` sizes its reduce from the learned or estimated number of groups, `ceil(groups / optimizer.target_rows_per_task)`. The count is floored at the worker count, and that floor is bounded by whether the groups can keep those workers busy, `_MIN_GROUPS_PER_REDUCER` (50,000) per reducer. Measured on the project cluster, warm, median of seven, every case checked against DuckDB:
 
 | groups | workers | floored at `workers` | bounded by work |
 |---|---|---|---|
@@ -90,100 +99,65 @@ That count is floored at the worker count, because a bucket is reduced by exactl
 | 200,000 | 64 | 348 ms | 249 ms (4) |
 | 1,000,000 | 64 | 880 ms | 434 ms (20) |
 
-A raw-row shuffle gets no such trim, and `row_shuffle_reducer_count` says so explicitly: a join, sort or window exchanges the rows themselves, so every input row lands in some bucket and there is no low-cardinality case where fewer buckets means less work. There the data-derived count may only *raise* the fan-out above one bucket per worker, never lower it.
+A join, sort or window exchanges the rows themselves, so `row_shuffle_reducer_count` may only raise the fan-out above one bucket per worker, never lower it.
 
-The *reduce* side is bounded the same way and for a different reason. A bucket is reduced by the one worker it hashes to (`bucket % workers`), so anything launched past the worker count is a task sitting in Ray's scheduler that cannot start, and `max_shuffle_partitions` permits 2,048 buckets. `dist/executors/ray_runtime/reduce.py::gather_in_windows` therefore keeps at most `distributed.pending_window_factor` times the worker count outstanding, `distributed.max_pending_tasks` overriding it when set.
-
-That window **slides**: one completion launches one new task, exactly as `map_barrier` fills from a `ray.wait`. Stepping it a chunk at a time bounds the queue just as well and serializes the stage behind its slowest task once per chunk, which matters most where the fan-out is a product of two of them. A combiner level is `n_reducers x ceil(sources / shuffle_fan_in)` tasks, so a 64-worker aggregate over 128 map partitions runs 1,024 tasks through a 256-deep window: four barriers where one slow bucket holds 255 idle actors, against four slots that refill the moment anything finishes. Results are returned in submission order either way, so nothing above this sees which shape it is.
+:::{dropdown} The sliding reduce window
+A bucket is reduced by the one worker it hashes to (`bucket % workers`), so tasks launched past the worker count can't start. `dist/executors/ray_runtime/reduce.py::gather_in_windows` keeps at most `distributed.pending_window_factor` times the worker count outstanding, or `distributed.max_pending_tasks` when set. The window slides: one completion launches one new task, so a slow bucket never holds a whole chunk of idle actors. Results return in submission order either way.
+:::
 
 ## Skew
 
-Two separate mechanisms handle skew, one for the read and one for the join.
+Scan splits are balanced up front. `dist/executors/partition_io/assignment.py::_balance` bin-packs Parquet row-group splits by uncompressed bytes from the footer when every split carries them, and by row count otherwise.
 
-Scan splits are balanced up front. Parquet `splits()` returns one split per run of row groups, and `dist/executors/partition_io/assignment.py::_balance` greedily bin-packs them. When every split carries its uncompressed size, as a Parquet row-group split does from its footer, it packs by bytes, because a row of a wide table costs more to decode than a row of a narrow one. Otherwise it packs by row count. That evens the *read*. It doesn't see codec cost or a slow remote store, which are properties of where the bytes live rather than how many there are.
+Join skew is a property of the key distribution. `dist/executors/join.py::_detect_hot_keys` runs a Misra-Gries heavy-hitters pass (`nat.heavy_hitters`, backed by `bc-sketches`), and a value is hot when its count clears `distributed.skew_join_fraction` of the rows. `nat.salted_partition_batches` then fans the probe-side hot rows across `salt` reducers and *replicates* the build-side hot rows to all of them. Cold keys hash as before, so the joined relation is unchanged.
 
-Join skew is different, because it's a property of the key distribution and you can't see it in the file layout. `dist/executors/join.py::_detect_hot_keys` runs a Misra-Gries heavy-hitters pass per partition using `nat.heavy_hitters`, which is backed by `bc-sketches`, and a value is hot when its summed count clears `distributed.skew_join_fraction` (0.10) of the rows. Hot keys are then salted. `nat.salted_partition_batches` fans the probe-side hot rows across `salt` reducers and *replicates* the build-side hot rows to all of them. Cold keys hash exactly as before, so the joined relation is unchanged.
+```python
+print(cfg.distributed.skew_join_fraction, cfg.distributed.skew_join_salt)  # 0.1 0
+```
 
-The detection pass costs a scan, so `dist/skew.py::resolve_hot_keys` asks the cheap sources first: the set learned for this join shape on a previous run, then the column statistics Kyber already holds, and only then the pre-pass. It runs the pre-pass on its own once the join's estimated input clears about 8.4M rows, because past that size one pass costs around 4% on a join that turns out uniform while an undetected 40% hot key costs 5.8x. `distributed.skew_join_salt` is the fan-out rather than a switch: 0, the default, leaves both the decision and the fan-out to the measurement; a positive value forces the pre-pass and pins the fan-out; a negative value never salts.
+`distributed.skew_join_salt` is the fan-out: 0 leaves the decision to measurement, a positive value forces the pre-pass and pins the fan-out, a negative value never salts. `dist/skew.py::resolve_hot_keys` asks the cheap sources first, the hot-key set learned for this join shape and Kyber's column statistics, and runs the pre-pass on its own once the estimated input clears about 8.4M rows. There one pass costs around 4% on a uniform join, while an undetected 40% hot key costs 5.8x.
 
-What makes the pass pay for itself is that its result is learned. `dist/skew.py` fingerprints the join shape with `join_skew_key`, a hash of both side IRs, the keys, and the join type, and persists the hot-key list in the `MetadataHub`. A shape with learned hot keys salts with no pre-pass at all on the next run. An empty learned list means "measured, not skewed", which is distinct from never-measured, so a non-skewed shape skips the probe while that verdict is fresh. The shape key hashes the plan rather than the bytes under it, so a table can drift into skew under an unchanged query. The verdict therefore expires: after a week (`_UNIFORM_VERDICT_TTL_S`), or once the join's estimated input has moved 4x from the size it was measured at (`_UNIFORM_VERDICT_DRIFT`), it reads as never-measured again. A learned *hot* list doesn't expire, because salting on a key that has since cooled costs some replication and never an answer.
+:::{dropdown} Learned skew verdicts
+`dist/skew.py` fingerprints the join shape with `join_skew_key`, a hash of both side IRs, the keys and the join type, and persists the hot-key list in the `MetadataHub`. A learned hot list salts with no pre-pass on the next run. An empty list means "measured, not skewed" and expires after a week (`_UNIFORM_VERDICT_TTL_S`) or once the estimated input moves 4x (`_UNIFORM_VERDICT_DRIFT`), since a table can drift into skew under an unchanged query. A hot list doesn't expire, because salting a cooled key costs some replication and never an answer.
 
-:::{warning}
-Salting is result-preserving only when each reducer's output is concatenated. `salting_is_safe` refuses it for a fused join-plus-aggregate, where the reducer finalizes its bucket locally. Salted reducers would each finalize a *partial* group and the union would carry several half-summed rows for the hot key. Nothing raises. The query returns a wrong answer.
+`salting_is_safe` refuses salting for a fused join-plus-aggregate, where each reducer finalizes its bucket locally and salted reducers would each finalize a partial group.
 :::
 
-## What the driver still does
+## What the driver does
 
-The driver composes the stages. For a distributed aggregate (`dist/executors/aggregate.py::_distributed_aggregate`) that means partitioning the source, running map tasks that call `nat.partial_aggregate` and `nat.partition_batches` and write one IPC file per bucket, then running reduce tasks that fold their inputs with `nat.combine` incrementally and call `nat.combine_finalize` once. The Rust functions are the same ones the single-node parallel executor uses, and they live in [`crates/bc-interp/src/dist.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/dist.rs).
+The driver composes the stages. For a distributed aggregate (`dist/executors/aggregate.py::_distributed_aggregate`) it partitions the source, runs map tasks calling `nat.partial_aggregate` and `nat.partition_batches`, then reduce tasks folding with `nat.combine` and calling `nat.combine_finalize` once. These are the same Rust functions the single-node parallel executor uses, in [`crates/bc-interp/src/dist.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/dist.rs).
 
-Some shapes avoid the shuffle entirely. A shuffle join co-partitions both sides by the join key, so when a group-by's keys include the join key every group lies entirely within one bucket and each reducer's bucket is already complete. `_distributed_join_aggregate` gives the reducer an IR of `aggregate(hash_join(...))` and there's no second exchange. That exchange elimination took a distributed join-then-aggregate from 71.6 s to 1.75 s, because the old path collected the whole join to the driver.
+Some shapes avoid a second shuffle entirely. When a group-by's keys include the join key, every group lies within one join bucket, so `_distributed_join_aggregate` gives the reducer `aggregate(hash_join(...))` with no second exchange. That took a distributed join-then-aggregate from 71.6 s to 1.75 s.
 
-:::{warning}
-Some shapes shouldn't distribute at all. When a plan has no distributed path and any source it actually reads is splittable, `_unsupported` raises a {py:exc}`PlanError <batcher.PlanError>` rather than quietly running the query on the driver. The silent fallback is how the join and UDF cliffs hid for as long as they did. A query that says `distributed=True` and runs on one node is a perf cliff and an OOM risk wearing a correct result. When every source is in-memory or non-splittable there's no distributed data to speak of, so one node is the correct plan rather than a fallback.
-:::
+When a plan has no distributed path and any source it reads is splittable, `_unsupported` raises a {py:exc}`PlanError <batcher.PlanError>` rather than quietly running the query on the driver. When every source is in-memory or non-splittable, one node is the correct plan.
 
-## Staging a UDF so the operator above it can shuffle
+### Staging a UDF so the operator above it can shuffle
 
-A `map_batches` pipeline is opaque. It runs in Python, it has no engine IR, and no shuffle can see through it, so a breaker sitting on top of one has nothing to co-partition. Batcher deals with that by cutting the query in two rather than by giving the breaker a second implementation: the UDF pipeline runs as its own distributed stage, lands its output as Parquet on cluster-shared scratch, and the breaker is then dispatched over a plain scan of that scratch. What runs afterwards is the ordinary distributed operator, with the shuffle, the broadcast decision, the skew handling and the spill it always had.
-
-The staging follows the plan's operands rather than a single chain, and that is what makes it cover the shape most inference jobs actually have. Embedding a table and then joining the embeddings to something bottoms out at a node with two operands, and so does a union of two inference branches. Each operand that contains a UDF is staged on its own; operands with no UDF are left exactly as they are, so a join of an inference branch against a plain Parquet table stages only the branch. `map_batches(...).join(other).group_by(...)` then reaches the fused join-aggregate reducer, the same one a join over two tables reaches.
-
-An operand whose staged output turns out empty is never folded away, because a breaker is not uniformly empty-preserving. An outer join with an empty right side still emits every left row, so "empty" there would be a wrong answer. Instead, every writing shard reports the UDF's output schema even when it wrote no file, and the empty operand is staged as a zero-row input of that type, so the breaker applies its own empty-input semantics. The operand is declined only when no shard ran the UDF at all and there is no schema to give it.
+A `map_batches` pipeline runs in Python with no engine IR, so no shuffle can see through it. Batcher cuts the query in two: the UDF pipeline runs as its own distributed stage and lands its output as Parquet on cluster-shared scratch, and the breaker above runs as the ordinary distributed operator over a scan of that scratch. Staging follows the plan's operands, so `map_batches(...).join(other).group_by(...)` stages only the UDF branch and reaches the fused join-aggregate reducer. An empty staged operand is passed as a zero-row input of the UDF's output schema, so an outer join still applies its own empty-input semantics. The operand is declined only when no shard ran the UDF at all and there is no schema to give it.
 
 ## What never reaches the driver
 
-Composing the stages is not the same as carrying their data, and the executor keeps those apart. A stage can be asked to leave its result where it was computed rather than hand it back, and every breaker that has a shuffle honors that: an aggregate, a `distinct`, a hash join, a sort, and a partitioned window all publish one bucket per reducer and return handles instead of rows. On the disk transport a handle is an Arrow IPC file and the relation is a `MaterializedSource`; on the Flight transport the bucket stays resident on the actor that produced it and the relation is a `FlightMaterializedSource`, which the next stage's workers fetch shared-nothing, straight from the holding actor.
-
-Where those cuts fall is decided by the plan alone, and a handle rather than a row is what crosses one.
+A stage can leave its result where it was computed. An aggregate, `distinct`, hash join, sort and partitioned window each publish one bucket per reducer and return handles: an Arrow IPC file (`MaterializedSource`) on the disk transport, or a bucket resident on the producing actor (`FlightMaterializedSource`) on Flight.
 
 ![Where a distributed query is cut, and what crosses a cut. The cut set is a plan property: plan_analysis._has_breaker names Aggregate, Sort, Join, Distinct and Limit, and every other node runs inside the stage it is already in, so a scan, filter and project chain feeding an aggregate, then a sort, then a limit is cut three times and the cluster does not enter into it. One cut is one stage. Inside a stage the input is cut into the worker count times four partitions, each a durable descriptor of splits with the projection already pushed into it, and a barrier deals them to whichever actor just went idle, keeping exactly workers tasks in flight so a slow node takes fewer. The map tasks compute partials, emit one bucket per reducer, and each bucket is reduced by the one worker it hashes to, through combine and combine_finalize. What crosses to the next stage is one handle per reducer bucket, scanned in place as an ordinary scan: the rows stay on the worker that computed them, and a multi-join query never round-trips an intermediate through the driver.](/_static/diagrams/distributed_stages.svg)
 
-Three things consume that. The adaptive executor scans one stage's buckets as the next stage's input, so a multi-join query never round-trips an intermediate through one process. {py:meth}`iter_batches(distributed=True) <batcher.Dataset.iter_batches>` reads one bucket at a time, so peak driver memory is a single reducer's output rather than the whole result. And an unpartitioned distributed write hands the buckets to the workers to write, so only file locators travel back.
+Three things consume those handles. The adaptive executor scans one stage's buckets as the next stage's input. {py:meth}`iter_batches(distributed=True) <batcher.Dataset.iter_batches>` reads one bucket at a time, so peak driver memory is one reducer's output. And an unpartitioned distributed write hands the buckets to the workers, so only file locators travel back.
 
-Whether the buckets can stay put is a property of the operator's result, not of its cost. The distinction that matters is how large the result is relative to the input:
-
-| Operator | Result size | Bucket order |
-|---|---|---|
-| `group_by` / `agg` | one row per group | irrelevant, the result is a multiset |
-| `distinct` | one row per distinct key | irrelevant |
-| Hash join | can exceed either input | irrelevant |
-| Window | one row per input row | irrelevant |
-| Sort | one row per input row | **is the answer** |
-
-The sort is the one where the ordering is carried by the layout itself. Its buckets are *ranges* of the leading key, globally ordered against one another, which is what lets the ordinary path concatenate them with no merge step. Keeping them in place preserves the same fact: the handles are listed in range order (reversed for a descending sort), and reading them in sequence is the sorted relation. Nothing re-sorts and nothing merges.
-
-A `Filter` or a `Project` stacked above a sort, such as the projection that drops a hoisted computed sort key, runs inside every reducer over its range bucket, so the buckets still stay put: a filter or projection of each range, read in range order, is that operator over the sorted relation. Two shapes decline and collect instead, because there is no partitioned form of what they are being asked for. Any other operator stacked above a breaker, and a `Filter` or `Project` above an aggregate, a join, a `distinct` or a window, is applied to the assembled result on the driver. A sort carrying a `limit` too large for the shuffle-free top-N, which takes a `limit` of up to 1,000,000 rows, has to cut an assembled result to select among the rows tied at the cut, although the disk transport reads only the leading range buckets that hold the first `limit` rows rather than every bucket.
-
-## Cost, and when not to use it
-
-Distribution is for scale-out and for larger-than-memory data. It isn't free, and on small inputs it isn't faster.
-
-::::{tab-set}
-:::{tab-item} Single-node
-```text
-TPC-H sf1 (6M rows), the udf-map workload:   86 ms
-
-no actor startup, no network shuffle, no serialization boundary
-this is what distributed.distribute_min_rows (20M) protects
+```python
+# docs: skip
+for batch in q.iter_batches(distributed=True, num_workers=4):
+    print(batch.num_rows)  # one reducer bucket at a time
 ```
-:::
 
-:::{tab-item} Distributed
-```text
-TPC-H sf1 (6M rows), the udf-map workload:   92 ms   (batcher, 4 workers)
+A sort's buckets are *ranges* of the leading key, listed in range order, so reading them in sequence is the sorted relation with no merge. A `Filter` or `Project` above a sort runs inside each reducer. Any other operator above a breaker is applied to the assembled result on the driver, as is a sort whose `limit` is too large for the shuffle-free top-N (up to 1,000,000 rows).
 
-the same rows come back either way. at this size the shuffle
-plus actor startup costs more than the whole query, and taking the distributed
-path anyway costs about 7%.
-```
-:::
-::::
+## Practical limits
 
-The warm session fleet (`distributed.reuse_session_fleet`, on by default) exists because spawning and tearing down the Flight fleet per {py:meth}`collect() <batcher.Dataset.collect>` cost about 1.5 s of a roughly 3 s query. It's health-checked and idle-auto-released after `session_fleet_idle_s` (30 s).
+- **Small inputs.** Actor startup and the shuffle are fixed costs, which is what `distributed.distribute_min_rows` (20M) protects under `"auto"`. On the TPC-H sf1 udf-map workload (6M rows), single-node ran in 86 ms and four workers in 92 ms.
+- **Fleet startup.** The warm session fleet (`distributed.reuse_session_fleet`, on by default) keeps the Flight fleet across {py:meth}`collect() <batcher.Dataset.collect>` calls, health-checked and released after `session_fleet_idle_s` (30 s) idle.
+- **Split balancing.** It evens bytes or rows, not codec cost or a slow remote store.
 
 ## Code map
-
-Each scheduling concern below lives in one file, so you can follow a task from submission to result in the source:
 
 | Concern | File |
 |---|---|

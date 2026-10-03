@@ -1,10 +1,10 @@
 # Differences and verification
 
-A port isn't finished when the verbs translate. This page covers the concepts that change whichever engine you come from, the familiar APIs Batcher deliberately doesn't have, and how to prove the ported script returns the same rows as the original. The name-by-name differences for PySpark, Polars, Daft, and Ray Data are in the generated reference: {doc}`spark/index`, {doc}`polars/index`, {doc}`daft/index`, and {doc}`ray-data/index`.
+This page covers the concepts that change whichever engine you come from, the familiar APIs Batcher replaces, and how to prove a port returns the same rows. Name-by-name differences are in the generated reference: {doc}`spark/index`, {doc}`polars/index`, {doc}`daft/index`, and {doc}`ray-data/index`.
 
 ## A dataset is lazy
 
-A {py:class}`Dataset <batcher.Dataset>` is a plan, not data. Transformations such as `filter`, `with_columns`, and `join` return a new `Dataset` and run nothing, and the plan runs only at a terminal operation such as `collect`, `to_arrow`, `to_pandas`, `count`, `iter_batches`, or a write. This is the Polars `LazyFrame` and Spark `DataFrame` model. If you come from pandas or an eager Polars `DataFrame`, a line that used to compute a value now only extends a plan. A print that relied on that value needs an explicit terminal call.
+A {py:class}`Dataset <batcher.Dataset>` is a plan, not data, as in a Polars `LazyFrame` or a Spark `DataFrame`. Coming from pandas, a line that used to compute a value now only extends a plan, and a terminal call such as `count`, `to_pydict`, or a write runs it.
 
 ```python
 import batcher as bt
@@ -17,19 +17,17 @@ print(plan.count())
 
 ## One spelling per capability
 
-Batcher doesn't add another engine's name as a second spelling of a capability it already has. Where two engines give one name different meanings, the generated reference records the difference as a mismatch, and the planned fix is a parameter on the Batcher spelling rather than a second function. Batcher also removed the second spellings it used to accept, such as `groupby` for `group_by` and `fillna` for `fill_null`.
-
-A removed spelling raises `AttributeError`, and so does another engine's spelling typed on a Batcher object. When the migration registry knows the name, the message names the spelling to use. The codemod rewrites a script that still uses a removed Batcher spelling. It prints a diff and changes nothing unless you pass `--write`, and `--check` exits 1 when any file would change:
+Batcher keeps one name per capability. Another engine's spelling, or a second spelling Batcher used to accept, raises `AttributeError` naming the replacement, and the codemod rewrites a script that still uses one. It prints a diff unless you pass `--write`:
 
 ```bash
 python -m batcher.migrate --from batcher --to batcher <paths>
 ```
 
-Replace `<paths>` with the files or directories to rewrite. Each engine's page in the generated reference says whether its codemod direction is implemented.
+Replace `<paths>` with the files or directories to rewrite.
 
 ## Write modes have different defaults
 
-A write that ports with its name unchanged can still behave differently, because the default save mode differs between engines. Batcher's `ds.write(path)` overwrites existing output by default, and `ds.write.delta(uri)` appends. The following table lists the defaults the migration registry records for the other engines:
+Default save modes differ between engines. Batcher's `ds.write(path)` overwrites by default, and `ds.write.delta(uri)` appends. The other engines default as follows:
 
 | Engine | Writer | Default when the target exists |
 |---|---|---|
@@ -38,7 +36,18 @@ A write that ports with its name unchanged can still behave differently, because
 | Daft | `write_parquet`, `write_csv` | append |
 | Ray Data | `write_parquet`, `write_csv` | append |
 
-Pass `mode=` explicitly on every ported write, so the port doesn't depend on either default. Batcher's file sinks reject `append`, so a Parquet or CSV write that appended in Daft or Ray Data needs a different layout here, such as a lakehouse table.
+Pass `mode=` explicitly on every ported write. `mode="error"` matches PySpark:
+
+```python
+ds.write.parquet("sales.parquet", mode="overwrite")
+try:
+    ds.write.parquet("sales.parquet", mode="error")
+except bt.PlanError:
+    print("refused: output exists")
+# refused: output exists
+```
+
+File sinks don't take `append`; a Parquet or CSV write that appended in Daft or Ray Data becomes a lakehouse table here.
 
 ## Integer overflow wraps
 
@@ -50,11 +59,15 @@ print(big.select(y=bt.col("x") + 1).to_pydict())
 # {'y': [-9223372036854775808]}
 ```
 
-An integer `sum` that overflows raises an `ExecutionError` instead, with a message telling you to cast the column to a wider type first. Spark's `try_add`, `try_subtract`, and `try_multiply`, which return null on overflow, have no Batcher equivalent. Batcher also stores unsigned 64-bit integers as signed 64-bit integers, so a `UInt64` value above `2**63 - 1` overflows on the way in.
+An integer `sum` that overflows raises an `ExecutionError` asking you to cast to a wider type first. Unsigned 64-bit integers are stored as signed 64-bit, so a `UInt64` above `2**63 - 1` overflows on the way in.
 
-## What Batcher deliberately does not have
+## APIs with a relational replacement
 
-Some familiar APIs are absent by design. You don't need this table to find out which: every one of them raises an `AttributeError` that names the reason and the replacement, so the traceback carries the mapping.
+Some familiar APIs are absent by design, because a relation has no row index or row order. Each one raises an `AttributeError` naming the replacement.
+
+:::{dropdown} The replacement table
+:open:
+
 
 | Absent | Why | Instead |
 |---|---|---|
@@ -66,7 +79,19 @@ Some familiar APIs are absent by design. You don't need this table to find out w
 | `df.resample` | Time bucketing is a grouping. | {py:meth}`ds.group_by(bucket=bt.window(bt.col("t"), "1h")).agg(...) <batcher.Dataset.group_by>` |
 | Looping over a {py:class}`GroupBy <batcher.GroupBy>` | It materializes one frame per key in Python and caps the job at one machine. | `.agg(...)`, or `.window(partition_by=[...])` to keep every row |
 
-Column attribute access such as `df.amount` is absent for a subtler reason: a column named `filter` or `join` would shadow a method, which is a real source of pandas bugs. Use `ds["amount"]` for the expression, or {py:func}`bt.col("amount") <batcher.col>` to build one.
+:::
+
+The two most common replacements, a row index and a running total:
+
+```python
+nums = bt.from_pydict({"x": [1, 2, 3]})
+print(nums.with_row_index("i").to_pydict())
+# {'i': [0, 1, 2], 'x': [1, 2, 3]}
+print(nums.window(order_by=["x"], functions={"running": ("sum", "x")}).to_pydict())
+# {'x': [1, 2, 3], 'running': [1, 3, 6]}
+```
+
+Column attribute access such as `df.amount` is absent too, because a column named `filter` would shadow a method. Use `ds["amount"]` or {py:func}`bt.col("amount") <batcher.col>`.
 
 ## The error messages teach you the mapping
 
@@ -109,9 +134,7 @@ A near miss on a real method gets a `Did you mean ...?` suggestion instead, so a
 
 ## Checking a port
 
-{py:meth}`ds.equals(other) <batcher.Dataset.equals>` compares *results* rather than plans, which is the question a migration raises. Both sides execute and their rows are compared. Two queries built from completely different verbs count as equal when their rows agree. A plan-shape comparison can't tell you that.
-
-Column names and types must match. Row order is ignored by default, because a relation is unordered. After a `sort`, pass `ordered=True` when the emitted order is part of the contract.
+{py:meth}`ds.equals(other) <batcher.Dataset.equals>` executes both sides and compares their rows, so two queries built from different verbs are equal when their results agree. Column names and types must match, and row order is ignored unless you pass `ordered=True`.
 
 ```python
 ds = bt.from_pydict({"status": ["paid", "open", "paid"], "amount": [10, 20, 30]})
@@ -120,12 +143,14 @@ ported = ds.filter(status="paid")
 expected = ds.filter(bt.col("status") == "paid")
 print(ported.equals(expected))
 # True
+print(ds.sort("amount").equals(ds.sort("amount", descending=True), ordered=True))
+# False
 ```
 
 ## Requirements and limitations
 
-- {py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_daft <batcher.from_daft>`, {py:func}`from_dask <batcher.from_dask>`, {py:func}`from_ray_dataset <batcher.from_ray_dataset>`, {py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>` each need the source framework installed. Batcher doesn't depend on any of them.
-- Dask and HuggingFace have a constructor but no exporter. To hand a result back to one of them, go through {py:meth}`to_arrow <batcher.Dataset.to_arrow>` or {py:meth}`to_pandas <batcher.Dataset.to_pandas>`.
+- {py:func}`from_pandas <batcher.from_pandas>`, {py:func}`from_polars <batcher.from_polars>`, {py:func}`from_spark <batcher.from_spark>`, {py:func}`from_daft <batcher.from_daft>`, {py:func}`from_dask <batcher.from_dask>`, {py:func}`from_ray_dataset <batcher.from_ray_dataset>`, {py:func}`from_huggingface <batcher.from_huggingface>`, {py:func}`from_torch <batcher.from_torch>`, and {py:func}`from_tf <batcher.from_tf>` each need the source framework installed.
+- To hand a result to Dask or HuggingFace, go through {py:meth}`to_arrow <batcher.Dataset.to_arrow>` or {py:meth}`to_pandas <batcher.Dataset.to_pandas>`.
 - `append` mode is accepted by lakehouse sinks only.
 - `merge_on` is a `write.delta` parameter. It has no equivalent on a plain Parquet write.
 - Distributed execution and the GPU actor pools need the optional `[ray]` extra.
@@ -133,7 +158,7 @@ print(ported.equals(expected))
 
 ## See also
 
-- {doc}`/getting-started/migration/transforming`: the replacements for most of the absent APIs above.
+- {doc}`/getting-started/migration/transforming`: the verb-by-verb table.
 - {doc}`/getting-started/migration/spark/index`, {doc}`/getting-started/migration/polars/index`, {doc}`/getting-started/migration/daft/index`, {doc}`/getting-started/migration/ray-data/index`: every name in each engine, with its Batcher spelling and what differs.
 - {doc}`/agents`: the migration skills, each ending in this verification step.
 - {doc}`/user-guide/operate/running/troubleshooting`: diagnosing a ported query that runs but misbehaves.

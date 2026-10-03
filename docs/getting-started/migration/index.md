@@ -1,18 +1,92 @@
 # Migrating to Batcher
 
-You don't have to relearn data engineering to move onto Batcher. This section maps the operations you know from pandas, Polars, PySpark, DuckDB, Daft, and Ray Data onto their Batcher spellings, and each page ends by showing how to prove the port returns the same rows.
+You don't have to relearn data engineering to move onto Batcher. This section maps what you know from pandas, Polars, PySpark, DuckDB, Daft, and Ray Data onto Batcher, and shows how to prove the port returns the same rows.
 
-Batcher keeps one spelling for each operation, so some of your vocabulary changes: `groupby`, `merge`, `fillna` and `drop_duplicates` are `group_by`, `join`, `fill_null` and `distinct` here. Don't memorize the list. A familiar name Batcher spells differently raises an error that names its replacement.
+The one concept to learn first: a {py:class}`Dataset <batcher.Dataset>` is *lazy*, like a Polars `LazyFrame`. Verbs build a plan, and a terminal call such as `to_pydict`, `collect`, `count`, or a write runs it.
 
-Learn one concept before anything else. A {py:class}`Dataset <batcher.Dataset>` is *lazy*. Transformations such as `select`, `filter`, `group_by().agg()`, and `join` build a plan and return a new `Dataset`. Nothing runs until a terminal operation such as `collect`, `to_arrow`, `to_pandas`, `write`, `count`, or `iter_batches`. If you know the Polars `LazyFrame`, you already know this model.
+```python
+import batcher as bt
+from batcher import col
+
+sales = bt.from_pydict({"region": ["e", "w", "e"], "amount": [10, 20, 30]})
+plan = sales.group_by("region").agg(total=col("amount").sum())  # nothing runs yet
+print(plan.sort("region").to_pydict())  # runs here
+# {'region': ['e', 'w'], 'total': [40, 20]}
+```
+
+## Side by side
+
+The same query in the engine you know, and in Batcher:
+
+::::{tab-set}
+:::{tab-item} pandas
+```python
+# docs: skip
+out = df[df.amount > 10].groupby("region", as_index=False).agg(total=("amount", "sum"))
+```
+
+```python
+out = sales.filter(col("amount") > 10).group_by("region").agg(total=col("amount").sum())
+print(out.sort("region").to_pydict())
+# {'region': ['e', 'w'], 'total': [30, 20]}
+```
+:::
+
+:::{tab-item} Polars
+```python
+# docs: skip
+out = lf.filter(pl.col("amount") > 10).group_by("region").agg(total=pl.col("amount").sum())
+```
+
+```python
+out = sales.filter(col("amount") > 10).group_by("region").agg(total=col("amount").sum())
+print(out.sort("region").to_pydict())
+# {'region': ['e', 'w'], 'total': [30, 20]}
+```
+:::
+
+:::{tab-item} PySpark
+```python
+# docs: skip
+out = df.filter(F.col("amount") > 10).groupBy("region").agg(F.sum("amount").alias("total"))
+```
+
+```python
+out = sales.filter(col("amount") > 10).group_by("region").agg(col("amount").sum().alias("total"))
+print(out.sort("region").to_pydict())
+# {'region': ['e', 'w'], 'total': [30, 20]}
+```
+:::
+
+:::{tab-item} DuckDB / SQL
+```python
+# docs: skip
+out = duckdb.sql("SELECT region, SUM(amount) AS total FROM sales WHERE amount > 10 GROUP BY region")
+```
+
+```python
+out = bt.sql("SELECT region, SUM(amount) AS total FROM sales WHERE amount > 10 GROUP BY region", sales=sales)
+print(out.sort("region").to_pydict())
+# {'region': ['e', 'w'], 'total': [30, 20]}
+```
+:::
+::::
+
+Some vocabulary changes, because Batcher keeps one spelling per operation. Type the name you know and the error names its replacement:
+
+```python
+try:
+    sales.groupby
+except AttributeError as exc:
+    print("use `.group_by`" in str(exc))
+# True
+```
 
 ## Coming from
 
-Where you start depends on where your code runs today. Code from pandas, Polars, and PySpark starts with the verb-by-verb table. DuckDB and SQL go to the SQL guide, Daft to the ML pipelines page, and Ray Data to its own port guide. Every route ends in the same place, proving the port returns the same rows:
+Pick the page to read first by where your code runs today:
 
 ![A decision tree from six source systems to the page to read first. pandas, where the shift is eager to lazy, Polars, where the LazyFrame model ports, and PySpark, where there is no SparkSession, all lead to Transforming and collecting, the verb-by-verb table. DuckDB and SQL, where the query often ports, lead to the SQL guide for bt.sql. Daft, where the shift is the UDF contract, leads to the ML pipelines page on batch inference. Ray Data, where there is no object store, leads to the Ray Data port guide. All four first pages then lead to Differences and verification, which covers what Batcher leaves out and how to prove the port returns the same rows. Name-by-name references list every public name for PySpark, Polars, Daft, and Ray Data.](/_static/diagrams/migration_chooser.svg)
-
-Each card names the one shift that matters most from that system and links to the page to read first.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -47,24 +121,21 @@ DataFrame verbs build, so you can mix the two.
 :::{grid-item-card} {octicon}`file-media;1.1em` Daft
 :link: /getting-started/migration/ml-pipelines
 :link-type: doc
-Both engines are lazy, so that model ports unchanged. The shift is the UDF contract:
-`@daft.udf` becomes `@bt.udf`, and declaring `input_columns` wrong is a correctness bug
-rather than a slow query, because an undeclared column can be pruned out from under the
-function.
+Both engines are lazy, so the model ports unchanged. The shift is the UDF contract:
+`@daft.udf` becomes `@bt.udf`, which declares the `input_columns` it reads.
 :::
 
 :::{grid-item-card} {octicon}`stack;1.1em` Ray Data
 :link: /getting-started/migration/ray-data
 :link-type: doc
-The verbs port almost directly. The shift is that bulk data never enters the Ray object
-store, so there is no object store to size and no spill storm to diagnose, and
+The verbs port almost directly. Bulk data never enters the Ray object store, and
 distribution is an argument to `collect` rather than a property of the dataset.
 :::
 ::::
 
 ## The translation tables
 
-All six source systems share these tables, because they're organized by what you're porting rather than where it came from. Each page reads in one sitting.
+These tables are organized by what you're porting, whichever system it came from.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -96,7 +167,7 @@ What Batcher deliberately does not have, and how to prove the port matches.
 
 ## Name-by-name reference
 
-For PySpark, Polars, Daft, and Ray Data, a generated reference lists every public name with its Batcher spelling, whether the two engines compute the same thing, and what is missing or different when they don't. Each row reads in both directions, and each section ends with a page that maps Batcher spellings back to the other engine. The pages are rendered from the same migration registry the `AttributeError` guidance reads, so the tables and the error messages agree.
+For PySpark, Polars, Daft, and Ray Data, a generated reference lists every public name with its Batcher spelling and status. It's rendered from the same registry the `AttributeError` guidance reads, so the tables and the error messages agree.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -126,67 +197,50 @@ For PySpark, Polars, Daft, and Ray Data, a generated reference lists every publi
 :::
 ::::
 
-## A first port, end to end
+## Verify the port
 
-Nearly every ported script has the same shape. Read lazily, chain verbs, and collect once at the end.
-
-```python
-import batcher as bt
-from batcher import col
-
-ds = bt.from_pydict({"city": ["NYC", "LA", "NYC"], "amount": [10, 20, 30]})
-out = (
-    ds.filter(col("amount") > 10)
-    .with_columns(tax=col("amount") * 0.1)
-    .group_by("city")
-    .agg(total=col("amount").sum(), n=bt.count())
-)
-print(out.sort("city").to_pydict())
-# {'city': ['LA', 'NYC'], 'total': [20, 30], 'n': [1, 1]}
-```
-
-Then check it against the original with {py:meth}`equals <batcher.Dataset.equals>`. It compares results rather than plans, and ignores row order by default:
+{py:meth}`equals <batcher.Dataset.equals>` compares results rather than plans, and ignores row order by default:
 
 ```python
-original = ds.filter(col("amount") > 10).select("city", "amount")
-ported = ds.filter(col("amount") > 10)[["city", "amount"]]
+original = sales.filter(col("amount") > 10).select("region", "amount")
+ported = sales.filter("amount > 10")[["region", "amount"]]
 print(ported.equals(original))
 # True
 ```
 
 ## Rewrite a script with the codemod
 
-`python -m batcher.migrate` rewrites a PySpark, Polars, Daft, or Ray Data script onto Batcher, and a Batcher script back onto any of the four. It reads the same migration registry these pages are built from, needs the `migrate` extra (`pip install "batcher-engine[migrate]"`), and doesn't need the compiled engine, so it runs anywhere Python does.
-
-To translate a Polars project and see the result before anything changes, run the following:
+`python -m batcher.migrate` rewrites a PySpark, Polars, Daft, or Ray Data script onto Batcher, and back. It needs the `migrate` extra (`pip install "batcher-engine[migrate]"`) but not the compiled engine. Preview a diff, then write it:
 
 ```bash
 python -m batcher.migrate src/ --from polars --to batcher
 python -m batcher.migrate src/ --from polars --to batcher --write --report migrate.json
 ```
 
-The first command prints a unified diff and leaves the files alone. The second rewrites them in place and writes every call it looked at to `migrate.json`, with a count of what it rewrote and what it left. `--check` exits with status 1 when any file would change, which is how you keep a converted tree converted in CI. The reverse direction is `--from batcher --to polars`, and exactly one side of every direction is `batcher`.
+The first command prints a diff and changes nothing. `--write` rewrites in place, `--report` records every call it looked at, and `--check` exits 1 when a file would change, which keeps a converted tree converted in CI.
 
-The codemod only rewrites what it can prove means the same thing. When a name has a different meaning in Batcher, has no Batcher equivalent yet, or sits on an object it can't identify, the call stays as written and the line before it gets a comment that says why:
+:::{dropdown} What the codemod leaves for you
+It only rewrites what it can prove means the same thing. A call with a different meaning or no equivalent stays as written, with a comment that says why:
 
 ```text
 # batcher-migrate: Polars `Expr.top_k` differs in Batcher (`Expr.top_k`): Polars top_k(k) returns the k largest values; Batcher's Expr.top_k returns the k most frequent values (to be renamed so top_k means largest)
 largest = df.select(pl.col("v").top_k(2))
 ```
 
-Where the difference is a default, it writes the default out. A Polars `sort` gains `nulls_first=True`, a Ray Data `map_batches` gains `batch_format="numpy"`, and a PySpark write gains `mode="error"`. Search the rewritten tree for `batcher-migrate:` to find everything left for you to port by hand. The foreign directions rewrite `.py` files only.
+Where the difference is a default, it writes the default out: a Polars `sort` gains `nulls_first=True`, a Ray Data `map_batches` gains `batch_format="numpy"`, and a PySpark write gains `mode="error"`. Search for `batcher-migrate:` to find everything left to port by hand.
+:::
 
 ## Porting with a coding agent
 
-Each source system has an agent skill that turns these tables into a procedure: `migrate-from-spark`, `migrate-from-polars-or-pandas`, `migrate-from-duckdb-sql`, `migrate-from-daft`, `migrate-from-ray-data`, and `migrate-from-a-sql-warehouse`. A skill carries more than the mappings. It also carries the concept shifts that silently produce wrong or slow results, and it finishes by proving the ported script returns the same rows as the original. See {doc}`/agents`.
+Each source system has an agent skill that turns these tables into a procedure ending in a verified port: `migrate-from-spark`, `migrate-from-polars-or-pandas`, `migrate-from-duckdb-sql`, `migrate-from-daft`, `migrate-from-ray-data`, and `migrate-from-a-sql-warehouse`. See {doc}`/agents`.
 
 ## Reporting a problem
 
-{py:func}`bt.show_versions() <batcher.show_versions>` prints the Batcher version, the compiled engine version, Python, the platform, and which optional backends are installed. Paste its output into the report. {py:func}`bt.versions() <batcher.versions>` returns the same information as a dict.
+Paste the output of {py:func}`bt.show_versions() <batcher.show_versions>` into the report. {py:func}`bt.versions() <batcher.versions>` returns the same information as a dict.
 
 ## See also
 
-- {doc}`/agents`: the migration skills, with the failure modes and the verification procedure.
+- {doc}`/agents`: the migration skills and the verification procedure.
 - {doc}`/user-guide/index`: the task-oriented guides for the API these pages map onto.
 - {doc}`/getting-started/concepts/lazy`: the lazy, immutable `Dataset` model in one page.
 - {doc}`/architecture/overview`: why a `Dataset` is lazy, and what runs where.

@@ -6,7 +6,7 @@ PyArrow is Batcher's substrate as much as its competitor. Batcher's data plane s
 
 ## Where a comparison exists
 
-PyArrow has no SQL surface and no query planner. It has `Table` and `compute`, so a benchmark case can be written for it only when the case is a single operator or a short chain of them. The operator mix is that kind of suite, and TPC-H, TPC-DS, ClickBench, JSON and the H2O.ai tasks are multi-table SQL that PyArrow can't express. A blank on those suites means PyArrow can't run the query, not that it lost.
+PyArrow has `Table` and `compute` but no SQL surface or query planner, so the comparison covers the operator mix only.
 
 ## The measured standing
 
@@ -28,18 +28,23 @@ String kernels show the same pattern. On the 2026-09-12 operator additions, a `L
 
 ## Why the margin is wide
 
-This isn't kernel against kernel. PyArrow executes an operator over a whole table on one thread. Batcher splits the same work into morsels of 16,384 rows or 1 MiB and runs them across every core. Where PyArrow must materialize an intermediate, such as a sort feeding a limit, Batcher's fused operators never allocate it: a top-N keeps only the running best rows. And a filtered count reads one column, because the optimizer prunes the scan to the predicate before anything decodes.
+This isn't kernel against kernel. PyArrow executes an operator over a whole table on one thread. Batcher splits the same work into morsels of 16,384 rows or 1 MiB and runs them across every core. Fused operators skip intermediates, so a top-N keeps only the running best rows, and a filtered count reads one column because the optimizer prunes the scan to the predicate.
 
-## Requirements and limitations
+Arrow data moves in and out without a copy:
 
-The following limits apply to this comparison:
+```python
+import batcher as bt
+import pyarrow as pa
 
-- **Kernel for kernel, the engines converge.** On a single vectorized pass over one column the two are the same order, and several of Batcher's kernels are Arrow's. The result is a statement about scheduling and planning, not about faster kernels.
-- **Coverage is the operator mix only.** Multi-table suites have no PyArrow column.
+table = pa.table({"k": ["a", "b", "a"], "v": [1, 2, 3]})
+out = bt.from_arrow(table).group_by("k").agg(total=bt.col("v").sum()).sort("k").to_arrow()
+print(out.to_pydict())
+# {'k': ['a', 'b'], 'total': [4, 2]}
+```
+
+Several of Batcher's kernels are Arrow's, so the margin is a statement about scheduling and planning rather than faster kernels.
 
 ## Reproduce
-
-The following command reruns the operator mix with PyArrow in the lineup:
 
 ```bash
 python benchmarks/run.py --benchmark operators --engines batcher,duckdb,pyarrow

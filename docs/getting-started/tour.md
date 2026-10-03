@@ -1,16 +1,14 @@
 # A tour of the engine
 
-This page is the breadth claim, in runnable form. Batcher says it covers SQL and DataFrames, batch and streaming, tables and media, analytics and models, one core and a cluster. Below is one small working example of each, on a single page, so you can judge the claim by running it rather than by reading about it.
-
-Every block here executes on every commit, as the whole documentation does. Where an example genuinely needs a broker, a GPU, or a cloud account, it is marked and the runnable stand-in is next to it.
+This page runs one small example of each thing Batcher does: SQL, DataFrames, streams, media, models, lakehouse tables and graphs, from one core up to a cluster. Every block runs on every commit.
 
 ```python
 import batcher as bt
 ```
 
-## Relational work, and ETL
+## Relational work and SQL
 
-The core is the part that looks like every other engine: filter, group, aggregate, write. What is different is that nothing has run yet when you finish typing it.
+Filter, group, aggregate, write. Nothing runs until you ask for a result.
 
 ```python
 orders = bt.from_pydict(
@@ -27,7 +25,7 @@ print(by_region.sort("region").to_pydict())
 # {'region': ['eu', 'us'], 'total': [120.0, 380.0]}
 ```
 
-A partitioned write with a completion marker is the other half of an ETL step:
+A partitioned write returns a manifest:
 
 ```python
 manifest = orders.write.parquet("warehouse/orders", partition_by=["region"], mode="overwrite")
@@ -37,9 +35,7 @@ print({"rows": manifest.total_rows, "files": manifest.num_files})
 
 {doc}`/user-guide/transform/index` · {doc}`/user-guide/moving-data/writing-data` · {doc}`/cookbook/data-engineering/index`
 
-## SQL over the same plan
-
-SQL is not a second engine or a compatibility layer. It builds the same `LogicalPlan` the verbs build, so you can start in one and finish in the other:
+SQL builds the same plan the verbs build. Start in one and finish in the other:
 
 ```python
 print(
@@ -69,9 +65,9 @@ print(ranked.sort("uid").to_pydict())
 
 {doc}`/user-guide/analyze/joins` · {doc}`/user-guide/analyze/window-functions`
 
-## Semi-structured data
+## Text, JSON and time
 
-JSON and nested columns are expressions, not a parsing step you bolt on the front:
+JSON and nested columns are expressions, so you never bolt a parsing step onto the front:
 
 ```python
 logs = bt.from_pydict(
@@ -86,18 +82,42 @@ print(
 # {'lvl': ['ERR', 'INFO'], 'words': [['disk', 'full'], ['ok']]}
 ```
 
+Lists explode into rows:
+
+```python
+tagged = bt.from_pydict({"k": [1, 1, 2], "tags": [["a", "b"], ["c"], []]})
+print(tagged.explode("tags").to_pydict())
+# {'k': [1, 1, 1], 'tags': ['a', 'b', 'c']}
+```
+
 {doc}`/api/accessors/nested` · {doc}`/cookbook/expressions/nested/index`
+
+Text cleanup and date parts are accessor calls too:
+
+```python
+import datetime as dt
+
+notes = bt.from_pydict({"text": ["Contact bob@x.io now", "no email here"]})
+print(notes.select(masked=bt.col("text").str.mask_emails()).to_pydict())
+# {'masked': ['Contact [EMAIL] now', 'no email here']}
+
+events = bt.from_pydict({"ts": [dt.datetime(2026, 1, 5, 9, 30), dt.datetime(2026, 3, 1, 17, 0)]})
+print(events.select(month=bt.col("ts").dt.month(), hour=bt.col("ts").dt.hour()).to_pydict())
+# {'month': [1, 3], 'hour': [9, 17]}
+```
+
+{doc}`/user-guide/transform/columns/expressions`
 
 ## Streaming
 
-Batch is the bounded case of streaming, so the operators are the same ones. The `rate` source generates rows without any external service, which is what makes this runnable:
+Batch is the bounded case of streaming, so the operators are the same. The `rate` source needs no external service:
 
 ```python
 print([batch.num_rows for batch in bt.read.rate_micro_batch(4, num_rows=8).iter_batches()])
 # [4, 4]
 ```
 
-Against Kafka the query is the same shape. The source line changes, and a JSON payload declares its fields, because the plan is typed before the first message arrives:
+Against Kafka only the source line changes:
 
 ```python
 # docs: skip
@@ -111,13 +131,11 @@ pages = clicks.select(page=bt.col("value").struct.field("page"), ms=bt.col("valu
 pages.write.delta("lake/live", trigger=bt.Trigger.processing_time("10s"), checkpoint="lake/_ck")
 ```
 
-A file or Delta sink takes appended rows only. A running aggregate goes to a memory sink with `output_mode="complete"`, or to `write.for_each_batch` for a custom upsert.
-
 {doc}`/user-guide/moving-data/streaming/index` · {doc}`/integrations/streams/kafka`
 
-## Data quality as part of the plan
+## Data quality
 
-A contract is a plan rewrite, so the check costs one pass and travels with the query:
+A contract is a plan rewrite. The check costs one pass and travels with the query:
 
 ```python
 raw = bt.from_pydict({"id": [1, 2, 3], "amount": [10.0, -1.0, 30.0]})
@@ -131,7 +149,7 @@ print(raw.dq.positive("amount").drop().to_pydict())
 
 ## Images, audio, and video
 
-Media columns are binary columns, and the accessors read them. A header question never decodes a pixel:
+Media columns are binary columns with accessors. A header question never decodes a pixel:
 
 ```python
 import base64
@@ -150,9 +168,9 @@ print(
 
 {doc}`/user-guide/transform/columns/media-accessor` · {doc}`/ml/preparing/multimodal/index`
 
-## Running a model
+## Models and vectors
 
-A fitted model meets the data where the data already is. Anything with the scikit-learn contract works, and the call takes the same scaling arguments whether it runs in one process or across a cluster:
+Anything with the scikit-learn contract runs over a dataset:
 
 ```python
 import numpy as np
@@ -168,9 +186,7 @@ print(rows.ml.predict(model, features=["f0", "f1"], output_column="label").to_py
 
 {doc}`/integrations/compute/scikit-learn` · {doc}`/ml/inference/index`
 
-## Embeddings and vector search
-
-Similarity is an expression over a list column, so retrieval is a query rather than a separate index service:
+Similarity is an expression over a list column. Retrieval is a query:
 
 ```python
 docs = bt.from_pydict(
@@ -185,7 +201,7 @@ print(near.select("doc").to_pydict())
 
 ## Lakehouse tables
 
-A Delta write is a transaction, and `merge_on` makes it a keyed upsert, which is what makes a retried job safe:
+A Delta write is a transaction, and `merge_on` makes it a keyed upsert:
 
 ```python
 bt.from_pydict({"id": [1, 2], "v": ["a", "b"]}).write.delta("lake/t", mode="append")
@@ -198,7 +214,7 @@ print(bt.read.delta("lake/t").sort("id").to_pydict())
 
 ## Geospatial and graphs
 
-Both are function libraries over ordinary columns, so a spatial predicate is a predicate and a graph algorithm is a sequence of joins:
+Both are function libraries over ordinary columns:
 
 ```python
 places = bt.from_pydict(
@@ -225,7 +241,7 @@ print([(node, round(score, 3)) for node, score in zip(*ranked.to_pydict().values
 
 ## Interop, in and out
 
-Nothing above requires committing to Batcher for a whole pipeline. It shares Arrow with the libraries already in your process, so a single step can move here and the result can go straight back:
+You don't have to move a whole pipeline. Batcher shares Arrow with the libraries already in your process, so a single step can run here and hand its result straight back:
 
 ```python
 import polars as pl
@@ -245,14 +261,14 @@ print(
 
 ## The same code, on a cluster
 
-Distribution is an argument on the terminal call, not a rewrite. The plan, the operators, and the result are the same; only the scheduling changes:
+Distribution is an argument on the terminal call, not a rewrite:
 
 ```python
 # docs: skip
 by_region.collect(distributed=True, num_workers=8)
 ```
 
-That works because every stateful operator is written once as a mergeable `partial → combine → finalize` triple, so one core, every core, and a cluster differ only in how that triple is scheduled.
+Every stateful operator is written once. One core and a whole cluster run the same code.
 
 {doc}`/user-guide/operate/running/index` · {doc}`/architecture/deep-dives/operators/mergeable-algebra`
 
@@ -265,4 +281,4 @@ That works because every stateful operator is written once as a mergeable `parti
 | A guide per capability | {doc}`/user-guide/index` |
 | A runnable recipe for your problem | {doc}`/cookbook/index` |
 | The equivalent of a call you already know | {doc}`migration/index` |
-| Whether it is actually fast | {doc}`/benchmarks/index` |
+| How fast it is | {doc}`/benchmarks/index` |

@@ -2,17 +2,58 @@
 
 This section covers batch inference: applying a model to every row of a dataset, on CPUs or GPUs, from a laptop to a Ray cluster.
 
-In Batcher a model is an operator in the plan. It sits between a scan and a sink like a filter would, it receives whole Arrow batches, and the engine decides how many copies of it run and where. You don't write a job that loads data, loops over it, and writes results. You write a pipeline, and scoring is one step of it. That changes what you get for free: the filter before the model is pushed down to the scan, the result streams instead of materializing, and the model loads once per worker and stays loaded for the rest of the session.
+In Batcher a model is an operator in the plan. It sits between a scan and a sink like a filter would, receives whole Arrow batches, and runs as many copies as the engine decides. The filter in front of it is pushed down to the scan. The result streams. The model loads once per worker.
 
 ## Pick an entry point
 
-Four calls on the `.ml` accessor cover almost every inference job. Each returns a new lazy {py:class}`Dataset <batcher.Dataset>`, so nothing runs until you collect or write.
+Four calls cover almost every inference job. Each returns a new lazy {py:class}`Dataset <batcher.Dataset>`. Nothing runs until you collect or write.
 
-{py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` is the general one. Pass a class whose constructor loads the model and whose `__call__` scores a batch, or pass a Hugging Face `transformers` model id with the `column` to score. {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` is the same call shaped for encoders, and takes a sentence-transformers model id.
+{py:meth}`ds.ml.infer <batcher.api.dataset.ml.DatasetML.infer>` is the general one. Pass a class whose constructor loads the model and whose `__call__` scores a batch:
 
-{py:meth}`ds.ml.predict <batcher.api.dataset.ml.DatasetML.predict>` scores a fitted tabular model: XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX. It detects the framework, assembles each batch's features into one dense matrix, and checks the feature order against the names the model recorded, because a reordered feature list changes every prediction without raising anywhere.
+```python
+import batcher as bt
+import pyarrow as pa
+import pyarrow.compute as pc
 
-{py:meth}`ds.ml.map_batches <batcher.api.dataset.ml.DatasetML.map_batches>` is the primitive underneath both. Reach for it when the step isn't a model at all, or when you need `batch_format="numpy"`, `"pandas"` or `"torch"`.
+
+class Upper:
+    def __init__(self):
+        pass  # load weights here, once per worker
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        return batch.append_column("loud", pc.utf8_upper(batch.column("text")))
+
+
+reviews = bt.from_pydict({"text": ["hi", "yo"]})
+print(reviews.ml.infer(Upper, output_columns=["text", "loud"]).to_pydict())
+# {'text': ['hi', 'yo'], 'loud': ['HI', 'YO']}
+```
+
+`infer` also takes a Hugging Face `transformers` model id with the `column` to score, and {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` is the same call shaped for sentence-transformers encoders.
+
+{py:meth}`ds.ml.predict <batcher.api.dataset.ml.DatasetML.predict>` scores a fitted tabular model from XGBoost, LightGBM, CatBoost, scikit-learn, or ONNX, and checks the feature order against the names the model recorded. Batcher's own estimators skip that step and predict directly:
+
+```python
+from batcher.ml.linear import LogisticRegression
+
+train = bt.from_pydict({"x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0], "y": [0, 0, 1, 0, 1, 1]})
+model = LogisticRegression(["x"], "y").fit(train)
+print(model.predict(train).to_pydict()["prediction"])
+# [0, 0, 0, 1, 1, 1]
+```
+
+{py:meth}`ds.map_batches <batcher.Dataset.map_batches>` is the primitive underneath. Reach for it when the step isn't a model, or when you want `batch_format="numpy"`, `"pandas"` or `"torch"`:
+
+```python
+def double(df):
+    df["x2"] = df["x"] * 2
+    return df
+
+
+ds = bt.from_pydict({"id": [1, 2], "x": [0.5, 1.0]})
+print(ds.map_batches(double, batch_format="pandas").to_pydict())
+# {'id': [1, 2], 'x': [0.5, 1.0], 'x2': [1.0, 2.0]}
+```
 
 For a model that left its training framework, {py:func}`bt.ml.onnx_predictor <batcher.ml.onnx_predictor>`, {py:func}`bt.ml.torch_predictor <batcher.ml.torch_predictor>` and {py:func}`bt.ml.openvino_predictor <batcher.ml.openvino_predictor>` build the load-once class for you.
 
@@ -56,13 +97,16 @@ class Classifier:
 )
 ```
 
-Replace `<your-bucket>` with a bucket you can read and write. Four arguments do most of the work. `batch_size` is the model's batch size, not the file's. `num_gpus` reserves devices per actor, and a fraction such as `0.5` packs two actors onto one GPU. `concurrency=(1, 8)` lets the pool scale between one and eight actors with the backlog. `max_errored_rows` bisects a batch that raises and drops the bad rows, so one corrupt input in ten million costs a row rather than the run.
+Replace `<your-bucket>` with a bucket you can read and write. Four arguments do most of the work:
+
+- `batch_size` is the model's batch size, not the file's.
+- `num_gpus` reserves devices per actor. A fraction such as `0.5` packs two actors onto one GPU.
+- `concurrency=(1, 8)` scales the pool between one and eight actors with the backlog.
+- `max_errored_rows` bisects a batch that raises and drops the bad rows, so one corrupt input costs a row rather than the run.
 
 ## Why it stays fast
 
-Batcher keeps the device busy with scheduling rather than per-workload tuning. A pipeline that decodes on CPUs and scores on GPUs splits into separate actor pools that overlap, so the next batch is being prepared while the current one is on the device. Actor pools stay warm across `collect()` calls in a session, which matters when a checkpoint takes longer to load than the scoring takes to run.
-
-On an 8xT4 Ray cluster, a two-stage JPEG-decode-into-ResNet-50 pipeline sustained 2,504 img/s at 81% GPU utilization, and EfficientNet-B0 packed two to a GPU sustained 6,764 img/s at 89%. Against Ray Data on a compute-bound pipeline, warm pools finished a 125,000-row job in 1.2 s against 10.5 s. The gap narrows as jobs grow, and at 4M rows Ray Data is ahead. {doc}`/benchmarks/results/ai-and-gpu` has the full measurements.
+A pipeline that decodes on CPUs and scores on GPUs splits into separate actor pools that overlap, so the next batch is prepared while the current one is on the device. Pools also stay warm across `collect()` calls. That matters when a checkpoint loads slower than the scoring runs. On an 8xT4 Ray cluster, EfficientNet-B0 packed two to a GPU sustained 6,764 img/s at 89% utilization. {doc}`/benchmarks/results/ai-and-gpu` has the full results.
 
 ## In this section
 
@@ -80,6 +124,8 @@ The following table lists the pages in this section, in the order a first scorin
 | {doc}`/ml/inference/streaming` | Which plans stream batch by batch into a training loop in bounded memory. The ordering and resume contract lives in {doc}`/ml/training/distributed-training`. |
 
 ## See also
+
+These pages pick up where this one stops:
 
 - {doc}`/getting-started/tutorials/ml/batch-inference`: build a scoring pipeline step by step on a laptop.
 - {doc}`/ml/retrieval/llm/index`: running language models, which have their own engines and batching.

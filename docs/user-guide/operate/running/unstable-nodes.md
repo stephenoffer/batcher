@@ -3,51 +3,34 @@
 This page describes how Batcher keeps a job alive on a GPU cluster whose nodes and devices
 fail underneath it, and what to configure when the defaults don't suit your fleet.
 
-At fleet scale a node rarely fails by disappearing. It fails by staying up and being wrong: a
-GPU that reports uncorrectable memory errors and keeps accepting work, a filesystem remounted
-read-only under the spill directory, a driver that no longer matches its CUDA runtime, a
-container image that half-deployed. In every one of those cases the scheduler still sees a
-healthy node with a free slot, so it keeps placing work there. One bad machine then walks the
-whole queue onto itself. You don't see a broken node. You see a job that never finishes.
+At fleet scale a node rarely fails by disappearing. It stays up and is wrong: a GPU reporting uncorrectable memory errors, a spill directory remounted read-only, a driver that no longer matches its CUDA runtime. The scheduler still sees a healthy node with a free slot, so one bad machine can walk the whole queue onto itself.
 
 ## What Batcher already does
 
-Four mechanisms run by default and need no configuration.
+Four mechanisms run by default:
 
-Batcher reads the driver's own error log. An Xid error is the only report of a double-bit ECC
-fault, a GPU that has fallen off the bus, or a device whose micro-controller has halted. NVML
-has no counter for any of them and `nvidia-smi` shows none of them. A device with a recent
-fatal Xid stops being scheduled, and the log line names the repair the device needs rather
-than only the fault it reported.
+- **Driver errors.** Batcher reads the driver's Xid log, the only report of a double-bit ECC fault or a GPU that fell off the bus. A device with a recent fatal Xid stops being scheduled, and the log line names the repair it needs.
+- **Kernel faults.** Batcher reads the kernel log for faults that aren't about the GPU, such as a worker killed by the out-of-memory killer.
+- **Outcomes.** A node that failed its last several tasks stops being scheduled whatever its telemetry says, and returns once it proves itself on real work.
+- **Retry budget.** A bounded share of a job may be spent retrying, so a broken fleet fails fast with the first real error.
 
-Batcher reads the kernel log for the faults that are not about the GPU at all. A worker killed
-by the kernel's out-of-memory killer never raises, never unwinds, and never logs, so from the
-orchestrator's side it is indistinguishable from a preemption or a network partition. The
-kernel wrote down exactly what happened, in the one place nothing else reads.
+The defaults are visible on the config:
 
-Batcher learns from outcomes, not only from readings. A node that has failed the last several
-tasks placed on it stops being scheduled whatever its telemetry says, and starts being
-scheduled again once it proves itself on real work.
+```python
+from batcher import Config
 
-Batcher bounds how much of a job may be spent retrying, so a systematically broken fleet fails
-quickly with the first real error instead of slowly with the last one.
+ft = Config().fault_tolerance
+print(ft.quarantine.failure_threshold, ft.quarantine.half_life_s, ft.fail_on_untrusted_results)
+# 3.0 300.0 True
+```
 
-## Evidence expires
-
-Every fault signal here is windowed, and that is deliberate. The kernel ring buffer holds a
-node's history, not its present, so a fatal Xid from before the last device reset is still
-sitting in it. A quarantine keyed on "the buffer contains a fatal code" never releases a
-device that has since been repaired, and a fleet then shrinks over its lifetime with nothing
-in any log to explain it.
-
-The same applies to the outcome ledger. Recorded failures decay over a half-life, a quarantine
-expires into probation rather than into a permanent verdict. Only a success clears one.
+:::{dropdown} Why every fault signal expires
+The kernel ring buffer holds a node's history, not its present, so a fatal Xid from before the last device reset is still in it. A quarantine keyed on "the buffer contains a fatal code" would never release a repaired device, and the fleet would shrink with nothing in any log to explain it. So every signal is windowed: recorded failures decay over a half-life, and a quarantine expires into probation. Only a success clears one.
+:::
 
 ## Check the fleet before you trust it
 
-{py:func}`bt.accelerator_problems() <batcher.accelerator_problems>` returns everything wrong with this node and its cluster as a list
-of complete sentences, so a failing deployment check can be pasted into an alert without a
-lookup table.
+{py:func}`bt.accelerator_problems() <batcher.accelerator_problems>` returns everything wrong with this node and its cluster as complete sentences, ready to paste into an alert. On a healthy node it returns an empty list:
 
 ```python
 import batcher as bt
@@ -56,38 +39,23 @@ for problem in bt.accelerator_problems():
     print(problem)
 ```
 
-On a healthy node it prints nothing. On a fleet with something wrong it names the device or
-the node, the condition, and what it costs, including the node-level faults that no GPU probe
-can see and the repair each condemned device needs.
+An empty list can also mean nothing could be read, such as in a container without the host kernel log or on a node without `pynvml`. {py:func}`bt.accelerators() <batcher.accelerators>` tells the two apart by listing what was detected:
 
-An empty list is not the same as a healthy fleet. Inside a container without the host kernel
-log, and on a node without `pynvml`, nothing can be read and nothing is reported. Use
-{py:func}`bt.accelerators() <batcher.accelerators>` when you need to tell "nothing is wrong" from "nothing could be checked".
+```python
+inventory = bt.accelerators()
+print(sorted(inventory)[:3])
+# ['backend', 'devices', 'power']
+```
 
 ## Set the collective timeout
 
-If your pipeline runs a multi-GPU collective, this is the highest-impact stability setting
-on the cluster. It is also one environment variable.
+A multi-GPU collective's default failure mode is to wait forever. When one rank dies, the others sit holding their GPUs, and no recovery mechanism runs because nothing has reported a failure.
 
-A collective's default failure mode is to wait forever. When one rank dies or one device
-faults, the surviving ranks do not raise. They sit in the collective holding their GPUs until
-something outside kills them. From the orchestrator's side nothing has failed at all: the task
-is running, the actor is alive, and no progress is being made. Every recovery mechanism on
-this page is downstream of a failure being reported, so none of them ever runs.
-
-Batcher sets `TORCH_NCCL_ASYNC_ERROR_HANDLING` and its older spelling on the GPU tasks it
-launches, which turns that hang into an ordinary task failure. It never overwrites a value you
-set yourself. If you launch your own workers, set it there too.
+Batcher sets `TORCH_NCCL_ASYNC_ERROR_HANDLING` and its older spelling on the GPU tasks it launches, which turns that hang into an ordinary task failure. It never overwrites a value you set. If you launch your own workers, set it there too.
 
 ## Tune the quarantine
 
-The defaults suit a fleet where a node failing three tasks in five minutes is unusual. Two
-situations call for a change.
-
-A fleet with a high background failure rate, such as a large spot cluster, wants a shorter
-half-life so a node is not held against its own past. A fleet where a failure is expensive,
-such as one running hours-long inference stages, wants a lower threshold so a bad node is
-taken out after fewer losses.
+The defaults suit a fleet where a node failing three tasks in five minutes is unusual. A large spot cluster wants a shorter half-life, so a node isn't held against its past. A fleet running hours-long stages wants a lower threshold, so a bad node is taken out after fewer losses.
 
 ```python
 import dataclasses
@@ -106,22 +74,11 @@ set_config(
 )
 ```
 
-Do not raise `max_blocked_fraction` to solve a fleet that keeps failing. When every node
-fails every task the cause is almost never the fleet. It is a credential, an image, or a
-model file, and condemning more nodes replaces an error message with an outage.
+Don't raise `max_blocked_fraction` to fix a fleet that keeps failing. When every node fails every task, the cause is a credential, an image, or a model file, not the fleet.
 
 ## When a device corrupts rather than loses
 
-Almost every failure loses work, and a retry exists to redo lost work. A double-bit ECC
-error and an uncontained ECC fault do something else: the device kept running and returned a
-number, and the number is wrong. The tasks that already succeeded on that device are as
-suspect as the one that failed.
-
-Batcher refuses to retry past those, and fails the run with a message saying so. That is on by
-default and it is not a performance trade: a job that retries past a corrupting fault finishes
-successfully and writes the corruption out, which is worse than the crash it avoided. Turn it
-off with `fault_tolerance.fail_on_untrusted_results` only where something downstream verifies
-the results independently.
+A double-bit or uncontained ECC fault doesn't lose work. The device kept running and returned a wrong number, so every task that already succeeded on it is suspect. Batcher refuses to retry past such a fault and fails the run with a message saying so, because a retry would finish successfully and write the corruption out. Turn this off with `fault_tolerance.fail_on_untrusted_results` only where something downstream verifies the results.
 
 Corruption is one of three verdicts Batcher reaches before it decides whether to retry at all, as the figure shows:
 
@@ -129,14 +86,10 @@ Corruption is one of three verdicts Batcher reaches before it decides whether to
 
 ## Requirements and limitations
 
-The Xid and node-fault readers need a readable `/dev/kmsg`, which means `CAP_SYSLOG` or a
-container that shares the host's kernel log. Device health needs `pynvml` on each worker,
-from `pip install 'batcher-engine[nvml]'`, or the AMD equivalent. Where a source cannot be
-read, Batcher reports nothing rather than assuming the worst, so a fleet never drains because
-a base image changed.
-
-Quarantine is keyed on the worker's placement within a fleet, so it is remembered across the
-stages of one job and not across separate jobs.
+- The Xid and node-fault readers need a readable `/dev/kmsg`: `CAP_SYSLOG`, or a container sharing the host's kernel log.
+- Device health needs `pynvml` on each worker (`pip install 'batcher-engine[nvml]'`), or the AMD equivalent.
+- An unreadable source reports nothing rather than assuming the worst, so a fleet never drains because a base image changed.
+- Quarantine is remembered across the stages of one job, not across separate jobs.
 
 ## See also
 

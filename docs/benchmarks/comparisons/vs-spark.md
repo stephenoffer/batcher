@@ -12,17 +12,20 @@ On one machine Batcher is far ahead. The following results are recorded in [`ben
 | Streaming drain of a Parquet backlog, 4M rows and 1,000 keys | **211.1 ms against 666.6 ms** for Spark Structured Streaming, 3.2x | 2026-08-18 |
 | Operator mix, sf1 | Batcher faster on **11 of 11** operators | 2026-07-25 |
 
-The operator sweep predates the Spark configuration fixes below, which the record notes changed no winner. The TPC-H figure was taken after three handicaps on Spark's side were removed: a pandas round trip on every result, 8 shuffle partitions on a 96-core box, and a Parquet re-read on every query where the other engines queried loaded tables. Spark now reads with `DataFrame.toArrow()`, uses one shuffle partition per core, and caches its tables before the clock starts. It is still 20x to 50x behind, because local-mode Spark carries about 90 ms of fixed cost per query that nothing amortizes on 6M rows.
-
-Read these as single-node results. Spark's per-stage machinery is priced for a cluster, so a single-node board measures Spark where it is weakest. {doc}`/benchmarks/results/scaling` has Batcher's distributed measurements, taken against Daft's Ray runner.
+Spark reads results with `DataFrame.toArrow()`, uses one shuffle partition per core, and caches its tables before the clock starts. These are single-node results. {doc}`/benchmarks/results/scaling` has Batcher's distributed measurements.
 
 ## Where each engine re-plans
 
-Spark's Adaptive Query Execution re-plans between stages. When a shuffle finishes, AQE reads the materialized shuffle statistics and can coalesce partitions, switch a sort-merge join to a broadcast join, or split a skewed partition. It is why Spark survives estimates that would sink a purely static optimizer.
+Spark's Adaptive Query Execution re-plans between stages on materialized shuffle statistics. Batcher re-plans the same way, at stage boundaries on measured cardinalities, with the same granularity as AQE. When an estimate is off by more than `optimizer.reoptimize_error` (2x by default), the rest of the query is re-planned on the measured numbers, and the result is identical either way.
 
-Batcher re-plans the same way, at stage boundaries on measured cardinalities, with the same granularity as AQE. When an estimate is off by more than `optimizer.reoptimize_error` (2x by default), the rest of the query is re-planned on the measured numbers, and the result is identical either way. Two things differ. AQE is on by default since Spark 3.2 and re-plans at shuffle-exchange query stages in local mode (`local[*]`) too, so both run on one machine. Batcher's loop runs inside the Python process rather than in a JVM beside it. And what it measures outlives the query: Core records actual cardinalities, operator times and peak memory into the metadata hub, sketches and calibrated costs feed Kyber on the next run, so a recurring query gets a better plan each time it executes.
+Two things differ. Batcher's loop runs inside the Python process rather than in a JVM beside it. And what it measures outlives the query: actual cardinalities, operator times and peak memory feed the optimizer on the next run, so a recurring query gets a better plan each time it executes. Single-node, the within-query loop engages on a joined query once the input clears 5M rows, or about 320 MB, per pipeline breaker it would cut at.
 
-The within-query loop isn't always on. Single-node, it engages on a query with a join once the input clears 5M rows, or about 320 MB, for each pipeline breaker it would cut at, so the simplest joined shape qualifies at about 10M rows.
+```python
+import batcher as bt
+
+print(bt.active_config().optimizer.reoptimize_error)
+# 2.0
+```
 
 ## Where the two engines differ
 
@@ -42,20 +45,27 @@ The distributed row carries the most weight. Batcher's stateful operators are bu
 
 ## Migrating
 
-The API is deliberately close to Spark's. {py:class}`Session <batcher.Session>`, SQL, `write` modes, triggers, watermarks and output modes all mirror the Spark spelling, and {doc}`/getting-started/migration/index` maps them verb by verb.
+The API is deliberately close to Spark's. {py:class}`Session <batcher.Session>`, SQL, `write` modes, triggers, watermarks and output modes all mirror the Spark spelling, and {doc}`/getting-started/migration/index` maps them verb by verb:
 
-## Requirements and limitations
+```python
+import batcher as bt
 
-The single-node board doesn't show what Spark does best. The following gaps are where Spark leads:
+session = bt.Session()
+session.register("sales", bt.from_pydict({"region": ["eu", "us", "eu"], "amount": [10, 20, 5]}))
+print(session.sql("SELECT region, SUM(amount) AS total FROM sales GROUP BY region ORDER BY region").to_pydict())
+# {'region': ['eu', 'us'], 'total': [15, 20]}
+```
 
-- **Shuffle survivability.** Batcher's shuffle can spill to disk, but the spill directory is worker-local, so a bucket outlives its worker only if a replica does. Spark's external shuffle service keeps shuffle output after the executor that wrote it is gone.
-- **Streaming guarantees.** Batcher's streaming is micro-batch. It can't express what a continuous-operator engine expresses, which is a limitation against Flink first and Spark Structured Streaming second.
-- **Lakehouse formats.** Batcher reaches Iceberg and Delta through `pyiceberg` and `delta-rs` rather than through its own table-format implementation, so format support tracks those libraries.
-- **Cluster scale.** No recorded benchmark sets Batcher against a tuned Spark cluster. Don't read this page as a claim about petabyte-scale Spark.
+:::{dropdown} Practical differences
+- Batcher's shuffle spill directory is worker-local, so a bucket outlives its worker only through a replica. Spark has an external shuffle service.
+- Batcher's streaming is micro-batch.
+- Iceberg and Delta are reached through `pyiceberg` and `delta-rs`, so format support tracks those libraries.
+- These measurements are single node. No recorded benchmark sets Batcher against a tuned Spark cluster.
+:::
 
 ## Reproduce
 
-The following commands rerun the Spark measurements. Spark needs a JVM as well as the `pyspark` wheel, and without one its adapter reports unavailable and the lineup drops it:
+Spark needs a JVM as well as the `pyspark` wheel.
 
 ```bash
 python benchmarks/run.py --benchmark tpch --engines batcher,spark

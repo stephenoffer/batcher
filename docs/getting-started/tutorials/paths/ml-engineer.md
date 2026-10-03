@@ -1,6 +1,6 @@
 # ML engineer learning path
 
-This path covers running models over large data: batch inference, embeddings, and GPUs, all through the `.ml` accessor. Your function sees a whole Arrow batch rather than a row, so the data path stays vectorized. A class-based model loads once per worker and is reused for every batch that worker sees, which keeps an expensive load out of the per-batch cost.
+Run models over large data: batch inference, embeddings, and GPUs. Your function sees a whole Arrow batch, never a row, and a class-based model loads once per worker.
 
 ## Reading order
 
@@ -37,9 +37,43 @@ print(ds.map_batches(score).to_pydict())
 # {'id': [1, 2, 3, 4], 'feature': [0.5, 1.5, 2.5, 3.5], 'score': [1.0, 3.0, 5.0, 7.0]}
 ```
 
+Prefer NumPy? Ask for `batch_format="numpy"` and return a dict of arrays:
+
+```python
+doubled = ds.map_batches(
+    lambda b: {"id": b["id"], "z": b["feature"] * 2}, batch_format="numpy"
+)
+print(doubled.to_pydict())
+# {'id': [1, 2, 3, 4], 'z': [1.0, 3.0, 5.0, 7.0]}
+```
+
+## Example: stream batches into a training loop
+
+`iter_batches` yields Arrow batches without materializing the whole dataset:
+
+```python
+print([batch.num_rows for batch in ds.iter_batches(batch_size=2)])
+# [2, 2]
+```
+
 ## Example: load a model once per worker
 
-Pass a class instead of a function and Batcher constructs it once per worker, then calls it on every batch that worker sees. You pay for the model load once, not per batch. GPUs and concurrency are declared on the call itself. This example needs a real model, so it's shown rather than run. Replace `load_model()` with your own loader.
+Pass a class instead of a function and Batcher constructs it once per worker, then calls it on every batch:
+
+```python
+class Scale:
+    def __init__(self) -> None:
+        self.weight = 10.0  # stands in for an expensive model load
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        return batch.append_column("y", pc.multiply(batch.column("feature"), self.weight))
+
+
+print(ds.map_batches(Scale).to_pydict())
+# {'id': [1, 2, 3, 4], 'feature': [0.5, 1.5, 2.5, 3.5], 'y': [5.0, 15.0, 25.0, 35.0]}
+```
+
+With a real model, declare GPUs and concurrency on the call. Replace `load_model()` with your own loader:
 
 ```python
 # docs: skip
@@ -78,9 +112,7 @@ tables, and the {doc}`GPU guide </ml/inference/gpu>` for accelerator placement.
 
 ## Recipes and deeper reading
 
-The {doc}`ML cookbook </cookbook/ml/pipelines/index>` covers the applied path: embeddings, batch
-scoring, RAG indexes, feature pipelines, and the train/test leak you get for free from a
-naive random split.
+The {doc}`ML cookbook </cookbook/ml/pipelines/index>` covers the applied path: embeddings, batch scoring, RAG indexes, feature pipelines, and leak-free splits.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -94,19 +126,19 @@ Encode a corpus, then retrieve from it.
 :::{grid-item-card} {octicon}`beaker;1.1em` LLM batch scoring
 :link: /cookbook/ml/pipelines/text/llm-batch-scoring
 :link-type: doc
-Structured output, and why the engine you pick barely matters.
+Structured output from an LLM over a whole table.
 :::
 
 :::{grid-item-card} {octicon}`graph;1.1em` Train/test split
 :link: /cookbook/ml/pipelines/features/train-test-split
 :link-type: doc
-The leak a naive random split hands you.
+Split by entity so nothing leaks.
 :::
 
 :::{grid-item-card} {octicon}`zap;1.1em` GPU execution
 :link: /architecture/deep-dives/distribution/gpu-execution
 :link-type: doc
-Why the device idles, and what stage-overlap does about it.
+Keep the device busy with stage overlap.
 :::
 ::::
 

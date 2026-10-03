@@ -12,20 +12,9 @@ import batcher as bt
 
 ## Reading from object storage in parallel
 
-A distributed scan against S3, GCS, or Azure is bound by request *latency*, not by
-bandwidth. A single connection sits far below what one node can pull, and every request
-waits tens of milliseconds, so what caps throughput is how many reads are outstanding at
-once. Each scan task therefore keeps a bounded window of reads in flight rather than
-fetching its files one after another, and yields the results in file order, so nothing
-downstream can tell the reads overlapped.
+A distributed scan against S3, GCS, or Azure is bound by request *latency*, not bandwidth. Each scan task keeps up to `BATCHER_SCAN_PREFETCH` reads (32 by default) in flight and yields results in file order, so the overlap is invisible downstream and a task never holds its whole partition in memory.
 
-The window is bounded rather than unlimited because the reads in flight are also the
-task's memory: at most `BATCHER_SCAN_PREFETCH` reads (32 by default) are outstanding, so a
-task holds a few files' worth of decoded batches and never its whole partition.
-
-This matters most when a task's splits land on many different files, which is the shape the
-balanced split assignment normally produces. The layout you write is what decides that
-shape, and you control it directly:
+The file layout you write decides how many files a task touches:
 
 ```python
 import tempfile
@@ -40,24 +29,18 @@ print(back.count(), back.agg(total=bt.col("amount").sum()).to_pydict())
 # 2000 {'total': [1999000.0]}
 ```
 
-Very small files are the case to avoid: each one costs a request whose latency the window
-can hide but not remove, and the per-file footer read is pure overhead. Aim for splits of
-tens of megabytes rather than tens of kilobytes, and prefer fewer, larger files when you
-control the writer.
+Avoid very small files. Each costs a request whose latency the window can hide but not remove. Aim for splits of tens of megabytes, not tens of kilobytes.
 
-The planner caches too, and on the driver rather than the workers. Reading a Parquet
-dataset's footers to learn its row count, byte size and per-column bounds is what lets a
-`count()` or a `max()` answer without touching a data page, and it costs real time on a wide
-dataset: on a 100-file TPC-H `lineitem` read that aggregation is 237 ms the first time. It is
-held against each file's identity, which is its path, size and modification time, so a second
-query over the same files reuses it in well under a millisecond, while a file rewritten
-underneath you misses and is read again. A file the filesystem cannot stat is never cached,
-because there would be no way to notice it changing.
+The planner caches Parquet footers on the driver, which is what lets a `count()` or `max()` answer without touching a data page:
 
-A file's schema is held the same way. Reading it means opening the file, and a strict read
-opens two of them: the first file, whose schema stands for the rest, and the last, checked so
-a column a later file added can't be dropped without warning. Both are kept against file
-identity, so building a second `Dataset` over the same files opens nothing.
+```python
+print(back.count(), back.agg(top=bt.col("amount").max()).to_pydict())
+# 2000 {'top': [1999.0]}
+```
+
+:::{dropdown} How the planner cache stays correct
+Footers and schemas are held against each file's identity: its path, size and modification time. A second query over the same files reuses them in well under a millisecond, while a file rewritten underneath you misses and is read again. A file the filesystem can't stat is never cached. A strict schema read opens the first and last file, so a column a later file added can't be dropped without warning, and a second `Dataset` over the same files opens nothing.
+:::
 
 A worker also keeps the batches it decoded, so a repeated query against the same files
 skips both the fetch and the decode. That cache is per worker process and bounded by

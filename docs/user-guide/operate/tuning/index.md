@@ -2,7 +2,31 @@
 
 These pages cover the levers that change how long a correct query takes, and the tools that tell you which lever to pull.
 
-Most queries need none of them. Batcher already pushes filters and columns into the scan, sizes its shuffle from the data volume, spills to disk instead of running out of memory, and remembers what each query measured so its next plan starts from facts rather than guesses. A top-N that ran once starts from the cut it learned, so its second run skips the row groups that cannot hold a winner and decodes the other columns only for the rows that survive. The pages below are for the query that still isn't fast enough, and for the shapes where knowing the engine pays off.
+Most queries need none of them. Batcher already pushes filters and columns into the scan, sizes its shuffle from the data volume, spills to disk instead of running out of memory, and remembers what each query measured so its next plan starts from facts.
+
+```python
+import batcher as bt
+
+orders = bt.from_pydict({"region": ["eu", "us", "eu"], "amount": [10, 20, 30]})
+run = orders.group_by("region").agg(total=bt.col("amount").sum()).stats()
+print(run.rows_out, run.spilled, run.bottleneck.kind)
+# 2 False aggregate
+```
+
+The common levers are one line each: cache a subtree several consumers share, or cap the memory a query may use so it spills instead of failing.
+
+```python
+from batcher.config import MemoryConfig, active_config, config_context
+
+paid = orders.filter(bt.col("amount") > 5).cache()
+print(paid.count(), paid.agg(total=bt.col("amount").sum()).to_pydict())
+# 3 {'total': [60]}
+
+capped = active_config().replace(memory=MemoryConfig(max_memory_bytes=256 * 1024 * 1024))
+with config_context(capped):
+    print(orders.sort("amount", descending=True).to_pydict())
+# {'region': ['eu', 'us', 'eu'], 'amount': [30, 20, 10]}
+```
 
 ## Where to start
 
@@ -22,7 +46,7 @@ Read the plan before you tune anything. The operator you would have guessed at i
 
 ## What stays the same while you tune
 
-Every lever in this section changes *how* a query runs, never *what* it returns. Caching, morsel size, spilling, bucket counts, the fast path, and the GPU backend are all result-invariant, and the runnable examples for spilling and caching print the comparison that proves it. That's what makes it safe to turn a knob and measure: if the numbers move, the plan moved, not the answer.
+Every lever in this section changes *how* a query runs, never *what* it returns. Caching, morsel size, spilling, bucket counts, and the GPU backend are all result-invariant, so it's safe to turn a knob and measure.
 
 ## See also
 

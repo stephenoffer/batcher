@@ -2,9 +2,30 @@
 
 This section covers the verbs that decide which rows survive and in what order: selecting and deriving, filtering, sorting, deduplicating, and sampling. They change the shape of the table rather than the contents of a column, which {doc}`/user-guide/transform/columns/index` covers.
 
-Each of these verbs comes with a contract you can test against, not just a behavior that usually holds. A sort states where nulls and NaN land in both directions. A keyed dedup says which row survives and why. A sample is a function of the data and the seed, so it returns the same rows on one core, sixteen, or a cluster. And every verb builds on the same lazy plan, so a filter written after a join still reaches the scan, and a `top_k` replaces a full sort with a bounded heap.
+Each verb comes with a contract you can test against. A sort states where nulls land, a keyed dedup says which row survives, and a seeded sample returns the same rows on one core or a cluster.
 
-Order the verbs by what they cut. A sort has to see every row before it can emit one, so every row a predicate removed earlier is a row the sort never orders, and a `distinct` or a `limit` in between cuts more of them still. Filter first and sort last.
+```python
+import batcher as bt
+
+ev = bt.from_pydict({"user": ["a", "b", "a", "c", "b", "a"], "score": [3.0, None, 7.0, 5.0, 9.0, 7.0]})
+print(ev.filter(bt.col("score") > 4).to_pydict())
+# {'user': ['a', 'c', 'b', 'a'], 'score': [7.0, 5.0, 9.0, 7.0]}
+print(ev.sort("score", descending=True).to_pydict())
+# {'user': ['b', 'a', 'a', 'c', 'a', 'b'], 'score': [9.0, 7.0, 7.0, 5.0, 3.0, None]}
+```
+
+Dedup, top-k, and seeded sampling are one call each:
+
+```python
+print(ev.distinct().sort("user", "score").to_pydict())
+# {'user': ['a', 'a', 'b', 'b', 'c'], 'score': [3.0, 7.0, 9.0, None, 5.0]}
+print(ev.top_k(2, by="score").to_pydict())
+# {'user': ['b', 'a'], 'score': [9.0, 7.0]}
+print(ev.sample(n=3, seed=7).sort("score").to_pydict())
+# {'user': ['c', 'b', 'b'], 'score': [5.0, 9.0, None]}
+```
+
+Filter first and sort last. A sort has to see every row before it emits one, so every row a predicate removes earlier is a row the sort never orders. `top_k` goes further and replaces a full sort with a bounded heap.
 
 ::::{grid} 1 2 2 3
 :gutter: 3

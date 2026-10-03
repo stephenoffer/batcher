@@ -1,18 +1,35 @@
 # Synthetic data generation
 
-Build test datasets in memory with plain Python and {py:obj}`bt.from_pydict <batcher.from_pydict>`. It's the simplest way to produce inputs for trying out a pipeline at a chosen size and shape. Everything here runs as written. `pip install batcher-engine` covers all of it except the numpy section, which also wants `numpy`.
+Build test datasets in memory with {py:func}`bt.range <batcher.range>`, {py:obj}`bt.from_pydict <batcher.from_pydict>`, and plain Python, at whatever size and shape a pipeline needs. Everything here runs on `pip install batcher-engine`, plus `numpy` for the numpy section.
 
 :::{tip}
-Seed the generator. `random.seed(0)` or `np.random.default_rng(0)` is the difference between a test that fails reproducibly and a test that fails on Tuesdays. Every example below is seeded for that reason.
+Seed every generator (`random.seed(0)`, `np.random.default_rng(0)`) so a failing test fails the same way every time.
 :::
 
-## A small fixed dataset
+## Generate in the engine
 
-{py:obj}`bt.from_pydict <batcher.from_pydict>` takes a column-oriented dict, so generate each column as a list.
+{py:func}`bt.range <batcher.range>` builds an integer column in the engine, and expressions derive the rest, with no Python lists at all:
 
 ```python
 import batcher as bt
 
+gen = bt.range(6).with_columns(bucket=bt.col("value") % 3, amount=bt.col("value") * 1.5)
+print(gen.to_pydict())
+# {'value': [0, 1, 2, 3, 4, 5], 'bucket': [0, 1, 2, 0, 1, 2], 'amount': [0.0, 1.5, 3.0, 4.5, 6.0, 7.5]}
+```
+
+It takes `start`, `stop`, `step`, and a column `name`:
+
+```python
+print(bt.range(0, 10, 3, name="id").to_pydict())
+# {'id': [0, 3, 6, 9]}
+```
+
+## A small fixed dataset
+
+{py:obj}`bt.from_pydict <batcher.from_pydict>` takes a column-oriented dict:
+
+```python
 ds = bt.from_pydict(
     {
         "id": list(range(1, 6)),
@@ -26,7 +43,7 @@ print(ds.to_pydict())
 
 ## Random columns
 
-Use the standard library `random` module to build columns of arbitrary size. Seed it.
+The standard library `random` module builds columns of any size:
 
 ```python
 import random
@@ -46,7 +63,7 @@ print(events.count())
 # 1000
 ```
 
-Run a real query against the generated data to confirm it is well formed:
+Query it like any other dataset:
 
 ```python
 by_region = events.group_by("region").agg(total=bt.col("amount").sum(), n=bt.count()).sort("region")
@@ -56,7 +73,7 @@ print(by_region.to_pydict()["region"])
 
 ## numpy columns
 
-When numpy is available, vectorized column generation is faster and reads cleanly. Convert arrays to lists for {py:func}`from_pydict <batcher.from_pydict>`.
+With numpy, generation is vectorized. Convert arrays to lists for {py:func}`from_pydict <batcher.from_pydict>`:
 
 ```python
 import numpy as np
@@ -77,7 +94,7 @@ print(numeric.columns)
 
 ## Joinable tables
 
-To exercise joins, generate a fact table and a small dimension table that share a key.
+To exercise joins, generate a fact table and a dimension table that share a key:
 
 ```python
 random.seed(1)
@@ -98,19 +115,28 @@ print(sorted(set(joined.to_pydict()["label"])))
 
 ## Which generator to reach for
 
-The right generator depends on how many rows you need and how much realism the data has to carry. Match your case to a row:
+Match your case to a row:
 
 | You want | Use |
 |---|---|
-| A handful of rows with exact values | A literal dict, as in the first section |
+| Any size, generated in the engine | {py:func}`bt.range <batcher.range>` plus expressions |
+| A handful of rows with exact values | A literal dict |
 | Arbitrary size, no dependency beyond the standard library | `random`, seeded |
 | Arbitrary size, fast, and numeric | `numpy`, with `default_rng(seed)` |
 | To exercise a join | Two tables sharing a key, as above |
 | A file on disk instead of memory | Generate, then {py:meth}`ds.write.parquet(path) <batcher.api.io_namespace.writer.Writer.parquet>` |
 
-:::{warning}
-Generated data is uniform. Real data isn't. A pipeline that is fast on `random.choice(["north", "south", "east", "west"])` may be slow on a production key with one value in ten million rows and a million values with one row each. Your synthetic corpus won't reproduce that skew unless you build it in on purpose.
-:::
+## Skewed keys
+
+Production keys are rarely uniform. Build the skew in on purpose to test a pipeline against a hot key:
+
+```python
+skewed = bt.range(1000).with_columns(
+    key=bt.when(bt.col("value") % 100 == 0).then(bt.lit("rare")).otherwise(bt.lit("hot"))
+)
+print(skewed.group_by("key").agg(n=bt.count()).sort("key").to_pydict())
+# {'key': ['hot', 'rare'], 'n': [990, 10]}
+```
 
 ## Where to go next
 

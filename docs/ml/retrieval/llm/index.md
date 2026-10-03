@@ -2,7 +2,7 @@
 
 This section covers running a language model over a column: the generation call, the prompts and conversations around it, and the engines and throughput decisions underneath.
 
-The workload is offline generation over millions of rows: summarizing tickets, labeling a corpus, extracting fields from documents, synthesizing training data. An LLM engine already does the hard GPU work, continuous batching and a KV cache, so Batcher doesn't try to replace it. It loads the engine once per worker, feeds it whole request lists without imposing an outer batch size that would fight its scheduler, and keeps the columnar work on either side in the data plane: building prompts from row columns before the call, and parsing and scoring the output after it.
+The workload is offline generation over millions of rows: summarizing tickets, labeling a corpus, extracting fields, synthesizing training data. The LLM engine does the GPU work, continuous batching and a KV cache. Batcher loads it once per worker, feeds it whole request lists, and keeps the columnar work on either side in the data plane: building prompts from columns before the call, and parsing the output after it.
 
 ## The call
 
@@ -37,11 +37,30 @@ print(out.sort("id").to_pydict()["response"])
 
 ## Built for a million-row job
 
-Per-row controls ride in columns, so one pass can mix very different requests. `max_tokens_column` gives a 16-token classification and a 2,000-token summary their own budgets, `temperature_column` does the same for sampling, and `adapter_column` routes each row to its own LoRA adapter on a single vLLM engine. `usage=True`, `finish_reason=True` and `logprobs=True` append token counts, truncation flags and the model's confidence as columns, so cost accounting and routing uncertain rows to review are queries rather than log scraping.
+Ask for a label from a fixed set and {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>` resolves the model's free-form answer against it, so `"Outage."` becomes `outage`:
 
-Failures stay contained. `max_errored_rows` drops a bounded number of failing rows instead of failing the job, `max_retries` retries a batch whose engine call raises, and every hosted engine takes `requests_per_minute` and `tokens_per_minute` to stay under a provider's rate limit.
+```python
+stub = lambda: lambda prompts: ["Outage." if "signal" in p else "speed" for p in prompts]
+labeled = tickets.ml.classify(stub, labels=["outage", "speed"], prompt_column="body")
+print(labeled.select("id", "label").sort("id").to_pydict())
+# {'id': [1, 2, 3], 'label': ['outage', 'speed', 'outage']}
+```
 
-On an 8xT4 Ray cluster with warm engine pools, HF gpt2 generated at 814.8 prompts per second with full output agreement. {doc}`/benchmarks/results/ai-and-gpu` has the measurement.
+Failures stay contained. `max_errored_rows` drops a bounded number of failing rows instead of failing the job:
+
+```python
+def flaky():
+    return lambda prompts: [1 / 0 if p == "slow" else p for p in prompts]
+
+
+kept = tickets.ml.generate(flaky, prompt_column="body", max_errored_rows=1, batch_size=1)
+print(kept.sort("id").to_pydict()["id"])
+# [1, 3]
+```
+
+Per-row controls ride in columns, so one pass mixes very different requests. `max_tokens_column` and `temperature_column` give each row its own budget and sampling, and `adapter_column` routes each row to its own LoRA adapter on one vLLM engine. `usage=True`, `finish_reason=True` and `logprobs=True` append token counts, truncation flags and confidence as columns. `max_retries` retries a batch whose engine call raises, and every hosted engine takes `requests_per_minute` and `tokens_per_minute`.
+
+On an 8xT4 Ray cluster with warm engine pools, HF gpt2 generates 814.8 prompts per second. {doc}`/benchmarks/results/ai-and-gpu` has the measurement.
 
 ## Engines
 

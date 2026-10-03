@@ -34,8 +34,7 @@ one batch or memory-map the whole thing.
 
 ## The three properties
 
-Every artifact above answers the same three questions, and a write site that answers only two
-of them is the shape this list keeps regrowing in.
+Every artifact above is owner-only, buffered, and compressed according to the device it lands on.
 
 ### Owner-only from the moment it exists
 
@@ -44,58 +43,33 @@ are world-writable, a cluster mount is shared between tenants, and a node scratc
 shared with whatever else the node is running. At the default umask a new file lands 0644. A
 new directory lands 0755.
 
-So the mode is set in the `open` call, never by a following `chmod`. A chmod leaves a window in
-which the rows are world-readable, and a reader that wins that race gets everything. One helper does this on each side of the boundary:
-`_internal/paths.py::open_private` and `private_dir` in the control plane, and
-`bc_arrow::create_private_file` and `create_private_dir` in the data plane. Both live in the
-lowest module their callers share. The alternative is a copy per subsystem, and copies drift.
-
-For the same-node shuffle the property is sharper than confidentiality. `/dev/shm` is
-writable, so at 0644 a local user could *plant* a well-formed bucket under a ticket a reducer
-is about to fetch. A planted file that decodes cleanly is read as authoritative shuffle data
-and silently changes the answer.
+So the mode is set in the `open` call, never by a following `chmod`, which would leave a window in which the rows are world-readable. One helper does this on each side of the boundary: `_internal/paths.py::open_private` and `private_dir` in the control plane, and `bc_arrow::create_private_file` and `create_private_dir` in the data plane. For the same-node shuffle this also prevents a local user from planting a well-formed bucket in `/dev/shm` under a ticket a reducer is about to fetch.
 
 [`tests/integration/test_artifact_permissions.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_artifact_permissions.py) drives each real writer and stats what landed.
-It is written that way deliberately: the helpers are ten lines and obviously correct in
-isolation, and what actually rots is a new write site that does not reach for them.
 
 ### Buffered
 
-Arrow's IPC writer issues a separate `write` per message *and* per buffer within it. A batch
-with `k` columns therefore costs on the order of `2k` syscalls, most of them a few KB of
-validity or offset data. Written straight to a file that is one syscall per buffer, and a spilled bucket of
-a few thousand morsels over a dozen columns is hundreds of thousands of syscalls for bytes that
-coalesce into a handful of large writes.
+Arrow's IPC writer issues a separate `write` per message and per buffer, so a batch with `k` columns costs on the order of `2k` syscalls. Buffering coalesces them into a handful of large writes, and the IPC bytes are identical either way, so it is pure throughput.
 
-Buffering is invisible to the reader, because the IPC bytes are identical either way, so it is
-pure throughput. Two shapes exist, and the difference is how many writers are open at once. The
-grace spill store holds one writer per partition, and the partition count grows with skew, so it budgets 32 MiB *in total* and divides it, never below 8 KiB or above 1 MiB per writer
-(`bc-runtime::agg::spill::store::write_buf_capacity`). The shm publisher and the Flight gather write
-exactly one file at a time, so each takes a fixed 1 MiB buffer that cannot multiply.
-
-A buffered writer has one failure mode worth naming. Dropping it flushes the tail and discards
-any error doing so. That publishes a truncated file, which reads back as a short bucket rather
-than as a failure. Every buffered path here calls `into_inner` explicitly to surface that
-error.
+:::{dropdown} Buffer sizing and flush errors
+The grace spill store holds one writer per partition, and the partition count grows with skew, so it budgets 32 MiB *in total* and divides it, never below 8 KiB or above 1 MiB per writer (`bc-runtime::agg::spill::store::write_buf_capacity`). The shm publisher and the Flight gather write one file at a time, so each takes a fixed 1 MiB buffer. Dropping a buffered writer would discard a flush error, so every buffered path calls `into_inner` explicitly to surface it.
+:::
 
 ### Compressed by what the link costs
 
-Compression trades a core against a device, and the device sets the exchange rate. So the
-decision is made per path, not globally:
+Compression trades a core against a device, so the decision is made per path, not globally:
 
 | Path | Under `"auto"` | Why |
 |---|---|---|
 | Rust grace spill | Zstd for a blob-bearing schema, otherwise none | On fast local disk, compressing numeric or string state costs more CPU than the I/O it saves. Only blob payloads win. |
-| Flight gather staging | The same rule, through `SpillCodec::Auto` | Same rows, same disk, so the same answer. Restating the policy is how a blob-bearing gather goes out uncompressed beside a compressed spill. |
+| Flight gather staging | The same rule, through `SpillCodec::Auto` | Same rows, same disk, so the same answer. |
 | Python local spill tier | None | The same measurement, on the same class of disk. |
 | Python remote spill tier | LZ4 | Object storage is slow and priced by the byte, so a cheap codec always pays. |
 | Disk shuffle on a shared mount | LZ4 | Every byte crosses the wire twice, once to the mount and once back to the reducer. |
 | Disk shuffle on node-local scratch | None | Fast disk, so it honours `memory.spill_compression` and stays uncompressed under the default. |
 | Same-node shm shuffle | None | The reader memory-maps the file and decodes zero-copy. Compressing it would force a copy of every buffer. |
 
-No read path needs to know any of this. An Arrow IPC message records its own codec, so a reader
-decompresses whatever it is handed, and a file written by an older build still reads. That is
-also why the choice is result-invariant: it trades CPU for bytes and nothing else.
+No read path needs to know any of this. An Arrow IPC message records its own codec, so the choice is result-invariant: it trades CPU for bytes and nothing else.
 
 ## Where the bytes go
 
@@ -104,9 +78,7 @@ Two questions decide where an artifact lands, and each has exactly one function 
 `_internal/site/scratch.py::spill_scratch_dir()` resolves *which disk this process spills to*. It takes the configured
 `memory.spill_dir`, else the best measured node-local volume, else the system temp directory.
 The hardware fingerprint that keys every learned spill threshold reads the same function, so a
-learned threshold names the disk the spill actually landed on. When those two disagreed, the
-fingerprint described a container's overlay while the spill went to the node's NVMe, and two
-machine classes that behave nothing alike were merged into one.
+learned threshold names the disk the spill actually landed on.
 
 `dist/shuffle_io.py::shared_scratch_root()` resolves *which directory every node can see*, which is a
 different question. The disk shuffle passes only paths between Ray tasks, so a path has to
@@ -148,22 +120,9 @@ removes its directory. `dist/spill/buckets.py::spill_scratch` removes a work dir
 operator-configured one alone. The cache's disk tier is process-scoped scratch rather than a durable store, and `DiskCacheTier.clear()` deletes its directory. The file cache evicts least-recently-used entries to stay under
 its byte budget.
 
-A remote file larger than the whole file-cache budget is never admitted. Caching it would
-evict every other entry and then, with nothing else left to drop, the entry itself. No single
-file can push the budget over. The read goes straight to the object store
-instead, and `file_cache_max_bytes` bounds the volume as stated rather than approximately.
-Concurrent readers that miss the same file share one download rather than each fetching a
-copy.
+A remote file larger than the whole file-cache budget is never admitted, so `file_cache_max_bytes` bounds the volume exactly, and concurrent readers that miss the same file share one download.
 
-Two cases survive a crash by design. The streaming checkpoint is durable on purpose, and
-`prune_state` bounds it by deleting snapshots older than the last commit. A spill directory
-orphaned by a killed process is swept by name on the next run, which is what the pid in
-`bc-spill-{pid}-{seq}` is for. The control plane's scratch directories follow the same rule. The
-work directory of a distributed out-of-core breaker and the result cache's disk tier are
-created by `carbonite/spill/scratch.py::scratch_dir` as `{prefix}{pid}-{suffix}`, and the first
-allocation under a root in each process removes the directories with that prefix whose pid is
-no longer a live process. A directory named any other way, or one belonging to a live process,
-is never touched.
+Two cases survive a crash by design. The streaming checkpoint is durable on purpose, and `prune_state` deletes snapshots older than the last commit. A spill directory orphaned by a killed process is swept on the next run, which is what the pid in `bc-spill-{pid}-{seq}` is for. The control plane's scratch directories, created by `carbonite/spill/scratch.py::scratch_dir` as `{prefix}{pid}-{suffix}`, follow the same rule: only directories with that prefix whose pid is no longer a live process are removed.
 
 ## See also
 

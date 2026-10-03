@@ -1,8 +1,24 @@
 # Lakehouse tables
 
-Batcher reads and writes the open table formats natively, with no JVM and no Spark cluster in the path. A Delta or Iceberg write is one atomic commit however many workers produced it, every read can time travel to an earlier version, and every read skips the files the table's own metadata proves can't match.
+Batcher reads and writes the open table formats natively, with no JVM and no Spark cluster in the path. A Delta or Iceberg write is one atomic commit however many workers produced it, every read can time travel, and every read skips the files the table's metadata rules out:
 
-Delta Lake is the most complete: merge, replace-where, change data feed, compaction, vacuum, and Delta Sharing reads. Iceberg adds native upserts, snapshot expiry, and the Puffin statistics other engines publish. Hudi tables written by your existing Spark or Flink jobs read in parallel, file slice by file slice.
+```python
+import os
+import tempfile
+
+import batcher as bt
+
+table = os.path.join(tempfile.mkdtemp(), "orders")
+bt.from_pydict({"id": [1, 2], "amount": [10, 20]}).write.delta(table)
+bt.from_pydict({"id": [3], "amount": [30]}).write.delta(table, mode="append")
+
+print(bt.read.delta(table).sort("id").to_pydict())
+# {'id': [1, 2, 3], 'amount': [10, 20, 30]}
+print(bt.read.delta(table, version=0).count())
+# 2
+```
+
+Delta Lake is the most complete: merge, replace-where, change data feed, compaction, vacuum, and Delta Sharing reads. Iceberg adds native upserts, snapshot expiry, and Puffin statistics. Hudi tables written by your Spark or Flink jobs read in parallel, file slice by file slice.
 
 ::::{grid} 1 2 2 3
 :gutter: 3

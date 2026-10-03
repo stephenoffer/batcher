@@ -1,6 +1,6 @@
 # Data engineer learning path
 
-This path is for building and running data pipelines: read a source, reshape it, join it against another, aggregate, write the result. The pipeline stays lazy until a terminal operation, and all per-row work runs in Rust.
+Build and run data pipelines: read a source, reshape it, join it, aggregate it, write the result. Pipelines stay lazy until a terminal operation, and all per-row work runs in Rust.
 
 ## Reading order
 
@@ -58,6 +58,37 @@ print(joined.to_pydict())
 # {'region': ['west', 'east', 'west'], 'amount': [1, 2, 3], 'label': ['W', 'E', 'W']}
 ```
 
+A left join keeps unmatched rows; an anti join returns only them:
+
+```python
+west_only = bt.from_pydict({"region": ["west"], "label": ["W"]})
+print(facts.join(west_only, on="region", how="left").sort("amount").to_pydict())
+# {'region': ['west', 'east', 'west'], 'amount': [1, 2, 3], 'label': ['W', None, 'W']}
+print(facts.join(west_only, on="region", how="anti").to_pydict())
+# {'region': ['east'], 'amount': [2]}
+```
+
+## Example: running totals with a window
+
+```python
+running = orders.with_columns(
+    running=bt.col("price").cum_sum().over("region", order_by="price")
+)
+print(running.select("region", "price", "running").to_pydict())
+# {'region': ['west', 'east', 'west', 'east', 'west'], 'price': [10.0, 20.0, 30.0, 40.0, 50.0], 'running': [10.0, 20.0, 40.0, 60.0, 90.0]}
+```
+
+## Example: write and read back
+
+```python
+orders.write.parquet("orders.parquet")
+east = bt.read.parquet("orders.parquet").filter(bt.col("region") == "east")
+print(east.to_pydict())
+# {'region': ['east', 'east'], 'price': [20.0, 40.0], 'qty': [2, 4]}
+```
+
+The filter is pushed into the Parquet scan, so only matching rows are decoded.
+
 ## Runnable examples
 
 These scripts build their own data and run directly with `python examples/<name>.py`:
@@ -70,7 +101,7 @@ These scripts build their own data and run directly with `python examples/<name>
 
 ## Recipes for the problems you'll hit
 
-The {doc}`data-engineering cookbook </cookbook/data-engineering/index>` is the applied half of this path. Each recipe opens on the failure and shows the code that avoids it.
+The {doc}`data-engineering cookbook </cookbook/data-engineering/index>` is the applied half of this path, one production pattern per page.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -90,13 +121,13 @@ Apply a change feed in the order the changes happened.
 :::{grid-item-card} {octicon}`filter;1.1em` Deduplication
 :link: /cookbook/data-engineering/maintenance/deduplication
 :link-type: doc
-Exactly-once is a property you build.
+Keep exactly one row per key.
 :::
 
 :::{grid-item-card} {octicon}`stack;1.1em` Schema evolution
 :link: /cookbook/data-engineering/modeling/schema-evolution
 :link-type: doc
-The column that changed type under you.
+Absorb new and widened columns across files.
 :::
 ::::
 

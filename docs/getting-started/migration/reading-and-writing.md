@@ -1,10 +1,10 @@
 # Reading, writing, and interop
 
-This page covers Batcher's readers, writers, constructors, and exporters, and where the reader and writer you already use in another engine maps onto them. Start here when the first thing a ported script does is load a file or hand a frame to Batcher.
+This page maps the readers, writers, constructors, and exporters you already use onto Batcher.
 
 ## Reading and writing
 
-Batcher gives you one callable namespace per direction. {py:obj}`bt.read(path) <batcher.read>` infers the format, and typed methods such as {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` and {py:meth}`bt.read.delta <batcher.api.io_namespace.reader.Reader.delta>` name it explicitly. {py:obj}`ds.write <batcher.Dataset.write>` mirrors it.
+{py:obj}`bt.read(path) <batcher.read>` infers the format, and typed methods such as {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` name it. {py:obj}`ds.write <batcher.Dataset.write>` mirrors it.
 
 ```python
 import batcher as bt
@@ -16,11 +16,20 @@ print(sorted(back.to_pydict()["amount"]))
 # [10, 20, 30]
 ```
 
-Every reader and writer in PySpark, Polars, Daft, and Ray Data has a row in the generated reference, with its Batcher spelling and what differs, such as a default save mode. PySpark's readers and writers are on {doc}`spark/io`. The Polars, Daft, and Ray Data readers are module functions, on {doc}`polars/io`, {doc}`daft/module`, and {doc}`ray-data/io`. Their writers are frame methods, on {doc}`polars/dataframe`, {doc}`daft/dataframe`, and {doc}`ray-data/dataset`.
+CSV and JSON work the same way:
 
-Polars splits reading into eager `read_*` and lazy `scan_*`. Batcher doesn't need the split. Every `bt.read.*` returns a {py:class}`Dataset <batcher.Dataset>` plan and does no I/O until a terminal operation, with the projection and predicate pushdown `scan_*` gives you. There's one spelling per format, and it's the lazy one.
+```python
+ds.write.csv("/tmp/sales_csv")
+ds.write.json("/tmp/sales_json")
+print(bt.read.csv("/tmp/sales_csv").count(), bt.read.json("/tmp/sales_json").count())
+# 3 3
+```
 
-If your fingers already type `pd.read_csv` or `pl.read_parquet`, the Batcher spelling moves the format behind a dot. There is no top-level `bt.read_csv`, and every common format has one typed reader:
+Every `bt.read.*` is lazy, like a Polars `scan_*`: it returns a {py:class}`Dataset <batcher.Dataset>` plan with projection and predicate pushdown, and does no I/O until a terminal call. The format moves behind a dot, so `pd.read_csv` becomes `bt.read.csv`. The generated reference covers every engine's readers: {doc}`spark/io`, {doc}`polars/io`, {doc}`daft/module`, and {doc}`ray-data/io`.
+
+:::{dropdown} Typed readers
+:open:
+
 
 | Reads | Batcher |
 |-------|---------|
@@ -35,7 +44,9 @@ If your fingers already type `pd.read_csv` or `pl.read_parquet`, the Batcher spe
 | Iceberg tables | {py:meth}`bt.read.iceberg(t) <batcher.api.io_namespace.reader.Reader.iceberg>` |
 | any SQL database | {py:meth}`bt.read.sql(q, uri=...) <batcher.api.io_namespace.reader.Reader.sql>` |
 
-For a source that isn't a file at all, {py:meth}`bt.read.table(name, ...) <batcher.api.io_namespace.reader.Reader.table>` constructs any registered connector by name. It's the escape hatch behind the typed readers.
+:::
+
+For a source that isn't a file, {py:meth}`bt.read.table(name, ...) <batcher.api.io_namespace.reader.Reader.table>` constructs any registered connector by name.
 
 ## Getting data in from another library
 
@@ -52,7 +63,18 @@ Pick the constructor for the object you're holding:
 | An Arrow table, or anything Arrow-exporting | {py:func}`bt.from_arrow(t) <batcher.from_arrow>` |
 | Something whose type you don't know | {py:func}`bt.from_any(obj) <batcher.from_any>` |
 
-Reach for {py:obj}`bt.from_any <batcher.from_any>` in migration code and glue. It dispatches on the type and routes to the right constructor, so a script that accepts "a frame" from a caller doesn't have to branch. {py:func}`bt.sql <batcher.sql>` uses it for every bound table, which is why you can pass a pandas frame or a plain dict straight into a query:
+Each one returns a lazy `Dataset`:
+
+```python
+import batcher as bt
+
+print(bt.from_pylist([{"a": 1}, {"a": 2}]).to_pydict())
+# {'a': [1, 2]}
+print(bt.from_records([(1, "x"), (2, "y")], columns=["n", "s"]).to_pydict())
+# {'n': [1, 2], 's': ['x', 'y']}
+```
+
+{py:obj}`bt.from_any <batcher.from_any>` dispatches on the type, so glue code that accepts "a frame" doesn't have to branch. {py:func}`bt.sql <batcher.sql>` uses it for every bound table, so a plain dict works as a table:
 
 ```python
 import batcher as bt
@@ -82,7 +104,7 @@ print(ds.select(name=bt.concat_str(bt.col("first"), bt.lit(" "), bt.col("last"))
 # {'name': ['ada lovelace']}
 ```
 
-`how` is `"vertical"` (the default), `"vertical_relaxed"` to deduplicate, `"diagonal"` to stack over the union of the columns, or `"horizontal"` to place frames side by side by row position.
+`how` is `"vertical"` (the default), `"vertical_relaxed"`, `"diagonal"`, or `"horizontal"`.
 
 {py:func}`bt.range <batcher.range>` follows `builtins.range`, single-argument form included, and {py:func}`bt.date_range <batcher.date_range>` follows `pandas.date_range` and `polars.date_range`:
 
@@ -99,7 +121,7 @@ Pass `end=` or `periods=`, the stride as `interval=` (Polars) or `freq=` (pandas
 
 ## Moving data in and out
 
-Most `from_*` constructors have a matching `to_*` exporter, so Batcher slots into an existing pipeline without a copy where the framework's Arrow bridge allows it.
+Most `from_*` constructors have a matching `to_*` exporter, zero-copy where the framework's Arrow bridge allows it:
 
 ```python
 # docs: skip
@@ -112,7 +134,16 @@ pl_df = ds.to_polars()  # Batcher -> Polars
 table = ds.to_arrow()  # Batcher -> pyarrow.Table
 ```
 
-Each row pairs a source system with its constructor and, where one exists, its exporter.
+Arrow and NumPy round-trip with no extra install:
+
+```python
+import pyarrow as pa
+
+ds = bt.from_arrow(pa.table({"a": [1, 2, 3]}))
+print(type(ds.to_arrow()).__name__, ds.to_numpy()["a"].tolist())
+# Table [1, 2, 3]
+```
+
 
 | Source | In | Out |
 |--------|----|----|
@@ -129,7 +160,7 @@ Each row pairs a source system with its constructor and, where one exists, its e
 | PyTorch | {py:func}`bt.from_torch(ds) <batcher.from_torch>` | {py:meth}`ds.ml.iter_torch_batches() <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` / {py:meth}`ds.ml.to_torch_dataloader() <batcher.api.dataset.ml.DatasetML.to_torch_dataloader>` |
 | TensorFlow | {py:func}`bt.from_tf(ds) <batcher.from_tf>` | {py:meth}`ds.ml.to_tf() <batcher.api.dataset.ml.DatasetML.to_tf>` |
 
-The `ml.iter_torch_batches` and `ml.to_tf` loaders yield a re-iterable dataset of per-batch tensor dicts, so a multi-epoch training loop streams the query in bounded memory.
+The torch and TensorFlow loaders stream per-batch tensor dicts, so a multi-epoch training loop runs in bounded memory.
 
 ## See also
 

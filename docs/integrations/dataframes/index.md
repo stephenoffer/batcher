@@ -1,8 +1,6 @@
 # DataFrames and arrays
 
-This section covers the libraries that run in the same Python process as Batcher: Polars, pandas, DuckDB, PyArrow, and NumPy. They are a different kind of integration from the connectors in the rest of this section. A connector reaches a system over a network and reads it in splits. These hand a buffer across a function call.
-
-The whole section rests on one fact. Batcher holds its data as Apache Arrow, and so do all of these, either natively or through a documented export. Moving a table between them is a pointer handoff through the [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html), not a serialization step, so the cost does not grow with the number of rows.
+This section covers the libraries that run in the same Python process as Batcher: Polars, pandas, DuckDB, PyArrow, and NumPy. Batcher holds its data as Apache Arrow, and so do all of these, so moving a table between them is a pointer handoff through the [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html) whose cost doesn't grow with the row count.
 
 ```python
 import batcher as bt
@@ -22,7 +20,17 @@ print(warm.to_polars())
 # └──────┴──────┘
 ```
 
-Neither call copied the columns. That is what makes it reasonable to reach for Batcher for one step of a pipeline written in something else, and to hand the answer straight back.
+Neither call copied the columns, so you can use Batcher for one step of a pipeline written in something else and hand the answer straight back. pandas and NumPy work the same way:
+
+```python
+import pandas as pd
+
+df = pd.DataFrame({"city": ["Oslo", "Lima"], "temp": [3.5, 19.0]})
+print(bt.from_pandas(df).filter(bt.col("temp") > 10).to_pandas().to_dict("list"))
+# {'city': ['Lima'], 'temp': [19.0]}
+print(bt.from_pandas(df).to_numpy()["temp"])
+# [ 3.5 19. ]
+```
 
 ## The libraries
 

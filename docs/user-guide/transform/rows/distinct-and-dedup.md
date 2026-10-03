@@ -92,7 +92,7 @@ print(events.distinct(["user"], keep="first", order_by="ts").sort("user").to_pyd
 
 This runs as a single reduction, not as a ranking. The engine hashes each row by its key once and keeps the minimum under the ordering, so nothing is sorted and no rank column is built. It is also *mergeable*, which is what lets it stay bounded under spill and lets a distributed run reduce each partition before the shuffle, sending one row per key instead of every row.
 
-That matters most at scale, because the two shapes grow differently. A ranking sorts, so its cost grows faster than the data. A reduction is a hash pass, so it grows with it. On a key that is 5% distinct, the reduction is 2 to 3x faster than the equivalent window at 2 million rows and 7 to 12x faster at 32 million. The dedup section of [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md) has the measurement and the hardware.
+A ranking sorts, so its cost grows faster than the data. A reduction is a hash pass that grows with it: on a key that is 5% distinct, it's 7 to 12x faster than the equivalent window at 32 million rows ([`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md)).
 
 If you want the rank itself rather than one row per key, write the window described in {doc}`window functions </user-guide/analyze/window-functions>`.
 

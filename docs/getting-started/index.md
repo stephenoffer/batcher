@@ -1,10 +1,10 @@
 # Getting started
 
-Batcher is one engine for your data work. You write DataFrame code or SQL in Python, and a compiled Rust engine runs it over Apache Arrow, on a laptop or across a Ray cluster, for tables, text, images, audio, and video alike. This section takes you from `pip install` to a working pipeline in a few minutes, then explains the handful of ideas that make it fast.
+You write DataFrame code or SQL in Python. Batcher's Rust engine runs it over Apache Arrow, on a laptop or on a Ray cluster. This section gets you from `pip install` to a working pipeline in a few minutes.
 
 ## Your first query
 
-Install the package, then run this. It builds a small dataset, aggregates it, and prints the answer:
+Install, then run:
 
 ```bash
 pip install batcher-engine
@@ -19,11 +19,30 @@ print(totals.to_pydict())
 # {'region': ['east', 'west'], 'revenue': [80.0, 165.0]}
 ```
 
-That's the whole shape of a Batcher program: build a dataset, chain lazy steps, ask for the result. Swap `from_pydict` for {py:obj}`bt.read <batcher.read>` on a directory of Parquet files and nothing else changes. The engine works through Arrow batches in parallel on every core and spills to disk under memory pressure, so the input can be far larger than RAM. On a Ray cluster, `collect(distributed=True)` runs the same plan across machines.
+That's the whole shape of a Batcher program. Build a dataset, chain lazy steps, then ask for the result. Here is the same query in SQL:
+
+```python
+query = "SELECT region, SUM(amount) AS revenue FROM orders GROUP BY region ORDER BY region"
+print(bt.sql(query, orders=orders).to_pydict())
+# {'region': ['east', 'west'], 'revenue': [80.0, 165.0]}
+```
+
+Real files change nothing else:
+
+```python
+orders.write.parquet("orders.parquet")
+print(bt.read.parquet("orders.parquet").count())
+# 3
+```
+
+The engine streams Arrow batches across every core and spills to disk under memory pressure, so your input can be larger than RAM. Scaling out to a Ray cluster takes one argument:
+
+```python
+# docs: skip
+totals.collect(distributed=True, num_workers=8)
+```
 
 ## Start here
-
-Most readers take these in order. Skip ahead if you already know the part a card covers.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -61,15 +80,7 @@ Spark, pandas, Polars, DuckDB, Daft, and Ray Data translated verb by verb, endin
 
 ## Where to go next
 
-Once a query runs, pick the path that matches how you like to learn. The {doc}`tutorials <tutorials/index>` walk you through complete pipelines, from a first ETL job to a lakehouse, a streaming job, and batch inference. The {doc}`user guide </user-guide/index>` takes one capability at a time, and the {doc}`cookbook </cookbook/index>` starts you from working code you can change. If you'd rather follow a reading list, the {doc}`learning paths <tutorials/paths/index>` order the pages for data engineers, data scientists, ML engineers, and platform engineers.
-
-Curious how fast it is? The {doc}`benchmarks </benchmarks/index>` page has the correctness-gated results against DuckDB, Polars, Daft, and Spark, with the hardware and the commands to reproduce each one.
-
-## See also
-
-- {doc}`/api/reference`: the one-page cheat sheet to keep open while you work.
-- {doc}`/ml/index`: embeddings, batch inference, and training data on the same engine.
-- {doc}`/user-guide/operate/running/troubleshooting`: what to read when the first query misbehaves.
+The {doc}`tutorials <tutorials/index>` build complete pipelines: a first ETL job, a lakehouse, a stream, batch inference. The {doc}`user guide </user-guide/index>` takes one capability per page. If you'd rather start from working code, open the {doc}`cookbook </cookbook/index>`, and the {doc}`learning paths <tutorials/paths/index>` order the pages by role. Keep {doc}`/api/reference` open while you work. {doc}`/ml/index` covers embeddings, batch inference, and training data on the same engine, and {doc}`/user-guide/operate/running/troubleshooting` helps when a first query misbehaves. For speed, see {doc}`/benchmarks/index`.
 
 ```{toctree}
 :hidden:

@@ -1,11 +1,6 @@
 # A distributed training pipeline
 
-Feed a data-parallel PyTorch job without starving it. The training loop is not the hard part. The
-hard part is the last mile: shaping features, splitting the data, and handing each rank a
-balanced, deterministic, resumable stream of tensors that keeps the GPU busy.
-
-The shaping and the loader run here on CPU. The blocks that need a cluster or GPUs are shown
-and marked.
+Feed a data-parallel PyTorch job a balanced, deterministic, resumable stream of tensors per rank, with the feature shaping and splitting done in the engine. The shaping and the loader run here on CPU. Blocks that need a cluster or GPUs are marked.
 
 | Step | Runs here | Needs |
 |---|---|---|
@@ -20,9 +15,7 @@ The engine side of this page is one flow, from shaped features to one stream per
 
 ## 1. Shape the features in the engine
 
-Feature work belongs in the engine, not in the training loop. Expressions run in Rust across
-every core; a `map_batches` in your `DataLoader` runs in Python, one worker at a time, while
-the GPU waits.
+Feature work belongs in the engine. Expressions run in Rust across every core, ahead of the GPU.
 
 ```python
 import batcher as bt
@@ -46,18 +39,7 @@ print(featured.columns)
 
 ## 2. Split before you fit
 
-:::{important}
-The split comes first, because a preprocessor fitted on the test rows has already leaked. No
-error is raised and no metric looks wrong. The model scores better offline than it
-ever will in production. Split, then fit, in that order, every time.
-:::
-
-Each row is assigned by a reproducible hash of its own values, so the two parts are disjoint
-and identical however the data is partitioned, on one core or on a cluster.
-
-Pass `key=` on a real corpus. Hashing only the identifying column keeps the split stable when
-the *other* columns change: recompute a feature and the same rows stay in train. Hash every
-column (the default) and the split moves the moment a value does.
+Split first, then fit, so no test statistic reaches the features. Each row is assigned by a reproducible hash, so the parts are disjoint and identical on one core or a cluster. `key=` hashes only the identifying column, so recomputing a feature keeps the same rows in train.
 
 ```python
 train, test = featured.ml.train_test_split(test_size=0.25, seed=7, key="user_id")
@@ -65,14 +47,20 @@ print(train.count(), test.count())
 # 44 20
 ```
 
-Sizes are binomial around `test_size * n` rather than exact, which is what a hash-keyed split
-buys you: no shuffle, no materialization, and the same assignment on every node.
+Sizes land near `test_size * n` with no shuffle and no materialization. `random_split` and `kfold` use the same hashing:
+
+```python
+parts = featured.ml.random_split([0.5, 0.25, 0.25], seed=7, key="user_id")
+print([p.count() for p in parts])
+# [26, 18, 20]
+folds = featured.ml.kfold(4, seed=7, key="user_id")
+print([(tr.count(), va.count()) for tr, va in folds])
+# [(47, 17), (55, 9), (46, 18), (44, 20)]
+```
 
 ## 3. Fit the preprocessor on train, transform both
 
-A {py:class}`StandardScaler <batcher.ml.preprocessors.StandardScaler>` is a fit/transform pair, and the fit is one mergeable pass over the data,
-the same partial, combine, and finalize algebra the aggregates use, so it runs on one core or
-a cluster with the same result. The transform stays inside the engine.
+A {py:class}`StandardScaler <batcher.ml.preprocessors.StandardScaler>` fit is one mergeable pass, so it gives the same statistics on one core or a cluster:
 
 ```python
 from batcher.ml import StandardScaler
@@ -90,9 +78,7 @@ The statistics come from `train` only. `test_x` is transformed with them, never 
 
 ## 4. Stream tensors, single process
 
-{py:meth}`ds.ml.iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` yields `{column: tensor}` dicts. It consumes the stream
-incrementally, so memory stays bounded and the loop starts before the whole dataset is read,
-and it overlaps the host-to-device copy of one batch with the host work of the next.
+{py:meth}`ds.ml.iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` yields `{column: tensor}` dicts from a bounded-memory stream, overlapping each host-to-device copy with the next batch's host work.
 
 ```python
 loader = train_x.select("clicks", "spend", "spend_per_click", "label").ml.iter_torch_batches(
@@ -106,24 +92,11 @@ print(tuple(batches[0]["clicks"].shape))
 # (16,)
 ```
 
-In real training, leave `device="auto"`, which picks CUDA, ROCm, XPU, or MPS and falls back
-to CPU, and set `pin_memory=True` so the copies are async. `local_shuffle_buffer_size=` gives a
-streaming approximation of a shuffle without materializing the dataset.
+In real training, leave `device="auto"` (CUDA, ROCm, XPU, or MPS, else CPU) and set `pin_memory=True`. `local_shuffle_buffer_size=` shuffles within a streaming buffer. The loader streams at 1.06 M rows/s through zero-copy DLPack in the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>`.
 
-The {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>` records this loader at
-1.06 M rows/s, streaming through zero-copy DLPack with background prefetch rather than a
-per-batch Arrow-to-tensor conversion.
+## 5. The sample order
 
-## 5. The sample order, before you trust it
-
-Data-parallel training needs four things from the loader, and they're worth checking rather
-than assuming. The ranks must be *balanced*, so nobody stalls at the all-reduce barrier. The
-order must be *deterministic*, so a resume is exact. It must be *elastic*: the same seed and
-epoch give the same global order at any `world_size`. And the ranks must be *independent*,
-with no central coordinator.
-
-The ordering functions are usable on their own, which is the easiest way to see what a resumed
-epoch will actually read:
+The loader's order is *balanced* across ranks, *deterministic* for exact resume, *elastic* across `world_size`, and computed per rank with no coordinator. The ordering functions are usable on their own:
 
 ```python
 from batcher.ml import epoch_order, usable_length
@@ -136,26 +109,25 @@ print(usable_length(8, 3), usable_length(8, 3, drop_last=False))
 # 6 9
 ```
 
-The next epoch reshuffles. `usable_length` is how many sample positions the epoch spans:
-always a multiple of `world_size`, trimmed with `drop_last=True` (the default) or padded
-without.
+The next epoch reshuffles. `usable_length` is the epoch's sample positions, a multiple of `world_size`, trimmed with `drop_last=True` (the default) or padded without.
 
-That order is computed rather than materialized. A shuffled index list costs about 28 bytes per
-sample in CPython, so a 10-billion-sample corpus would want roughly 280 GB of driver RAM
-before a single row is read. `epoch_permutation` is a keyed pseudorandom bijection on
-`[0, n)` instead: index in, shuffled index out, no state. Its memory is constant whatever the
-corpus size, and seeking to sample 900,000,000,000 is modular arithmetic rather than a walk.
+The order is computed, never materialized. `epoch_permutation` is a keyed bijection on `[0, n)`, so ten billion samples cost constant memory and any position is a direct lookup:
+
+```python
+from batcher.ml import epoch_permutation
+
+perm = epoch_permutation(10_000_000_000, seed=42)
+print(len(perm), perm[123_456_789])
+# 10000000000 6584942393
+```
 
 ## 6. One iterable per rank
 
 {py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` returns a `torch.utils.data.IterableDataset` over this rank's slice of
 that global order.
 
-:::{warning}
-`stream_loader` is the *only* shard authority. Do not add a `DistributedSampler` on top of
-it: the two will shard the same data twice, each rank will see a slice of a slice, and most
-of your corpus will silently never reach the model. Nothing errors. The loss curve gets
-worse for a reason you cannot see.
+:::{important}
+`stream_loader` is the shard authority. Don't add a `DistributedSampler` on top of it, or each rank reads a slice of a slice.
 :::
 
 ```python
@@ -173,14 +145,11 @@ print(sorted(first), tuple(first["label"].shape))
 # ['clicks', 'label', 'spend', 'spend_per_click'] (8,)
 ```
 
-Rank 1 constructs the identical object with `rank=1` and reads a disjoint slice. Bump `epoch`
-at the top of each epoch to reseed the shuffle. Pass the checkpointed `global_consumed` on
-restart and the rank resumes exactly where it stopped, with no sample repeated or skipped.
+Rank 1 passes `rank=1` and reads a disjoint slice. Bump `epoch` each epoch, and pass the checkpointed `global_consumed` on restart to resume exactly where the rank stopped.
 
 ## 7. The training loop
 
-Everything above is engine work. This part is yours, and it needs a GPU, so it is shown and
-not run.
+Everything above is engine work. The loop is yours, and it needs a GPU.
 
 :::{dropdown} The DDP training loop, in full
 ```python
@@ -217,15 +186,12 @@ def train(rank: int, world_size: int, epoch: int, resume_offset: int = 0) -> Non
 :::
 
 :::{tip}
-`batch_size=None` on the `DataLoader` is not a typo. The stream already yields sized
-batches, so letting torch re-batch them would collate twice.
+Pass `batch_size=None` to the `DataLoader`. The stream already yields sized batches.
 :::
 
 ## 8. Larger than memory
 
-`stream_loader` materializes the dataset once, which is fine up to RAM. Past that, write the
-corpus as shards and stream from disk. The sample-order contract is the same either way; only
-the residency changes.
+`stream_loader` holds the dataset in memory. Past RAM, write the corpus as shards and stream from disk with the same sample-order contract.
 
 ::::{tab-set}
 :::{tab-item} Fits in memory
@@ -270,10 +236,7 @@ consumed concurrently with backpressure.
 
 ## 9. Preprocessing on the cluster
 
-When the corpus lives in object storage and the features are expensive, run the shaping
-distributed. It's the same plan, and only the scheduling changes. The result has the same rows,
-column names, and column types as the single-node run. A floating-point reduction is identical
-up to reassociation, since the partition count sets the summation order.
+When the corpus lives in object storage, run the shaping distributed. It's the same plan with the same rows, column names, and types as the single-node run.
 
 ```python
 # docs: skip

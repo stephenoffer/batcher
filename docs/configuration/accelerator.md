@@ -76,13 +76,11 @@ served.
 These fields are the {py:class}`DeviceMemoryConfig <batcher.config.DeviceMemoryConfig>`
 dataclass.
 
-### Two allocators, two failure modes
+### Two allocators
 
-The first five fields configure RAPIDS/RMM, which the relational GPU kernels allocate through.
-The three `torch_` fields configure PyTorch's caching allocator, which is what every inference
-stage allocates through. A worker routinely uses both, and they fail differently, so both are
-configured before the first tensor is allocated.
+The first five fields configure RAPIDS/RMM, which the relational GPU kernels allocate through. The three `torch_` fields configure PyTorch's caching allocator, which every inference stage allocates through. The defaults pick a stream-ordered pool for RAPIDS, growable segments for PyTorch so varying tensor sizes don't fragment the device, and a per-process cap so one actor can't exhaust a shared GPU. Both PyTorch settings are skipped when `PYTORCH_CUDA_ALLOC_CONF` is already set.
 
+::::{dropdown} How each allocator setting behaves
 PyTorch's failure mode is fragmentation. The allocator carves the device into fixed segments
 and splits blocks out of them, so a workload whose tensor sizes vary, meaning mixed image
 resolutions or mixed sequence lengths and therefore every real batch, leaves each segment
@@ -109,6 +107,7 @@ its memory gets no pool at all rather than one sized from a guess.
 `managed` backs the pool with unified memory, so a working set larger than the device migrates over the bus instead of failing.
 
 `spill_to_host` stays off because the fan-out has a better answer to the same event. A shard that overflows is subdivided and rerun on the device, which is exact because the stage is mergeable. Spilling pre-empts that: the shard no longer raises, so it finishes by paging columns across PCIe instead. Turn it on for a plan with no mergeable reducer to subdivide, where the choice is between slow and failed. With `statistics` on, an overflowing shard is subdivided by the factor its own high-water mark says will clear it, rather than being halved repeatedly.
+::::
 
 ```python
 from batcher import Config

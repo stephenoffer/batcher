@@ -3,27 +3,15 @@
 This page catalogs the agent skills Batcher ships, and explains how a coding agent
 picks one and how you use them in your own project.
 
-Batcher ships a set of *agent skills*, which are task-scoped instruction files that
-teach a coding agent, whether Claude Code or anything else that reads them, how to use
-this engine correctly. They live in `.claude/skills/<name>/SKILL.md` in the repository.
+Batcher ships *agent skills*: task-scoped instruction files that teach a coding agent, such as Claude Code, how to use the engine correctly. They live in `.claude/skills/<name>/SKILL.md` in the repository.
 
-A skill isn't documentation for you to read start to finish, but this guide is. A skill
-is a procedure an agent loads when it recognizes the task: how to port a PySpark job,
-how to triage a query that returns wrong rows, or how to add an IO format without
-breaking the layer contract. Each one carries the API surface it needs, the traps that
-surface hides, and, for anything that changes results, the way to verify the work rather
-than assume it.
+A skill is a procedure an agent loads when it recognizes the task, such as porting a PySpark job, triaging a query that returns wrong rows, or adding an IO format. Each one carries the API surface it needs and a step that verifies the work. Every skill was written against the live API with its examples executed, so the agent writes lazy, batch-first code with real method names from the first try.
 
-Every skill was written against the live API and its examples were executed, so a name
-that appears in one is a name that exists.
+Ask for the task and the agent picks the skill:
 
-## Why these exist
-
-An agent pointed at an unfamiliar engine fails in predictable ways. It invents plausible
-method names, assumes eager execution, writes a per-row Python loop where the whole
-design depends on batches, and reports success without checking the result. The skills
-below exist to pre-empt exactly those failures, and each names the verification step
-that catches them.
+```text
+Port jobs/daily_revenue.py from PySpark to Batcher and prove it returns the same rows.
+```
 
 ## Using the engine
 
@@ -45,9 +33,7 @@ diagnosing a query that misbehaves.
 
 ## Migrating to Batcher
 
-One skill per source system. Each carries the concept shifts that actually bite, a porting
-recipe that starts with the codemod and ends by proving the ported script returns the same
-rows as the original, and a section on going back.
+One skill per source system. Each carries the concept shifts that matter, a porting recipe that starts with the codemod and ends by proving the ported script returns the same rows, and a section on going back.
 
 | Skill | Source |
 |---|---|
@@ -60,7 +46,7 @@ rows as the original, and a section on going back.
 
 The narrative version of these tables is {doc}`/getting-started/migration/index`, and the name-by-name
 reference for PySpark, Polars, Daft, and Ray Data is generated from the migration registry beside it. The
-skills add the failure modes, the codemod step, the way back, and the verification procedure.
+skills add the codemod step, the way back, and the verification procedure.
 
 ## Extending the engine
 
@@ -123,15 +109,13 @@ The usage and migration skills apply anywhere Batcher is installed. The extensio
 (`add-*`, `run-quality-gate`) assume you are inside the Batcher source tree and reference
 `just` recipes that only exist there.
 
-## Keeping them honest
+## Keeping them current
 
-A skill that describes an API which has since changed is worse than no skill, because an
-agent will trust it. Two things guard against that.
+An agent trusts a skill, so a skill must track the API. Two things keep it current.
 
 Every skill was written against the live API rather than from memory, with symbols verified by introspection and code blocks executed. And [`tests/docs/test_skill_coverage.py`](https://github.com/stephenoffer/batcher/blob/main/tests/docs/test_skill_coverage.py) fails if a skill exists that this page doesn't list, if a listed skill has no file, or if a skill is missing its `name` or `description` frontmatter, so the catalog can't quietly fall behind the directory.
 
-When you change an API, the skill that teaches it is part of the change, exactly as its
-documentation is.
+When you change an API, update the skill that teaches it in the same change.
 
 ## See also
 

@@ -2,9 +2,42 @@
 
 This section covers {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, the language every column computation in Batcher is written in, and the batch UDF for the rare job it cannot express.
 
-An expression describes a computation rather than running one. `bt.col("price") * bt.col("qty")` builds a small typed tree that the optimizer can inspect, push into a scan, or drop when nothing reads it, and that the Rust data plane then evaluates over whole Arrow batches. The Cranelift JIT compiles the arithmetic it supports and falls back to the interpreter for the rest, with identical results either way. That is why column work in Batcher never becomes a Python loop, and why the same expression is fast on three rows or three billion.
+An expression describes a computation rather than running one. `bt.col("price") * bt.col("qty")` builds a small typed tree that the optimizer can inspect and push into a scan, and that the Rust engine evaluates over whole Arrow batches. Column work never becomes a Python loop.
 
-The language is broad enough that you rarely leave it. Typed accessor namespaces put hundreds of methods one keystroke away: text cleaning, regex, and compression on `.str`, calendars and time zones on `.dt`, nested data on `.list`, `.struct`, `.map`, and `.json`, whole images, waveforms, and video clips on `.image`, `.audio`, and `.video`, and even genomic sequences on `.seq`. Pandas and Polars spellings are there as aliases, so a ported script mostly runs as written. Every method is callable from SQL as well.
+```python
+import batcher as bt
+
+items = bt.from_pydict(
+    {"sku": ["a-1", "b-2", "c-3"], "price": [2.5, 10.0, 4.0], "qty": [4, 1, None],
+     "tags": [["x", "y"], [], ["z"]], "ts": ["2024-01-05", "2024-02-10", "2024-03-15"]}
+)
+total = bt.col("price") * bt.col("qty")
+print(total)
+# (col('price') * col('qty'))
+print(items.select("sku", total=total).to_pydict())
+# {'sku': ['a-1', 'b-2', 'c-3'], 'total': [10.0, 10.0, None]}
+```
+
+Typed accessor namespaces put hundreds of methods one keystroke away: `.str` for text, `.dt` for calendars, `.list`, `.struct`, `.map`, and `.json` for nested data, `.image`, `.audio`, and `.video` for media, and `.seq` for genomic sequences.
+
+```python
+print(items.select(
+    bt.col("sku").str.upper().alias("sku"),
+    bt.col("tags").list.len().alias("n_tags"),
+    bt.col("ts").str.to_date().dt.month().alias("month"),
+).to_pydict())
+# {'sku': ['A-1', 'B-2', 'C-3'], 'n_tags': [2, 0, 1], 'month': [1, 2, 3]}
+```
+
+Conditionals and null handling are expressions too, and any SQL expression drops in with {py:func}`bt.sql_expr <batcher.sql_expr>`:
+
+```python
+tier = bt.when(bt.col("price") > 5).then(bt.lit("high")).otherwise(bt.lit("low"))
+print(items.select("sku", tier=tier, qty=bt.col("qty").fill_null(0)).to_pydict())
+# {'sku': ['a-1', 'b-2', 'c-3'], 'tier': ['low', 'high', 'low'], 'qty': [4, 1, 0]}
+print(items.select(bt.sql_expr("upper(sku) AS s")).to_pydict())
+# {'s': ['A-1', 'B-2', 'C-3']}
+```
 
 Read {doc}`Expressions <expressions>` first. The rest of the section assumes it.
 

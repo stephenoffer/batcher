@@ -1,39 +1,27 @@
 # Batch inference
 
-Run a function over a dataset in whole Arrow batches, through the `.ml` accessor. Your
-function receives a `pyarrow.RecordBatch`, never a row, so per-element work stays
-vectorized and out of the Python hot path. You write a batch scoring function first, then
-the class form of it that loads a model once per worker instead of once per batch. The toy
-example runs as written. The real-model parts are shown rather than executed.
+Run a function over a dataset in whole Arrow batches. Your function receives a `pyarrow.RecordBatch`, never a row, so per-element work stays vectorized. You write a batch scoring function first, then the class form that loads a model once per worker.
 
 | Step | Needs |
 |---|---|
-| The batch function | `pip install batcher-engine` |
+| The batch function and the stub class | `pip install batcher-engine` |
 | The `Classifier` class | `torch` and a saved model; shown, not run |
 | `num_gpus=1.0` | A GPU |
 
 ## The shape of a batch function
 
-{py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` applies `fn` to each Arrow `RecordBatch` and expects a
-`RecordBatch` back. Here a trivial function scores each row by a column, standing in
-for a model's forward pass.
+{py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` applies `fn` to each Arrow `RecordBatch` and expects a `RecordBatch` back. Here a vectorized multiply stands in for a model's forward pass:
 
 ```python
 import batcher as bt
 import pyarrow as pa
+import pyarrow.compute as pc
 
-ds = bt.from_pydict(
-    {
-        "id": [1, 2, 3, 4],
-        "feature": [0.5, 1.5, 2.5, 3.5],
-    }
-)
+ds = bt.from_pydict({"id": [1, 2, 3, 4], "feature": [0.5, 1.5, 2.5, 3.5]})
 
 
 def score(batch: pa.RecordBatch) -> pa.RecordBatch:
-    feature = batch.column("feature").to_pylist()
-    preds = [round(x * 2.0, 1) for x in feature]
-    return batch.append_column("score", pa.array(preds))
+    return batch.append_column("score", pc.multiply(batch.column("feature"), 2.0))
 
 
 scored = ds.map_batches(score)
@@ -41,30 +29,54 @@ print(scored.to_pydict())
 # {'id': [1, 2, 3, 4], 'feature': [0.5, 1.5, 2.5, 3.5], 'score': [1.0, 3.0, 5.0, 7.0]}
 ```
 
-:::{warning}
-The pyarrow `.to_pylist()` here turns one batch's column into Python values for the toy computation.
-Don't copy that into a real pipeline. It materializes every element as a Python object,
-which is exactly the per-row cost the batch interface exists to avoid. A real model reads
-the Arrow buffers directly, through the column's `to_numpy()` or DLPack into torch, and no
-per-row Python work happens at all.
+The function reads Arrow buffers directly, so no Python object is built per element. A real model does the same through the column's `to_numpy()` or DLPack into torch.
+
+Prefer NumPy or pandas? Set `batch_format` and the batch arrives in that form:
+
+::::{tab-set}
+:::{tab-item} NumPy
+```python
+def shift(batch):
+    batch["feature"] = batch["feature"] + 1
+    return batch
+
+
+print(ds.map_batches(shift, batch_format="numpy").to_pydict()["feature"])
+# [1.5, 2.5, 3.5, 4.5]
+```
 :::
+
+:::{tab-item} pandas
+```python
+doubled = ds.map_batches(lambda df: df.assign(double=df["feature"] * 2), batch_format="pandas")
+print(doubled.to_pydict()["double"])
+# [1.0, 3.0, 5.0, 7.0]
+```
+:::
+::::
 
 ## Loading a model once per worker
 
-:::{tip}
-Pass the class, not an instance and not a closure over a loaded model. When `fn` is a
-class, Batcher constructs it once per worker and reuses it across batches, so an expensive
-model load is paid once for every batch that worker sees. A model loaded per batch is the
-most common reason an inference pipeline is slow. On the {doc}`AI and GPU benchmark
-</benchmarks/results/ai-and-gpu>`, a gpt2 load takes about 7 seconds against roughly 1 second
-of generation, so loading once is most of the win.
-:::
-
-The difference is where the load sits relative to the batches:
+Pass the class, not an instance. Batcher constructs it once per worker and reuses it across batches, so an expensive model load is paid once per worker instead of once per batch:
 
 ![On the left, a plain function such as def score(batch) is used as-is on every batch, so a function that loads its model pays the load on batch 1, again on batch 2, and again on batch 3. On the right, a class such as Classifier is built once per worker, its constructor loads the model a single time, and that one instance's call method scores batch 1, batch 2, and batch 3 with the model it already holds. A gpt2 load takes about 7 seconds against about 1 second of generation, so the load is most of the cost.](/_static/diagrams/model_load_once.svg)
 
-The class is callable: its `__call__` takes a batch and returns a batch.
+The class is callable: `__init__` loads, `__call__` scores. Constructor arguments go through `fn_constructor_kwargs`:
+
+```python
+class Scaler:
+    def __init__(self, factor: float) -> None:
+        self.factor = factor  # stands in for an expensive model load
+
+    def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
+        return batch.append_column("score", pc.multiply(batch.column("feature"), self.factor))
+
+
+print(ds.map_batches(Scaler, fn_constructor_kwargs={"factor": 10.0}).to_pydict()["score"])
+# [5.0, 15.0, 25.0, 35.0]
+```
+
+The real model has the same shape, with a GPU reservation and an actor pool:
 
 ```python
 # docs: skip
@@ -97,7 +109,15 @@ labeled.write.parquet("output/labeled.parquet")
 
 ## Controlling batching and resources
 
-`map_batches` accepts any of the following arguments to tune throughput and placement:
+`batch_size` sets the rows per call, and `output_columns` declares the schema `fn` returns:
+
+```python
+small = ds.map_batches(score, batch_size=2, output_columns=["id", "feature", "score"])
+print(small.to_pydict()["score"])
+# [1.0, 3.0, 5.0, 7.0]
+```
+
+:::{dropdown} Every throughput and placement argument
 
 - `batch_size`: rows per batch handed to `fn`.
 - `output_columns`: the columns `fn` returns, when the engine should know the output
@@ -108,17 +128,14 @@ labeled.write.parquet("output/labeled.parquet")
   such as a model path.
 - `max_retries` and `max_errored_rows`: how many times a failing batch is retried, and how
   many per-row errors the job tolerates before it fails.
+:::
 
 The same accessor also offers {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` and
 {py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>` for the common inference and embedding cases. See the
 {doc}`ML guide </ml/index>` and {doc}`inference reference </ml/inference/inference>`.
 
 :::{tip}
-Leave `batch_size` unset unless you have measured a reason to set it. Adaptive batch sizing
-picks a VRAM-safe default and halves the batch on a CUDA OOM, which is why
-{py:meth}`ds.map_batches(Model, num_gpus=1) <batcher.Dataset.map_batches>` with no knobs runs at 2,451 img/s and 82% GPU
-utilization over 131k images on 8xT4 in the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>`,
-within 2% of the hand-tuned `batch_size=128` run.
+On a GPU, leave `batch_size` unset. Adaptive batch sizing picks a VRAM-safe default and halves the batch on a CUDA OOM. {py:meth}`ds.map_batches(Model, num_gpus=1) <batcher.Dataset.map_batches>` with no knobs reaches 2,451 img/s at 82% GPU utilization on 8xT4, within 2% of a hand-tuned run. See the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>`.
 :::
 
 ## Where to go next
@@ -151,7 +168,7 @@ Fractional GPUs, stage overlap, and the warm pool.
 
 - {doc}`Inference guide </ml/inference/inference>`: `infer`, `embed`, `generate`, and the pool.
 - {doc}`PyTorch integration </ml/inference/pytorch>`: zero-copy tensors, device transfer, prefetch.
-- {doc}`UDFs </user-guide/transform/columns/udfs>`: the batch-callback contract, and its cost.
+- {doc}`UDFs </user-guide/transform/columns/udfs>`: the batch-callback contract.
 - {doc}`GPU execution </architecture/deep-dives/distribution/gpu-execution>`: why stage overlap lifts a two-stage
   pipeline from 942 to 2,504 img/s.
 - {doc}`ML API reference </api/models/ml>`: the full `.ml` accessor surface.

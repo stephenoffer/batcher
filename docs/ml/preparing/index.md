@@ -2,11 +2,11 @@
 
 This section covers the work between a raw source and a model: feature preprocessing for tabular models, decoding images, audio and video into tensors, and tokenizing text.
 
-Preparation is usually where an ML pipeline spends its CPU and its engineering time. In Batcher it is ordinary plan work. Every step on these pages is an expression or an operator, so it streams in bounded memory, runs on every core, and distributes across a cluster without a second code path. Nothing gets pulled onto the driver to be looped over in Python.
+In Batcher preparation is ordinary plan work. Every step on these pages is an expression or an operator, so it streams in bounded memory, runs on every core, and distributes without a second code path.
 
 ## Tabular features: fit once, replay anywhere
 
-The preprocessors follow the scikit-learn contract you already know, with one difference that matters at scale. `fit` learns its state with one mergeable aggregate over the data, so fitting a scaler on a billion rows is a single distributed pass rather than a sample pulled into memory. `transform` bakes the learned values into an expression and stays lazy.
+The preprocessors follow the scikit-learn contract. `fit` learns its state with one mergeable aggregate, so fitting a scaler on a billion rows is a single distributed pass. `transform` bakes the learned values into an expression and stays lazy.
 
 The example below splits by a stable key, fits an imputer, a scaler and an encoder on the training rows only, and applies the same learned state to the held-out rows:
 
@@ -29,16 +29,35 @@ print(prep.transform(test).columns)
 # ['id', 'age', 'city_paris', 'city_rome']
 ```
 
-The encoder learned its categories from the training rows, so the held-out rows get exactly those indicator columns. That is the leak-free behavior an offline score depends on, and a fitted `Chain` saves to one file that serving can load.
+The encoder learned its categories from the training rows, so the held-out rows get exactly those indicator columns. A fitted `Chain` saves to one file that serving can load.
 
 ## Media: decode in the engine
 
-Images, audio and video decode through expressions on the `.image`, `.audio` and `.video` namespaces, implemented in Rust rather than as a Python UDF per row. An image goes from encoded bytes to a normalized `float32` tensor in one expression, audio becomes a mel spectrogram that matches `torchaudio`, and curation measures such as sharpness, entropy and perceptual hashes run as predicates you can filter on. The block below needs image files, so it is shown but not executed:
+Images, audio and video decode through expressions on the `.image`, `.audio` and `.video` namespaces, implemented in Rust. Curation measures run as predicates you can filter on:
+
+```python
+import io
+
+import numpy as np
+from PIL import Image
+
+
+def png(pixels):
+    buf = io.BytesIO()
+    Image.fromarray(pixels).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+bright = np.full((8, 8, 3), 200, dtype="uint8")
+photos = bt.from_pydict({"id": [1, 2], "bytes": [png(bright), png(bright // 20)]})
+print(photos.select("id", lum=bt.col("bytes").image.brightness().round(2)).to_pydict())
+# {'id': [1, 2], 'lum': [0.78, 0.04]}
+```
+
+An image goes from encoded bytes to a normalized `float32` tensor in one expression. The block below needs image files, so it is shown but not executed:
 
 ```python
 # docs: skip
-import batcher as bt
-
 images = bt.read.images("s3://<your-bucket>/images/")
 tensors = images.with_columns(
     pixels=bt.col("bytes").image.to_tensor_f32(
@@ -47,11 +66,29 @@ tensors = images.with_columns(
 )
 ```
 
-On one 96-core machine, decoding and resizing 2,000 JPEGs to 224x224 ran at 4,649-4,788 img/s, 1.87-1.96x Daft and 6.35-6.61x Ray Data on the same corpus. {doc}`/benchmarks/results/multimodal-ingest` has the full measurement.
-
 ## Text: tokens as a column
 
-A tokenizer in the training loop leaves the GPU waiting on CPU work. As a pipeline stage it runs once, in parallel, and writes token ids to disk for every later epoch. {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` drives a Hugging Face fast tokenizer once per Arrow batch, and {py:func}`pack_sequences <batcher.ml.pack_sequences>` packs the result into dense fixed-length blocks for causal-LM pretraining.
+A tokenizer in the training loop leaves the GPU waiting on CPU work. As a pipeline stage it runs once, in parallel. {py:class}`Tokenizer <batcher.ml.preprocessors.Tokenizer>` takes a Hugging Face fast tokenizer or any `str -> list` callable:
+
+```python
+from batcher.ml import Tokenizer
+
+notes = bt.from_pydict({"id": [1, 2], "text": ["hello world", "one two three"]})
+tok = Tokenizer("text", lambda s: s.split(), output_column="tokens")
+print(tok.fit_transform(notes).to_pydict()["tokens"])
+# [['hello', 'world'], ['one', 'two', 'three']]
+```
+
+{py:func}`pack_sequences <batcher.ml.pack_sequences>` packs token lists into dense fixed-length blocks for causal-LM pretraining, with an EOS at each seam:
+
+```python
+from batcher.ml import pack_sequences
+
+corpus = bt.from_pydict({"tokens": [[1, 2, 3], [4, 5], [6, 7, 8, 9]]})
+packed = list(pack_sequences(corpus.iter_batches(), token_column="tokens", seq_len=4, eos_token=0))
+print(packed[0].to_pydict())
+# {'tokens': [[1, 2, 3, 0], [4, 5, 0, 6], [7, 8, 9, 0]]}
+```
 
 ## In this section
 

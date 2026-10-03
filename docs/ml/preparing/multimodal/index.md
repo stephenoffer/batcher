@@ -2,7 +2,7 @@
 
 This section covers turning media into columns a model can read: fetching the bytes, decoding them into tensors, curating what comes back, and moving the result through a pipeline without paying for it twice.
 
-The chain is always the same. References such as URLs and file paths become bytes, bytes become tensors, and tensors reach a model. In Batcher each link is a lazy operator over whole batches. The decode itself is an expression on the `.image`, `.audio` or `.video` namespace, implemented in Rust, so a million images never turn into a million Python calls. The same expressions work as filters, which is how you drop a blank or blurred image before anything expensive touches it.
+References become bytes, bytes become tensors, and tensors reach a model. Each link is a lazy operator over whole batches, and the decode is an expression on the `.image`, `.audio` or `.video` namespace, implemented in Rust. A million images never turn into a million Python calls, and the same expressions work as filters.
 
 ## Decode, screen, and fingerprint in one pass
 
@@ -44,6 +44,45 @@ The following diagram traces the two rows through that plan:
 
 ![Two PNGs, id 1 noisy and id 2 black, enter one plan that runs on one collect. The screen, brightness() greater than 0.05, keeps id 1 and drops id 2, so the black image never reaches the tensor or the hash. The surviving row goes to two expressions in the same pass: to_tensor(8, 8) decodes it into an 8 by 8 by 3 uint8 tensor in the image column, and phash() fingerprints it as a 64-bit hash in an Int64 phash column. The output is one row with id, image and phash. Each step is a Rust expression over whole batches, so no image becomes a Python call.](/_static/diagrams/media_screen_pass.svg)
 
+## Audio works the same way
+
+The `.audio` measures reduce a clip to a number, so screening a corpus is a predicate. The example below writes two one-second WAV clips with the standard library, a tone and silence:
+
+```python
+import wave
+
+
+def wav(samples, rate=16000):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes((samples * 32767).astype("<i2").tobytes())
+    return buf.getvalue()
+
+
+t = np.arange(16000) / 16000
+clips = bt.from_pydict(
+    {"id": [1, 2], "bytes": [wav(0.5 * np.sin(2 * np.pi * 440 * t)), wav(np.zeros(16000))]}
+)
+print(
+    clips.select(
+        "id",
+        level=col("bytes").audio.rms().round(3),
+        silent=col("bytes").audio.silence_ratio().round(2),
+    ).to_pydict()
+)
+# {'id': [1, 2], 'level': [0.354, 0.0], 'silent': [0.02, 1.0]}
+```
+
+Keep only the clips with signal:
+
+```python
+print(clips.filter(col("bytes").audio.rms() > 0.01).select("id").to_pydict())
+# {'id': [1]}
+```
+
 ## What runs natively
 
 The following table summarizes the in-engine surface per modality. {doc}`/api/accessors/media` lists every method, with signatures:
@@ -58,7 +97,7 @@ The mel spectrogram and MFCC match `torchaudio` to 1e-6, and the image photometr
 
 ## How fast it is
 
-On one busy 96-core machine with a release build, decoding and resizing 2,000 JPEGs to 224x224 ran at 4,649-4,788 img/s, and at 5,693 img/s in a separate run on an idle 96-core node. That is 1.87-1.96x Daft 0.7.23 and 6.35-6.61x Ray Data 2.56 on the same frames, with every engine required to return the same frame count at the same shape first. Computing entropy, a perceptual hash and a horizontal flip per image ran 5.67-5.76x faster than the per-row Pillow loop a Daft or Ray Data user would write for those, and decoding 2,000 audio clips took 20.4 ms, 19.8x a per-clip `soundfile` loop. {doc}`/benchmarks/results/multimodal-ingest` has the details.
+Decoding and resizing 2,000 JPEGs to 224x224 on one 96-core machine runs at 4,649-4,788 img/s, 1.87-1.96x Daft and 6.35-6.61x Ray Data on the same frames. {doc}`/benchmarks/results/multimodal-ingest` has the details.
 
 ## In this section
 

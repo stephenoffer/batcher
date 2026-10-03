@@ -1,17 +1,28 @@
 # Sort internals
 
-Sort is the one operator whose *order* is the answer. Every other hash-based operator here
-produces an unordered relation, and the tests compare them as multisets, which means a bug in
-those paths shows up as a wrong row, loudly. A sort bug shows up as rows in the wrong order,
-and an order-independent assertion cannot see it. That asymmetry is why this operator has more
-determinism machinery than any other, and why `sort(descending=True)` once silently returned
-unsorted data under spill while every gate stayed green.
+Sort is the one operator whose *order* is the answer. Every hash-based operator produces an unordered relation, so a bug there shows up as a wrong row. A sort bug shows up as rows in the wrong order, which an order-independent assertion can't see. That's why this operator carries more determinism machinery than any other. This page covers the five sort paths, the tie-break that makes them agree, top-N fusion, and the gather that dominates most sorts.
+
+Every path breaks ties on the original row index, so tied rows keep their input order in either direction, and the out-of-core path returns the identical sequence:
+
+```python
+import batcher as bt
+from batcher.config import Config, MemoryConfig, config_context
+
+t = bt.from_pydict({"k": [2, 1, 2, 1, None], "row": [0, 1, 2, 3, 4]})
+print(t.sort("k").to_pydict())
+# {'k': [1, 1, 2, 2, None], 'row': [1, 3, 0, 2, 4]}
+print(t.sort("k", descending=True).to_pydict())
+# {'k': [2, 2, 1, 1, None], 'row': [0, 2, 1, 3, 4]}
+
+ds = bt.from_pydict({"x": [i * 7919 % 1000 for i in range(5000)], "i": list(range(5000))})
+q = ds.sort("x", "i", descending=True)
+with config_context(Config().replace(memory=MemoryConfig(max_memory_bytes=1))):
+    print(q.to_pydict() == ds.sort("x", "i", descending=True).to_pydict())  # spilled == in-memory
+# True
+```
 
 :::{important}
-The engine has five sort paths, and all five must produce the **identical permutation**, not
-merely a correctly sorted one. The parallel and spilling paths each sort a *slice* of the input
-and concatenate the results, so "sorted" is not enough: two paths that order tied rows
-differently produce different relations from the same query.
+The engine has five sort paths, and all five must produce the **identical permutation**, not merely a correctly sorted one. The parallel and spilling paths each sort a slice of the input and concatenate the results, so two paths that ordered tied rows differently would return different relations from the same query.
 :::
 
 | Path | Taken when | Code |
@@ -24,72 +35,28 @@ differently produce different relations from the same query.
 
 ```text
    sort_indices(keys, batch)
-        │
         ├─ input exceeds the memory envelope? ──────► external merge sort
-        │                                               sorted runs → bounded k-way merge
-        │
         ├─ > 2^17 rows, full sort, leading key
         │  is int / float / temporal / bytes? ──────► parallel sample-sort
-        │                                               sample → range-partition → sort ranges
-        │
         ├─ single text or binary key? ──────────────► stable byte-key sort
-        │
-        ├─ single fixed-width key, full sort,
-        │  no NaN? ─────────────────────────────────► LSD radix sort
-        │                                               O(n·w), order-preserving u64 transform
-        │
+        ├─ single fixed-width key, no NaN? ─────────► LSD radix sort
         ├─ 2-8 numeric / temporal keys whose
         │  measured ranges fit 96 bits? ────────────► composite packed-key sort
-        │                                               narrow each key to its range, pack, sort words
-        │
         └─ otherwise ───────────────────────────────► row-encoded stable comparison sort
 
-   every path breaks ties on the original row index, so ties resolve to input order
-   and the permutation is unique.
+   every path breaks ties on the original row index, so the permutation is unique.
 ```
 
 ## The permutation and its tie-break
 
-`sort_indices` ([`crates/bc-interp/src/ops/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/mod.rs)) evaluates the key expressions and builds a
-`UInt32Array` permutation. `sort_batch` then `take`s the whole batch through it.
-
-Arrow's comparison sorts are not stable. `lexsort_to_indices` and `sort_to_indices` leave rows
-with equal keys in an arbitrary, input-size-dependent order. For a single-node engine that is
-merely surprising; for this one it is a correctness bug, because a range of the input sorted on
-one thread and the whole input sorted on another would order tied rows differently, and `seq ==
-par` would fail bit-for-bit.
-
-So every path breaks ties on the **original row index**. The radix paths get it from stability or
-carry it inside the packed word, the row-encoded fallback (`bc_arrow::row_sort`) compares it in
-the comparator, and the last-resort `lexsort` appends it as a final ascending key. Ties then
-resolve to input order, a deterministic total order and exactly what a stable sort yields. The slice a
-parallel range sorts is always gathered in ascending original-row order, so a slice-local `0..n`
-index preserves the input's relative order of tied rows within it.
+`sort_indices` ([`crates/bc-interp/src/ops/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/ops/mod.rs)) evaluates the key expressions and builds a `UInt32Array` permutation, and `sort_batch` `take`s the whole batch through it. Arrow's comparison sorts aren't stable, so every path breaks ties on the original row index: the radix paths through stability or by carrying it inside the packed word, the row-encoded fallback (`bc_arrow::row_sort`) in its comparator, and the last-resort `lexsort` as a final ascending key. The slice a parallel range sorts is always gathered in ascending original-row order, so a slice-local index preserves the input's tie order.
 
 ## Natural runs come first
 
-Real data is often already partly in order: files each written sorted, an append-only log, a
-`UNION ALL` of sorted sources, a re-sort by the key a scan is clustered on. Before either radix
-path runs, `ops/run_sort.rs` finds the key's maximal ordered **runs**, sorts only what lies between
-them, and merges pairwise in `log2(k)` parallel rounds. `is_ordered` is its degenerate case.
+Real data is often partly in order: files each written sorted, an append-only log, a `UNION ALL` of sorted sources. Before either radix path runs, `ops/run_sort.rs` finds the key's maximal ordered runs, sorts only what lies between them, and merges pairwise in `log2(k)` parallel rounds. The detection strides like DuckDB's vergesort, jumping `n / log2(n)` positions at a time, so failing to find a run costs about `3 * log2(n)` comparisons. That's what lets it run unconditionally. Unlike vergesort, a descending run is reversed only when it's strictly descending, which keeps the sort stable.
 
-Detection is nearly free when there are no runs to find, which is what lets it run
-unconditionally. The technique is DuckDB's, whose in-memory sort is
-`vergesort(begin, end, less, fallback = ska_sort)`. Vergesort does not walk the input looking
-for runs, it **strides**: it jumps `n / log2(n)` positions ahead, asks which way the pair there
-is ordered, and only then expands outward to the run's limits. Failing to find a run therefore
-costs about `3 * log2(n)` comparisons over the whole input, sixty-odd on six million rows. So the
-engine *proves* the ordering on the rows in hand rather than trusting a plan-level declaration: a
-false declaration is a wrong answer, while a proof that finds nothing is a rounding error.
-
-**Stability is where this departs from vergesort, and it has to.** Vergesort feeds `std::sort`,
-which is unstable, so it reverses any non-ascending run; reversing a run holding two equal keys
-would emit the later row first. A descending run is therefore exploited here only when it is
-**strictly** descending, which makes its reversal tie-free. Two further gates hand the input back
-untouched: above sixty-four runs, and when the runs cover less than half the rows.
-
-Measured on six million rows with a `float64` payload, two builds differing only in whether
-detection runs:
+:::{dropdown} Measured effect of run detection
+Six million rows with a `float64` payload, two builds differing only in whether detection runs:
 
 | key structure | detection off | detection on | |
 |---|---|---|---|
@@ -97,329 +64,16 @@ detection runs:
 | strictly descending | 23.6 ms | 17.8 ms | **1.32x** |
 | two sorted halves concatenated | 23.1 ms | 18.4 ms | **1.26x** |
 
-Random input is unchanged, which is what makes the check safe on every sort. A fully sorted key
-costs 18.3 ms, almost all of it the payload gather, so the run shapes collect most of what was
-available. Detection sees the runs of whatever
-slice it is handed, and above 2^17 rows the sample-sort range-routes first, so each range holds
-rows from every run and the runs inside it are shorter. That is why sixty-four sorted parts
-measure at parity while two do not.
-
-## Path 1: radix (single fixed-width key, full sort)
-
-`ops/radix_sort/`. An LSD radix sort over an order-preserving `u64` transform of the key:
-sign-flipped for signed integers, bit-inverted for descending, an IEEE-order transform matching
-Arrow's `total_cmp` for floats. O(n·w) in the key width against the comparison sort's O(n log n),
-producing the identical relation.
-
-It declines rather than risks: a column containing a `NaN` (no single numeric position), a
-string or boolean key, or a top-N returns `None` and the caller uses the comparison sort. A
-multi-key sort declines here too, and is picked up by the composite path below.
-
-A float key's rank spans all 64 bits, so it runs all eight counting passes, each a random gather
-over the key array. Above 2^18 rows (`FLOAT_SCATTER_MAX_ROWS`, about L2) that array leaves cache,
-so a large float column sorts `(key, row)` pairs instead of scattering an index. This used to be a
-decline, on the reasoning that a large float sort only arrives here per range. That holds on 96
-cores and not on 16, where 6M rows cut into ranges of 400K: on 15 such ranges the index-scatter
-radix took 89.4 ms, the comparison sort 67.0 ms, and the pair sort 37.5 ms.
-
-Nulls are grouped first or last per `nulls_first`, in input order. The sort is stable.
-
-## Path 2: composite packed key (several numeric or temporal keys)
-
-A multi-key `ORDER BY` has no single-column fast path. `ORDER BY o_orderdate, o_shippriority`
-would fall to the comparison sort, which encodes every row into Arrow's comparable byte format
-and pays `O(n log n)` memcmps over it. Those two columns hold about 2,400 and 5 distinct values:
-fifteen bits, against the ninety-six their declared types claim.
-
-`packed_multi_sort_indices` (`ops/radix_sort/packed.rs`) measures each key column's live value
-range, gives it only the bits that range needs, and packs the tuple into one word laid out
-most-significant key first. Comparing two packed words as integers compares their fields left to
-right and stops at the first difference, which is the definition of lexicographic order.
-
-The row's position rides in the low 32 bits of the same word, so sorting the words ascending
-also breaks every tie. A key of at most 32 bits fits a `u64` with its position; up to 96 bits
-it takes a `u128`. Both are sorted directly as plain words, which beat a counting sort at every
-width measured. The wide tier is what admits floats: a float ranks at up to 64 bits and never
-fits beside another key in a `u64`, and `ORDER BY l_partkey DESC, l_extendedprice` over 15
-concurrent 400K-row ranges went from 98.3 ms on the comparison sort to 41.3 ms packed.
-
-The narrowing is the idea DuckDB calls compressed materialization
-(`src/optimizer/compressed_materialization/compress_order.cpp`), which rewrites a column to
-`value - min` at the smallest width its catalog statistics allow. Batcher measures the range on
-the rows in hand instead, so it needs no statistics, is exact on every input, and narrows
-intermediates that no catalog describes.
-
-Four details carry the correctness:
-
-- **Direction lives in the key, not the sort.** Each field holds the order-preserving rank the
-  single-key radix already uses, which folds `descending` in by inverting, so a sort can mix
-  directions per key and the packed word still sorts ascending. A float ranks through the same
-  function, so NaN and `-0.0` are not ordered a second way here.
-- **Nulls are encoded inside their field**, not partitioned out, because a multi-key sort's nulls
-  are per column and interleaved. A null takes the field's lowest value under `nulls_first` and its
-  highest otherwise, and the field widens by one value only when the column has a null.
-- **A constant column takes zero bits.** It cannot separate two rows, so it costs nothing.
-- **Ties keep input order**, through the position packed into the word.
-
-It declines to the comparison sort on a string or boolean key, on fewer than 64 rows, on more
-than eight keys, and whenever the ranges need more than 96 bits. The decline is cheap: a range
-measured over a *prefix* can only widen, so 4,096 rows are enough to *reject* a key that will not
-fit, and the exact scan runs only for a key that might.
-
-Measured on 8M rows when the path landed, best of three interleaved runs against the comparison sort it replaces:
-
-| Shape | Before | After | |
-|---|---|---|---|
-| `ORDER BY <date>, <priority>` (12,000 distinct pairs) | 1,878 ms | 625 ms | **3.0x** |
-| `ORDER BY <int>, <int>` (3 M distinct pairs) | 112 ms | 59 ms | **1.9x** |
-| `ORDER BY <int> DESC, <int>` | 90 ms | 60 ms | **1.5x** |
-| `ORDER BY <int>, <int>, <int>` (narrow) | 133 ms | 71 ms | **1.9x** |
-| `ORDER BY <full-width int>, <full-width int>` (declines) | 66 ms | 61 ms | 1.1x |
-| `ORDER BY <string>, <int>` (declines) | 199 ms | 200 ms | 1.0x |
-
-Those figures isolate the packing. On the committed benchmark case the two changes on this page
-compound: `op-sort-multikey-narrow` (`ORDER BY l_shipdate, l_suppkey` over 6M `lineitem` rows)
-went from **1,590 ms to 52 ms**, 37.1x slower than DuckDB to 1.28x. The packing alone accounts
-for about 3x of that; the rest is the temporal routing noted under path 4.
-
-## Path 3: stable byte-key sort
-
-`ops/byte_sort.rs`, for a `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` or `FixedSizeBinary`
-key. These five are one sort with five spellings of "read this row's bytes", because Arrow
-orders all of them the same way: `memcmp` on the value bytes, with a shorter value that is a
-prefix of a longer one sorting first.
-
-Byte keys had no radix path, so a byte-keyed `ORDER BY` was the one sort whose tie order was
-nondeterministic, and that nondeterminism is precisely what blocked the parallel sample-sort on
-such a key, because a range's tie order could not be made to agree with the whole-array sort's.
-
-This module supplies the missing guarantee: nulls grouped by `nulls_first` in input order,
-non-null rows sorted byte-lexicographically, and descending inverting only the key comparison,
-never the tie-break. Equal keys always keep input order, so the serial oracle and the per-range
-sorts produce the identical relation.
-
-Inside it, four strategies are tried cheapest first, and all four produce the same permutation:
-
-1. **Already ordered.** One pass. A stable sort leaves an ordered input alone, so the
-   permutation is the identity. This is the constant range a low-cardinality sample-sort
-   produces, and it is exact rather than a heuristic.
-1. **Rank.** For a column with a few thousand distinct values, hash each row to a dense id,
-   order the distinct values among themselves, and place every row by counting. No comparisons
-   at all.
-1. **Radix.** For a key of eight bytes or fewer that a zero-padded pack orders exactly, the key
-   becomes one order-preserving `u64` and the shared integer radix sorts it.
-1. **Packed-prefix comparison.** Otherwise, carry the first eight bytes of each key inline as a
-   `u64` so a comparison the prefix settles is a register compare rather than two random reads
-   of the offset buffer and two of the value bytes.
-
-The pack is exact only when nothing is padded, or when no `0` byte appears in the column: `ab`
-and `ab\0` pad to the same eight bytes but are genuinely unequal, and treating them as tied
-would silently resolve them by input order. A `FixedSizeBinary` column is uniform by
-construction, which is why a *random* fixed-width key still qualifies.
-
-The radix stops at one word deliberately: a two-word form measured slower than the prefix
-comparison at every width tried, because eight bytes had nearly separated the rows already.
-
-### Why binary keys matter
-
-A short fixed-width key over a wide payload is the canonical large-sort shape: a hash, a UUID,
-a checksum, and the 10-byte-key/90-byte-payload record the
-[CloudSort](https://sortbenchmark.org/) benchmark defines. It used to be the worst-served sort in
-the engine, because three places each kept their own short list of sortable byte types: the
-permutation builder fell to an unstable `lexsort`, the sample-sort ran on **one core**, and the
-distributed range partitioner refused to distribute. All three read one list
-(`bc_runtime::byte_key::is_byte_key`). Measured on 1.5M rows of 10-byte keys over 90-byte
-payloads, single node:
-
-| Key type | Before | After | Speedup |
-|---|---|---|---|
-| `FixedSizeBinary(10)` | 895 ms | 57 ms | **15.7x** |
-| `Binary` | 1,155 ms | 48 ms | **23.9x** |
-| `LargeBinary` | 1,263 ms | 54 ms | **23.3x** |
-
-Text keys of the same shape are unchanged, at 0.97x, 0.99x and 1.10x for 4, 8 and 12
-characters, so this widened a path rather than trading one key family for another. Both builds
-ran alternately over five rounds and the minimum of each is reported.
-
-Against DuckDB on the same Arrow input, `python benchmarks/cloudsort.py` puts the whole record
-shape at 7.2x to 21.3x, and the ratio grows with scale because the sample-sort's ranges are what
-fill the cores:
-
-| Records | Case | Batcher | DuckDB | Ratio |
-|---|---|---|---|---|
-| 1M | `binary(10)`, key only | 16.4 ms | 155.0 ms | 9.4x |
-| 1M | `binary(10)` + `binary(90)` payload | 35.0 ms | 366.7 ms | 10.5x |
-| 16M | `binary(10)`, key only | 171.7 ms | 2220.7 ms | 12.9x |
-| 16M | `binary(10)` + `binary(90)` payload | 453.0 ms | 9369.5 ms | 20.7x |
-
-## Path 4: parallel sample-sort
-
-`ops/sample_sort/`, above 2^17 rows, for a full sort with a float, integer, temporal, text or
-binary leading key.
-
-Sample ~8,192 rows to estimate quantile boundaries, range-partition the rows by the leading key,
-and sort each range in parallel. The ranges are globally ordered relative to each other, so the
-sorted relation is the ranges in key order: no final merge, and no concatenation, because
-the executor consumes a `Vec<RecordBatch>` anyway.
-
-```text
-   sample ~8,192 rows ──► quantile boundaries   b0 < b1 < b2
-                                │
-                                ▼
-   route each row to a range by its leading key   (row INDICES only, no payload copy)
-   ┌──────────┬──────────┬──────────┬──────────┐
-   │ range 0  │ range 1  │ range 2  │ range 3  │  globally ordered relative to each other
-   └────┬─────┴────┬─────┴────┬─────┴────┬─────┘
-        │          │          │          │
-     sort keys  sort keys  sort keys  sort keys   in parallel, on a cheap gather of the
-        │          │          │          │        key columns alone
-        ▼          ▼          ▼          ▼
-      compose that permutation with the range's row indices
-        │          │          │          │
-        └──────────┴────┬─────┴──────────┘
-                        ▼
-         gather every column ONCE, per range
-                        │
-                        ▼
-   the ranges, in key order, ARE the sorted relation: no merge, no concat
-```
-
-The payload is gathered exactly once, and that is the whole point of the design. Materializing
-the ranges up front, and again to sort them, and a third time to concatenate, copied every
-column three times. On a 5M-row, 6-column sort that was two thirds of the work.
-
-Multi-key sorts work: rows bucket by the leading key (equal leading keys never span a boundary),
-then each range sorts by the full key list, so a plain concatenation in leading-key order is the
-globally sorted multi-key relation.
-
-This is the single-node form of the distributed range sort, and it comes from the same
-`bc_runtime::shuffle` range partitioners: one implementation, two scales.
-
-:::{note}
-A temporal leading key routes as `i64`, which it once did not. The routing tested
-`DataType::is_integer()`, which is false for `Date32`, `Date64`, `Timestamp`, `Time32/64` and
-`Duration`, so every one of them fell through and `ORDER BY <date>` ran **serially**, on
-however many cores the box had. On 6M rows a date sort with 2,500 distinct values took 643 ms,
-against 38 ms for the same sort on an `Int64` column holding *more* distinct values. Those types
-are physically signed integers whose numeric order is the type's order, in every unit and with
-or without a time zone, so they take the same routing. Two stay out. `Interval` is not one
-integer: `MonthDayNano` is three fields in 128 bits and none orders it. `Time32` is one integer
-that Arrow will not widen, so admitting it would raise rather than sort; the routing also
-declines on a failed cast, which keeps that class of mistake to a missed optimization.
+Input with more than sixty-four runs, or whose runs cover less than half the rows, is handed back untouched.
 :::
 
-## Scaling and skew
+## The fixed-width paths
 
-How the phases of a distributed sort scale with the worker count, and how the engine adapts to
-data that is already ordered, low-cardinality, or dominated by one key, are their own subject:
-see {doc}`Sorting at scale </architecture/deep-dives/operators/sort-at-scale>`.
+**LSD radix** (`ops/radix_sort/`) sorts an order-preserving `u64` transform of a single key: sign-flipped for signed integers, bit-inverted for descending, an IEEE-order transform matching Arrow's `total_cmp` for floats. It's O(n·w) against O(n log n) and produces the identical relation. Above 2^18 rows a float column sorts `(key, row)` pairs instead of scattering an index, since the key array has left cache. A `NaN`, a string or boolean key, or a top-N declines to the comparison sort.
 
-## Path 5: external merge sort
-
-`ops/external_sort.rs`, when the input exceeds the memory envelope. Sort each input morsel into a
-run and spill it (dropping the input batch as you go), then merge the runs with a bounded-fan-in
-streaming k-way merge over a `BinaryHeap` of encoded rows.
-
-Peak memory is O(`sort_merge_fanin` morsels), 16 by default, regardless of input size: only one
-batch per run in the active merge group is resident, and the output streams back to disk between
-passes. The result equals a single in-memory `sort_batch` over the whole input, and spill files are
-Arrow IPC through the same `DiskSpillStore` the aggregate uses. The figure shows the two phases:
-
-![External sorting in two phases. If the sort fits its memory envelope, parallel_sort_batch runs with no disk at all. If it does not, pass 0 accumulates morsels into a run of at most a quarter of the operator budget capped at 64 MiB, sorts it, and writes it to one Arrow IPC file that is closed immediately, dropping each input batch as it goes so the relation is never all resident. Passes 1 onward then merge at most 16 runs at a time through a min-heap over each run's head row, with one batch per reader resident, writing one longer run per group and repeating while more than one run remains; the final pass streams the sorted rows 16,384 at a time. The merged row count is checked against the rows that went in, because a truncated spill file reads back as a valid shorter stream, which is a sorted prefix rather than an error.](/_static/diagrams/sort_run_merge.svg)
-
-## Top-N is not sort-then-slice
-
-A `LIMIT` above a `Sort` is fused by the optimizer into `Sort { keys, limit }`, and `parallel_top_n`
-reduces each morsel to its own local top-k before merging the narrow set of survivors. The whole
-input is never concatenated and never fully sorted.
-
-Both routes return the same k rows. They differ in how much of the relation each one has to order,
-and how much of it each one has to copy:
-
-![Top-N against sort-then-slice. Sort-then-slice concatenates the morsels into one batch, orders every row and gathers every column, then keeps k, so the relation is copied twice and ordered once to retain a fraction of it. The engine instead reduces each morsel in parallel to its own heap of k, where a row that cannot reach the answer costs one comparison against the current worst; the narrow candidates carry keys only and leave the payload behind; they merge to k rows with ties broken on morsel and row so the survivor matches the stable sort's; and the wide columns are gathered exactly once at the end. The relation is never concatenated and never fully sorted. The heap is used when k is small against the morsel, above which the morsel is sorted and sliced because a linear sort costs no more, and a shared bound can skip a whole morsel whose key range cannot reach the answer, switching itself off after 32 checks that excluded nothing.](/_static/diagrams/topn_heap.svg)
-
-Per morsel, `top_k_indices_of` tries the cheapest shape first. When `k` is at most half the
-morsel, a bounded heap *selects* the best `k`: a single key ranks through the same
-order-preserving `u64` the radix builds, and a multi-key sort selects on its leading key. A row
-that cannot beat the current worst costs one comparison, and the survivors come back already
-sorted. It replaced a full per-morsel sort that measured `ORDER BY <i64> LIMIT 10` over 6M rows at
-53 ms across the pool. A large `k` over a single text, binary, integer or temporal key sorts the
-morsel and slices it instead. Everything else, including a large `k` over a float, falls to an
-O(n) quickselect over a total-order comparator that walks each `ORDER BY` key and then the row
-index. A float skips the full sort because its radix runs eight scattering passes, and routing it
-to the quickselect moved `ORDER BY <f64> DESC LIMIT 100` over 6M rows from 3.0x DuckDB to 1.57x.
-
-Quickselect is unstable, so the order in which a morsel hands back its candidates is arbitrary. The
-global merge therefore tie-breaks on the survivor's original `(morsel, row)` rather than on its
-position in the flattened candidate array. Those two agree only when every morsel returns rows in
-ascending-row order, which the radix full sort happened to do and the quickselect does not, and the
-gap between them was a live wrong-answer bug: a different tied row survived at the same rank than
-the stable oracle keeps, visible only with real key ties, since a distinct second sort key removes
-them. `parallel_top_n_float_key_matches_eager` pins the fixed behavior across `-0.0`/`0.0`, `NaN`,
-heavy ties, and every ascending/descending by nulls-first combination.
-
-The fusion is worth the machinery. On the last full published operator sweep, `sort → LIMIT` ran
-in 14.1 ms against Polars' 601 ms, which sorts the whole relation and then slices it.
-
-## The gather is the cost
-
-For most sorts the comparison work is not the bottleneck; the `take` of every column through the
-permutation is. That is why the sample-sort works so hard to gather once, and why [`crates/bc-runtime/src/gather/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/gather) exists. Arrow's `take` on a variable-length byte
-column is far slower than the memory it moves: it drives `MutableArrayData::extend` once per row,
-paying a call and bounds checks to copy a handful of bytes. On a 5M-row sort, adding one string
-column cost ~52 ms, an order of magnitude more than the ~50 MB of characters involved. The fast
-path does two passes: one to sum the gathered lengths into the offset buffer, one to
-`copy_from_slice` the bytes. Every other type, a nullable index array, or an offset overflow
-delegates to Arrow's `take`, so it is a pure short-circuit and never a second semantics.
-
-`Utf8`, `LargeUtf8`, `Binary` and `LargeBinary` share one layout, an offset buffer and a value
-buffer, so the fast path is one implementation generic over Arrow's `ByteArrayType`. Binary
-matters most here because it is the *payload* type, and a sort of narrow keys over wide binary
-payloads spends more than half its time in this function. `FixedSizeBinary` is simpler still,
-row `k` at `k * width`, and filling it in parallel is 8x to 22x faster than the single-threaded
-Arrow `take` it used to fall to.
-
-:::{warning}
-`FixedSizeBinaryArray::value_data()` returns the whole underlying buffer, while `value(i)` reads
-at `(offset + i) * width`. A fill that indexes from zero therefore gathers the wrong bytes from
-any **sliced** array, and every morselized executor hands out slices. That is a wrong answer
-rather than an error, so the fill bases its addressing on `value_offset(0)` and the sliced case
-is asserted against Arrow at four widths.
-:::
-
-## Which path a query takes
-
-The surface is one call whatever runs underneath, so what this section shows is which of the
-paths above a given key list reaches. For what `sort` itself does with nulls, ties and NaN, see
-{doc}`sorting rows </user-guide/transform/rows/sorting>`.
-
-A binary key sorts through the same call, and by the same byte order, whichever of the three
-binary types it is spelled as:
+**Composite packed key** (`packed_multi_sort_indices`) handles a multi-key `ORDER BY` such as `ORDER BY o_orderdate, o_shippriority`. It measures each key's live value range, gives it only the bits that range needs, and packs the tuple into one word, most-significant key first, with the row position in the low 32 bits. Comparing packed words as integers is lexicographic order, and ties keep input order. Up to 32 key bits fit a `u64`; up to 96 take a `u128`, which is what admits floats. Direction is folded into each field, so mixed directions still sort ascending:
 
 ```python
-import pyarrow as pa
-
-import batcher as bt
-
-records = pa.table(
-    {
-        "key": pa.array([b"\x02\x00", b"\x00\xff", b"\x01\x7f"], type=pa.binary(2)),
-        "payload": pa.array([b"c" * 8, b"a" * 8, b"b" * 8], type=pa.binary()),
-    }
-)
-print(bt.from_arrow(records).sort("key").to_pydict()["key"])
-```
-
-```text
-[b'\x00\xff', b'\x01\x7f', b'\x02\x00']
-```
-
-Two integer keys with mixed directions take the composite packed key, with nothing in the query
-asking for it:
-
-```python
-import batcher as bt
-
 orders = bt.from_pydict(
     {
         "orderdate": [19_950_301, 19_950_302, 19_950_301, 19_950_302],
@@ -428,36 +82,103 @@ orders = bt.from_pydict(
     }
 )
 print(orders.sort("orderdate", "shippriority", descending=[False, True]).to_pydict())
+# {'orderdate': [19950301, 19950301, 19950302, 19950302], 'shippriority': [1, 0, 1, 0],
+#  'revenue': [30.0, 10.0, 20.0, 40.0]}
 ```
 
-```text
-{'orderdate': [19950301, 19950301, 19950302, 19950302], 'shippriority': [1, 0, 1, 0], 'revenue': [30.0, 10.0, 20.0, 40.0]}
-```
+:::{dropdown} Packed-key details and measurements
+The narrowing is the idea DuckDB calls compressed materialization (`src/optimizer/compressed_materialization/compress_order.cpp`), but Batcher measures the range on the rows in hand, so it needs no statistics and narrows intermediates no catalog describes. Nulls are encoded inside their field (lowest value under `nulls_first`, highest otherwise), and a constant column takes zero bits. It declines on a string or boolean key, under 64 rows, over eight keys, or past 96 bits; a range measured over a 4,096-row prefix is enough to reject a key that won't fit.
 
-:::{dropdown} The explained plan, with the fusion visible
-```text
-query plan (planned)                                2 operators
-───────────────────────────────────────────────────────────────
-OPERATOR             ESTIMATE  NOTES
-sort  [top 2 by x]      est≈2  (exact)
-└─ scan  [source 0]     est≈5  (exact)  pushed[top 2 by x desc]
-```
+Measured on 8M rows, best of three interleaved runs against the comparison sort:
 
-This is the plan for `sort("x", descending=True).limit(2)` over a five-row source. There is no
-`limit` node above the sort. The sort node absorbed it, reads as `top 2 by x`, and runs a top-N
-instead of a full sort. The bound reaches the scan as well.
+| Shape | Comparison sort | Packed | |
+|---|---|---|---|
+| `ORDER BY <date>, <priority>` (12,000 distinct pairs) | 1,878 ms | 625 ms | **3.0x** |
+| `ORDER BY <int>, <int>` (3 M distinct pairs) | 112 ms | 59 ms | **1.9x** |
+| `ORDER BY <int> DESC, <int>` | 90 ms | 60 ms | **1.5x** |
+| `ORDER BY <int>, <int>, <int>` (narrow) | 133 ms | 71 ms | **1.9x** |
 :::
 
-## The rule for testing this
+## Stable byte-key sort
+
+`ops/byte_sort.rs` sorts `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary` as one sort, because Arrow orders all five by `memcmp` on the value bytes. Nulls group by `nulls_first` in input order, and descending inverts only the key comparison, never the tie-break. Four strategies are tried cheapest first, all producing the same permutation:
+
+1. **Already ordered.** One pass, and the permutation is the identity.
+1. **Rank.** For a few thousand distinct values, hash each row to a dense id, order the distinct values, and place every row by counting.
+1. **Radix.** A key of eight bytes or fewer that a zero-padded pack orders exactly becomes one `u64` for the integer radix.
+1. **Packed-prefix comparison.** Otherwise, the first eight bytes ride inline as a `u64`, so most comparisons are a register compare.
+
+```python
+import pyarrow as pa
+
+records = pa.table(
+    {
+        "key": pa.array([b"\x02\x00", b"\x00\xff", b"\x01\x7f"], type=pa.binary(2)),
+        "payload": pa.array([b"c" * 8, b"a" * 8, b"b" * 8], type=pa.binary()),
+    }
+)
+print(bt.from_arrow(records).sort("key").to_pydict()["key"])
+# [b'\x00\xff', b'\x01\x7f', b'\x02\x00']
+```
+
+A short fixed-width key over a wide payload (a hash, a UUID, the 10-byte-key/90-byte-payload record of [CloudSort](https://sortbenchmark.org/)) is the canonical large-sort shape. Against DuckDB on the same Arrow input, `python benchmarks/cloudsort.py` measures it at 7.2x to 21.3x, growing with scale:
+
+| Records | Case | Batcher | DuckDB | Ratio |
+|---|---|---|---|---|
+| 1M | `binary(10)`, key only | 16.4 ms | 155.0 ms | 9.4x |
+| 1M | `binary(10)` + `binary(90)` payload | 35.0 ms | 366.7 ms | 10.5x |
+| 16M | `binary(10)`, key only | 171.7 ms | 2220.7 ms | 12.9x |
+| 16M | `binary(10)` + `binary(90)` payload | 453.0 ms | 9369.5 ms | 20.7x |
+
+## Parallel sample-sort
+
+`ops/sample_sort/`, above 2^17 rows. Sample ~8,192 rows to estimate quantile boundaries, range-partition the rows by the leading key, and sort each range in parallel. The ranges are globally ordered, so the sorted relation is the ranges in key order, with no final merge and no concatenation. Multi-key sorts bucket by the leading key and sort each range by the full key list. Temporal keys (`Date32`, `Date64`, `Timestamp`, `Time64`, `Duration`) route as `i64`. This is the single-node form of the distributed range sort, built on the same `bc_runtime::shuffle` range partitioners.
+
+```text
+   sample ~8,192 rows ──► quantile boundaries   b0 < b1 < b2
+   route each row to a range by its leading key   (row INDICES only, no payload copy)
+   ┌──────────┬──────────┬──────────┬──────────┐
+   │ range 0  │ range 1  │ range 2  │ range 3  │  globally ordered relative to each other
+   └────┬─────┴────┬─────┴────┬─────┴────┬─────┘
+     sort keys  sort keys  sort keys  sort keys   in parallel, on the key columns alone
+        └──────────┴────┬─────┴──────────┘
+         gather every column ONCE, per range: the ranges, in order, ARE the result
+```
+
+How a distributed sort scales and adapts to skew is on {doc}`Sorting at scale </architecture/deep-dives/operators/sort-at-scale>`.
+
+## External merge sort
+
+`ops/external_sort.rs`, when the input exceeds the memory envelope. Each morsel is sorted into a run and spilled, then the runs merge through a bounded-fan-in k-way merge over a `BinaryHeap` of encoded rows. Peak memory is O(`sort_merge_fanin` morsels), 16 by default, regardless of input size, and the result equals an in-memory `sort_batch` over the whole input. Spill files are Arrow IPC through the same `DiskSpillStore` the aggregate uses.
+
+![External sorting in two phases. If the sort fits its memory envelope, parallel_sort_batch runs with no disk at all. If it does not, pass 0 accumulates morsels into a run of at most a quarter of the operator budget capped at 64 MiB, sorts it, and writes it to one Arrow IPC file that is closed immediately, dropping each input batch as it goes so the relation is never all resident. Passes 1 onward then merge at most 16 runs at a time through a min-heap over each run's head row, with one batch per reader resident, writing one longer run per group and repeating while more than one run remains; the final pass streams the sorted rows 16,384 at a time. The merged row count is checked against the rows that went in, because a truncated spill file reads back as a valid shorter stream, which is a sorted prefix rather than an error.](/_static/diagrams/sort_run_merge.svg)
+
+## Top-N is not sort-then-slice
+
+The optimizer fuses a `LIMIT` above a `Sort` into `Sort { keys, limit }`, and `parallel_top_n` reduces each morsel to its own top-k before merging the survivors. The input is never concatenated and never fully sorted. The plan shows the fusion, with no `limit` node and the bound pushed into the scan:
+
+```python
+ds = bt.from_pydict({"x": [4, 1, 5, 2, 3]})
+q = ds.sort("x", descending=True).limit(2)
+print(q.to_pydict())
+# {'x': [5, 4]}
+print(q.explain())
+# sort  [top 2 by x]      est≈2  (exact)
+# └─ scan  [source 0]     est≈5  (exact)  pushed[top 2 by x desc]
+```
+
+![Top-N against sort-then-slice. Sort-then-slice concatenates the morsels into one batch, orders every row and gathers every column, then keeps k, so the relation is copied twice and ordered once to retain a fraction of it. The engine instead reduces each morsel in parallel to its own heap of k, where a row that cannot reach the answer costs one comparison against the current worst; the narrow candidates carry keys only and leave the payload behind; they merge to k rows with ties broken on morsel and row so the survivor matches the stable sort's; and the wide columns are gathered exactly once at the end. The relation is never concatenated and never fully sorted. The heap is used when k is small against the morsel, above which the morsel is sorted and sliced because a linear sort costs no more, and a shared bound can skip a whole morsel whose key range cannot reach the answer, switching itself off after 32 checks that excluded nothing.](/_static/diagrams/topn_heap.svg)
+
+Per morsel, `top_k_indices_of` picks the cheapest shape: a bounded heap when `k` is at most half the morsel, a sort-and-slice for a large `k` over a single text, binary, integer or temporal key, and an O(n) quickselect otherwise. The global merge tie-breaks on each survivor's original `(morsel, row)`, so the kept rows match the stable sort's exactly. On the last full published operator sweep, `sort → LIMIT` ran in 14.1 ms against Polars' 601 ms.
+
+## The gather is the cost
+
+For most sorts the `take` of every column through the permutation costs more than the comparisons. That's why the sample-sort gathers once, and why [`crates/bc-runtime/src/gather/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-runtime/src/gather) exists. For the byte layouts (`Utf8`, `LargeUtf8`, `Binary`, `LargeBinary`) it does two passes, one to sum lengths into the offset buffer and one to `copy_from_slice` the bytes, instead of Arrow's per-row `extend`. `FixedSizeBinary` fills in parallel, 8x to 22x faster than the single-threaded Arrow `take`. Any other type, a nullable index array, or an offset overflow delegates to Arrow's `take`, so this is a short-circuit and never a second semantics.
+
+## Testing a sort
 
 :::{warning}
-Never assert a sort with an order-independent comparison. The differential harness's
-`assert_same` is a multiset comparison: correct for a group-by, and completely blind to a sort
-bug. Sort assertions compare sequences, across the cross-product of `{collect, spill,
-iter_batches, distributed}` and `{nulls, empty, one row, duplicates, -0.0/NaN, descending}`.
-That cross-product is [`tests/differential/test_diff_operator_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_operator_matrix.py), and it exists because
-the shape that broke, `descending=True` under spill, was never the shape anyone was thinking
-about.
+Never assert a sort with an order-independent comparison. The differential harness's `assert_same` is a multiset comparison: correct for a group-by and blind to a sort bug. Sort assertions compare sequences, across the cross-product of `{collect, spill, iter_batches, distributed}` and `{nulls, empty, one row, duplicates, -0.0/NaN, descending}` in [`tests/differential/test_diff_operator_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_operator_matrix.py).
 :::
 
 ## Where the code lives

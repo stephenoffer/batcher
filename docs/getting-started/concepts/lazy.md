@@ -7,31 +7,28 @@ import batcher as bt
 
 ds = bt.from_pydict({"x": [1, 2, 3, 4], "g": ["a", "b", "a", "b"]})
 
-filtered = ds.filter(bt.col("x") > 1)  # ds is unchanged
-projected = filtered.select("x")  # filtered is unchanged
-
-print(ds.columns)
-# ['x', 'g']
+wide = ds.with_columns(y=bt.col("x") * 2)  # a new Dataset
+print(ds.columns, wide.columns)  # ds is unchanged
+# ['x', 'g'] ['x', 'g', 'y']
 ```
 
-Immutability means you can branch a pipeline from any intermediate handle and reuse it without copying data or worrying that a later step changed it.
+Branch a pipeline from any intermediate handle and reuse it freely. Nothing is copied, and no later step can change it:
+
+```python
+evens = ds.filter(bt.col("x") % 2 == 0)
+print(evens.select("x").to_pydict(), evens.select("g").to_pydict())
+# {'x': [2, 4]} {'g': ['b', 'b']}
+```
 
 ## Why waiting pays off
 
-Because nothing runs early, the optimizer sees your whole query before it touches a byte. It can move a filter you wrote last down into the scan, read only the columns the final `select` needs, and choose a join strategy knowing what feeds the join. An eager library runs each step as you write it and can't take any of those back.
+Because nothing runs early, the optimizer sees your whole query before it touches a byte. It moves a filter you wrote last down into the scan, reads only the columns the final `select` needs, and picks a join strategy knowing what feeds the join.
 
 ## Terminal operations trigger execution
 
-Chaining calls only grows the plan. The optimizer runs, and the engine executes, when you call a *terminal* operation.
+Chaining calls only grows the plan. The engine runs it when you call a *terminal* operation.
 
 ![The query lifecycle: reading and transforming build a lazy LogicalPlan; a terminal operation triggers optimization and execution, returning an Arrow result.](/_static/diagrams/lifecycle.svg)
-
-The common terminal operations are the following:
-
-- {py:meth}`to_pydict() <batcher.Dataset.to_pydict>` returns a column-oriented dict, and {py:meth}`to_pylist() <batcher.Dataset.to_pylist>` returns a list of row dicts.
-- {py:meth}`collect() <batcher.Dataset.collect>` returns a `pyarrow.Table`, and {py:meth}`count() <batcher.Dataset.count>` returns only the row count.
-- {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` streams Arrow record batches instead of materializing everything.
-- `write.parquet(...)`, `write.csv(...)`, `write.json(...)`, and the generic {py:obj}`write(...) <batcher.Dataset.write>` send the result to a sink.
 
 ```python
 plan = ds.filter(bt.col("x") >= 2).select("x")  # nothing runs yet
@@ -39,12 +36,40 @@ print(plan.to_pydict())  # runs here
 # {'x': [2, 3, 4]}
 ```
 
-A dataset doesn't hold on to its result, so a second terminal call executes the plan again. If you'll ask several questions of one expensive intermediate result, mark it with {py:meth}`cache() <batcher.Dataset.cache>` and the first materializing call stores it.
-
-`explain()` returns the optimized plan as text without executing it. Reach for it when you want to confirm what the optimizer did:
+Each terminal returns the result in a different shape:
 
 ```python
-print(plan.explain())
+print(plan.count())
+# 3
+print(plan.to_pylist())
+# [{'x': 2}, {'x': 3}, {'x': 4}]
+print(plan.collect().num_rows)  # a pyarrow.Table
+# 3
+```
+
+{py:meth}`iter_batches() <batcher.Dataset.iter_batches>` streams Arrow record batches instead of materializing everything, and `write.parquet(...)`, `write.csv(...)`, `write.json(...)`, and {py:obj}`write(...) <batcher.Dataset.write>` send the result to a sink:
+
+```python
+for batch in plan.iter_batches():
+    print(batch.num_rows)
+# 3
+```
+
+## Cache and explain
+
+A dataset doesn't keep its result, so a second terminal call runs the plan again. Mark an expensive intermediate with {py:meth}`cache() <batcher.Dataset.cache>` and the first materializing call stores it:
+
+```python
+cached = plan.cache()
+print(cached.count(), cached.to_pydict())
+# 3 {'x': [2, 3, 4]}
+```
+
+`explain()` returns the optimized plan as text without executing it. Here the filter is already pushed into the scan:
+
+```python
+print("pushed" in plan.explain())
+# True
 ```
 
 ## See also

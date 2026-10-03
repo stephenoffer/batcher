@@ -1,8 +1,41 @@
 # Warehouses
 
-Batcher reads your warehouse through each service's bulk Arrow protocol, never a row-by-row cursor. A Snowflake result arrives as parallel cloud-storage chunks, a BigQuery table as parallel Storage Read API streams, and a Databricks table as its own Delta files, read without a warehouse at all. Filters push down on all three, so rows a query discards never cross the network.
+Batcher reads your warehouse through each service's bulk Arrow protocol, never a row-by-row cursor. A Snowflake result arrives as parallel cloud-storage chunks, a BigQuery table as parallel Storage Read API streams, and a Databricks table as its own Delta files. Filters push down on all three, and the schema comes from a zero-row probe or table metadata, so planning costs no scan.
 
-The connectors also plan cheaply. A Snowflake query or a Databricks warehouse query gets its schema from a zero-row probe, and a BigQuery or Databricks table gets it from metadata, so learning a table's columns doesn't cost a scan. A warehouse table then joins against the lake in one plan.
+Each read is one call that returns a lazy dataset, ready to join against the lake. These blocks need an account, so they are shown but not executed:
+
+::::{tab-set}
+:::{tab-item} Snowflake
+
+```python
+# docs: skip
+import batcher as bt
+
+conn = {"account": "acme-prod", "user": "svc_batcher", "password": "env:SNOWFLAKE_PASSWORD"}
+orders = bt.read.snowflake("SELECT * FROM SALES.ORDERS", connection_kwargs=conn)
+```
+
+:::
+:::{tab-item} BigQuery
+
+```python
+# docs: skip
+events = bt.read.bigquery(table="acme-data.analytics.events", project="acme-billing")
+purchases = events.filter(bt.col("event_type") == "purchase")
+```
+
+:::
+:::{tab-item} Databricks
+
+```python
+# docs: skip
+orders = bt.read.databricks(
+    "main.sales.orders", workspace="https://acme.cloud.databricks.com", token="env:DATABRICKS_TOKEN"
+)
+```
+
+:::
+::::
 
 ::::{grid} 1 2 2 3
 :gutter: 3

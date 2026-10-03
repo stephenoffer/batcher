@@ -2,13 +2,9 @@
 
 This page reports Batcher's results on the classical side of the engine: TPC-H, ClickBench, the operator mix, JSON and scans, measured against DuckDB, Polars and Daft on identical input.
 
-:::{important}
-Every timing on this page passed the correctness gate first. The harness runs the query on each engine, compares the results as a sorted row multiset within float tolerance, and refuses to record a ratio when they disagree. On TPC-H q6 that gate withholds a number from two other engines, because both return the wrong revenue.
-:::
-
 ## The suites
 
-The current board was swept 2026-09-13 on a quiet 48-core (24 physical plus SMT), 92 GiB box, four engines, best of five, one process per case. Each cell is a suite geomean of `batcher_ms / engine_ms`, so **below 1.00 means Batcher is faster**:
+Swept 2026-09-13 on a 48-core (24 physical plus SMT), 92 GiB box, four engines, best of five, one process per case. Each cell is a suite geomean of `batcher_ms / engine_ms`, so **below 1.00 means Batcher is faster**:
 
 | Suite | DuckDB, native store | DuckDB, same Arrow | Polars |
 |---|---:|---:|---:|
@@ -19,9 +15,14 @@ The current board was swept 2026-09-13 on a quiet 48-core (24 physical plus SMT)
 | Operator mix (46) | **0.75** | **0.47** | **0.16** |
 | H2O.ai `groupby` (10) | 1.05 | **0.83** | **0.53** |
 
-Against DuckDB reading the same Arrow, the like-for-like execution comparison, Batcher is 4x faster on TPC-H and 6x on ClickBench. Against DuckDB's native compressed store, which pairs DuckDB's storage engine with its execution engine, Batcher leads five suites of six.
+Against DuckDB reading the same Arrow, Batcher is 4x faster on TPC-H and 6x on ClickBench. Against DuckDB's native compressed store it leads five suites of six.
 
-Two sweeps add what that board doesn't carry. The scan suite's 27 cases, which read Parquet, CSV and JSON across several file layouts, measured **0.57x DuckDB and 0.24x Polars** (2026-09-11, same 48-core box, pairwise lineups). TPC-DS sf1 measured **0.98x** against DuckDB's native store on the same day. {doc}`/benchmarks/results/tpch` carries TPC-H query by query, and {doc}`/benchmarks/results/engine-matrix` sets every engine side by side.
+| Also measured 2026-09-11, same box | DuckDB | Polars |
+|---|---:|---:|
+| Scan and I/O (27 cases: Parquet, CSV, JSON) | **0.57x** | **0.24x** |
+| TPC-DS sf1 (99), DuckDB native store | **0.98x** | |
+
+{doc}`/benchmarks/results/tpch` carries TPC-H query by query, and {doc}`/benchmarks/results/engine-matrix` sets every engine side by side.
 
 ## Operators
 
@@ -41,26 +42,43 @@ The operator mix times single data-plane kernels over TPC-H `lineitem` at sf1 (6
 | Window {py:func}`lag() <batcher.lag>` | 179.7 ms | 151.4 ms | 3,216.9 ms | 1.19x | **0.06x** |
 | Window `rank()` | 220.7 ms | 132.7 ms | 988.8 ms | 1.66x | **0.22x** |
 
-A filtered count is the widest DuckDB margin, and it comes from the plan rather than the kernel. `.count()` over a filter compiles to a `COUNT(*)` aggregate, projection pushdown prunes the scan to the one column the predicate reads, and the count fuses into a single {py:func}`count_if <batcher.count_if>` pass. Against Polars, top-N is 50x because a fused top-N heap keeps only the running best rows and never sorts the relation.
+Two plan-level shapes explain the widest margins. A filtered count prunes the scan to the one column the predicate reads and fuses into a single {py:func}`count_if <batcher.count_if>` pass. A sort followed by a limit becomes a fused top-N that keeps only the running best rows, which `explain()` shows as one operator:
 
-The 46-case mix added string functions, set operations, scalar expressions and six more join shapes. Some of the new cases are large wins, such as a semi-join at 0.28x DuckDB and an anti-join at 0.27x. Others are the losses listed in [`benchmarks/results/LOSS_BACKLOG.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/LOSS_BACKLOG.md), which is where work on them is tracked.
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"k": [3, 1, 2, 5, 4], "v": [30, 10, 20, 50, 40]})
+top = ds.sort("v", descending=True).limit(2)
+assert "top 2 by v" in top.explain()
+print(top.to_pydict())
+# {'k': [5, 4], 'v': [50, 40]}
+```
+
+The 46-case mix adds string functions, set operations, scalar expressions and six more join shapes, including a semi-join at **0.28x** DuckDB and an anti-join at **0.27x**.
 
 ## Against Daft
 
-Daft is a fast multi-core Rust engine. On a five-engine board taken 2026-08-28 on a 92-core box, best of five, Batcher's geomean against it was 0.21x on TPC-H sf1, 0.17x at sf10, 0.11x on ClickBench, 0.07x on the operators and 0.04x on JSON. The Daft geomeans cover only the queries Daft answers correctly. It returns wrong results on TPC-H q6 and q15, and it can't plan q21 or q22. {doc}`/benchmarks/comparisons/vs-daft` has the full comparison, including multimodal and distributed work.
+On a five-engine board taken 2026-08-28 on a 92-core box, best of five:
 
-## Requirements and limitations
+| Suite | vs Daft |
+|---|---:|
+| TPC-H sf1 | **0.21x** |
+| TPC-H sf10 | **0.17x** |
+| ClickBench | **0.11x** |
+| Operators | **0.07x** |
+| JSON | **0.04x** |
 
-These results are single-node and steady state. The following caveats apply:
+The Daft geomeans cover only the queries Daft answers correctly. {doc}`/benchmarks/comparisons/vs-daft` has the full comparison, including multimodal and distributed work.
 
-- **H2O.ai `groupby`** is the one suite where DuckDB's native store is ahead, at 1.05x, on low-cardinality string keys it keeps dictionary-encoded.
-- **Several ClickBench cases and the global-sum operator** are an unfiltered `SUM`, `AVG` or `COUNT(DISTINCT)` over an in-memory table. Batcher answers them exactly from statistics it recorded on an earlier run, so their timing is a lookup rather than a scan.
-- **The operator table** above is from a smaller, older machine than the suite board. Compare ratios within it, not its absolute times against another table.
+:::{dropdown} Scope of these numbers
+- Results are single node and steady state.
+- An unfiltered `SUM`, `AVG` or `COUNT(DISTINCT)` over an in-memory table, such as the global-sum operator and several ClickBench cases, is answered exactly from statistics recorded on an earlier run.
+- The operator table is from an older 16-core machine. Compare ratios within it, not its absolute times against another table.
+:::
 
 ## Reproduce
 
-The following commands rerun each board on this page:
-
+:::{dropdown} Commands that rerun each board on this page
 ```bash
 python benchmarks/run.py --benchmark tpch --engines batcher,duckdb,duckdb_arrow,polars --isolate
 python benchmarks/run.py --benchmark clickbench --engines batcher,duckdb,duckdb_arrow,polars --isolate
@@ -68,6 +86,7 @@ python benchmarks/run.py --benchmark operators --tier single
 python benchmarks/run.py --benchmark scan --engines batcher,duckdb
 python benchmarks/run.py --benchmark tpch --engines batcher,daft
 ```
+:::
 
 ## See also
 

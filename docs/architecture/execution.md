@@ -3,51 +3,42 @@
 This page describes how Batcher turns an optimized plan into results: the lazy API, the
 pipeline and breaker model, and the three execution paths.
 
-Batcher runs across two planes. Python is the control plane. It builds a plan,
-optimizes it, and decides resource bounds, but never touches a row in the hot path.
-Rust is the data plane, where every per-row and per-batch computation runs over
-Apache Arrow. The two meet at a single boundary, a JSON plan IR plus zero-copy
-Arrow `RecordBatch`es carried over the Arrow C Data Interface, and nothing else
-crosses it. The Python entry point is Core handing the plan to the native engine, in
-`core/executor.py`:
+Python builds and optimizes the plan. Rust runs every per-row computation over Apache Arrow. The two meet at a JSON plan IR plus zero-copy Arrow `RecordBatch`es, and nothing else crosses.
+
+:::{dropdown} Where the plan crosses into Rust
+Core hands the plan to the native engine in `core/executor.py`:
 
 ```python
 out, metrics_json = _native.execute_plan_metered(plan.to_json(), sources, engine_cfg, query_id)
 ```
 
-For the contributor's view, which crate runs which scale, the thresholds with their
-config names, and the metadata layer that answers some terminals without a scan, see
-{doc}`Execution engine </architecture/internals/execution>`.
+{doc}`Execution engine </architecture/internals/execution>` has the contributor's view: which crate runs which scale, the thresholds with their config names, and the metadata layer that answers some terminals without a scan.
+:::
 
 ## Lazy evaluation
 
-The API is lazy and immutable. Each operation returns a new {py:class}`Dataset <batcher.Dataset>` wrapping a
-`LogicalPlan`, and nothing computes until a terminal call.
+The API is lazy and immutable. Each operation returns a new {py:class}`Dataset <batcher.Dataset>` wrapping a `LogicalPlan`, and nothing computes until a terminal call:
 
 ```python
+# docs: run
 import batcher as bt
 
-ds = bt.read("data.parquet")
-filtered = ds.filter(bt.col("x") > 0)
-result = filtered.select("x", "y")  # still no execution
-
-rows = result.collect()  # the plan runs here
+ds = bt.from_pydict({"x": [-1, 2, 3, 15], "y": ["a", "b", "c", "d"]})
+result = ds.filter(bt.col("x") > 0).select("x", "y")  # builds a plan, runs nothing
+print(type(result).__name__)
+# Dataset
+print(result.collect().to_pydict())  # the plan runs here
+# {'x': [2, 3, 15], 'y': ['b', 'c', 'd']}
 ```
 
-Deferring the work is what buys whole-query optimization. By `collect`, the optimizer
-sees the entire computation and can push predicates and projections down, fuse operators,
-and choose join orders before a single batch is read. It buys mid-query re-optimization
-too, because at any point there is still one plan to revise rather than a sequence of
-steps that have already run.
+By `collect`, the optimizer sees the entire computation. It can push predicates and projections down, fuse operators and order joins before a batch is read, and it still has one plan to revise mid-query.
 
-The terminal operations are {py:meth}`collect() <batcher.Dataset.collect>`, which returns a PyArrow `Table`;
-`to_pydict()`; `count()`; `iter_batches()`, which streams a result without
-materializing it whole; and the `write` namespace, either {py:obj}`ds.write("out/") <batcher.Dataset.write>` or a typed
-form such as {py:meth}`ds.write.parquet(...) <batcher.api.io_namespace.writer.Writer.parquet>`. To see the optimized plan without running it,
-call `explain()`:
+The terminals are {py:meth}`collect() <batcher.Dataset.collect>`, which returns a PyArrow `Table`; `to_pydict()`; `count()`; `iter_batches()`, which streams a result; and the `write` namespace, either {py:obj}`ds.write("out/") <batcher.Dataset.write>` or a typed form such as {py:meth}`ds.write.parquet(...) <batcher.api.io_namespace.writer.Writer.parquet>`. `explain()` shows the optimized plan without running it:
 
 ```python
-print(ds.filter(bt.col("x") > 10).select("a", "b").explain())
+# docs: run
+plan = ds.filter(bt.col("x") > 10).select("y").explain()
+assert "pushed[x > 10]" in plan
 ```
 
 ## Pipelines and breakers
@@ -60,14 +51,16 @@ distinct, or a window.
 
 ![A streaming Scan-Filter-Project pipeline feeding two pipeline breakers: the HashJoin build, then the Aggregate.](/_static/diagrams/pipeline_breakers.svg)
 
-Breakers are where the model does its real work. Data materializes there, spills
-there under memory pressure, shuffles there when a query is distributed, and gets
-re-optimized there once real numbers are known. The unit of work flowing through a
-pipeline is the *morsel*, a `RecordBatch` of 16,384 rows or 1 MiB, whichever limit it
-reaches first. The row bound keeps scheduling granular and the working set in cache. The
-byte bound is the one that fires on wide data such as images or embeddings, where a
-single row can outweigh a whole default morsel. The two bounds are
-`execution.morsel_rows` and `execution.morsel_bytes`.
+Breakers do the real work. Data materializes there, spills there under memory pressure, shuffles there when a query is distributed, and gets re-optimized there once real numbers are known.
+
+The unit of work flowing through a pipeline is the *morsel*, a `RecordBatch` of 16,384 rows or 1 MiB, whichever limit it reaches first. The row bound keeps the working set in cache. The byte bound fires on wide data such as images or embeddings:
+
+```python
+# docs: run
+cfg = bt.active_config().execution
+print(cfg.morsel_rows, cfg.morsel_bytes)
+# 16384 1048576
+```
 
 ## Execution paths
 
@@ -77,20 +70,9 @@ other two paths are tested against it.
 
 ![One shared Expr and RelOp feeding three execution tiers. The Tier-0 sequential interpreter is the correctness oracle. The Tier-0 parallel path changes only scheduling and must equal the oracle. The Tier-1 Cranelift JIT must be bit-for-bit identical on its supported subset, and an unsupported expression falls back to the interpreter rather than diverging.](/_static/diagrams/execution_tiers.svg)
 
-Tier-0 parallel reuses the same operator code and changes only the scheduling. It
-morselizes, runs on a rayon thread pool, and hash-shuffles into the breakers,
-computing exactly what the sequential path does. Tier-1 is the Cranelift JIT, which
-compiles the supported subset of column expressions to machine code once per operator
-and reuses that across every morsel. On anything it doesn't support, the JIT falls back
-to the interpreter rather than diverge, so it stays bit-for-bit identical to the
-interpreter on its subset.
+Tier-0 parallel reuses the same operator code and changes only the scheduling: it morselizes, runs on a rayon thread pool, and hash-shuffles into the breakers. Tier-1 is the Cranelift JIT. It compiles fixed-width numeric and temporal arithmetic, comparisons, boolean logic and `CASE` once per operator, caches the artifact process-wide, and reuses it across every morsel. Anything else falls back to the interpreter, so the JIT stays bit-for-bit identical to it.
 
-The JIT compiles scalar expressions, never relational state. Hash tables, partial
-aggregates and sort buffers live in `bc-runtime`, so re-planning a query at a breaker
-throws away at most a compiled expression, and a compiled artifact is cached
-process-wide, so the next plan that needs the same expression over the same column types
-reuses it. The compiled subset covers fixed-width numeric and temporal arithmetic,
-comparisons, boolean logic and `CASE`. Everything else runs on the interpreter.
+The JIT compiles scalar expressions, never relational state. Hash tables, partial aggregates and sort buffers live in `bc-runtime`, so re-planning at a breaker throws away at most a compiled expression.
 
 ## One algebra, single node to cluster
 
@@ -102,9 +84,7 @@ many cores (the parallel path builds partials and combines them), and many machi
 where the distributed path composes the same `partial`, `combine`, and `finalize`.
 There is no separate distributed operator with its own semantics, so the rows, the
 column names and the column types come back the same on a laptop and on a cluster.
-[`tests/integration/test_distributed.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_distributed.py) asserts that equality operator by operator.
-It skips without Ray installed, which is the state CI runs in, so the arm that proves
-the claim runs only where a cluster is available.
+[`tests/integration/test_distributed.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_distributed.py) asserts that equality operator by operator against a Ray cluster.
 
 ## Adaptive re-optimization
 
@@ -114,37 +94,40 @@ those numbers, and when an estimate was off by more than `optimizer.reoptimize_e
 (2.0 by default), Kyber re-plans the rest of the query on the measured values before
 continuing.
 
-This is stage-boundary re-optimization, the same granularity Spark AQE works at, and
-Batcher runs it single-node as well as distributed. DuckDB, by contrast, optimizes once
-before it runs. `adaptive="auto"` is the default, and it spends the loop only where it
-can pay for itself. On a single node it engages on a query that contains a join, whose
-join inputs are still sized by a guess, and that clears a floor of 5 million rows or
-about 320 MB for each pipeline breaker the loop would cut at. The simplest joined shape
-qualifies at about 10 million rows. A query with no join never qualifies on one node,
-so most queries take the one-shot plan. On a cluster, a plan the one-shot dispatcher
-can't run correctly, such as a breaker nested under another breaker, takes the staged
-path at any size. A separate cross-query loop feeds sketch-backed statistics from each
-run into the next, so estimates sharpen the more a query runs, at any size.
+This is stage-boundary re-optimization, the same granularity Spark AQE works at, and Batcher runs it single-node as well as distributed. `adaptive="auto"`, the default, spends the loop where it can pay for itself: on a single node, a joined query that clears 5 million rows or about 320 MB per pipeline breaker the loop would cut at, so the simplest joined shape qualifies at about 10 million rows. A separate cross-query loop feeds sketch-backed statistics from each run into the next, at any size.
+
+`explain(analyze=True)` runs the query and prints each operator's estimate beside its measured row count:
+
+```python
+# docs: run
+report = ds.filter(bt.col("x") >= 3).explain(analyze=True)
+assert "actual=2" in report
+```
 
 ## Memory and spilling
 
-Carbonite owns the memory envelope. It throttles at the soft limit,
-`memory.soft_limit` (85% of the envelope by default), and spills to disk before the
-budget is exhausted. Aggregation, join, sort and window all have a spill path, so a query
-too large for memory keeps running on a slower one. It gets slower. It doesn't die.
-Spilling changes where state lives and never what the query computes.
+Carbonite owns the memory envelope. It throttles at `memory.soft_limit` (85% of the envelope by default) and spills to disk before the budget is exhausted. Aggregation, join, sort and window all have a spill path, so a query too large for memory gets slower rather than failing. Spilling changes where state lives, never what the query computes. This group-by runs under a 64 MiB envelope:
+
+```python
+# docs: run
+import dataclasses
+
+cfg = bt.active_config()
+tight = dataclasses.replace(cfg, memory=dataclasses.replace(cfg.memory, max_memory_bytes=64 << 20))
+big = bt.from_pydict({"k": [i % 1000 for i in range(200_000)], "v": list(range(200_000))})
+with bt.config_context(tight):
+    print(big.group_by("k").agg(s=bt.col("v").sum()).sort("k").limit(2).to_pydict())
+# {'k': [0, 1], 's': [19900000, 19900200]}
+```
 
 ## Distribution
 
-Ray is an optional dependency used for task and actor scheduling and control-plane
-metadata only, and single-node execution never loads it. On a cluster, each worker
-hosts the same in-process Rust engine, and bulk Arrow batches move between workers
-over Arrow Flight (`bc-transport`) with credit-based flow control. One credit is one
-in-flight batch slot, and a producer blocks when its credits reach zero. Those batches
-bypass the Ray object store entirely, which is where the serialization overhead and OOM
-risk of an object-store shuffle would otherwise come from. The radix-partition-and-spill
-machinery that does single-node out-of-core also becomes the distributed shuffle, so
-disk and network are two sinks for one mechanism.
+Ray is an optional dependency used for scheduling and control-plane metadata only, and single-node execution never loads it. On a cluster, each worker hosts the same in-process Rust engine, and bulk Arrow batches move between workers over Arrow Flight (`bc-transport`) with credit-based flow control: one credit is one in-flight batch slot, and a producer blocks at zero. Batches bypass the Ray object store entirely. The radix-partition-and-spill machinery behind single-node out-of-core is also the distributed shuffle, so disk and network are two sinks for one mechanism.
+
+```python
+# docs: skip
+result = big.group_by("k").agg(s=bt.col("v").sum()).collect(distributed=True, num_workers=4)
+```
 
 ## See also
 

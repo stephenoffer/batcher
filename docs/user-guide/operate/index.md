@@ -1,8 +1,33 @@
 # Operate
 
-This section covers what happens after the query is correct: making it fast, and keeping it healthy while it runs.
+This section covers the work that starts once a query returns the right answer. Make it fast, then keep it healthy while it runs.
 
-Batcher is built to be inspected. `explain()` shows the planned operator tree with a cardinality estimate on every line, and `explain(analyze=True)` runs the query and puts the measured rows, wall time, peak memory, spill, and backend beside each estimate. Execution records what it measured for the optimizer to consume on the next run, so a query's history informs its next plan. You don't have to guess where the time went.
+You don't have to guess where the time went. `explain()` prints the planned operator tree, with a cardinality estimate on every line:
+
+```python
+import batcher as bt
+
+orders = bt.from_pydict({"region": ["west", "east", "west"], "amount": [120.0, 80.0, 45.0]})
+query = orders.filter(bt.col("amount") > 50).group_by("region").agg(total=bt.col("amount").sum())
+print(query.explain())
+```
+
+```text
+query plan (planned)                                     3 operators
+────────────────────────────────────────────────────────────────────
+OPERATOR                      ESTIMATE  NOTES
+aggregate  [by region · sum]     est≈1  (default)
+└─ filter  [amount > 50]         est≈1  (default)
+   └─ scan  [source 0]           est≈3  (exact)  pushed[amount > 50]
+```
+
+`explain(analyze=True)` goes further. It actually runs the query and prints measured rows, time, memory and spill beside each estimate. Those measurements feed the optimizer on the next run, so a query's history informs its next plan.
+
+```python
+profile = query.explain(analyze=True)
+print(profile.splitlines()[0].split()[:3])
+# ['query', 'plan', '(measured)']
+```
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -10,19 +35,19 @@ Batcher is built to be inspected. `explain()` shows the planned operator tree wi
 :::{grid-item-card} {octicon}`rocket;1.1em` Making it fast
 :link: /user-guide/operate/tuning/index
 :link-type: doc
-Read the plan, then work the levers: memory and spill, caching, pushdown, very large tables, skewed keys, object storage, and the GPU backend.
+Read the plan first. Then pull whichever lever it points at, from caching and pushdown to skewed keys or the GPU backend.
 :::
 
 :::{grid-item-card} {octicon}`pulse;1.1em` Keeping it running
 :link: /user-guide/operate/running/index
 :link-type: doc
-Progress and structured events, metrics a scrape loop can read, the errors you will hit, and GPU fleets whose devices come and go.
+Progress and structured events, and metrics a scrape loop can read. Also the errors you'll hit, and GPU fleets whose devices come and go.
 :::
 ::::
 
 ## Where to start
 
-Start with the symptom. A query that is correct but slow belongs in the tuning half, and the first stop there is always the plan. A query that raises, hangs, or dies partway belongs in the running half, and troubleshooting is organized by the error you are looking at.
+Start with the symptom. If the query is correct but slow, go to tuning and read the plan before anything else. Does it raise, hang or die partway? Go to running, where troubleshooting is sorted by the error you're looking at.
 
 The table below lists every page in both halves, tuning first.
 
@@ -46,6 +71,8 @@ The table below lists every page in both halves, tuning first.
 | {doc}`Running on unstable nodes <running/unstable-nodes>` | Keeping a job alive when GPUs and nodes fail underneath it |
 
 ## See also
+
+Settings and background for the levers above.
 
 - {doc}`/configuration/index`: the settings behind every lever on these pages.
 - {doc}`/configuration/fault-tolerance`: the retry and recovery settings the running half refers to.
