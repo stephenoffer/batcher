@@ -77,3 +77,14 @@ def test_a_fold_that_does_not_combine_a_partial_sum_stays_above_it(func):
 def test_a_filter_on_a_partial_value_stays_above_it():
     path, _, size = _target(_plan("sum", filter_partial=True))
     assert path == ("right",) and size == 10
+
+
+def test_the_first_pass_count_does_not_charge_the_reported_overrun_to_the_other_builds():
+    """The engine's reported bytes are what it had counted when it stopped, not the builds'
+    total. TPC-H q9 under a 0.65 GB cap reported 470 MB beside a 192 MB side; charging the
+    difference to the other builds asked for 120 passes (declined past 32) where 2 fit."""
+    from batcher.api.orchestration.chunked_sideways import _MAX_PASSES, _pass_count
+
+    assert _pass_count(469_546_331, 348_966_092, 192_000_000) == 2
+    assert _pass_count(10**12, 10**6, 10**12) == _MAX_PASSES
+    assert _pass_count(1_000, 1_000_000, 0) is None

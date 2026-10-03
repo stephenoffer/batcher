@@ -282,16 +282,12 @@ def run_partitioned_build(
     passes = _pass_count(needed, budget, side_bytes)
     if passes is None:
         return None
-    partials: list[pa.RecordBatch] = []
-    for p in range(passes):
-        stage = copy.deepcopy(agg)
-        parent, side = _at(stage["input"], side_path[:-1]), side_path[-1]
-        restrict = _in_part(keys, passes, p)
-        parent[side] = {"op": "filter", "input": parent[side], "predicate": restrict}
-        out = run_stage(sources, _stage(opt, stage))
-        if out is None:
+    # `needed` is what the engine had counted when it gave up, not the builds' total, so the
+    # count is a first guess: a pass that still does not fit doubles it and starts over.
+    while (partials := _run_passes(agg, side_path, keys, passes, sources, opt, run_stage)) is None:
+        if passes >= _MAX_PASSES:
             return None
-        partials.extend(b for b in out if b.num_rows)
+        passes = min(_MAX_PASSES, passes * 2)
     if not partials:
         return None
     combine = {
@@ -458,21 +454,45 @@ def _partition_join(
     return None if best is None else (best[1], best[2], best[0])
 
 
-def _pass_count(needed: int, budget: int, side_bytes: int) -> int | None:
-    """How many passes fit the builds under `budget` with one side split, or `None`.
+def _run_passes(
+    agg: dict[str, Any],
+    side_path: tuple,
+    keys: list[str],
+    passes: int,
+    sources: list[Source],
+    opt: PhysicalPlan,
+    run_stage: Callable[[list[Source], PhysicalPlan], list[pa.RecordBatch] | None],
+) -> list[pa.RecordBatch] | None:
+    """Every pass's partial groups with the build at `side_path` split `passes` ways, or `None`
+    as soon as one pass does not fit."""
+    partials: list[pa.RecordBatch] = []
+    for p in range(passes):
+        stage = copy.deepcopy(agg)
+        parent, side = _at(stage["input"], side_path[:-1]), side_path[-1]
+        restrict = _in_part(keys, passes, p)
+        parent[side] = {"op": "filter", "input": parent[side], "predicate": restrict}
+        out = run_stage(sources, _stage(opt, stage))
+        if out is None:
+            return None
+        partials.extend(b for b in out if b.num_rows)
+    return partials
 
-    Only the partitioned side shrinks, so the passes are sized from its share: the other
-    builds keep `needed - side` and the side contributes `side / passes`, against eight tenths
-    of the budget for headroom. Its scanned bytes stand in for its build bytes, capped at what
-    the engine reported. When the other builds alone exceed that, no pass count can fit and
-    the plan declines rather than paying for passes that will each be refused.
+
+def _pass_count(needed: int, budget: int, side_bytes: int) -> int | None:
+    """The first pass count to try with one build side split, or `None` with nothing to split.
+
+    The side, by its scanned bytes capped at what the engine reported, against eight tenths
+    of the budget; the caller doubles from there while a pass is refused, which costs little
+    because a refusal comes while the builds are built, before the probe streams. The other
+    builds are deliberately not charged from `needed`: that is only what the engine had
+    counted when it stopped, and it overstates them -- TPC-H q9 under a 0.65 GB cap reported
+    470 MB, which priced the other builds at nearly the whole budget and asked for 120 passes,
+    where 2 fit and ran in 2.6 s.
     """
     side = min(side_bytes, needed)
-    room = int(budget * 0.8) - (needed - side)
-    if side <= 0 or room <= 0:
+    if side <= 0 or budget <= 0:
         return None
-    passes = max(2, -(-side // room))
-    return passes if passes <= _MAX_PASSES else None
+    return min(_MAX_PASSES, max(2, -(-side // int(budget * 0.8))))
 
 
 def _in_part(keys: list[str], parts: int, p: int) -> dict[str, Any]:
