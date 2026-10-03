@@ -8,6 +8,18 @@ chronological log follows the "Resume here" section. A mirror lives at
 
 ## Resume here (state at 2026-10-02 ~22:30 PDT)
 
+**Update 2026-10-02 ~23:50 PDT**
+
+- 39127198 is **not sufficient**: c98-dist4-4w q1-q8 OK, q9 ran 30 min (timeout) with 9
+  **kernel** OOM kills (dmesg count, i.e. Ray's memory monitor did not pre-empt them). The
+  Ray report naming processes did not reach the driver this time.
+- Aligned integration tests on a cluster (c98-disttest-fit): 29 passed; 5 failed only because
+  `deltalake`/`pyiceberg` are not installed on Ray workers (environmental).
+- jobkit `nodemem.py` now prints the top 3 processes by RSS per node and the last kernel kill.
+  Relaunched c98-diag2-q9 (prodjob_9au8jgjunp2i7xmgysjemjs353) with fit decisions logged
+  (`DIAG fit`). Next: read its diag.log/nodemem.log to see whether the memory is held by
+  `_aligned_units_task`, fleet actors, or the shuffle-join stage.
+
 **Update 2026-10-02 ~23:15 PDT**
 
 - `39127198` fix(dist): `dist/executors/aligned/memory_fit.py` sizes aligned unit tasks by
