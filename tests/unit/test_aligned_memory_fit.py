@@ -56,3 +56,20 @@ def test_nodes_too_small_for_a_task_are_not_counted():
     nodes = [(0, 4 * _GB), (16, 42 * _GB), (16, 42 * _GB)]
     fit = fit_units(nodes, unit_cpus=8, slots=4, largest_unit=256 << 20)
     assert (fit.slots, fit.per_node, fit.memory_bytes) == (4, 2, 21 * _GB)
+
+
+def test_a_node_with_more_cores_but_no_more_memory_runs_what_its_memory_holds():
+    # 64 cores beside 16 on the same 64 GB: cores alone would put 8 tasks on the large node,
+    # each handed the 32 GB budget, four times what the node has.
+    nodes = [(64, 64 * _GB), (16, 64 * _GB)]
+    fit = fit_units(nodes, unit_cpus=8, slots=10, largest_unit=6 * _GB)
+    assert fit.per_node == 2 and fit.memory_bytes == 32 * _GB
+    assert fit.slots == 4
+
+
+def test_a_node_with_more_memory_keeps_its_cores_busy():
+    # Memory is not the constraint on the large node, so it keeps a task per 8 cores.
+    nodes = [(64, 512 * _GB), (16, 64 * _GB)]
+    fit = fit_units(nodes, unit_cpus=8, slots=10, largest_unit=256 << 20)
+    assert fit.memory_bytes == 32 * _GB
+    assert fit.slots == 8 + 2

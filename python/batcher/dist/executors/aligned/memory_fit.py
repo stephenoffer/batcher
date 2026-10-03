@@ -60,7 +60,11 @@ def fit_units(
     per_node = max(1, min(by_cores, by_memory))
     cpus = max(unit_cpus, min(c for c, _ in usable) // per_node)
     budget = min(m for _, m in usable) // per_node
-    return UnitFit(cpus, sum(c // cpus for c, _ in usable), per_node, budget)
+    # Every task is handed `budget`, so a node runs no more than its memory holds of them: on
+    # a mixed cluster a node with more cores than the tightest one but no more memory would
+    # otherwise take a task per `cpus` cores and overrun its memory by the core ratio.
+    slots = sum(min(c // cpus, max(1, m // budget)) for c, m in usable)
+    return UnitFit(cpus, slots, per_node, budget)
 
 
 def fit_units_to_cluster(unit_cpus: int, slots: int, largest_unit: int) -> UnitFit:

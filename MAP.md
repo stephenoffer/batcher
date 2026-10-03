@@ -991,7 +991,7 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `analysis.py` | 487 | Which part of a plan can run whole on each worker, over one key range of its inputs. |
 | `hoist.py` | 163 | Evaluate the parts of an aligned cut that read no aligned source, once, before its units. |
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
-| `memory_fit.py` | 82 | How many aligned units a node may run at once, from its memory as well as its cores. |
+| `memory_fit.py` | 86 | How many aligned units a node may run at once, from its memory as well as its cores. |
 | `reduce.py` | 216 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
 | `rewrite.py` | 232 | Push each join against a broadcast input down to the broadcast input it keys on. |
 | `route.py` | 458 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |

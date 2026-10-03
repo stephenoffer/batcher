@@ -291,7 +291,7 @@ def run_cut(
         get_logger("dist").info("aligned: files do not follow the key; declined")
         return None
     # Cores alone said how many tasks a node runs; a large unit's memory may say fewer.
-    fit = fit_units_to_cluster(unit_cpus, slots, max(u.nbytes for u in units))
+    fit = fit_units_to_cluster(unit_cpus, slots, max((u.nbytes for u in units), default=0))
     unit_cpus, slots = fit.unit_cpus, fit.slots
 
     started = time.perf_counter()
