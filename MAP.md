@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1557 Python modules across 220 packages and 328 Rust files across 14 crates.
+Covering 1558 Python modules across 220 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -991,10 +991,11 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `analysis.py` | 487 | Which part of a plan can run whole on each worker, over one key range of its inputs. |
 | `hoist.py` | 163 | Evaluate the parts of an aligned cut that read no aligned source, once, before its units. |
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
+| `memory_fit.py` | 82 | How many aligned units a node may run at once, from its memory as well as its cores. |
 | `reduce.py` | 216 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
 | `rewrite.py` | 232 | Push each join against a broadcast input down to the broadcast input it keys on. |
 | `route.py` | 458 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
-| `run.py` | 473 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
+| `run.py` | 479 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
 | `transfer.py` | 306 | Moving an aligned run's inputs and results between the driver and the fleet. |
 | `units.py` | 295 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
 

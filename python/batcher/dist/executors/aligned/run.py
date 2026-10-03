@@ -36,6 +36,7 @@ from batcher.dist.executors.aligned.hoist import (
     hoist_broadcasts,
 )
 from batcher.dist.executors.aligned.local import local_broadcast, resolve_local
+from batcher.dist.executors.aligned.memory_fit import fit_units_to_cluster
 from batcher.dist.executors.aligned.reduce import (
     prefer_hash_joins,
     reduce_broadcasts,
@@ -289,6 +290,9 @@ def run_cut(
     if units is None:
         get_logger("dist").info("aligned: files do not follow the key; declined")
         return None
+    # Cores alone said how many tasks a node runs; a large unit's memory may say fewer.
+    fit = fit_units_to_cluster(unit_cpus, slots, max(u.nbytes for u in units))
+    unit_cpus, slots = fit.unit_cpus, fit.slots
 
     started = time.perf_counter()
     held_tables: dict[int, pa.Table] = {}
@@ -300,7 +304,7 @@ def run_cut(
     reduce_broadcasts(body, held_tables, local)
     body = prefer_hash_joins(body)
     sliced = sliceable_broadcasts(body, cut, held_tables)
-    cfg_json = engine_config_json(num_cpus=unit_cpus)
+    cfg_json = engine_config_json(num_cpus=unit_cpus, memory_bytes=fit.memory_bytes)
     held: dict[int, object] = {
         sid: t.to_batches() or [pa.RecordBatch.from_pylist([], schema=t.schema)]
         for sid, t in held_tables.items()
@@ -343,6 +347,8 @@ def run_cut(
     # by its requests' latency, not the link -- TPC-H q19 at SF100 ran its reads at ~150 MB/s
     # a node with the CPUs 17% busy -- and a third keeps more of them in flight.
     depth = 3 if max((u.nbytes for u in units), default=0) <= _SMALL_UNITS_BYTES else 2
+    if fit.memory_bytes is not None:
+        depth = min(depth, fit.per_node)  # a warm actor's calls share its node's memory
     results = _run_units(calls, held, empties, unit_cpus, slots, depth)
     if results is None:
         get_logger("dist").info(
