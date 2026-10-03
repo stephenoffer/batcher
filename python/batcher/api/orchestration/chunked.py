@@ -17,13 +17,19 @@ the envelope, returns `None` here and takes the path it would have taken anyway.
 
 from __future__ import annotations
 
+import re
 import time
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
 from batcher import core
-from batcher.api.orchestration.chunked_sideways import run_staged_held, run_staged_sideways
+from batcher.api.orchestration.chunked_sideways import (
+    run_partitioned_build,
+    run_staged_held,
+    run_staged_sideways,
+)
 from batcher.api.orchestration.sizing import projected_input_bytes
 from batcher.api.orchestration.stages import read_scanned
 
@@ -209,9 +215,12 @@ def execute_chunked(
         chunks = iter_spill_chunks(sources[driving], projection, predicate, spill_chunk_bytes())
         return core.execute_local_chunked(opt, resident, driving, chunks, _held_budget())
     except Exception as exc:
-        if type(exc).__name__ == "MemoryBudgetExceededError":
-            return None  # the aggregate needs to spill: the out-of-core path will
-        raise
+        if type(exc).__name__ != "MemoryBudgetExceededError":
+            raise
+        # The build sides outgrew the envelope: try the plan in passes that each hold a slice
+        # of its largest build (`chunked_sideways.run_partitioned_build`) before handing it to
+        # the out-of-core route, which spills every join. Never from inside a pass.
+        return _partitioned(sources, opt, input_bytes_of, python_chunks, str(exc))
 
 
 def _pushed(opt: PhysicalPlan, i: int) -> tuple[list[str] | None, dict | None]:
@@ -246,6 +255,37 @@ def _held_budget() -> int:
     from batcher.config import active_config
 
     return (active_config().memory.max_memory_bytes or machine_memory_bytes()) // 2
+
+
+#: Set while `_partitioned` runs its passes, so a pass that still does not fit declines rather
+#: than partitioning again.
+_PARTITIONING: ContextVar[bool] = ContextVar("batcher_partitioning", default=False)
+
+_BUDGET_MESSAGE = re.compile(r"\((\d+) bytes\) exceeds the memory budget \((\d+) bytes\)")
+
+
+def _partitioned(sources, opt, input_bytes_of, python_chunks: bool, message: str):
+    """`run_partitioned_build` for a build-side budget refusal, or `None`."""
+    found = _BUDGET_MESSAGE.search(message)
+    if found is None or "join build sides" not in message or _PARTITIONING.get():
+        return None
+    token = _PARTITIONING.set(True)
+    try:
+        return run_partitioned_build(
+            sources,
+            opt,
+            input_bytes_of,
+            lambda srcs, stage: execute_chunked(
+                srcs,
+                stage,
+                lambda i: projected_input_bytes(srcs, stage.source_projections, [i]),
+                python_chunks=python_chunks,
+            ),
+            int(found.group(1)),
+            int(found.group(2)),
+        )
+    finally:
+        _PARTITIONING.reset(token)
 
 
 def _held_limit() -> int:
