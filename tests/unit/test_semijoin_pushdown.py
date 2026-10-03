@@ -72,3 +72,35 @@ def test_antijoin_pushed_below_inner_join():
     antis = _find_joins(ir, "anti")
     assert antis, "expected an anti join in the plan"
     assert not _find_joins(antis[0]["left"], "inner"), "anti join should sink below the inner join"
+
+
+class _Rows:
+    def __init__(self, rows: float) -> None:
+        self.rows = rows
+
+
+class _StubContext:
+    """An optimizer context whose estimator answers from a fixed `plan -> rows` table."""
+
+    def __init__(self, rows: dict[str, float]) -> None:
+        self.estimator = self
+        self._rows = rows
+
+    def estimate(self, plan: str) -> _Rows:
+        return _Rows(self._rows[plan])
+
+
+def test_a_rounding_difference_is_a_tie_and_the_semijoin_goes_first():
+    # TPC-H q18 at sf10: both filters estimated to keep all of `orders`, the inner join by
+    # 7e-6 rows less. An exact comparison read that as the inner join being the more
+    # selective, kept the semijoin above it, and joined all 15M orders to keep 6,398.
+    from batcher.kyber.rules.joins.outer_float import semijoin_goes_first
+
+    ctx = _StubContext({"a": 15_000_000.0, "semi": 15_000_000.0, "inner": 14_999_999.999993334})
+    assert semijoin_goes_first(ctx, "a", "semi", "inner")
+    # Controls: a genuinely more selective inner join still keeps the semijoin above it,
+    # and a genuinely more selective semijoin still sinks.
+    ctx = _StubContext({"a": 15_000_000.0, "semi": 15_000_000.0, "inner": 14_000_000.0})
+    assert not semijoin_goes_first(ctx, "a", "semi", "inner")
+    ctx = _StubContext({"a": 15_000_000.0, "semi": 6_398.0, "inner": 15_000_000.0})
+    assert semijoin_goes_first(ctx, "a", "semi", "inner")
