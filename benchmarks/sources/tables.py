@@ -32,6 +32,7 @@ already has ``read_parquet``) — see :func:`table_uris`.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 from collections.abc import Collection, Iterable
@@ -189,6 +190,13 @@ def _reader() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     con.sql("INSTALL httpfs; LOAD httpfs;")
     con.sql("SET enable_progress_bar=false")
+    # A private bucket (a cluster's own artifact storage) needs credentials, which httpfs does
+    # not look for on its own: on an Anyscale node it read `s3://.../tpch_zstd` as
+    # `AccessDenied: No credentials are provided`, so every distributed case died before its
+    # first query. The AWS credential chain finds the instance role there; where no chain is
+    # configured the secret cannot be built, and anonymous reads of public buckets proceed.
+    with contextlib.suppress(duckdb.Error):
+        con.sql("CREATE SECRET (TYPE s3, PROVIDER credential_chain)")
     region = os.environ.get("BENCH_S3_REGION")
     if region:
         con.sql(f"SET s3_region='{region}'")
