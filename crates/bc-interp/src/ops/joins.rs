@@ -194,16 +194,26 @@ pub(crate) fn gather_join_output(
     // ordering question at all — `par_iter().collect()` keeps `output` order. It is worth doing:
     // on a 20M-row self-join this loop was 2.1s of a 4.0s join, the single largest serial block
     // in the whole query, while the hash build and probe beside it were already parallel.
+    //
+    // A side gathered by exactly `0, 1, .., n-1` reproduces its columns, so they are shared
+    // rather than copied -- the check `gather_join_output_with` makes, missing here. Every
+    // as-of join emits each left row once and in order, so its whole left side was a copy:
+    // 1M left rows over two columns, every query.
+    let left_ident = is_identity_permutation(&idx.left, left.num_rows());
+    let right_ident = is_identity_permutation(&idx.right, right.num_rows());
     let columns: Vec<ArrayRef> = output
         .par_iter()
         .map(|col| -> Result<ArrayRef, InterpError> {
-            let (batch, indices) = match col.side {
-                JoinSide::Left => (left, &idx.left),
-                JoinSide::Right => (right, &idx.right),
+            let (batch, indices, ident) = match col.side {
+                JoinSide::Left => (left, &idx.left, left_ident),
+                JoinSide::Right => (right, &idx.right, right_ident),
             };
             let source = batch
                 .column_by_name(&col.name)
                 .ok_or_else(|| InterpError::UnknownJoinColumn(col.name.clone()))?;
+            if ident {
+                return Ok(Arc::clone(source));
+            }
             gather_column(source.as_ref(), indices)
         })
         .collect::<Result<_, _>>()?;
@@ -751,6 +761,8 @@ mod tests {
         )
         .expect("gather");
         assert_eq!(out.column(0).as_ref(), left.column(0).as_ref());
+        // Shared, not copied: an equal copy passes the line above, and copying was the cost.
+        assert!(Arc::ptr_eq(out.column(0), left.column(0)));
 
         // A shorter buffer selects a subset, so it must not be treated as the identity.
         assert!(!is_identity_permutation(
