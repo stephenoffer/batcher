@@ -2,7 +2,15 @@
 
 Batcher reports what it did to the monitoring stack your platform already runs: a Prometheus endpoint with a Grafana dashboard in the repository, OpenTelemetry traces, and OpenLineage run events with column-level lineage.
 
-The engine produces signals and owns no exporter. Your organization already operates a collector, a metrics backend, a tracing backend, and a lineage catalog, and a data engine that brought its own would be one more stack to run. Each page here connects a signal Batcher already measures to the system that already consumes that kind of signal.
+The engine produces signals and owns no exporter, so it plugs into the collector, metrics backend, tracing backend, and lineage catalog you already run. Each signal is one option away:
+
+```python
+from batcher.config import get_option, option_context
+
+with option_context("observability.otel_traces", True):
+    print(get_option("observability.otel_traces"))
+# True
+```
 
 The following table maps each page to what it covers:
 
@@ -13,9 +21,18 @@ The following table maps each page to what it covers:
 
 ## Tracing
 
-Set `observability.otel_traces` to `True` and configure a tracer provider in your host application. Batcher then emits one OpenTelemetry span per query, with a child span per operator. On a distributed run the child spans include the operators that ran on the workers, so the query that matters most doesn't show up as a bare span.
+Set `observability.otel_traces` to `True` and configure a tracer provider in your host application. Batcher emits one OpenTelemetry span per query, with a child span per operator, including the operators that ran on workers in a distributed run.
 
-Install the `otel` extra, which carries only the OpenTelemetry API. Batcher uses the same measured profile as the event log, so tracing adds the span emit and no extra measurement. The SDK and the OTLP exporter stay with your application, which already owns them.
+```python
+# docs: skip
+import batcher as bt
+from batcher.config import set_option
+
+set_option("observability.otel_traces", True)
+bt.read.parquet("events/").group_by("user").agg(n=bt.count()).collect()
+```
+
+Install the `otel` extra, which carries only the OpenTelemetry API. Tracing reuses the profile the event log already measures, and the SDK and OTLP exporter stay with your application.
 
 ## See also
 

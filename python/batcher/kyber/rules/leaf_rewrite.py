@@ -60,7 +60,6 @@ from batcher.plan.expr_ir.nodes import Array, HashRows, MakeStruct
 from batcher.plan.expr_rewrite import map_node_expressions, transform_expr_up
 from batcher.plan.ir_tags import SAFE_BINARY_OPS
 from batcher.plan.logical import Aggregate, Filter, LogicalPlan, Project, Sort, Window
-from batcher.plan.visitor import transform_up
 
 __all__ = [
     "EXPR_NODES",
@@ -71,7 +70,6 @@ __all__ = [
     "register_leaf_rule",
     "rewrite_node",
     "safe_expr",
-    "whole_plan_expr_rule",
 ]
 
 #: The plan nodes that carry expressions, and therefore the `matches` of every leaf rule.
@@ -127,29 +125,6 @@ def safe_expr(expr: Expr) -> bool:
             expr.otherwise
         )
     return False
-
-
-def whole_plan_expr_rule(leaf: Callable[[Expr], Expr]):
-    """Lift a leaf `Expr -> Expr` rewrite into a whole-plan rule body.
-
-    The `plan_rule` counterpart to `rewrite_node`: where that lifts a leaf over the
-    expressions of *one* node, this lifts it over every expression of every node in the
-    tree. Use it when a rewrite has no node-type it can be indexed on and must simply run
-    everywhere.
-
-    Args:
-        leaf: The leaf rewrite, applied bottom-up to every sub-expression.
-
-    Returns:
-        A `f(plan, ctx) -> plan` suitable for `plan_rule`.
-    """
-
-    def apply(plan: LogicalPlan, _ctx) -> LogicalPlan:
-        return transform_up(
-            plan, lambda node: map_node_expressions(node, lambda e: transform_expr_up(e, leaf))
-        )
-
-    return apply
 
 
 def collapse_doubled_call(node_type: type, fn: str) -> Callable[[Expr], Expr]:
@@ -223,12 +198,12 @@ def collapse_involution(node_type: type, fn: str) -> Callable[[Expr], Expr]:
 def node_expr_rule(leaf: Callable[[Expr], Expr]):
     """Lift a leaf `Expr -> Expr` rewrite into the `f(node, ctx)` body a node rule registers.
 
-    The node-level counterpart of `whole_plan_expr_rule`, and the last piece of the leaf-rule
-    shape that was still being written out by hand. Six modules in `rules/exprs/` each carried a
-    private ``_make_<family>_rule`` factory whose whole body was this closure, and
-    `register_leaf_rule` had a seventh copy inline as a default-argument lambda. The six existed
-    only because a *family* of rules — one per date part, one per shift direction — builds its
-    leaf from a parameter and so cannot use `register_leaf_rule`'s single-leaf shape.
+    The last piece of the leaf-rule shape that was still being written out by hand. Six modules
+    in `rules/exprs/` each carried a private ``_make_<family>_rule`` factory whose whole body
+    was this closure, and `register_leaf_rule` had a seventh copy inline as a default-argument
+    lambda. The six existed only because a *family* of rules — one per date part, one per shift
+    direction — builds its leaf from a parameter and so cannot use `register_leaf_rule`'s
+    single-leaf shape.
 
     Args:
         leaf: The leaf rewrite, applied bottom-up to every sub-expression of the node.

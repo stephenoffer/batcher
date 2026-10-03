@@ -1,20 +1,12 @@
 # Optimizing a slow query
 
-This tutorial teaches the loop you run when a query is slow: read the plan, run the query under measurement, find the operator that dominated, and fix that one. Batcher tells you what it planned and what it measured, so you never have to guess.
-
-The bug on this page is the most common one there is: a Python callback doing work an expression could do.
-
-The loop has three steps, and you go around it again after every fix:
+Batcher tells you exactly what it planned and what it measured, so tuning a query is a short loop: read the plan, measure, fix the operator that dominated. This tutorial runs that loop on the most common case there is, a Python callback doing work an expression could do.
 
 ![The loop has three steps. First, read the plan with explain(), which runs nothing. Then run the query under stats() to measure it operator by operator and find the hot spot. Then fix that one operator, and run explain() and stats() again. In this tutorial, the before state is a map_batches callback, with no row estimates in the plan and the fee arithmetic running on 200,000 rows. The after state is the same arithmetic as an expression, with the filter pushed into the scan and the fee computed on 20,000 rows. Both return the same answer, with ten times less arithmetic after the fix.](/_static/diagrams/slow_query_loop.svg)
 
-:::{note}
-**What you'll build.** A 200,000-row query with a `map_batches` in the middle of it, a diagnosis, and a one-line rewrite. You need `pip install batcher-engine` and nothing else. Everything runs as written, in memory, in under a second.
-:::
-
 ## Where this ends up
 
-The naive version puts a Python callback between the scan and the filter. The rewrite says the same arithmetic as an expression. The following table compares the two:
+You'll take a 200,000-row query with a `map_batches` in the middle and rewrite it in one line. The following table compares the two versions:
 
 | | Naive (`map_batches`) | Rewritten as an expression |
 |---|---|---|
@@ -23,8 +15,6 @@ The naive version puts a Python callback between the scan and the filter. The re
 | Row estimates in `explain()` | `est≈?` on every operator | An estimate and its source on every operator |
 | Execution tier for the arithmetic | A Python call per batch | The Rust data plane, eligible for the Cranelift JIT |
 | The answer | Correct | Identical |
-
-Both versions are right. One of them does ten times the arithmetic to get there.
 
 ## 1. The data and the query
 
@@ -61,7 +51,7 @@ print(result["country"], [round(v, 2) for v in result["fees"]])
 # ['fr', 'us'] [14399.7, 14397.0]
 ```
 
-Float sums carry the usual binary floating-point tail, which is why the output is rounded. The answer is correct. Now find out what it cost.
+The output is rounded because float sums carry a binary tail. Now find out what it cost.
 
 ## 2. Profile it, and read what is missing
 
@@ -73,19 +63,18 @@ print("MapBatches" in [op.kind for op in stats.ops])
 # True
 ```
 
-The row counts and timings are real. What's missing is the plan. Run `explain()` on `slow` and every operator reads `est≈?`, with a note that the plan contains a UDF stage shown un-lowered, so there is no optimized tree and no row estimate anywhere in it.
+The row counts and timings are real. What's missing is the plan: every operator in `explain()` reads `est≈?`.
 
-:::{warning}
-That absence is the diagnosis. A `map_batches` is a Python callback. The optimizer can't see inside it, can't know which columns it reads, and can't know what it does to the row count. The engine can time it, but it can't plan around it.
-:::
+```python
+print("est≈?" in slow.explain())
+# True
+```
 
-Two costs follow. First, the filter can't move below the callback, because a predicate is only pushed past an operator the optimizer understands. The UDF runs on all 200,000 rows to produce a `fee` column that 180,000 of them immediately throw away.
-
-Second, every batch round-trips through Python. A per-batch Python UDF in the middle of a native pipeline costs about half its throughput even when it does nothing. That was measured on image ingest, where removing one re-typing `map_batches` from the read path took decode from 2,000 to 4,600 images per second. The {doc}`multimodal ingest benchmark </benchmarks/results/multimodal-ingest>` has the full account.
+That is the diagnosis. The optimizer can't see inside a Python callback, so it can't push the filter below it. The UDF computes a `fee` on all 200,000 rows, and 180,000 of them are thrown away immediately. Every batch also round-trips through Python.
 
 ## 3. Say it as an expression instead
 
-The UDF multiplies a column by a constant. Expressions do that in Rust, and the optimizer can see through them.
+The UDF multiplies a column by a constant. An expression does that in Rust, in plain sight of the optimizer:
 
 ```python
 fast = (
@@ -97,7 +86,7 @@ fast = (
 )
 ```
 
-Nothing has run. This is a lazy plan, and this time a fully relational one, so you can look at it before you pay for it.
+Nothing has run yet, and this time the whole plan is visible.
 
 ## 4. Read the plan
 
@@ -120,11 +109,14 @@ sort  [country]                          est≈4  (default)
 ```
 :::
 
-Read it bottom-up and notice what moved. You wrote the projection before the filter. The optimizer put the filter underneath it, and pushed the predicate into the scan, because it can now see that `fee` isn't needed to evaluate `status == 'error'`. The arithmetic runs on 20,000 rows, not 200,000.
+Read it bottom-up. You wrote the projection before the filter, and the optimizer pushed the predicate into the scan, so the arithmetic runs on 20,000 rows instead of 200,000:
 
-That is the whole fix. It was unavailable while the UDF stood in the way.
+```python
+print("pushed[status = error]" in fast.explain())
+# True
+```
 
-The notes column matters too. `(exact)` on the scan is a known count. `(default)` on everything above it is a prior, because the optimizer has no statistics on these columns yet.
+`(exact)` marks a known count; `(default)` is a prior, used until the optimizer has statistics.
 
 ## 5. Measure it
 
@@ -163,11 +155,13 @@ print(run.rows, round(by_kind["filter"].selectivity, 2))
 # 2 0.1
 ```
 
-The projection sees 20,000 rows because the filter ran first. The `BACKEND` column names the tier that ran each operator's expressions: `interp`, `jit`, or `interp+jit` when some sub-expressions compiled with Cranelift and others fell back. A Python callback never appears there, because it never reaches either tier.
+The projection sees 20,000 rows because the filter ran first. The `BACKEND` column names the tier that ran each operator: `interp`, `jit`, or `interp+jit` when part of an expression compiled with Cranelift.
 
-`run.bottleneck` names the operator that dominated the engine's own time, and `run.bottleneck_summary()` says whether the run was I/O-bound or compute-bound. That's where you look next.
+`run.bottleneck` names the operator that dominated, and `run.bottleneck_summary()` says whether the run was I/O-bound or compute-bound.
 
-Read the `operators:` line first, though. The total covers the whole terminal call, and the operators cover only the engine work inside it. The rest is planning, optimization, admission, and building the Arrow result. When operators are a large share of the clock, the table is worth reading. On a small query they are often a few percent, and then nothing in the table is what you were waiting for: the fix is fewer, larger calls or a cached plan. `RunStats.wall_clock_summary()` prints the same line for a script.
+:::{dropdown} Reading the wall-clock line
+The `operators:` line splits the total into engine work and everything else: planning, optimization, admission, and building the Arrow result. On a small query the operators are often a few percent of the clock, and the fix is fewer, larger calls or a cached plan. `RunStats.wall_clock_summary()` prints the same line for a script.
+:::
 
 ## 6. Check the estimate against the measurement
 
@@ -179,15 +173,14 @@ print(round(agg.est_rows), "->", agg.rows_out)
 # 4 -> 2
 ```
 
-Here the prior was close. On a join it can be badly wrong, and a bad estimate is what steers join order into huge intermediates. In the TPC-H record, a cold q5 with no learned distinct counts was steered into 12M to 18M-row intermediates. Comparing `est_rows` with `rows_out` is how you catch that.
+Batcher acts on the gap between estimate and measurement in two ways:
 
-Batcher acts on the gap in two ways. Within a query, the adaptive loop re-plans at pipeline breakers, such as a sort, an aggregate, or a join build, when the relative error `|actual - estimate| / estimate` exceeds `optimizer.reoptimize_error` (2.0 by default). That loop engages on joined queries large enough to justify staging, at 5,000,000 rows or about 320 MB for each breaker it would cut at, so the small query on this page runs in one pass.
-
-Across runs, Core records each operator's measured row count alongside Kyber's prediction into the `MetadataHub`, and Kyber reads it the next time it plans that shape. Core measures and Kyber decides. That TPC-H q5 ran 7,115 ms cold and 300 ms warm.
+- **Within a query**, the adaptive loop re-plans at pipeline breakers (a sort, an aggregate, a join build) when the relative error exceeds `optimizer.reoptimize_error` (2.0 by default). It engages on joined queries of 5,000,000 rows or about 320 MB per breaker, so this small query runs in one pass.
+- **Across runs**, measured row counts land in the `MetadataHub`, and the optimizer plans the same shape from evidence the next time.
 
 ## 7. Stop recomputing a shared upstream
 
-If several queries hang off one expensive intermediate, `cache()` stores its result once. The cache is bounded by `memory.result_cache_max_bytes`, 256 MiB by default, and yields memory back to running queries under pressure, so it can't grow the process without bound.
+If several queries hang off one expensive intermediate, `cache()` stores its result once. The cache is bounded by `memory.result_cache_max_bytes` (256 MiB by default) and yields memory to running queries under pressure.
 
 ```python
 failures = events.filter(bt.col("status") == "error").cache()
@@ -200,12 +193,12 @@ print(failures.group_by("country").agg(n=bt.count()).sort("country").to_pydict()
 ```
 
 :::{tip}
-A terminal that materializes the result, such as `collect` or `to_pydict`, is what fills the cache. `count()` is served from a warm cache but never fills one. A transform on the cached dataset, such as the `group_by` above, is a new result that runs from the cached input rather than recomputing the filter. If you cache and see no speedup, check that something filled it.
+`collect` or `to_pydict` fills the cache; `count()` reads a warm cache but never fills one. Transforms on a cached dataset run from the cached input.
 :::
 
 ## 8. When it is memory, not CPU
 
-A query that dies is slower than a query that is slow. Setting `memory.max_memory_bytes` opts the engine into spilling. Aggregation, distinct, sort, join build, and partitioned windows all spill to disk rather than exceed the envelope, and the spilled result is bit-identical to the in-memory one.
+Set `memory.max_memory_bytes` and the engine keeps to it. Aggregation, distinct, sort, join build, and partitioned windows all spill to disk rather than exceed the budget, with the same result:
 
 ```python
 from batcher.config import Config, MemoryConfig, config_context
@@ -219,7 +212,7 @@ print(bounded == fast.to_pydict())
 ```
 
 :::{important}
-In production, set `max_memory_bytes` to the real ceiling, such as the container or cgroup limit, and let Carbonite decide when to spill. You don't ask an operator to spill. You give the engine a budget and it keeps to it. Leave the budget unset and the engine has no envelope to respect, so a query that outgrows RAM fails instead of slowing down.
+In production, set `max_memory_bytes` to the real ceiling, such as the container or cgroup limit. Without a budget there is nothing to spill against.
 :::
 
 ## The loop, in short
@@ -228,7 +221,7 @@ To diagnose any slow query, complete the following steps:
 
 1. Run `explain()`. Check that the predicate reached the scan, that the projection sits above the filter, and that the join picked the build side you expected.
 1. Run `stats()`. Find the operator that took the time, and check whether anything spilled.
-1. Fix that operator. A Python `map_batches` in the middle of a relational pipeline is the first thing to suspect, because it blocks pushdown and keeps the arithmetic out of the Rust tiers.
+1. Fix that operator. A Python `map_batches` in a relational pipeline is the first suspect.
 1. Cache a shared upstream with `cache()`, and set a memory budget so a big query slows down instead of failing.
 
 ## Where to go next

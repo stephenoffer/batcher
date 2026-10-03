@@ -2,21 +2,44 @@
 
 This section covers a Batcher job in production: seeing what it is doing, finding out why it stopped, and keeping it alive on hardware that doesn't stay up.
 
-Batcher is built to be watched. Every subsystem, from the Kyber optimizer to the distributed scheduler, publishes to one event bus, and every surface you look at reads from it. The terminal line, the web dashboard, the per-query JSON event log, the Prometheus counters and the OpenTelemetry spans all carry the same measurements under the same query id. A log line joins to the plan and the profile of the run that wrote it, so none of these surfaces can disagree with another.
+Batcher is built to be watched. Every subsystem publishes to one event bus, and the terminal line, the web dashboard, the JSON event log, the Prometheus counters, and the OpenTelemetry spans all read from it under the same query id.
 
 ## See what a job is doing
 
-Run a query in a terminal and it tells you where it is. The status line names the phase, such as `optimizing`, `admission` or `on cluster`, so a slow small query says whether the time went to planning or to executing. When the query finishes, the line collapses to one summary that also records what else happened: inputs skipped, bytes spilled, workers lost. A job that survived a failure says so beside its result.
+In a terminal, a status line names the phase, such as `optimizing`, `admission`, or `on cluster`, and collapses to a one-line summary when the query finishes. The same measurements are queryable as a `Dataset`:
 
-For more than one query at a time, {py:func}`bt.start_ui() <batcher.start_ui>` opens a dashboard that groups every run of the same plan shape into one pipeline. Re-running a query builds a baseline, so "was this run slow?" has an answer. A scrape loop gets the same numbers from `/metrics` in Prometheus format, including what each run cost the machine in CPU, memory and disk.
+```python
+import batcher as bt
+
+orders = bt.from_pydict({"region": ["eu", "us", "eu"], "amount": [10, 20, 30]})
+orders.group_by("region").agg(total=bt.col("amount").sum()).collect()
+
+history = bt.query_history(limit=5)
+print({"total_elapsed_ms", "rows_produced", "spilled"} <= set(history.columns))
+# True
+```
+
+For many queries at once, {py:func}`bt.start_ui() <batcher.start_ui>` opens a dashboard that groups runs of the same plan shape and builds a baseline, and `/metrics` serves the same numbers to a Prometheus scrape loop.
 
 ## Find out why it stopped
 
-Batcher's errors are typed and they say what to do. A misspelled column raises {py:exc}`ColumnNotFoundError <batcher.ColumnNotFoundError>`, and a near miss names the column you meant. Every failure subclasses {py:exc}`BatcherError <batcher.BatcherError>`, and many also subclass the builtin you would already catch, such as `ValueError` or `ImportError`. Ctrl-C stops a long `collect()` between morsels or operators, and a cancelled query never returns a partial result.
+Errors are typed and say what to do. Every failure subclasses {py:exc}`BatcherError <batcher.BatcherError>`, many also subclass the builtin you would already catch, and a near-miss column name suggests the one you meant:
+
+```python
+try:
+    orders.select("amuont").collect()
+except bt.ColumnNotFoundError as err:
+    print(isinstance(err, bt.BatcherError), isinstance(err, KeyError))
+    print(str(err).split("Did you mean")[1].split("?")[0].strip())
+# True True
+# 'amount'
+```
+
+Ctrl-C stops a long `collect()` between morsels, and a cancelled query never returns a partial result.
 
 ## Run on a GPU fleet
 
-At datacenter scale a device rarely fails by disappearing. It stays up and gets slower or wronger. Batcher reads the driver's Xid log and the kernel log for faults no GPU probe reports. It takes a node that keeps failing tasks out of rotation, and refuses to retry past a device that may have corrupted results. It also places a multi-device collective inside one NVLink domain, prefers a MIG partition over a whole device when a model fits one, and clamps fan-out to a power budget you set. When a GPU stage is correct but slow, sampling classifies each device as compute bound, transfer bound, throttled, starved or contended, and names the one thing to change.
+At datacenter scale a device rarely fails by disappearing. It gets slower or wronger. Batcher reads the driver's Xid log for faults no probe reports, takes a repeatedly failing node out of rotation, places collectives inside one NVLink domain, prefers a MIG partition when a model fits one, and clamps fan-out to a power budget. When a GPU stage is slow, sampling classifies each device as compute bound, transfer bound, throttled, starved, or contended.
 
 ## Pages in this section
 

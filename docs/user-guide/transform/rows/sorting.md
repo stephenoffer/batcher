@@ -192,7 +192,7 @@ print(merged.to_pydict()["v"])
 # ['a', 'e', 'b', 'f', 'c', 'g', 'd', 'h']
 ```
 
-Two things bound what this is worth. It applies to fixed-width keys, and the runs have to be long. A column that is *nearly* sorted with frequent out-of-order rows has no long stretches to merge, and sorts at its usual cost. Measured on six million rows, run detection made a strictly descending key 1.32x faster and two concatenated sorted halves 1.26x faster than the same sort without it, and left random input unchanged. Most of what remains is the cost of moving the rows into their new order, which no ordering trick removes. {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>` has the measurement.
+It applies to fixed-width keys with long sorted runs. A column that is only *nearly* sorted has no long stretches to merge. Random input sorts at its usual cost. {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>` has the measurements.
 
 Descending data counts as ordered too, and reversing it is free. That holds only when the descending stretch has no repeated keys, because reversing a run holding two equal rows would swap them.
 

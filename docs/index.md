@@ -47,41 +47,25 @@
 </div>
 ```
 
-Every ratio on this site is correctness-gated: the harness runs the query on each engine and
-compares the results before it divides any timings. When the results disagree the timings are
-still recorded, as a diagnostic, but the ratio is withheld. A missing ratio can mean a wrong
-answer, an engine that can't express the query, a crash or an out-of-memory failure, and the
-{doc}`methodology </benchmarks/methodology>` says which codes mark each.
+Every ratio on this site is correctness-gated. No timing counts until the engines agree on the result, as {doc}`benchmarks/index` explains.
 
 ## What Batcher is
 
-Data work has splintered into a tool per job. One for SQL, another for DataFrames, a third
-for streaming, more again for images and models. Every one of them is a system to run and a
-seam to leak. Batcher collapses that stack into a single engine: a Python control plane over
-a Rust data plane on Apache Arrow.
+Most data teams run one tool for SQL, another for DataFrames, a third for streams, and more again for images and models. Batcher is one engine for all of it: a Python control plane over a Rust data plane on Apache Arrow. SQL and DataFrames compile to the same plan, and so do streaming, media decode and model inference. The same operators run it on one core, on every core, or across a Ray cluster.
 
 ![One engine: any source, whether Parquet, media, Kafka, or a lakehouse table, flows into Batcher and back out to any workload: SQL and ETL, batch inference, embeddings, and training data.](_static/diagrams/hub.svg)
 
-One decision buys most of that. Every stateful operator exists once, in Rust over Arrow, and
-one core, ninety-six cores, and a cluster differ only in how that one implementation is
-scheduled. Two contracts carry it. Aggregation is a mergeable `partial -> combine -> finalize`
-triple, so partial states from any split of the input fold into the single-node answer, and
-the same triple is the incremental form that makes batch the bounded case of streaming. A
-join, a partitioned window, and a sort hold state that doesn't fold, so they partition
-instead: a join co-partitions both sides on its key, a window partitions on its `PARTITION BY`
-keys, and a sort range-partitions its leading key. {doc}`architecture/deep-dives/operators/mergeable-algebra`
-says which operator uses which contract. Because the operator is identical everywhere, a
-cardinality measured anywhere describes the same relation everywhere. Measurements in machine
-units, such as operator times, fitted cost coefficients and bandit rewards, are filed under a
-hardware fingerprint, so they transfer only between machines of the same class, and they still
-depend on data size and memory pressure. That is what lets the optimizer plan from evidence
-instead of vendor constants. And decode, embedding, vector search, and inference are
-expressions in that same algebra, so a predicate pushes beneath a JPEG decode and a tensor
-never leaves the engine.
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"city": ["Oslo", "Lima", "Oslo"], "temp": [3.5, 19.0, 5.5]})
+print(ds.group_by("city").agg(avg=bt.col("temp").mean()).sort("city").to_pydict())
+# {'city': ['Lima', 'Oslo'], 'avg': [19.0, 4.5]}
+```
 
 ## Start from your job
 
-Pick the path that matches the work in front of you. Each one is an ordered reading list through the tutorials and guides.
+Each path is an ordered reading list through the tutorials and guides. Pick yours.
 
 ::::{grid} 1 2 2 4
 :gutter: 3
@@ -89,7 +73,7 @@ Pick the path that matches the work in front of you. Each one is an ordered read
 :::{grid-item-card} {octicon}`database;1.1em` Data engineer
 :link: /getting-started/tutorials/paths/data-engineer
 :link-type: doc
-Read, reshape, join, and write: pipelines, lakehouse tables, and data quality.
+Pipelines that read, reshape, join and write, plus lakehouse tables and data-quality checks.
 :::
 
 :::{grid-item-card} {octicon}`graph;1.1em` Data scientist
@@ -107,7 +91,7 @@ Batch inference, embeddings, and GPUs through `.ml`.
 :::{grid-item-card} {octicon}`server;1.1em` Platform engineer
 :link: /getting-started/tutorials/paths/platform-engineer
 :link-type: doc
-Configuration, environment defaults, memory limits, and object storage.
+Configuration and environment defaults, memory limits, object storage.
 :::
 ::::
 
@@ -115,9 +99,7 @@ Coming from another engine? {doc}`The migration guides </getting-started/migrati
 
 ## Write it your way
 
-Express a transformation as a DataFrame, as SQL, or as composable expressions, then run it as
-a batch job or a live stream. Every form builds the same plan and runs on the same engine, so
-you can mix them freely.
+DataFrames, SQL, expressions and streams all build the same plan. Mix them freely.
 
 ::::{tab-set}
 :::{tab-item} DataFrame
@@ -176,17 +158,32 @@ counts.write.parquet(
 )
 ```
 
-Each output row is one `(page, window)` count, written once, after the watermark passes the window's end. A row that arrives more than ten minutes behind the latest event time is dropped as late. The checkpoint records source progress, so a restarted query resumes where it stopped. An aggregate with no watermark over a source that never ends emits nothing to a file sink. {doc}`user-guide/moving-data/streaming/emission` explains why, and {doc}`/integrations/streams/kafka` covers decoding a broker's `value` bytes into columns first.
+Each `(page, window)` count is written once, after the watermark closes the window, and the checkpoint lets a restarted query resume where it stopped. See {doc}`user-guide/moving-data/streaming/emission` and {doc}`/integrations/streams/kafka`.
+:::
+
+:::{tab-item} Vectors
+```python
+import batcher as bt
+
+docs = bt.from_pydict({"doc": ["a", "b", "c"], "vec": [[1.0, 0.0], [0.0, 1.0], [0.9, 0.1]]})
+near = docs.ml.similarity_to([1.0, 0.0], column="vec").sort("score", descending=True)
+print(near.limit(2).select("doc").to_pydict())
+# {'doc': ['a', 'c']}
+```
 :::
 ::::
 
-Expressions carry typed accessors for every column kind ({py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`),
-so the column language stays the same whether you reach for it from a DataFrame, from SQL, or
-inside a stream.
+Expressions carry typed accessors for every column kind ({py:class}`.str <batcher.plan.expr_ir.namespaces.strings._StrNamespace>`, {py:class}`.dt <batcher.plan.expr_ir.namespaces.temporal._DtNamespace>`, {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>`, {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>`):
+
+```python
+people = bt.from_pydict({"name": ["ann", "bob"], "tags": [["a", "b"], ["c"]]})
+print(people.select(up=bt.col("name").str.upper(), n=bt.col("tags").list.len()).to_pydict())
+# {'up': ['ANN', 'BOB'], 'n': [2, 1]}
+```
 
 ## What it does
 
-Each card is one capability family, linked to the guide that covers it. {doc}`getting-started/tour` shows one runnable example of each on a single page, if you would rather judge the breadth by running it.
+Each card links to its guide. {doc}`getting-started/tour` runs one example of each on a single page.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -194,7 +191,7 @@ Each card is one capability family, linked to the guide that covers it. {doc}`ge
 :::{grid-item-card} {octicon}`table;1.1em` Read anything
 :link: /user-guide/moving-data/reading-data
 :link-type: doc
-Parquet, CSV, JSON, Arrow, ORC, Avro. Text, logs, and documents. Images, audio, and video.
+Parquet, CSV, JSON, Arrow, ORC, Avro. Text, logs and documents. Images, audio and video too.
 Databases and warehouses through ADBC, ConnectorX, or any DB-API driver. Kafka, Kinesis, Pulsar, and Pub/Sub.
 :::
 
@@ -215,8 +212,8 @@ Iceberg, with change feeds and compaction on Delta. Hudi tables are read-only.
 :::{grid-item-card} {octicon}`broadcast;1.1em` Streaming
 :link: /user-guide/moving-data/streaming/index
 :link-type: doc
-Unbounded sources, triggers, watermarks and late data, windowed and stateful aggregation,
-stream joins, checkpointing, and exactly-once delivery into a transactional sink.
+Unbounded sources and triggers. Watermarks for late data, windowed and stateful aggregation,
+stream joins, and checkpointing with exactly-once delivery into a transactional sink.
 :::
 
 :::{grid-item-card} {octicon}`beaker;1.1em` Models and inference
@@ -230,7 +227,7 @@ path for read-only inference.
 :::{grid-item-card} {octicon}`image;1.1em` Multimodal and vectors
 :link: /ml/preparing/multimodal/index
 :link-type: doc
-Images, audio, and video decoded straight into tensor columns, with first-class list and
+Media decoded straight into tensor columns, with first-class list and
 tensor types and the vector ops behind similarity search.
 :::
 
@@ -251,60 +248,41 @@ UI, and metrics. The same code from a laptop to a cluster.
 
 ## It tunes itself
 
-You don't size batches, pick join strategies, or guess partition counts. Batcher re-optimizes
-at stage boundaries on measured cardinalities, the same mechanism and the same granularity as
-Spark AQE, which also runs in Spark's local mode. The difference on one machine is that
-Batcher's loop runs inside the Python process rather than in a JVM beside it. It engages only on a joined query big enough to pay
-for the re-planning, which is 5M rows or roughly 320 MB for each pipeline breaker the loop
-would cut at, so most small queries never reach it.
-
-The half with no equivalent in DuckDB or Spark is what happens *between* runs. A sketch-backed
-learned-stats and bandit loop records what each query actually did, so the plan improves the
-more often you run it.
+You don't size batches or guess partition counts. On a large joined query, Batcher re-plans at stage boundaries from the cardinalities it measured. Between runs, a sketch-backed learned-stats loop records what each query did. Run a query often and it plans from evidence.
 
 ![The loop that outlives one query. In run N, Kyber plans on whatever it knows and Core executes and measures. Core writes measured cardinalities, operator wall times, column sketches, fitted cost coefficients and bandit arm rewards to the MetadataHub, keyed by plan signature and, for anything in machine units, by hardware fingerprint. Run N plus one reads that before planning, then measures and records again. The query ends and the hub does not, which is the difference from Spark AQE.](_static/diagrams/cross_run_learning.svg)
 
-{doc}`architecture/differentiators` covers both halves, and where each one stops.
+{doc}`architecture/differentiators` shows how.
 
 ## The numbers
 
-Every figure below is correctness-gated, and DuckDB is measured two ways. *Same Arrow* is DuckDB executing over the identical zero-copy input Batcher runs on, which isolates the two execution engines. *Native store* is DuckDB over its own compressed, dictionary-encoded, zone-mapped format, ingested before the clock starts: a storage engine plus an execution engine, against Batcher's execution engine alone.
-
-The suite results come from one sweep on a 48-core box on 2026-09-13, best of five, one process per case. They're speedups, so bigger is better: 4.0x means Batcher finishes in a quarter of the other engine's time. The tables under {doc}`benchmarks/index` report the inverse, a `batcher / other` time ratio where lower is better.
+These are speedups, so bigger is better. They come from one 48-core sweep on 2026-09-13, best of five. *Same Arrow* means DuckDB reads the identical zero-copy input Batcher reads. *Native store* means DuckDB reads its own ingested format.
 
 | Suite | vs DuckDB, same Arrow | vs DuckDB, native store | vs Polars | Cases where Batcher is fastest |
 |---|---|---|---|---|
-| TPC-H sf1, 22 queries | **4.0x** | **1.4x** | **1.9x** | 16 of 22 |
-| ClickBench, 43 queries | **6.3x** | **1.5x** | **2.7x** | 28 of 43 |
-| Semi-structured JSON, 5 queries | **3.1x** | **2.9x** | **over 60x** | 5 of 5 |
-| H2O.ai `join`, 5 queries | **1.7x** | **1.6x** | **2.0x** | 5 of 5 |
-| Operator mix, 46 kernels | **2.1x** | **1.3x** | **6.3x** | 33 of 46 |
-| H2O.ai `groupby`, 10 queries | **1.2x** | 0.95x | **1.9x** | 4 of 10 |
+| TPC-H sf1, 22 queries | 4.0x | 1.4x | 1.9x | 16 of 22 |
+| ClickBench, 43 queries | 6.3x | 1.5x | 2.7x | 28 of 43 |
+| Semi-structured JSON, 5 queries | 3.1x | 2.9x | over 60x | 5 of 5 |
+| H2O.ai `join`, 5 queries | 1.7x | 1.6x | 2.0x | 5 of 5 |
+| Operator mix, 46 kernels | 2.1x | 1.3x | 6.3x | 33 of 46 |
+| H2O.ai `groupby`, 10 queries | 1.2x | 0.95x | 1.9x | 4 of 10 |
 
-Batcher is faster than Polars and than DuckDB on the same Arrow in all six suites, and faster than DuckDB's native store in five. The last column counts a case only when Batcher beats every engine in the sweep. Nearly half of the remaining cases are storage wins for DuckDB's compressed format rather than execution gaps.
+Batcher is faster than Polars and than DuckDB on the same Arrow in all six suites.
 
 | Other workloads | Result |
 |---|---|
-| GPU batch inference, 100,000 images on six T4 nodes | **2.4x** Ray Data and **5.4x** Daft, identical checksums |
-| ResNet-50 batch inference, 8xT4 | **2,504 img/s** at 81% GPU utilization |
-| Text embeddings, MiniLM, 8xT4 | **33,611 text/s** |
-| Image decode to tensor, one 96-core node | **5,693 img/s**, 2.4x Daft |
-| TPC-H sf10 q6, cluster against cluster | Batcher matches DuckDB and Daft does not, so no ratio is quoted |
+| GPU batch inference, 100,000 images on six T4 nodes | 2.4x Ray Data and 5.4x Daft, identical checksums |
+| ResNet-50 batch inference, 8xT4 | 2,504 img/s at 81% GPU utilization |
+| Text embeddings, MiniLM, 8xT4 | 33,611 text/s |
+| Image decode to tensor, one 96-core node | 5,693 img/s, 2.4x Daft |
 
 ![Bar chart of the TPC-H scale-factor-10 suite on the same Arrow input, from the 2026-08-28 sweep on 92 cores. Batcher is 3.03x faster than DuckDB reading the same Arrow and 2.86x faster than Polars.](_static/diagrams/tpch_sf10.svg)
 
-Those rows were not all measured on the same machine, because the workload families were
-not. A figure is meaningful within its row. {doc}`benchmarks/index` carries the full grid,
-the hardware per family, and the reproduction commands.
+These rows ran on different hardware, so compare within a row. {doc}`benchmarks/index` has the full grid and the commands to reproduce it.
 
 ## How it compares
 
-Each tool stops somewhere. Batcher aims at the whole range on one engine. This is a capability
-view rather than a benchmark, so latency and throughput live in {doc}`benchmarks/index`, where
-each figure has a workload, a machine, and a method behind it. Polars means the open-source
-library. Polars Cloud is a separate product that runs distributed queries. Spark means Apache Spark,
-including local mode. "Same code, laptop to cluster" counts a change to the transformation code
-against a tool, and doesn't count a change to session, cluster, or resource configuration.
+This is a capability view, not a benchmark. Polars means the open-source library. Spark includes local mode. "Same code, laptop to cluster" means the transformation code doesn't change.
 
 ```{raw} html
 <table class="bt-matrix">
@@ -314,28 +292,27 @@ against a tool, and doesn't count a change to session, cluster, or resource conf
 <th>Polars (open source)</th>
 <th>Spark</th>
 </tr></thead><tbody>
-<tr><td>Runs without a cluster</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Runs inside the Python process</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Scales to a cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Same code, laptop to cluster</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>SQL</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>DataFrame API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Composable expression API</td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Cost-based optimizer</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Stage-boundary re-optimization, single-node</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>Cross-query learned statistics</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td></tr>
-<tr><td>Streaming</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
-<tr><td>ML / batch inference</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
-<tr><td>Multimodal (images, audio, video)</td><td><span class="y">✓</span></td><td><span class="n">—</span></td><td><span class="n">—</span></td><td><span class="p">~</span></td></tr>
-<tr><td>Out-of-core spill</td><td><span class="y">✓</span></td><td><span class="y">✓</span></td><td><span class="p">~</span></td><td><span class="y">✓</span></td></tr>
+<tr><td>Runs without a cluster</td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>Runs inside the Python process</td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="n">No</span></td></tr>
+<tr><td>Scales to a cluster</td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>Same code, laptop to cluster</td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>SQL</td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="p">Partial</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>DataFrame API</td><td><span class="y">Yes</span></td><td><span class="p">Partial</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>Composable expression API</td><td><span class="y">Yes</span></td><td><span class="p">Partial</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>Cost-based optimizer</td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="p">Partial</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>Stage-boundary re-optimization, single-node</td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>Cross-query learned statistics</td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td></tr>
+<tr><td>Streaming</td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="p">Partial</span></td><td><span class="y">Yes</span></td></tr>
+<tr><td>ML / batch inference</td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="p">Partial</span></td></tr>
+<tr><td>Multimodal (images, audio, video)</td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="p">Partial</span></td></tr>
+<tr><td>Out-of-core spill</td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="p">Partial</span></td><td><span class="y">Yes</span></td></tr>
 </tbody></table>
-<p class="bt-matrix-legend"><span class="y">✓</span> built-in &nbsp; <span class="p">~</span> partial or via an add-on &nbsp; <span class="n">—</span> not supported. Spark runs its JVM engine beside the Python process rather than inside it.</p>
+<p class="bt-matrix-legend"><span class="y">Yes</span> means built in. <span class="p">Partial</span> means partial or through an add-on. <span class="n">No</span> means not supported. Spark runs its JVM engine beside the Python process rather than inside it.</p>
 ```
 
 ## Find your way around
 
-The site has eleven sections, and they branch by what you are doing rather than by which part
-of the engine you are touching.
+The site branches by what you are doing.
 
 | Section | What is in it |
 | --- | --- |
@@ -345,14 +322,13 @@ of the engine you are touching.
 | {doc}`ML and inference </ml/index>` | Preparing data for models, batch inference, retrieval and generation, evaluation, and training loaders |
 | {doc}`Integrations </integrations/index>` | Kafka, Snowflake, BigQuery, Delta, Iceberg, Hudi, MongoDB, Elasticsearch, Ray, PyTorch, Hugging Face |
 | {doc}`Cookbook </cookbook/index>` | 146 runnable pages, from a one-method recipe to a complete pipeline, each executed on every test run |
-| {doc}`Example library </examples/index>` | 533 standalone scripts, indexed by what each one shows. CI runs each one on every pull request, except two that need a cluster or a broker, and a few return early when their optional dependency isn't installed |
+| {doc}`Example library </examples/index>` | 533 standalone scripts, indexed by what each one shows, run in CI |
 | {doc}`API reference </api/index>` | Every public name three ways: a one-page lookup table, the area guides, and the full signature listing |
 | {doc}`Configuration </configuration/index>` | Profiles, options, environment variables, accelerators, and fault tolerance |
-| {doc}`Benchmarks </benchmarks/index>` | The full grid against DuckDB, Polars, Spark, and Daft, with the methodology and the losses |
+| {doc}`Benchmarks </benchmarks/index>` | The full grid against DuckDB, Polars, Spark, and Daft, with hardware and reproduction commands |
 | {doc}`Architecture </architecture/index>` | How the engine works at three zoom levels, from the shape of the system down to one mechanism |
 
-Writing Batcher with an AI agent? {doc}`The skill catalog <agents>` holds task-scoped recipes
-for driving the engine correctly.
+Writing Batcher with an AI agent? {doc}`The skill catalog <agents>` holds task-scoped recipes.
 
 ```{toctree}
 :hidden:

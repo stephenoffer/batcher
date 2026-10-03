@@ -230,21 +230,34 @@ impl Codegen<'_, '_> {
                 use bc_expr::Literal;
                 use cranelift_codegen::ir::condcodes::IntCC;
                 let (v, ty) = self.emit_typed(input);
-                // A float set is matched on RAW BITS, not by float equality. The
-                // interpreter keys membership with `f64::to_bits` because the operator
-                // this folds from compares by *total* order, and total-order equality is
-                // bit equality -- so `-0.0` never matches `0.0` and a NaN column value
-                // matches only an identically-patterned NaN literal. An `fcmp Equal` here
-                // would silently disagree on both.
+                // A float set is matched on CANONICAL bits (`bc_arrow::canon_f64_bits`), as
+                // the interpreter keys it: `-0.0` is `0.0` and every NaN is one NaN, which is
+                // what `=` says. Not an `fcmp Equal`, which would make NaN match nothing.
+                // The probe is canonicalized in-line -- NaN to the canonical NaN's bits, either
+                // zero to `+0.0` -- and each literal key through the same function.
                 let probe = match ty {
-                    ScalarTy::F64 => self.b.ins().bitcast(types::I64, MemFlags::new(), v),
+                    ScalarTy::F64 => {
+                        use cranelift_codegen::ir::condcodes::FloatCC;
+                        let zero = self.b.ins().f64const(0.0);
+                        let is_zero = self.b.ins().fcmp(FloatCC::Equal, v, zero);
+                        let unsigned = self.b.ins().select(is_zero, zero, v);
+                        let bits = self.b.ins().bitcast(types::I64, MemFlags::new(), unsigned);
+                        let is_nan = self.b.ins().fcmp(FloatCC::Unordered, v, v);
+                        let nan_bits = self
+                            .b
+                            .ins()
+                            .iconst(types::I64, bc_arrow::CANONICAL_NAN_BITS_F64 as i64);
+                        self.b.ins().select(is_nan, nan_bits, bits)
+                    }
                     _ => v,
                 };
                 let mut acc = self.b.ins().iconst(types::I8, 0);
                 for lit in set {
                     let key = match (ty, lit) {
-                        (ScalarTy::F64, Literal::Float(x)) => x.to_bits() as i64,
-                        (ScalarTy::F64, Literal::Int(x)) => (*x as f64).to_bits() as i64,
+                        (ScalarTy::F64, Literal::Float(x)) => bc_arrow::canon_f64_bits(*x) as i64,
+                        (ScalarTy::F64, Literal::Int(x)) => {
+                            bc_arrow::canon_f64_bits(*x as f64) as i64
+                        }
                         (_, Literal::Int(x)) => *x,
                         _ => unreachable!("validated in analyze"),
                     };

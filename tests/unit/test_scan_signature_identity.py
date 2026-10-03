@@ -151,3 +151,29 @@ def test_a_source_id_remap_preserves_the_key():
     assert isinstance(shifted, Scan)
     assert shifted.source_id == 3
     assert shifted.source_key == "id:table-a"
+
+
+def test_in_memory_relations_with_different_columns_do_not_share_a_signature():
+    """The q72 collision: one filter over two unrelated in-memory relations.
+
+    `d_year = 1999` keeps 365 of `date_dim`'s 73,049 rows. The same filter over an earlier
+    query's materialized intermediate kept 41,649, and with every in-memory scan rendered as
+    one token the two shared a learned entry -- so TPC-DS q72, run after the rest of the suite,
+    planned its `date_dim` filter at 41,649 rows and joined `inventory` to `catalog_sales` first.
+    """
+    from batcher.kyber.signature import plan_signature
+
+    dates = bt.from_pydict({"d_date_sk": [1, 2], "d_year": [1999, 2000], "d_moy": [1, 2]})
+    staged = bt.from_pydict({"d_year": [1999, 1999], "sales": [1.0, 2.0]})
+    pred = bt.col("d_year") == 1999
+    assert plan_signature(dates.filter(pred)._plan) != plan_signature(staged.filter(pred)._plan)
+
+
+def test_the_same_columns_at_another_size_still_share_a_signature():
+    """What the shared token protected: a frame rebuilt or grown is still the same relation."""
+    from batcher.kyber.signature import plan_signature
+
+    small = bt.from_pydict({"d_year": [1999], "d_moy": [1]})
+    grown = bt.from_pydict({"d_year": [1999, 2000, 2001], "d_moy": [1, 2, 3]})
+    pred = bt.col("d_year") == 1999
+    assert plan_signature(small.filter(pred)._plan) == plan_signature(grown.filter(pred)._plan)

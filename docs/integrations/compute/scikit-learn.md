@@ -47,7 +47,7 @@ print(scored.select("id", "p").to_pydict()["p"][1])
 
 You could call the model inside a batch UDF. `ds.ml.predict` exists because doing that well means solving four problems that have nothing to do with your model: assembling the feature matrix in the right column order, keeping it out of Python object space, sizing the batch against the model's memory, and reusing one loaded model across batches rather than pickling it per call.
 
-It also takes the scaling arguments — `num_workers`, `num_gpus`, `concurrency`, `batch_size` — so moving from one process to a cluster is an argument rather than a rewrite. {doc}`/ml/inference/index` covers them.
+It also takes the scaling arguments, `num_workers`, `num_gpus`, `concurrency`, and `batch_size`, so moving from one process to a cluster is an argument rather than a rewrite. {doc}`/ml/inference/index` covers them.
 
 ## Scoring the scores
 
@@ -63,7 +63,7 @@ print(truth.select(acc=bt.accuracy("y", "pred"), f1=bt.f1_score("y", "pred")).to
 
 ## When to use Batcher's own estimators instead
 
-Batcher ships in-engine estimators — {py:obj}`bt.ml.LinearRegression <batcher.ml.LinearRegression>`, {py:obj}`bt.ml.KMeans <batcher.ml.KMeans>`, and the preprocessors — that fit over a `Dataset` without materializing it. Reach for them when the *training* data does not fit in memory, because scikit-learn's `fit` takes an array that does.
+Batcher ships in-engine estimators, such as {py:obj}`bt.ml.LinearRegression <batcher.ml.LinearRegression>`, {py:obj}`bt.ml.KMeans <batcher.ml.KMeans>`, and the preprocessors, that fit over a `Dataset` without materializing it. Reach for them when the *training* data does not fit in memory, because scikit-learn's `fit` takes an array that does.
 
 Reach for scikit-learn when it has an estimator Batcher does not, when you need its exact numerics, or when the model is already fitted and in production. The two compose: fit in scikit-learn, score with `ds.ml.predict`, or fit in Batcher and export.
 

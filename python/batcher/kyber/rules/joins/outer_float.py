@@ -221,6 +221,10 @@ def _does_not_fan_out(inner: Join, a: LogicalPlan, ctx: OptimizerContext) -> boo
     return ctx.estimator.estimate(inner).rows <= a_rows * _MAX_FANOUT
 
 
+#: Relative slack under which two kept fractions count as equal (see `semijoin_goes_first`).
+_TIE = 1e-9
+
+
 def semijoin_goes_first(
     ctx: OptimizerContext, a: LogicalPlan, membership: LogicalPlan, inner: LogicalPlan
 ) -> bool:
@@ -244,4 +248,8 @@ def semijoin_goes_first(
         return True
     kept_by_membership = ctx.estimator.estimate(membership).rows / a_rows
     kept_by_inner = ctx.estimator.estimate(inner).rows / a_rows
-    return kept_by_membership <= kept_by_inner
+    # A tie within rounding is a tie. On TPC-H q18 both filters were estimated to keep all of
+    # `orders` -- 15,000,000 rows against the inner join's 14,999,999.999993 -- and an exact
+    # comparison read the 7e-6-row difference as the inner join being the more selective, so
+    # the semijoin stayed above `customer ⋈ orders` and every order was joined to keep 6,398.
+    return kept_by_membership <= kept_by_inner * (1 + _TIE)

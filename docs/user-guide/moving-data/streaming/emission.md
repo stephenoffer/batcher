@@ -4,11 +4,36 @@ This page covers *when* each relational shape produces output over an unbounded 
 what to do about the shapes that produce none until the input ends. It assumes the pipeline
 basics in {doc}`/user-guide/moving-data/streaming/index`.
 
-Every relational shape that works on a bounded dataset also runs on an unbounded one, and
-`iter_batches()` will drive all of them. What differs is *when* a shape produces output,
-and over a source that never ends that difference decides whether you see anything at all.
+Every relational shape that runs on a bounded dataset also runs on an unbounded one. What differs is *when* it produces output, and over a source that never ends, that decides whether you see anything at all.
 
-The shapes fall into two groups, and the split isn't about memory:
+```python
+import datetime as dt
+
+import pyarrow as pa
+
+import batcher as bt
+from batcher import col
+
+schema = pa.schema([("user", pa.string()), ("amount", pa.int64()), ("ts", pa.timestamp("us"))])
+
+
+def at(h, m):
+    return dt.datetime(2024, 1, 1, h, m)
+
+
+def feed():
+    yield pa.record_batch({"user": ["a", "b"], "amount": [10, 5], "ts": [at(10, 5), at(10, 40)]}, schema=schema)
+    yield pa.record_batch({"user": ["a", "c"], "amount": [7, 3], "ts": [at(11, 25), at(11, 50)]}, schema=schema)
+
+
+stream = bt.from_batches(feed, schema, bounded=False)
+
+# Row-wise shapes emit per batch, as rows arrive.
+print([b.num_rows for b in stream.filter(col("amount") > 4).iter_batches()])
+# [2, 1]
+```
+
+The shapes fall into two groups:
 
 | Shape | When it emits |
 |-------|---------------|
@@ -29,37 +54,33 @@ return one finished result: it refuses a top-N or a keyed `distinct(subset=...)`
 stream outright. {doc}`index` has the detail, under "Look at a stream before you
 build on it".
 
-The second group folds its input into one running state and finalizes when the input
-stops. That is the right answer for a source that ends, including an unbounded-by-type
-source that drains, such as an incremental file read under
-{py:meth}`Trigger.available_now() <batcher.Trigger.available_now>`. Over a source that
-genuinely never ends, such as a Kafka topic, "at end of input" never arrives and the query
-consumes without emitting. `iter_batches()` warns with a `PerformanceWarning` before its first read when an unbounded source feeds one of these three shapes, and names the ways to get output while rows arrive.
+The "once, at end of input" shapes fold everything into one running state and finalize when the input stops. That works for a source that drains, such as an incremental file read under {py:meth}`Trigger.available_now() <batcher.Trigger.available_now>`. Over a Kafka topic, end of input never arrives, so `iter_batches()` warns with a `PerformanceWarning` before its first read and names the ways to get output sooner.
 
-Put one shape from each row of the table side by side on the same four triggers and the difference is entirely one of timing:
+Side by side on the same four triggers, the difference is entirely timing:
 
 ![A grid of three shapes against four triggers of one unbounded stream, plus a final column for when the input ends, with illustrative event times, a one-hour window, and ten minutes of allowed lateness. The highest event time seen at each trigger is 10:40, 11:05, 11:25 and 11:50, so the watermark is 10:30, 10:55, 11:15 and 11:40. A row-wise shape such as filter, select, with_columns or map_batches emits each trigger's own rows as they arrive, and has nothing left to emit when the input ends. A with_watermark plus window aggregate emits nothing on triggers 1 and 2, emits the 10:00 to 11:00 window on trigger 3 because 11:15 is the first watermark at or past that window's end, and emits nothing on trigger 4 because the 11:00 to 12:00 window is still open; that window is emitted when the input ends. A group_by().agg() with no watermark emits nothing on any trigger and emits the whole result only when the input ends. A draining source reaches that last column. A Kafka topic never does.](/_static/diagrams/streaming_emission.svg)
 
-Memory is not the signal to watch here, and top-N is the case that shows why: it keeps only
-the running best `n` rows, so it is perfectly bounded and still produces nothing until the
-input ends. A global `sum` is the same. Neither has an answer while rows are arriving,
-which is the actual reason, and it is a property of the question rather than of the engine.
+Memory isn't the issue. A top-N keeps only the best `n` rows, so it is bounded, yet it has no answer until the input ends. Neither does a global `sum`.
 
-To get output as rows arrive from one of those shapes, ask a question that has an answer so
-far. Either window it, so each window is finite and the watermark closes it, or run it as a
-streaming query, which emits the running result on the trigger:
+To get output as rows arrive, ask a question that has an answer so far. Window it, so the watermark closes each finite window:
 
 ```python
-# docs: skip
-# Windowed: each window is a finite question, closed by the watermark.
-(
+windowed = (
     stream.with_watermark("ts", "10 minutes")
     .group_by(w=bt.window(col("ts"), "1 hour"))
     .agg(total=col("amount").sum())
-    .iter_batches()
 )
+for batch in windowed.iter_batches():
+    print(batch.to_pydict()["total"])
+# [15]
+# [10]
+```
 
-# Or a streaming query, which emits the running result every trigger.
+The 10:00 window emits as soon as the watermark passes 11:00. The 11:00 window is still open when the input ends, so it emits then. Or run it as a streaming query, which emits the running result on every trigger:
+
+```python
+# docs: skip
+# A streaming query, which emits the running result every trigger.
 q = (
     stream.group_by("user")
     .agg(total=col("amount").sum())
@@ -78,43 +99,19 @@ every group every trigger. {doc}`index` covers both under "Output modes".
 
 ## What a streaming aggregate emits above itself
 
-A streaming aggregate is not limited to a bare `group_by(...).agg(...)`. The row-wise
-operators above it run too, applied to each snapshot the fold emits: a projection, a
-`filter` playing the part of SQL's `HAVING`, and any expression written *over* aggregates.
-The last is the common case, because `col("v").sum() / bt.count()` is one keyword to you
-and a projection over an aggregate to the engine, as are `col("v").max() - col("v").min()`
-and the regression and correlation functions.
-
-The answer matches the batch plan, because a row-wise operator's output for a row depends
-on that row alone, so applying it to the running result is what applying it to the whole
-input computes. This holds on a cluster as well: the driver applies the same operators to
-the combined result, so `distributed=True` returns what one machine returns.
-
-A `filter` above the aggregate can drop a group it kept on an earlier trigger, for example
-when a running `sum` falls back below a threshold. What the sink then holds depends on the
-output mode. In `"complete"` mode each snapshot replaces the sink's contents, including a
-snapshot with no rows left, so the sink ends on the batch answer. In `"update"` mode Batcher
-emits only rows that are present and changed. A group that leaves the filter's set produces no
-row at all, and there is no deletion or tombstone record, so an upsert sink keeps that group's
-last emitted row. When a group can cross a `HAVING` threshold in both directions, use
-`"complete"`, or apply the threshold downstream of an `"update"` sink.
+Row-wise operators above a streaming aggregate run on each snapshot the fold emits: a projection, a `filter` playing SQL's `HAVING`, and expressions over aggregates such as `col("v").sum() / bt.count()`. The answer matches the batch plan, on one machine or with `distributed=True`.
 
 ```python
-import pyarrow as pa
-
-import batcher as bt
-from batcher import col
-
-schema = pa.schema([("user", pa.string()), ("amount", pa.int64())])
+schema2 = pa.schema([("user", pa.string()), ("amount", pa.int64())])
 
 
-def feed():
-    yield pa.record_batch({"user": ["a", "b"], "amount": [10, 5]}, schema=schema)
-    yield pa.record_batch({"user": ["a"], "amount": [7]}, schema=schema)
+def feed2():
+    yield pa.record_batch({"user": ["a", "b"], "amount": [10, 5]}, schema=schema2)
+    yield pa.record_batch({"user": ["a"], "amount": [7]}, schema=schema2)
 
 
 query = (
-    bt.from_batches(feed, schema, bounded=False)
+    bt.from_batches(feed2, schema2, bounded=False)
     .group_by("user")
     .agg(total=col("amount").sum(), n=bt.count())
     .with_columns(mean=col("total") / col("n"))
@@ -124,27 +121,18 @@ query = (
 )
 query.await_termination()
 print(sorted(bt.read_memory("per_user_mean").to_pydict()["user"]))
+# ['a']
 ```
 
-`sort` and `limit` stay out. Neither is row-wise, so neither has a meaning on a *running*
-result that matches what it means over the whole input. Sort downstream of the sink.
+:::{dropdown} A `HAVING` filter that drops a group later
+A `filter` above the aggregate can drop a group it kept on an earlier trigger, such as when a running `sum` falls back below a threshold. In `"complete"` mode each snapshot replaces the sink's contents, so the sink ends on the batch answer. In `"update"` mode Batcher emits only rows that are present and changed, with no tombstone record, so an upsert sink keeps that group's last emitted row. When a group can cross the threshold in both directions, use `"complete"`, or apply the threshold downstream of an `"update"` sink.
+:::
 
-One shape refuses rather than approximating: `output_mode="append"` on a windowed
-aggregation. A closed window is emitted once and never revised, so no later snapshot can
-correct a projection applied to a partial one. Use `"complete"` or `"update"`, which
-re-emit, or derive the columns downstream of the sink.
+`sort` and `limit` aren't row-wise, so sort downstream of the sink. `output_mode="append"` on a windowed aggregation refuses rather than approximating: a closed window is emitted once and never revised, so no later snapshot can correct a projection applied to a partial one. Use `"complete"` or `"update"`, or derive the columns downstream.
 
 ## First-row latency on a `map_batches` stream
 
-A `map_batches` function only spreads across the worker pool when it is handed several
-batches at once, so the streaming iterator collects source batches into a window before
-calling it. That window closes on size or on age, whichever comes first. The age bound is
-`streaming.max_window_latency_seconds`, one second by default, and it is what keeps a
-low-rate stream responsive: without it the window would wait for four million rows or
-128 MiB, which at 2,000 rows a second is 33 minutes before the first output and on a slower
-topic considerably longer. Raise it to trade first-row latency for larger, more efficient
-windows. It applies only to unbounded sources, so batch reads keep the size-based window
-and their existing throughput unchanged. See {doc}`/configuration/options`.
+The streaming iterator collects source batches into a window before calling a `map_batches` function, so the function can spread across the worker pool. The window closes on size (four million rows or 128 MiB) or on age, whichever comes first. The age bound, `streaming.max_window_latency_seconds`, defaults to one second and keeps a low-rate stream responsive. Raise it to trade first-row latency for larger windows. It applies only to unbounded sources. See {doc}`/configuration/options`.
 
 ## See also
 

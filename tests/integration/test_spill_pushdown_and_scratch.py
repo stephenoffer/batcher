@@ -207,3 +207,49 @@ def test_an_empty_spilling_join_carries_the_in_memory_schema():
 def test_spill_collect_still_declines_a_plan_shape_it_cannot_spill():
     source = _RecordingSource(rows=20)
     assert spill_collect(_ds(source).filter(bt.col("c0") > 0)._plan, [source], 4) is None
+
+
+# --------------------------------------------------------------------------
+# A spilling join writes each bucket in large pieces, not one piece per 8 MiB morsel.
+# --------------------------------------------------------------------------
+class _WideSource(_RecordingSource):
+    """Three batches of 1.2M rows (~19 MB each), every one over the 8 MiB morsel."""
+
+    def __init__(self) -> None:
+        super().__init__(rows=1)
+        n = 1_200_000
+        self._table = pa.table({"k": pa.array(range(n)), "v": pa.array(range(n))})
+        self._batches = 3
+
+    def iter_batches(self, projection=None):
+        self.projections.append(list(projection) if projection is not None else None)
+        table = self._table.select(projection) if projection is not None else self._table
+        for _ in range(self._batches):
+            yield from table.to_batches()
+
+
+def test_a_spilling_join_writes_each_bucket_once_per_chunk(monkeypatch):
+    """The partition phase read 8 MiB morsels, and `partition_batches` returns one batch per
+    bucket for whatever it is given, so every spill write was ~8 MiB / buckets -- a few KB at
+    the 1,024-bucket ceiling. TPC-H sf1000 q9 spent four hours writing like that. Read in
+    `spill_chunk_bytes` chunks, a side that fits one chunk writes each bucket once."""
+    from batcher.dist.spill.buckets import BucketWriters
+
+    writes: dict[tuple[str, int], int] = {}
+    original = BucketWriters.write
+
+    def counting(self, bucket, batch):
+        if batch.num_rows:
+            key = (self._tag, bucket)
+            writes[key] = writes.get(key, 0) + 1
+        original(self, bucket, batch)
+
+    monkeypatch.setattr(BucketWriters, "write", counting)
+    left, right = _WideSource(), _RecordingSource(rows=40)
+    right._table = pa.table({"k": pa.array(range(40)), "w": pa.array(range(40))})
+    ds = _ds(left).join(_ds(right), on="k")
+    out = br.execute_spilling_join(ds._plan, [left, right], num_partitions=4)
+    assert out.num_rows == 3 * 40
+    wide = {k: n for k, n in writes.items() if n > 0}
+    assert wide, "the join wrote no buckets at all"
+    assert max(wide.values()) == 1, f"a bucket was written in pieces: {writes}"

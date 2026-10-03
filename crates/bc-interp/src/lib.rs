@@ -56,13 +56,13 @@ pub use stream::chunked::{
     chunkable, execute_chunked, execute_units, execute_units_metered, partial_aggregate_units,
     NextChunk,
 };
-pub use stream::{UnitSource, LOCATOR};
 pub use stream::{
     execute_streaming, execute_streaming_metered, execute_streaming_parallel,
     execute_streaming_parallel_metered, execute_streaming_parallel_metered_or_hand_off,
     execute_streaming_parallel_or_hand_off, materializing_aggregate_is_faster,
     streaming_parallelizes,
 };
+pub use stream::{ScanKeyFilter, UnitSource, LOCATOR};
 
 use metrics::{IdGen, Stopwatch};
 

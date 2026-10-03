@@ -1,8 +1,15 @@
 //! The driving relation as a sequence of units read on demand by the workers that scan it.
 
+use std::sync::Arc;
+
 use arrow::array::RecordBatch;
+use bc_runtime::join::KeyFilter;
 
 use crate::InterpError;
+
+/// A runtime join filter placed on a lazily-read scan: the probe-side column, named as the scan
+/// produces it, and the build side's key digest.
+pub type ScanKeyFilter = (String, Arc<KeyFilter>);
 
 /// A driving relation read one unit at a time, on demand, by the worker that scans it.
 ///
@@ -23,6 +30,25 @@ pub trait UnitSource: Sync {
     /// # Errors
     /// Whatever reading the unit reports.
     fn read(&self, unit: usize) -> Result<Vec<RecordBatch>, InterpError>;
+
+    /// [`UnitSource::read`], told the runtime join filters placed on this scan's output.
+    ///
+    /// A source that can test a key while decoding -- before it materializes the columns only
+    /// the surviving rows need -- may drop the rows `keys` refute. Dropping is optional and
+    /// always sound: the executor applies the same filters to whatever this returns
+    /// (`runtime_filter::apply`), and a [`KeyFilter`] never refutes a key its build side holds.
+    /// `keys` is the same for every unit of one execution. The default ignores them.
+    ///
+    /// # Errors
+    /// Whatever reading the unit reports.
+    fn read_keyed(
+        &self,
+        unit: usize,
+        keys: &[ScanKeyFilter],
+    ) -> Result<Vec<RecordBatch>, InterpError> {
+        let _ = keys;
+        self.read(unit)
+    }
 
     /// This relation reading only `columns`, in that order, with a [`LOCATOR`] column appended
     /// that [`UnitSource::fetch`] resolves back to the row — or `None` when it cannot locate

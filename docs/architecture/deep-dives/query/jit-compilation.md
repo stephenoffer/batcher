@@ -1,23 +1,31 @@
 # JIT compilation
 
-*Tier-1* is Batcher's just-in-time compiler for scalar expressions. It lives in `bc-codegen` and turns a scalar `bc_expr::Expr` tree, the one the interpreter evaluates, into native machine code with Cranelift. This page describes what it compiles, how it handles nulls, and why it falls back more often than you might expect.
+*Tier-1* is Batcher's just-in-time compiler for scalar expressions. It lives in `bc-codegen` and turns the same `bc_expr::Expr` tree the interpreter evaluates into native machine code with Cranelift. This page describes what it compiles, how it handles nulls, and when it hands work back to the interpreter.
 
-The problem it solves is allocation. The interpreter materializes a full Arrow array for every node of an expression tree. For `(a - b) * c` over a morsel that is two temporary 16,384-element arrays, three kernel passes, and three trips through memory. The values never stay in registers.
+The interpreter materializes a full Arrow array for every node of an expression tree, so `(a - b) * c` over a morsel costs two temporary arrays and three trips through memory. Tier-1 compiles the tree into a single native loop instead: each output element is computed in registers and written straight to the result buffer. The win grows with the depth of the expression.
 
-Tier-1 fixes that one thing. It compiles the expression tree into a single native loop: one pass over the row index, each output element computed in registers and written straight to the result buffer. No intermediates. The win grows with the depth of the expression.
+You can see which tier ran in {py:meth}`Dataset.stats() <batcher.Dataset.stats>`:
 
-It's a narrow tool, deliberately.
+```python
+import batcher as bt
+
+n = 200_000
+ds = bt.from_pydict({"g": [i % 10 for i in range(n)], "a": list(range(n)), "s": [str(i) for i in range(n)]})
+numeric = ds.group_by("g").agg(t=bt.sum(bt.col("a") * 2 + 1))
+strings = ds.group_by("g").agg(t=bt.sum(bt.col("s").str.len_chars()))
+print({op.kind: op.backend for op in numeric.stats().ops})  # {'aggregate': 'jit', 'scan': 'interp'}
+print({op.kind: op.backend for op in strings.stats().ops})  # {'aggregate': 'interp', 'scan': 'interp'}
+```
+
+The numeric aggregate input compiles. The string function is outside the subset, so the interpreter evaluates it, with the same result either way.
 
 :::{important}
-On the subset it accepts, the JIT must be **bit-for-bit identical** to `bc_expr::Expr::eval`.
-On everything else it must **fall back silently**. A JIT that disagrees with the interpreter
-is worse than no JIT, because the interpreter is the oracle everything else is tested
-against. There is no third option where it is "close enough".
+On the subset it accepts, the JIT must be **bit-for-bit identical** to `bc_expr::Expr::eval`. On everything else it must **fall back silently**. The interpreter is the oracle everything is tested against, so there is no "close enough".
 :::
 
 ## What compiles
 
-From [`crates/bc-codegen/src/analyze.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/analyze.rs), which is the authority. The crate docstring in `lib.rs` still lists only null-free `Int64`/`Float64` columns, which predates the temporal and nullable paths below.
+[`crates/bc-codegen/src/analyze.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/analyze.rs) is the authority:
 
 | Variant | Compiles | Notes |
 |---|---|---|
@@ -26,49 +34,30 @@ From [`crates/bc-codegen/src/analyze.rs`](https://github.com/stephenoffer/batche
 | `Binary` | `Add`/`Sub`/`Mul`/`Div`/`Mod`, the six comparisons, `And`/`Or` over boolean sub-results | integer `Div`/`Mod` only against a constant divisor (below) |
 | `Not` | of a boolean sub-result | |
 | `Case` | over the numeric subset | lowered to a `select` chain in the interpreter's reverse-fold order, so the first matching `WHEN` wins |
-| `Cast` | `i64 → f64`, or a no-op | a *rounding* conversion, not an exact one: an integer beyond 2^53 lands on the nearest representable double. It rounds exactly as the interpreter's Arrow cast does, so the two tiers stay bit-identical |
+| `Cast` | `i64 → f64`, or a no-op | rounds exactly as the interpreter's Arrow cast does, so the two tiers stay bit-identical |
 | `Math`, `Math2` | value-only math over the numeric subset | libm calls, so the SIMD body excludes them |
 | `IsNan`, `IsInf` | over a `Float64` operand | any other operand type declines |
 | everything else | no | strings, date functions, lists, structs, `IsNull`, `Coalesce`, media decode → `CodegenError::Unsupported`, and the caller uses `Expr::eval` |
 
-One subtlety that is easy to get wrong and is worth stating: an integer divisor compiles only
-when it is a **nonzero, non-`-1` constant**. Cranelift's `sdiv`/`srem` trap on divide-by-zero
-and on `i64::MIN / -1`; a constant divisor that is neither cannot trap, and truncation-toward-
-zero plus dividend-signed remainder are exactly Arrow's semantics. A variable divisor stays on
-the interpreter.
+An integer divisor compiles only when it is a **nonzero, non-`-1` constant**, because Cranelift's `sdiv`/`srem` trap on divide-by-zero and on `i64::MIN / -1`. A variable divisor stays on the interpreter.
 
-## The generated code
-
+:::{dropdown} The generated function's ABI
 ```text
 fn(n: i64, cols: *const *const u8, out: *mut u8)
 ```
 
-`cols` is an array of pointers, one per referenced column, in stable first-seen order. Each entry points at that column's raw values buffer. Passing them as an array rather than as separate arguments means there's no fixed ceiling on how many distinct columns an expression may reference. `out` is a fresh output buffer holding `n` `i64`s, `n` `f64`s, or, for a boolean result, a packed Arrow bitmask of `ceil(n/8)` zeroed bytes that the loop ORs one bit per row into, LSB-first, so the resulting `BooleanArray` wraps the buffer with no repack pass.
+`cols` is an array of pointers to each referenced column's raw values buffer, in stable first-seen order, so there's no ceiling on how many columns an expression references. `out` holds `n` `i64`s, `n` `f64`s, or a packed LSB-first Arrow bitmask for a boolean result, so the `BooleanArray` wraps it with no repack. The Kleene body uses a wider signature that also carries per-column validity in and a validity buffer out. Promotion mirrors Arrow: any `f64` operand makes the subtree `f64`.
+:::
 
-The Kleene body described below uses a wider signature that also carries per-column validity in and a validity buffer out.
+## Nulls: three paths
 
-Type promotion mirrors Arrow: if any operand in a subtree is `f64`, the whole subtree is
-computed in `f64` with `i64 → f64` conversions inserted; otherwise it computes in `i64`.
-
-## Nulls: three paths, not one
-
-Arrow columns carry a validity bitmap, and the JIT loop reads a raw values buffer that has
-garbage at null slots. Three cases, decided per batch in `CompiledExpr::eval`:
+Arrow columns carry a validity bitmap, and the JIT loop reads raw values that are garbage at null slots. `CompiledExpr::eval` decides per batch:
 
 1. **No nulls in any referenced column.** Run the loop. This is the fast path.
-1. **Nulls, and the expression is null-propagating.** Compute over the raw buffers, then AND
-   the inputs' validity bitmaps together and apply the combined mask to the result. This is
-   correct exactly when the SQL result is null *iff* an input is null, and when no operation
-   can trap on the garbage at a masked-out slot: `Col`, `Lit`, `Add`/`Sub`/`Mul`, the
-   comparisons, value-only math, the numeric casts, `Not`, and the constant-divisor `Div`/`Mod`
-   above. The predicate is `kleene::is_null_propagating`.
-1. **Nulls, and the expression is a compound predicate** (`And`/`Or` somewhere). The
-   combined-mask trick is *wrong* here: `false AND null` is `false`, not null. So a second
-   body is compiled in a value+validity ABI that carries per-column validity into the loop
-   and reads a validity buffer back out: real three-valued logic, still on the JIT.
-   `needs_kleene` selects it.
+1. **Nulls, and the expression is null-propagating.** Compute over the raw buffers, then AND the inputs' validity bitmaps into the result. `kleene::is_null_propagating` admits `Col`, `Lit`, `Add`/`Sub`/`Mul`, comparisons, value-only math, numeric casts, `Not`, and the constant-divisor `Div`/`Mod`.
+1. **Nulls, and the expression is a compound predicate.** `false AND null` is `false`, so a combined mask would be wrong. `needs_kleene` selects a second body compiled in a value-plus-validity ABI: real three-valued logic, still on the JIT.
 
-Anything else with nulls (`Case`, `Coalesce`) falls back to the interpreter for that batch.
+Anything else with nulls, such as `Case` or `Coalesce`, falls back to the interpreter for that batch only.
 
 ```text
   once, per operator                 per batch, in CompiledExpr::eval
@@ -94,51 +83,34 @@ Anything else with nulls (`Case`, `Coalesce`) falls back to the interpreter for 
                                                   └─► Err ──► Tier-0, this batch only
 ```
 
-The two fallbacks are independent, and both land on the same oracle. `try_compile` returning
-`None` means the *expression* is outside the subset. `eval` returning `Err` means *this
-batch* is, and only this batch reverts.
-
-Those two refusals leave the compiled path at different heights because they cost different amounts:
-
 ![Where the JIT gives up, and how much it gives up each time. The compiled path runs down the left: bc-codegen's analyze() decides which types and operators can compile, a successful compile yields one Arc<CompiledExpr> that is Send plus Sync and shared by every worker, compiled exactly once, and bc-interp drives eval(batch) over 16,384 rows at a time, reusing that artifact for every morsel and never recompiling. The compile cache on the right, keyed on the expression and the schema and capped at 1024 entries, is asked before anything compiles, and a refusal is remembered too. The two refusal edges differ in blast radius. Failing analyze means the expression is outside the subset, so that operator never compiles at all and runs on Expr::eval, the interpreter and the oracle, for the life of the query. Failing at eval, on nulls the compiled body cannot carry, costs this batch only and the next one tries again. The subset is narrow on purpose: numeric, date and timestamp columns, arithmetic and comparison, and no strings.](/_static/diagrams/jit_fallback.svg)
+
+Nulls take a path through the JIT rather than out of it, so a nullable numeric column still compiles:
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"a": [1.0, None, 3.0], "b": [10.0, 20.0, None]})
+print(ds.select(y=(bt.col("a") - bt.col("b")) * 2).to_pydict())  # {'y': [-18.0, None, None]}
+```
 
 ## SIMD
 
-The scalar loop is the baseline. [`crates/bc-codegen/src/simd.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/simd.rs) emits a vector body when
-every node is in the vectorizable subset: numeric leaves, integer `+`/`-`/`*` and float
-`+`/`-`/`*`/`/`, the comparisons (the big filter win), `Not`, and the numeric casts.
+[`crates/bc-codegen/src/simd.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/simd.rs) emits a vector body when every node is vectorizable: numeric leaves, integer `+`/`-`/`*`, float `+`/`-`/`*`/`/`, the comparisons, `Not`, and numeric casts. Width comes from `bc_arrow::HardwareProfile`: 2 f64 lanes on SSE2 and NEON, 4 on AVX2, and 8 on AVX-512. Automatic detection caps at 4, because 512-bit code can down-clock the core, so the 8-lane width is opt-in. A scalar remainder loop handles the tail.
 
-Width comes from the host at compile time via `bc_arrow::HardwareProfile`: 2 f64 lanes on SSE2 and NEON, 4 on AVX2, and 8 on AVX-512. Detection caps the automatic choice at 4 even on an AVX-512 host, because 512-bit code can down-clock the core, so the 8-lane width is opt-in. Cranelift legalizes a wider IR vector into native instructions where the ISA has them and splits it into 128-bit ops otherwise. A width that doesn't lower natively is at worst a no-op, never a wrong answer. A scalar remainder loop handles the rows past the last full step.
+Integer `Div`/`Mod`, float `Mod`, `Math`, and `Case` stay scalar so every lane is bit-identical to the interpreter. Boolean `And`/`Or` vectorize as a mask combine on a null-free batch, with the Kleene body as the fallback.
 
-The excluded ops are excluded because their per-lane result would not be bit-identical:
-integer `Div`/`Mod` scalarize and can trap, float `Mod` is an `fmod` libcall, `Math`/`Math2`
-are libm libcalls, and `Case` is a branch. Boolean `And`/`Or` vectorize as a bitwise mask
-combine, correct on a null-free batch, with the Kleene body kept as the per-batch fallback
-when a referenced column turns out to carry nulls.
+## Compile once
 
-## Compile once, or lose
+`compile_expr` is a pure function of `(expr, the types of the columns it references, the SIMD override)`, and the sample batch is consulted only for types. So the artifact is reused across every morsel, operator instance, and `execute_plan` call that shares the triple. The process-wide memo in [`crates/bc-codegen/src/cache.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/cache.rs) makes the compile an admission price paid once, which matters most on the streaming and per-UDF paths that call `execute_plan` in a loop.
 
-Cranelift compilation is the JIT's entire fixed cost, and `compile_expr` is a pure function
-of `(expr, the types of the columns it references, the SIMD override)`. The sample batch is
-consulted only for column types, never for values. So the artifact is reusable across every
-morsel, every operator instance, and every `execute_plan` call that shares the triple.
-
-Without a memo, the engine recompiles every filter and projection on *each* `execute_plan`. That cost is fixed, so it doesn't shrink with the input: on a small query it's pure loss, and it's worst on the per-batch streaming path and the per-operator UDF path, both of which call `execute_plan` in a loop. The memo in [`crates/bc-codegen/src/cache.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/cache.rs) is what makes the compile an admission price paid once rather than once per call.
-
-:::{warning}
-[`crates/bc-codegen/src/cache.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/cache.rs) keys its process-wide `HashMap` on the *full structural
-rendering* of that triple, compared for equality and never merely hashed. A hash collision
-handing back code compiled for a different expression is a silent wrong answer, and a silent
-wrong answer is the one failure mode this whole tier is built to make impossible.
+:::{important}
+The cache keys on the *full structural rendering* of that triple and compares for equality, never merely by hash, so a collision can't hand back code compiled for a different expression. It caps at 1024 entries and also remembers which expressions are unsupported.
 :::
-
-The cache caps at 1024 entries (each owns a `JITModule`, a page or two of executable memory),
-and a known-unsupported expression is remembered as such so the analysis is not repeated
-either.
 
 ## Who calls it
 
-Only the parallel paths: `bc-interp::par` and the streaming executor in `bc-interp::stream`. The sequential oracle passes `&None`:
+Only the parallel paths, `bc-interp::par` and the streaming executor in `bc-interp::stream`. The sequential oracle passes `&None`:
 
 ```rust
 // crates/bc-interp/src/ops/mod.rs
@@ -156,61 +128,25 @@ fn eval_jit(jit: &Jit, expr: &Expr, batch: &RecordBatch) -> Result<ArrayRef, Int
 }
 ```
 
-The parallel path compiles once per operator, using the first morsel as the type sample
-(`ops::try_compile`), and shares the `Arc<CompiledExpr>` across rayon workers (`CompiledExpr`
-is `Send + Sync`). Compiling per morsel would lose to the interpreter outright.
+The parallel path compiles once per operator from the first morsel and shares the `Arc<CompiledExpr>` across rayon workers.
 
-## Using it
+There is no user-facing switch, because the result is identical either way. The `backend` tag reads `interp`, `jit`, or `interp+jit` when some of an operator's expressions compiled and others fell back, and the process-wide `backends` counter in {doc}`/user-guide/operate/running/metrics` tallies the same tags across queries. The default streaming executor keeps `Filter` and `Project` on the interpreter, where Arrow's comparison kernels are already SIMD, and compiles aggregate group keys and inputs. The materializing parallel executor (`par.rs`) compiles filters and projections too.
 
-There is no user-facing switch, by design: the result is identical either way. You can observe which tier ran, though. {py:meth}`Dataset.stats() <batcher.Dataset.stats>` reports a `BACKEND` column per operator, and each `op.backend` on the returned run reads `interp`, `jit`, or `interp+jit` when some of an operator's expressions compiled and others fell back. The process-wide `backends` counter in {doc}`/user-guide/operate/running/metrics` tallies the same tags across queries.
+Growing the subset follows a fixed rule: teach the interpreter first, then either teach the JIT *and* prove parity, or leave the JIT to fall back.
 
-Expect `interp` on filters and projections in most queries. The engine's default streaming executor keeps `Filter` and `Project` on the interpreter by a measured choice, recorded at the `Filter` arm in [`crates/bc-interp/src/stream/mod.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/stream/mod.rs): wiring the JIT into that path measured 1.01x over TPC-H, with five queries slower, because Arrow's comparison kernels are already SIMD. On that path the JIT compiles aggregate group keys and inputs, and the materializing parallel executor (`par.rs`) compiles filters and projections too. The `backend` tag records what actually compiled, so it is the thing to read rather than this table.
-
-The shape that compiles:
-
-```python
-import batcher as bt
-
-ds = bt.from_pydict({"a": [1, 2, 3, 4], "b": [10.0, 20.0, 30.0, 40.0], "s": ["x", "y", "x", "z"]})
-
-# Numeric arithmetic and comparison: this is inside the Tier-1 subset.
-fast = ds.filter((bt.col("a") * 2 + 1) > bt.col("b") / 4).select("a", "b")
-
-# A string function is outside the subset: the interpreter evaluates it.
-slow = ds.filter(bt.col("s").str.starts_with("x")).select("a", "s")
-
-print(fast.to_pydict())
-print(slow.to_pydict())
-```
-
-```text
-{'a': [1], 'b': [10.0]}
-{'a': [1, 3], 's': ['x', 'x']}
-```
-
-## What the subset covers
-
-The JIT's leverage is concentrated in numeric-heavy projection and filter chains. A predicate
-that touches a string or a date function runs on the interpreter instead, at the same result.
-
-Growing the subset follows a fixed rule: teach the interpreter first, then either teach the
-JIT *and* prove parity against it, or leave the JIT to fall back. Never ship a JIT path that
-disagrees with the oracle.
-
-## Where the code lives
-
+:::{dropdown} Where the code lives
 - [`crates/bc-codegen/src/lib.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/lib.rs): `CompiledExpr`, the ABI, dispatch between scalar and SIMD
 - [`crates/bc-codegen/src/analyze.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/analyze.rs): subset validation and type inference
 - [`crates/bc-codegen/src/emit.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/emit.rs): the scalar Cranelift emitter
 - [`crates/bc-codegen/src/simd.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/simd.rs): the vector emitter and its lane rules
 - [`crates/bc-codegen/src/kleene.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/kleene.rs): `needs_kleene` / `is_null_propagating`
 - [`crates/bc-codegen/src/cache.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-codegen/src/cache.rs): the process-wide compile memo
+:::
 
 ## See also
 
 - {doc}`Architecture </architecture/index>`: where a second execution tier is allowed to live.
 - {doc}`Execution engine </architecture/internals/execution>`: the tiering contract at the architecture level.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the parity argument, stated formally.
 - {doc}`Performance </user-guide/operate/tuning/performance>`: writing predicates that land on this tier.
 - {doc}`Analytics benchmarks </benchmarks/results/analytics>`: the operator benchmarks on numeric filter and projection shapes.
 - {doc}`Expression evaluation </architecture/deep-dives/query/expression-evaluation>`: the Tier-0 oracle it must match.

@@ -47,10 +47,10 @@ Two savings come without asking. Optimized plans are memoized: re-issuing a quer
 
 ```python
 plan = events.filter(bt.col("amount") > 5).group_by("region").agg(n=bt.count())
-print(plan.explain().splitlines()[0].split()[0])
-# aggregate
+print(plan.explain().splitlines()[0].split("  ")[0])
+# query plan (planned)
 print(plan.sort("region").to_pydict())
-# {'region': ['eu', 'us'], 'n': [2, 3]}
+# {'region': ['eu', 'us'], 'n': [2, 2]}
 ```
 
 Connectors also load on first use. Importing Batcher doesn't import every database, warehouse, and message-broker connector; a format family is imported the first time you name one of its formats, so a process that never opens a Snowflake table never pays for it.
@@ -73,15 +73,17 @@ with config_context(quiet):
 
 Setting `BATCHER_OBSERVABILITY_EVENT_LOG=false` before the process starts does the same. No result changes. Only the archived profile goes.
 
-The document's cost is roughly fixed while the query's isn't, so it matters in proportion to how small the queries are. Measured on a 50,000-row SQLite table with the release engine, in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md):
+The document's cost is roughly fixed, so it matters only for tiny queries. On a serving-shaped workload, switch it off. On anything that reads more than a few thousand rows, don't bother.
+
+:::{dropdown} Measured cost of the event log
+Measured on a 50,000-row SQLite table with the release engine, in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md):
 
 | Workload | Event log on | Off |
 | --- | --- | --- |
 | A terminal op over a one-row table, no operators | 1.945 ms | **0.733 ms** (-62%) |
 | A point lookup pushed to the database | 3.503 ms | **2.930 ms** (-16%) |
 | Point lookups per second, one process | 309 | **374** |
-
-On a serving-shaped workload, switch it off. On anything that reads more than a few thousand rows, don't bother.
+:::
 
 ### The small-query fast path
 
@@ -247,9 +249,7 @@ print(events.profile().columns)
 
 ## Measure your own change
 
-Benchmark numbers live in one place, {doc}`/benchmarks/index`, so a figure is never restated in two pages that can drift apart. Every number there is correctness-gated: the engines must return the identical result before any timing is recorded. {doc}`/benchmarks/results/analytics` covers operators, TPC-H, and connectors, {doc}`/benchmarks/results/scaling` covers distributed scaling and spilling, and {doc}`/benchmarks/methodology` covers hardware and reproduction.
-
-To measure a change the way the project does, run the harness:
+Benchmark results and methodology live in {doc}`/benchmarks/index`, with {doc}`/benchmarks/results/analytics`, {doc}`/benchmarks/results/scaling`, and {doc}`/benchmarks/methodology` behind it. To measure a change the way the project does, run the harness:
 
 ```bash
 python benchmarks/run.py --benchmark operators               # single-node operator mix (sf1)

@@ -2,14 +2,14 @@
 
 This page describes how to install Batcher, add the optional extras for clusters, cloud storage, table formats, and ML, and build the engine from source.
 
-Batcher installs from one wheel. The distribution is named `batcher-engine`, and it imports as `batcher`. The bare `batcher` name on PyPI belongs to an unrelated project, so install the full name. The wheel carries the Python control plane and the compiled Rust engine together, and its few dependencies include PyArrow and the SQL parser, so DataFrames, SQL, and Parquet work with nothing else installed.
+Batcher installs from one wheel. The distribution is named `batcher-engine` and imports as `batcher` (the bare `batcher` name on PyPI is an unrelated project). The wheel carries the Python control plane and the compiled Rust engine, so DataFrames, SQL, and Parquet work with nothing else installed.
 
 Everything else is an optional extra layered on top of that wheel:
 
 ![A two-layer stack. The bottom layer is the core wheel, installed with pip install batcher-engine: the Python control plane with Dataset, SQL, and the optimizer, the precompiled Rust engine that needs no toolchain, and the required dependencies pyarrow, numpy, sqlglot, and psutil, on Python 3.11 or newer. An arrow labeled each plugs into the same API points up to the optional extras layer, grouped as clusters (ray), object stores (cloud), lakehouse (delta, iceberg, hudi), streaming (kafka, kinesis, pubsub, pulsar, eventhubs), media decode (image, audio, video), ML frameworks (torch, tensorflow, jax), LLMs and embeddings (st, vllm, sglang), and dataframes (pandas, polars), with the bundles lakehouse, streaming, multimodal, and all. A feature whose extra is missing raises MissingDependencyError.](/_static/diagrams/install_extras_stack.svg)
 
 :::{important}
-No `batcher-engine` release has been published to PyPI, and the GitHub repository has no tagged release. `pip install batcher-engine` therefore fails with "No matching distribution found". The container images under `ghcr.io/stephenoffer/batcher` are pushed by the same tagged release job, so they aren't available either. Install from the repository, as the next section shows. That compiles the engine on your machine and needs a Rust toolchain, 1.89 or newer (`rust-version` in `Cargo.toml`). The `pip install batcher-engine` commands elsewhere in these docs describe the package the release workflow publishes, and work once a release is tagged.
+No `batcher-engine` release is on PyPI yet, so `pip install batcher-engine` reports "No matching distribution found". Install from the repository, which compiles the engine and needs a Rust toolchain 1.89 or newer. The `pip install batcher-engine` commands in these docs work once a release is tagged.
 :::
 
 ## Requirements
@@ -42,25 +42,17 @@ print(ds.select(doubled=bt.col("x") * 2).to_pydict())
 # {'doubled': [2, 4, 6]}
 ```
 
-If that prints, the control plane and the compiled engine are both in place.
 
 ## Confirm what you installed
 
-`bt.__version__` is the installed package's version string, the same one `pip show batcher-engine` reports:
-
-```python
-import batcher as bt
-
-print(isinstance(bt.__version__, str))
-# True
-```
-
-It says nothing about which extras are present or which engine build is loaded. {py:func}`bt.versions() <batcher.versions>` answers both: it returns a dict with the Batcher version, the compiled engine's version and build profile, and one key per optional backend. Check it first when an extra seems to be missing:
+{py:func}`bt.versions() <batcher.versions>` returns the Batcher version, the compiled engine's version and build profile, and one key per optional backend:
 
 ```python
 info = bt.versions()
 print("batcher" in info, "engine" in info, "engine_profile" in info)
 # True True True
+print(isinstance(bt.__version__, str))
+# True
 ```
 
 Each optional backend key, such as `ray`, `torch`, `polars`, or `deltalake`, holds the installed version, or the string `"not installed"` when that package is absent. {py:func}`bt.show_versions() <batcher.show_versions>` prints the same information as a block, which is what to paste into a bug report:
@@ -76,7 +68,14 @@ python         : 3.13.15
 
 ## Optional extras
 
-Extras add integrations without changing the core API, so code you write doesn't need to know which ones are present. When a feature needs a package you haven't installed, Batcher raises `MissingDependencyError`, an `ImportError` that carries the exact install command. Install extras with the usual bracket syntax, several at once if you like:
+Extras add integrations without changing the core API. When a feature needs a package you haven't installed, Batcher raises `MissingDependencyError`, an `ImportError` whose message carries the exact install command:
+
+```python
+print(issubclass(bt.MissingDependencyError, ImportError))
+# True
+```
+
+Install extras with the usual bracket syntax:
 
 ```bash
 pip install "batcher-engine[ray,cloud,delta]"
@@ -88,7 +87,7 @@ Before a release exists, name the repository as the source of the same extras:
 pip install "batcher-engine[ray,cloud,delta] @ git+https://github.com/stephenoffer/batcher.git"
 ```
 
-The following table lists the extras most people reach for first, grouped by what they turn on. `pyproject.toml` declares the full set, including connectors for individual warehouses, databases, and message queues. Bundles such as `lakehouse`, `streaming`, `multimodal`, and `all` install a whole group at once.
+The following table lists the extras most people reach for first. `pyproject.toml` declares the full set, and bundles such as `lakehouse`, `streaming`, `multimodal`, and `all` install a whole group at once.
 
 | Extra | What it turns on | Read more |
 |---|---|---|
@@ -100,17 +99,6 @@ The following table lists the extras most people reach for first, grouped by wha
 | `torch`, `tensorflow`, `jax` | Handing batches to ML frameworks | {doc}`/integrations/compute/pytorch` |
 | `st`, `vllm`, `sglang` | Text embeddings and LLM batch inference | {doc}`/ml/retrieval/index` |
 | `pandas`, `polars`, `numpy` | Converting results with `to_pandas`, `to_polars`, and `to_numpy` | {doc}`/getting-started/migration/index` |
-| `duckdb` | The reference engine the differential tests and benchmarks compare against | {doc}`/benchmarks/methodology` |
-
-Ray only schedules the work. Bulk data moves between workers over Arrow Flight rather than through the Ray object store, so adding the `ray` extra changes where a query runs and not what it returns.
-
-## Install an unreleased revision
-
-Installing from the git repository compiles the Rust engine on your machine, so you need a [Rust toolchain](https://rustup.rs) first:
-
-```bash
-pip install "git+https://github.com/stephenoffer/batcher.git"
-```
 
 ## Build from source
 

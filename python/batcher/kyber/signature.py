@@ -100,10 +100,24 @@ def _struct(node: LogicalPlan):
         # excluding `Scan` from learned row counts. Fixing the token fixes it for every
         # consumer at once instead of one exclusion at a time.
         #
-        # `""` — a synthetic scan over an intermediate, or a source that cannot name itself —
-        # keeps the old shared token, which is the honest answer for a relation with no
-        # cross-run identity and is what those scans always had.
-        return ["scan", node.source_key]
+        # A relation with no durable key -- an in-memory frame, or a synthetic scan over an
+        # intermediate -- is told apart by its **column names** instead. One empty token for
+        # all of them shared every learned entry across every in-memory relation in the
+        # process, and the confidence gate in `kyber.measured_selectivity` was the only thing
+        # between that and a plan.
+        # It did not hold on TPC-DS: `d_year = 1999` over the 73,049-row `date_dim` (365
+        # rows) learned 41,649 from the same filter over an earlier query's materialized
+        # intermediate, and q72 -- run after the rest of the suite, never alone -- joined
+        # `inventory` to `catalog_sales` first: 939M estimated rows, 7.3 s and 240 s of CPU
+        # (sf1) against 240 ms. Columns separate exactly that pair, and they are what the
+        # empty token's reasons ask to keep: the same frame rebuilt or grown keeps its
+        # schema, so a ratio learned on it still carries over. Two unrelated relations with
+        # identical columns still share, the bounded residual the confidence gate is for.
+        # Names, not types: a column widened between runs (`int64` -> `float64`) is the same
+        # relation, and what was learned on it still applies (`kyber.learned_tuning.topn_bound`
+        # seeds across exactly that). Only this token changes: `Scan.source_key` (and the
+        # result cache keyed by it) stay empty for in-memory data.
+        return ["scan", node.source_key or ",".join(node.schema.names)]
     if isinstance(node, Filter):
         return ["filter", _norm(node.predicate.to_ir()), plan_signature(node.input)]
     if isinstance(node, Project):

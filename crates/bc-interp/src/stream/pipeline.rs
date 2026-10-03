@@ -138,12 +138,16 @@ pub(super) fn scan_stream(batches: &[RecordBatch]) -> Morsels<'_> {
 /// worker and dropped once its morsels have passed through, so a worker holds one unit rather
 /// than its whole share of the relation. Zero-row batches are dropped — the caller keeps the
 /// schema carrier for a relation that turns out empty.
+///
+/// `keys` are the runtime join filters placed on this scan, handed to the source so it can test
+/// them while decoding ([`super::chunked::units::UnitSource::read_keyed`]).
 pub(super) fn unit_stream<'a>(
     src: &'a dyn super::chunked::units::UnitSource,
     units: std::ops::Range<usize>,
+    keys: Vec<super::chunked::units::ScanKeyFilter>,
 ) -> Morsels<'a> {
     Box::new(units.flat_map(move |unit| {
-        let decoded: Vec<Result<RecordBatch, InterpError>> = match src.read(unit) {
+        let decoded: Vec<Result<RecordBatch, InterpError>> = match src.read_keyed(unit, &keys) {
             Ok(batches) => batches
                 .into_iter()
                 .flat_map(|b| {

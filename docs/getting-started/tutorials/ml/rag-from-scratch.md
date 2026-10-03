@@ -1,14 +1,6 @@
 # RAG from scratch
 
-Retrieval-augmented generation is two dataset operations wearing a trench coat: embed a
-corpus, then for each question retrieve the nearest chunks and hand them to a model. There
-is no RAG operator in Batcher, and there does not need to be one. It is chunk, embed, score,
-generate, and all four are ordinary Dataset work.
-
-This tutorial builds the whole loop with a stub embedder and a stub model, so the retrieval
-half runs here on `pip install batcher-engine` alone. No GPU, no model download, no vector
-database. Every block that needs a real model is marked and shown rather than run, and
-swapping a stub for the real thing is a one-line change.
+Retrieval-augmented generation is chunk, embed, score, and generate, and all four are ordinary Dataset work. This tutorial builds the whole loop with a stub embedder and a stub model, so it runs on `pip install batcher-engine` alone: no GPU, no model download, no vector database. Swapping a stub for the real model is a one-line change.
 
 | Step | Runs here | Needs |
 |---|---|---|
@@ -43,15 +35,15 @@ what you have.
 
 ## 2. Chunk
 
-A document is too big to embed usefully and too big to fit in a prompt. `.str.chunk(size,
-overlap)` splits a string column into a list of chunks; `explode` turns that list into one
-row per chunk. Both run in the engine, on every core, with no Python in the loop.
+`.str.chunk(size, overlap)` splits a string column into a list of overlapping chunks, in the engine:
 
-:::{tip}
-Overlap matters: a sentence that straddles a chunk boundary is otherwise lost to retrieval.
-Along with the prompt template, it is one of the two things on this page you will actually
-spend time tuning.
-:::
+```python
+tiny = bt.from_pydict({"text": ["abcdefghij"]})
+print(tiny.select(chunks=bt.col("text").str.chunk(4, overlap=1)).to_pydict())
+# {'chunks': [['abcd', 'defg', 'ghij']]}
+```
+
+`explode` then turns the list into one row per chunk. Overlap keeps a sentence that straddles a boundary retrievable.
 
 ```python
 chunks = (
@@ -82,9 +74,7 @@ vectors = chunks.ml.embed(
 vectors.write.parquet("s3://index/chunks/")
 ```
 
-That warm pool is the difference between a benchmark and a bill. MiniLM loads in about 2 seconds and embeds nearly instantly, so an engine that reloads
-the model per execution spends its entire runtime loading. Measured on 8xT4 over 8,192 texts,
-Batcher embeds at **33,611 text/s** with the model loaded once for the session.
+With the model loaded once for the session, Batcher embeds **33,611 text/s** on 8xT4.
 
 For the tutorial, a deterministic bag-of-words stub stands in: a `map_batches` that appends
 a vector column, exactly the shape the real encoder has.
@@ -111,13 +101,23 @@ print(index.count())
 
 ## 4. Retrieve
 
-Retrieval is a score and a top-N. {py:meth}`.list.cosine_similarity <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_similarity>` scores each row's vector against
-a query vector broadcast as a literal. `top_k` keeps the best rows without sorting the
-relation. It runs on the fused top-N heap that leads Daft 8.1x on an sf1
-`ORDER BY ... DESC LIMIT 20` in {doc}`the Daft comparison </benchmarks/comparisons/vs-daft>`.
+Retrieval is a score and a top-N. {py:meth}`.list.cosine_similarity <batcher.plan.expr_ir.namespaces.collections._ListNamespace.cosine_similarity>` scores each row's vector against a query vector, and `top_k` keeps the best rows without sorting the relation:
 
-The {py:meth}`l2_norm <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` filter drops empty vectors: a zero vector has no direction, cannot clear any
-threshold, and would otherwise pollute the ranking with undefined scores.
+```python
+vecs = bt.from_pydict({"doc": ["a", "b", "c"], "embedding": [[1.0, 0.0], [0.6, 0.8], [0.0, 1.0]]})
+probe = bt.array(bt.lit(1.0), bt.lit(0.0))
+print(vecs.with_columns(score=bt.col("embedding").list.cosine_similarity(probe)).to_pydict()["score"])
+# [1.0, 0.6, 0.0]
+```
+
+{py:meth}`ds.ml.similarity_to <batcher.api.dataset.ml.DatasetML.similarity_to>` is the same score as one call:
+
+```python
+print(vecs.ml.similarity_to([1.0, 0.0]).top_k(1, by="score").to_pydict()["doc"])
+# ['a']
+```
+
+On the corpus, an {py:meth}`l2_norm <batcher.plan.expr_ir.namespaces.collections._ListNamespace.l2_norm>` filter first drops zero vectors, which have no direction to score:
 
 ```python
 question = "how many days until my refund arrives"
@@ -137,8 +137,7 @@ print(found["doc_id"], [round(s, 3) for s in found["score"]])
 The refund chunk comes first. The support chunk, which also mentions a day, comes second,
 and the engine chunk does not appear at all.
 
-That was a brute-force scan, which is the right answer up to a surprisingly large corpus.
-Past that, put the vectors in Lance and use the ANN index.
+That was a brute-force scan, which serves a large corpus well. Past that, put the vectors in Lance and use the ANN index.
 
 ::::{tab-set}
 :::{tab-item} Brute-force scan
@@ -172,10 +171,15 @@ vectors into candidate pairs, and only the candidates get the exact cosine score
 
 ## 5. Generate
 
-Build the prompt with a string expression, which is a column operation like any other, and
-hand it to a model. An *engine* is a zero-arg callable returning a
-`list[str] -> list[str]` function, so a deterministic stub can stand in for a 7B model and
-the pipeline is testable with no GPU.
+Build the prompt with a string expression:
+
+```python
+pair = bt.from_pydict({"q": ["when?"], "ctx": ["five days"]})
+print(pair.select(prompt=bt.format_string("Q: {} CONTEXT: {}", bt.col("q"), bt.col("ctx"))).to_pydict())
+# {'prompt': ['Q: when? CONTEXT: five days']}
+```
+
+Then hand it to a model. An *engine* is a zero-arg callable returning a `list[str] -> list[str]` function, so a deterministic stub can stand in for a 7B model:
 
 ```python
 def stub_llm():
@@ -217,34 +221,24 @@ engine = vllm_engine(
 )
 ```
 
-:::{warning}
-Set `chat=True` for any instruction-tuned model. Left unset, the engine takes the completion
-path, which is right for a base model and wrong for a chat model. It skips the chat template,
-so the model answers a prompt in a format it was never trained on. Batcher warns once per process
-when `chat` is unset and the model ships a chat template, but the job still runs and the output
-still degrades. Passing `chat=False` explicitly silences that warning. This is the most common
-way a RAG pipeline ends up producing plausible garbage.
+:::{important}
+Set `chat=True` for an instruction-tuned model so the engine applies its chat template. Use `chat=False` for a base model.
 :::
 
 ## 6. Why the loop is fast
 
-Both halves of RAG are on the benchmark, and both are warm-pool workloads: the model loads
-once per session rather than once per job. Distributed over 8xT4 and correctness-gated on
-output agreement, the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>` measured the following:
+The model loads once per session rather than once per job. On 8xT4, the {doc}`AI and GPU benchmark </benchmarks/results/ai-and-gpu>` measured the following:
 
 | Half of RAG | Batcher |
 |---|---:|
 | Text embeddings (MiniLM, 8,192 texts) | **33,611 text/s** |
 | LLM generation (gpt2, 2,048 prompts) | **814.8 prompt/s** |
 
-Neither number comes from a RAG-specific code path. They come from the same mechanisms every
-`map_batches` inference pipeline gets: session-warm pools, stage-overlapped streaming, and an
-adaptive batch size that does not have to be tuned.
+Both come from what every `map_batches` pipeline gets: session-warm pools, stage-overlapped streaming, and adaptive batch sizing.
 
 ## Where to go next
 
-Keep the stub embedder and the stub engine after the real ones arrive. They are what keeps
-the whole pipeline testable on a machine with no GPU.
+Keep the stubs after the real models arrive. They keep the pipeline testable on a machine with no GPU.
 
 ::::{grid} 1 3 3 3
 :gutter: 3
@@ -258,7 +252,7 @@ vLLM engines, chat templates, structured output.
 :::{grid-item-card} {octicon}`search;1.1em` Vector search
 :link: /ml/retrieval/vector-search
 :link-type: doc
-The ANN index, for when the brute-force scan stops being enough.
+The ANN index, for corpora past a scan.
 :::
 
 :::{grid-item-card} {octicon}`graph;1.1em` AI and GPU benchmarks

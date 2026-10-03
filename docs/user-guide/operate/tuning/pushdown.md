@@ -5,18 +5,7 @@ rows and columns you don't need are never read, decoded, or sent over the networ
 
 ## What pushdown is
 
-A filter written against a `Dataset` is an operator in the plan. Before running it, Kyber
-looks for a filter sitting directly above a scan and offers that predicate to the source.
-A source that understands it applies the filter *where the data lives*: a `WHERE` clause
-the database evaluates, a row group a parquet reader skips without decoding, a partition
-directory that is never listed.
-
-The saving is not a constant factor. A predicate applied after a result set has crossed
-the network has already cost the scan, the transfer, and the driver's memory. Applied in
-the database, that work never happens.
-
-Column pushdown works the same way and is why `select` before a wide read matters: a
-columnar source reads only the columns the plan still needs.
+Kyber offers a filter sitting directly above a scan to the source, which applies it *where the data lives*: a `WHERE` clause the database evaluates, a Parquet row group skipped without decoding, a partition directory never listed. Column pushdown works the same way, so a columnar source reads only the columns the plan still needs.
 
 The figure shows both on one plan, as written and as Kyber leaves it:
 
@@ -24,13 +13,7 @@ The figure shows both on one plan, as written and as Kyber leaves it:
 
 ## Pushdown never changes your results
 
-The engine keeps its own filter operator regardless of what the source did with the
-predicate. That one rule makes pushdown safe to reason about. A source that ignores the
-predicate entirely, or applies only part of it, returns more rows, and the
-engine's filter removes them.
-
-So a predicate that fails to push is a performance question, never a correctness one. You
-never need to check whether a filter "worked".
+The engine keeps its own filter operator whatever the source did with the predicate. A source that ignores it, or applies only part, returns extra rows that the engine's filter removes. A predicate that fails to push is a performance question, never a correctness one.
 
 ### Floating-point columns and NaN
 
@@ -69,10 +52,7 @@ Batcher translates this subset of a predicate:
 | A constant | `col("a").is_in([])`, which folds to a constant false |
 | `AND` and `OR` of any of the above | `col("a") > 5 & col("b").is_in([1, 2])` |
 
-A spilled query takes the same predicate. `collect(spill=True)` reads its input through the
-out-of-core aggregate, join, sort, and window executors, and each of them offers the source
-the filter above its scan, so a selective filter over a large Parquet table prunes its row
-groups whether or not the query spills.
+A spilled query (`collect(spill=True)`) offers the source the same predicate, so row groups prune whether or not the query spills.
 
 Anything else stays with the engine. The common cases that don't push are a comparison
 between two columns (`col("a") > col("b")`), arithmetic on the filtered column

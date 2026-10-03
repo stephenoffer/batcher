@@ -27,8 +27,9 @@
 //! `row_filter` measured the same trade crossing over below 10 % selected on one shape, and
 //! nothing about that figure carries to another.
 //!
-//! So the scan measures it. Until it has decided, it alternates — even-numbered row groups are
-//! read with the filter, odd ones without — and times the decode per row each way. Once each
+//! So the scan measures it. Until it has decided, it alternates — of the first `2 * SAMPLES`
+//! row groups to start, even-numbered ones are read with the filter and odd ones without, and
+//! any later one without — and times the decode per row each way. Once each
 //! side has [`SAMPLES`] row groups it keeps the faster for the rest of the scan; a filter seen
 //! keeping over [`CLEAR_LOSS`] of its rows is dropped without waiting. A wrong verdict costs
 //! speed, never rows.
@@ -201,14 +202,22 @@ impl LateFilter {
     }
 
     /// Whether the next row group should be read with the filter installed.
+    ///
+    /// Undecided, the first `2 * SAMPLES` reads to start alternate and every later one reads
+    /// without the filter. Alternating every start instead made the exploration as large as
+    /// the scan's concurrency rather than [`SAMPLES`]: row groups are read in parallel, so by
+    /// the time the first samples finished, half of everything already in flight had started
+    /// the filtered way. On three sf10 `lineitem` files (18 row groups) TPC-H q6 read at least 8
+    /// of 18 with a filter that cost ~120 ns a row against ~42 without, every query, since each
+    /// scan decides afresh -- 225 ms against 130 ms with the filter disabled.
     pub(crate) fn install(&self) -> bool {
         match self.state.load(Ordering::Relaxed) {
             ON => true,
             OFF => false,
-            _ => self
-                .started
-                .fetch_add(1, Ordering::Relaxed)
-                .is_multiple_of(2),
+            _ => {
+                let n = self.started.fetch_add(1, Ordering::Relaxed);
+                n < 2 * SAMPLES && n.is_multiple_of(2)
+            }
         }
     }
 
@@ -708,6 +717,24 @@ mod tests {
         assert!(fresh.install());
         assert!(!fresh.install());
         assert!(fresh.install());
+    }
+
+    /// However many reads start before a verdict, exactly `SAMPLES` of them carry the filter,
+    /// all among the first `2 * SAMPLES`: the exploration is bounded by the samples it needs,
+    /// not by how many row groups the scan has in flight.
+    #[test]
+    fn an_undecided_scan_installs_only_its_samples() {
+        let fresh = filter_of(&["a"]);
+        let starts: Vec<bool> = (0..40).map(|_| fresh.install()).collect();
+        assert_eq!(starts.iter().filter(|&&on| on).count() as u64, SAMPLES);
+        let window = usize::try_from(2 * SAMPLES).unwrap();
+        assert!(starts[window..].iter().all(|&on| !on));
+        // The verdict still arrives from those samples, and then governs every read.
+        for _ in 0..SAMPLES {
+            fresh.record(true, 100_000, 1_000, 1_000_000);
+            fresh.record(false, 100_000, 100_000, 2_000_000);
+        }
+        assert!((0..10).all(|_| fresh.install()));
     }
 
     /// A mask that does not fit its batch keeps every row rather than losing any.

@@ -17,9 +17,10 @@ import dataclasses
 from collections.abc import Callable
 
 from batcher.plan.expr_ir import Col
-from batcher.plan.logical import Aggregate, Join, LogicalPlan, Project, Scan
+from batcher.plan.logical import Aggregate, Join, LogicalPlan, Project, Scan, Unnest, Unpivot
 
 __all__ = [
+    "NO_BASE",
     "children",
     "reparent_unvalidated",
     "scanned_source_ids",
@@ -311,6 +312,11 @@ _BASE_NAMES_SLOT = "_c_walk_with_base_names"
 #: sees stands for itself. Shared and never written to, like every map this walk hands up.
 _NO_NAMES: dict[str, str] = {}
 
+#: The base name `walk_with_base_names` gives a column an operator creates rather than
+#: carries. No source's schema holds the empty name; a caller collecting names to look up
+#: in one discards it.
+NO_BASE = ""
+
 
 def _base_names(
     node: LogicalPlan, pairs: list[tuple[LogicalPlan, dict[str, str]]]
@@ -350,6 +356,18 @@ def _base_names(
             for key in node.group_keys
             if isinstance(key.expr, Col)
         }
+    if isinstance(node, (Unnest, Unpivot)):
+        # A column these *create* has no base column, and leaving it out of the map would make
+        # it "stand for itself": `explode("qs")` keeps the name `qs` for the elements, so every
+        # caller resolved it to the source's **list** column and sketched whole lists -- 210 ms
+        # of a 4 ms query's first run, filed under a name that describes something else. The
+        # empty name matches no source's schema, which is the honest answer.
+        made = (
+            (node.alias, node.index_alias)
+            if isinstance(node, Unnest)
+            else (node.variable_name, node.value_name)
+        )
+        return {**merged, **{name: NO_BASE for name in made if name is not None}}
     # Everything else either shapes rows without renaming columns (filter, sort, limit,
     # distinct) or combines relations that already agree on their names (union), so the
     # names its consumers see are the ones its input carried.

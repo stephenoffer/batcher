@@ -1,8 +1,21 @@
 # Databases
 
-Batcher reads straight out of the operational databases your applications already write to, and writes results back into them. Point it at a PostgreSQL connection string, a MongoDB collection or a DynamoDB table, and the extract arrives as Arrow with your filter and column list already pushed to the server.
+Batcher reads straight out of the operational databases your applications write to, and writes results back. The extract arrives as Arrow with your filter and column list already pushed to the server. These blocks need a running database, so they are shown but not executed:
 
-The same `mode` vocabulary covers every write: `append` to load, `upsert`, `update` and `delete` to maintain a table key by key. A retried or replayed job lands on the same rows instead of duplicating them.
+```python
+# docs: skip
+import batcher as bt
+
+users = bt.read.sql("SELECT * FROM users", uri="postgresql://svc@db:5432/app")
+events = bt.read.mongo(uri="mongodb://mongo.internal:27017", database="app", collection="events")
+```
+
+One `mode` vocabulary covers every write: `append` to load, and `upsert`, `update` and `delete` to maintain a table key by key, so a retried job lands on the same rows instead of duplicating them.
+
+```python
+# docs: skip
+users.write.sql("users_clean", uri="postgresql://svc@db:5432/app", mode="upsert", key_columns="id")
+```
 
 ::::{grid} 1 2 2 3
 :gutter: 3

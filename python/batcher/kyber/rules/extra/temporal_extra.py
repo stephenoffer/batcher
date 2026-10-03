@@ -58,9 +58,9 @@ from collections.abc import Callable
 
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, node_rule, plan_rule
+from batcher.kyber.rule import Phase, node_rule
 from batcher.kyber.rules.extra.temporal_sargable import _column_kind, _range_expr
-from batcher.kyber.rules.leaf_rewrite import whole_plan_expr_rule
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.kyber.rules.normalize.ranges import (
     _TRUNC_SUBDAY,
     _match_trunc_and_lit,
@@ -455,8 +455,11 @@ DEFAULT_REGISTRY.add(
     )
 )
 
+# Fused leaves, offered only `DateTrunc` nodes. As whole-plan rules with no declared shape
+# they walked every expression of every node on every NORMALIZE iteration of every query,
+# with or without a `date_trunc` in it.
 for _name, _fn in (
     ("date_trunc_idempotent", _collapse_same_unit),
     ("date_trunc_nested_to_coarser", _collapse_to_coarser),
 ):
-    DEFAULT_REGISTRY.add(plan_rule(_name, Phase.NORMALIZE, whole_plan_expr_rule(_fn)))
+    register_leaf_rule(_name, _fn, expr_matches=(DateTrunc,))

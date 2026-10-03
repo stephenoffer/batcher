@@ -13,6 +13,7 @@ use arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
 use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::{DataType, Date32Type, Float64Type, Int64Type};
 use arrow::error::ArrowError;
+use bc_arrow::canon_f64_bits;
 
 use crate::{BinaryOp, ExprError, Literal};
 
@@ -239,22 +240,21 @@ pub(crate) fn eval_in_list(array: &ArrayRef, set: &[Literal]) -> Result<ArrayRef
             let members = Ranged::new(items);
             masked(members.mask(a.values()), a.nulls())
         }
-        // A float column can reach `InList`: the fold rule collapses a chain of
-        // `float_col = <int literal>` disjuncts (integers are foldable literals) into an
-        // `InList` without inspecting the column's type. Membership is keyed by the raw
-        // 64-bit pattern so it is bit-for-bit identical to the `col = lit` path it folds
-        // from: that path compares by total order (`-0.0 != 0.0`, `NaN` matches nothing),
-        // and total-order equality *is* bit equality. The fold only ever produces
-        // integer-valued literals (0.0, 1.0, …, all canonical positive bits), so a column
-        // `-0.0`/`NaN` correctly never lands in the set.
+        // A float column reaches `InList` both from a user's `is_in` and from the fold rule,
+        // which collapses a chain of `float_col = <int literal>` disjuncts into one. Either
+        // way `x IN (a, b)` must mean `x = a OR x = b`, and `=` compares by float identity
+        // (`bc_arrow::float_ident`): `-0.0` equals `0.0`, and NaN equals NaN. Membership is
+        // therefore keyed by the *canonical* bits on both sides. Raw bits made `-0.0 IN (0)`
+        // false while `-0.0 = 0` was true -- so a single-element list, which the optimizer
+        // rewrites to `=`, kept a row that the same list with a second member dropped.
         DataType::Float64 => {
             let a = array.as_primitive::<Float64Type>();
-            let Some(items) = all_converted(set, |l| literal_f64(l).map(f64::to_bits)) else {
+            let Some(items) = all_converted(set, |l| literal_f64(l).map(canon_f64_bits)) else {
                 return membership_generic(array, set);
             };
             let members = Members::new(items);
             membership(a.nulls(), a.len(), |i| {
-                members.contains(&a.value(i).to_bits())
+                members.contains(&canon_f64_bits(a.value(i)))
             })
         }
         DataType::Utf8 => {
@@ -549,11 +549,14 @@ mod tests {
         );
     }
 
-    /// A float column can reach `InList` (the fold collapses `float_col = <int>` chains).
-    /// It must not error, and must match the `col = lit` total-order semantics it folds
-    /// from: `-0.0` does not match integer `0`, and `NaN` matches nothing.
+    /// A float column can reach `InList` (the fold collapses `float_col = <int>` chains, and
+    /// `is_in` produces one directly). It must not error, and must agree with `=`, which
+    /// compares by float identity: `-0.0` matches `0`, as `-0.0 = 0` does. This test once
+    /// pinned the opposite on the premise that `col = lit` compared raw bits; it does not --
+    /// the unoptimized `f = 0` keeps `-0.0`, and the optimizer-invariance property test found
+    /// `f IN (0)` (rewritten to `=`) and the bare `InList` returning different rows.
     #[test]
-    fn float_membership_matches_total_order_equality() {
+    fn float_membership_matches_float_identity_equality() {
         use arrow::array::Float64Array;
         let arr: ArrayRef = Arc::new(Float64Array::from(vec![
             Some(1.0),
@@ -572,11 +575,31 @@ mod tests {
                 Some(true),  // 1.0 ∈
                 Some(true),  // 2.0 ∈
                 Some(false), // 3.0 ∉
-                Some(false), // -0.0 does NOT match literal 0 (total order, like `col = 0`)
+                Some(true),  // -0.0 matches literal 0, as `-0.0 = 0` does
                 Some(true),  // 0.0 matches literal 0
-                Some(false), // NaN matches nothing
+                Some(false), // NaN is not in a set without NaN
                 None,        // null → null
             ]
+        );
+    }
+
+    /// The set side is canonicalized too: a `-0.0` literal matches both zeros, and a NaN
+    /// literal matches a NaN of any bit pattern, as `=` does.
+    #[test]
+    fn float_set_literals_are_canonicalized() {
+        use arrow::array::Float64Array;
+        let other_nan = f64::from_bits(0x7ff0_0000_0000_0001);
+        let arr: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(-0.0),
+            Some(f64::NAN),
+            Some(other_nan),
+            Some(1.0),
+        ]));
+        let set = [Literal::Float(-0.0), Literal::Float(f64::NAN)];
+        assert_eq!(
+            run(arr, &set),
+            vec![Some(true), Some(true), Some(true), Some(true), Some(false)]
         );
     }
 

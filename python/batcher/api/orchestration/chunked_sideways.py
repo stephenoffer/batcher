@@ -25,8 +25,22 @@ side lacks can only form a group the join discards whole — the argument
 `join_par::sideways` makes, applied to the same plans. The outer input's rows are computed once
 and read back unchanged, so the query's other operators see exactly what they saw before.
 
-Layer: api (orchestration). It decides nothing Kyber has not: it acts only on the plan's
-`prefer_sideways` verdict, and declines, returning `None`, on any shape it cannot prove.
+## The second staged form: an aggregate over a held input
+
+The chunked path streams one relation and reads every other one whole, so a plan that scans a
+fact table twice holds the second copy. TPC-H q18 at sf1000 is the shape: one `lineitem` scan
+streams into the final join, and the other -- 6 billion rows, under the `HAVING sum > 300`
+aggregate -- is read into memory before the engine starts, and the query is SIGKILLed on a
+247 GiB node. `run_staged_held` runs that aggregate's subtree first, on the chunked path, where
+its scan is the largest and therefore the one that streams, and the rest of the plan reads its
+result: a few thousand rows where it held billions. It acts only when the held input is large
+against the memory the chunked path may hold, and declines when another subtree over the same
+source computes the same thing -- TPC-H q15 compares a view's `sum` for equality with a `max` of
+the same sums, and two executors summing in different orders disagree in the last bit.
+
+Layer: api (orchestration). It decides nothing Kyber has not: the sideways form acts only on the
+plan's `prefer_sideways` verdict, the held form only on measured input sizes, and both decline,
+returning `None`, on any shape they cannot prove.
 """
 
 from __future__ import annotations
@@ -43,7 +57,7 @@ if TYPE_CHECKING:
     from batcher.io.source import Source
     from batcher.plan.physical import PhysicalPlan
 
-__all__ = ["run_staged_sideways"]
+__all__ = ["run_partitioned_build", "run_staged_held", "run_staged_sideways"]
 
 #: Join types whose unmatched right rows are never emitted, so the right side may be restricted.
 _RESTRICTABLE = frozenset({"inner", "left", "semi", "anti"})
@@ -110,6 +124,388 @@ def run_staged_sideways(
             "aggregates": [],
         }
     return run_stage(staged, _stage(opt, ir))
+
+
+def run_staged_held(
+    sources: list[Source],
+    opt: PhysicalPlan,
+    input_bytes_of: Callable[[int], int],
+    run_stage: Callable[[list[Source], PhysicalPlan], list[pa.RecordBatch] | None],
+    held_limit: int,
+) -> list[pa.RecordBatch] | None:
+    """The plan's result with each oversized held input's aggregate run first, or `None`.
+
+    Args:
+        sources: The plan's bound sources.
+        opt: The optimized physical plan.
+        input_bytes_of: Maps a source id to its projected input bytes; picks the driving scan.
+        run_stage: Runs one stage on the chunked path (`chunked.execute_chunked`).
+        held_limit: Projected bytes above which a scan the chunks do not drive is staged.
+
+    Returns:
+        The result batches, or `None` when no held input qualifies or a stage declined; the
+        caller then takes the path it would have taken anyway.
+    """
+    scanned = _scans(opt.ir)
+    if len(set(scanned)) < 2:
+        return None
+    driving = max(set(scanned), key=input_bytes_of)
+    ir = copy.deepcopy(opt.ir)
+    staged = list(sources)
+    for scan_id in sorted(set(scanned) - {driving}):
+        if input_bytes_of(scan_id) <= held_limit:
+            continue
+        path = _held_subtree(ir, scan_id)
+        if path is None or _computed_twice(ir, path, staged):
+            continue
+        out = run_stage(staged, _stage(opt, copy.deepcopy(_at(ir, path))))
+        if not out:
+            return None
+        from batcher.io.source import InMemorySource
+
+        staged.append(InMemorySource(out, zone_maps=False, ephemeral=True))
+        _at(ir, path[:-1])[path[-1]] = {"op": "scan", "source_id": len(staged) - 1}
+    if len(staged) == len(sources):
+        return None
+    return run_stage(staged, _stage(opt, ir))
+
+
+#: Operators a held input's staged subtree may contain: row-wise, plus the breakers whose
+#: output does not grow with their input the way a join's can.
+_HELD_OPS = frozenset({"filter", "project", "aggregate", "sort", "limit", "distinct"})
+
+
+def _held_subtree(ir: dict[str, Any], scan_id: int) -> tuple | None:
+    """The path to the topmost join-free subtree over only `scan_id` holding an aggregate."""
+    for path, node in _walk(ir):
+        if not path or "e" in node or node.get("op") == "scan":
+            continue
+        # Relations only: a binary expression carries an `op` too (`gt`), but also an `e`.
+        nodes = [n for _, n in _walk(node) if "e" not in n]
+        if any(n.get("op") not in _HELD_OPS | {"scan"} for n in nodes):
+            continue
+        if [n["source_id"] for n in nodes if n.get("op") == "scan"] != [scan_id]:
+            continue
+        if any(n.get("op") in ("aggregate", "distinct") for n in nodes):
+            return path
+    return None
+
+
+def _computed_twice(ir: dict[str, Any], path: tuple, sources: list[Source]) -> bool:
+    """Whether another subtree computes what `path` does, over a scan of the same source."""
+    target = _normalized(_at(ir, path), sources)
+    for other_path, node in _walk(ir):
+        if "e" in node or other_path[: len(path)] == path or path[: len(other_path)] == other_path:
+            continue
+        if _normalized(node, sources) == target:
+            return True
+    return False
+
+
+def _normalized(node: dict[str, Any], sources: list[Source]) -> str:
+    """`node`'s IR with each scan naming its source *object*, not its binding id."""
+    import json
+
+    def norm(v):
+        if isinstance(v, dict):
+            if v.get("op") == "scan":
+                return {"op": "scan", "source": id(sources[v["source_id"]])}
+            return {k: norm(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [norm(x) for x in v]
+        return v
+
+    return json.dumps(norm(node), sort_keys=True, default=str)
+
+
+#: How each decomposable aggregate's per-pass results combine (`run_partitioned_build`).
+_COMBINE = {
+    "count_star": "sum",
+    "count": "sum",
+    "sum": "sum",
+    "min": "min",
+    "max": "max",
+    "bool_and": "bool_and",
+    "bool_or": "bool_or",
+}
+
+#: The most passes a partitioned build takes before declining to the out-of-core route.
+_MAX_PASSES = 32
+
+
+def run_partitioned_build(
+    sources: list[Source],
+    opt: PhysicalPlan,
+    input_bytes_of: Callable[[int], int],
+    run_stage: Callable[[list[Source], PhysicalPlan], list[pa.RecordBatch] | None],
+    needed: int,
+    budget: int,
+) -> list[pa.RecordBatch] | None:
+    """The plan's result in `P` passes, each holding 1/P of its largest build side, or `None`.
+
+    The chunked path's build sides do not spill, so a plan whose builds outgrow the envelope
+    left it for the out-of-core route, which spills every join, nested, and joined TPC-H q9's
+    bucket pairs one at a time: 370 s at sf100 on a 32 GiB node, where DuckDB took 25. Here the
+    largest build is restricted to the keys with `hash(key) mod P == p`, one pass per `p`, and
+    the passes' aggregates are combined by the same algebra the distributed path merges with.
+
+    **Why it is sound.** The partitioned join is inner, or semi with the build as its right
+    side, and every operator between it and the plan's top aggregate is a filter, projection,
+    inner join, or the probe side of a semi join. So each row reaching the aggregate joined
+    exactly one build row, whose key fixes the one pass it belongs to: the passes partition
+    the aggregate's input, and an aggregate of sums, counts, minima and maxima over a partition
+    combines exactly. Probe rows whose key is in another partition match nothing, and the
+    runtime key filter the restricted build implies skips most of them during the decode.
+
+    Args:
+        sources: The plan's bound sources.
+        opt: The optimized physical plan.
+        input_bytes_of: Maps a source id to its projected input bytes; sizes build sides.
+        run_stage: Runs one stage on the chunked path.
+        needed: The build bytes the engine reported when it gave up.
+        budget: The budget it gave up against.
+
+    Returns:
+        The result batches, or `None` when the plan's shape does not qualify or a pass still
+        does not fit; the caller then takes the route it would have taken anyway.
+    """
+    found = _top_aggregate(opt.ir)
+    if found is None or budget <= 0:
+        return None
+    agg_path, agg = found
+    scanned = _scans(opt.ir)
+    driving = max(set(scanned), key=input_bytes_of) if scanned else None
+    target = _partition_join(agg["input"], input_bytes_of, driving, _agg_reads(agg))
+    if target is None:
+        return None
+    side_path, keys, side_bytes = target
+    passes = _pass_count(needed, budget, side_bytes)
+    if passes is None:
+        return None
+    # `needed` is what the engine had counted when it gave up, not the builds' total, so the
+    # count is a first guess: a pass that still does not fit doubles it and starts over.
+    while (partials := _run_passes(agg, side_path, keys, passes, sources, opt, run_stage)) is None:
+        if passes >= _MAX_PASSES:
+            return None
+        passes = min(_MAX_PASSES, passes * 2)
+    if not partials:
+        return None
+    combine = {
+        "op": "aggregate",
+        "input": {"op": "scan", "source_id": len(sources)},
+        "group_keys": [
+            {"expr": {"e": "col", "name": k["alias"]}, "alias": k["alias"]}
+            for k in agg["group_keys"]
+        ],
+        "aggregates": [
+            {
+                "func": _COMBINE[a["func"]],
+                "alias": a["alias"],
+                "input": {"e": "col", "name": a["alias"]},
+            }
+            for a in agg["aggregates"]
+        ],
+    }
+    ir = copy.deepcopy(opt.ir)
+    if agg_path:
+        _at(ir, agg_path[:-1])[agg_path[-1]] = combine
+    else:
+        ir = combine
+    # The combine reads only the passes' partial groups, a resident relation the chunked path
+    # cannot stream (it declines one), so it runs on the resident engine. The plan's other
+    # sources are not read above the aggregate and are bound empty.
+    from batcher import core
+
+    resident: list[list[pa.RecordBatch]] = [[] for _ in sources]
+    return core.execute_local(_stage(opt, ir), [*resident, partials])
+
+
+def _top_aggregate(ir: dict[str, Any]) -> tuple[tuple, dict[str, Any]] | None:
+    """The plan's top aggregate below any sort/limit/project, if every aggregate decomposes."""
+    path: tuple = ()
+    node = ir
+    while node.get("op") in ("sort", "limit", "project", "filter"):
+        path, node = (*path, "input"), node["input"]
+    if node.get("op") != "aggregate" or not _decomposes(node):
+        return None
+    return path, node
+
+
+def _decomposes(agg: dict[str, Any]) -> bool:
+    """Whether every aggregate of `agg` combines across partitions of its input (`_COMBINE`)."""
+    return all(
+        spec.get("func") in _COMBINE and not set(spec) - {"func", "alias", "input"}
+        for spec in agg.get("aggregates") or []
+    )
+
+
+def _renames(project: dict[str, Any]) -> bool:
+    """Whether `project` only selects columns, under their own names, computing nothing."""
+    return all(
+        item["expr"].get("e") == "col" and item["expr"].get("name") == item["alias"]
+        for item in project.get("exprs") or []
+    )
+
+
+#: Marks a column read by something other than an aggregate's plain input (a key, a predicate,
+#: an expression): it must not be a pre-aggregation's partial value. Equals no `_COMBINE` func.
+_OPAQUE = ""
+
+
+def _agg_reads(agg: dict[str, Any]) -> dict[str, str] | None:
+    """Column -> how `agg` folds it, or `None` when `agg` must not see a group split in two.
+
+    Counting a pre-aggregation's rows counts its groups, so a count over partial groups is
+    wrong however it is combined; anything else read as more than a plain input is opaque.
+    """
+    reads: dict[str, str] = {}
+    for spec in agg.get("aggregates") or []:
+        if spec["func"] in ("count", "count_star"):
+            return None
+        inp = spec.get("input") or {}
+        if inp.get("e") == "col":
+            reads[inp["name"]] = reads.get(inp["name"], spec["func"])
+            if reads[inp["name"]] != spec["func"]:
+                reads[inp["name"]] = _OPAQUE
+        else:
+            reads.update(dict.fromkeys(_ir_columns(inp), _OPAQUE))
+    for key in agg.get("group_keys") or []:
+        reads.update(dict.fromkeys(_ir_columns(key), _OPAQUE))
+    return reads
+
+
+def _ir_columns(node: Any) -> set[str]:
+    """Every column an IR expression (or list or dict of them) names."""
+    if isinstance(node, dict):
+        found = {node["name"]} if node.get("e") == "col" and "name" in node else set()
+        for v in node.values():
+            found |= _ir_columns(v)
+        return found
+    if isinstance(node, list):
+        return set().union(*(_ir_columns(v) for v in node)) if node else set()
+    return set()
+
+
+def _opaque(reads: dict[str, str] | None, cols: set[str] | list[str]) -> dict[str, str] | None:
+    return None if reads is None else {**reads, **dict.fromkeys(cols, _OPAQUE)}
+
+
+def _side_reads(
+    join: dict[str, Any], side: str, reads: dict[str, str] | None
+) -> dict[str, str] | None:
+    """`reads` in one join input's own column names: the join's `output` renames, its keys read."""
+    if reads is None:
+        return None
+    if join.get("output") is None:
+        return None  # no explicit output mapping to follow: do not cross a pre-aggregation
+    mine = {o["alias"]: o["name"] for o in join["output"] if o["side"] == side}
+    below = {mine[c]: f for c, f in reads.items() if c in mine}
+    return _opaque(below, join.get(f"{side}_keys") or [])
+
+
+def _partition_join(
+    node: dict[str, Any], input_bytes_of, driving: int | None, reads: dict[str, str] | None
+) -> tuple[tuple, list[str], int] | None:
+    """`(path, keys, scanned bytes)` of the largest build side that may be partitioned, or `None`.
+
+    Reached only through filters, projections, inner joins and semi joins' probe sides (see
+    `run_partitioned_build`); a candidate is an inner or semi equi-join whose build side does
+    not read the driving scan -- that relation streams, it is not a build.
+
+    It also crosses a pre-aggregation (an eager aggregate Kyber pushed below a join), which a
+    pass then emits as *partial* groups: a group whose rows span passes arrives as several
+    rows. That is sound only when nothing above it can tell. `reads` is what the path above
+    does with each column (`_agg_reads`): every partial value must be folded by the aggregate
+    above with the function that combines it -- a sum of partial sums, a minimum of partial
+    minima -- and read nowhere else, and only joins, filters and plain selections may lie
+    between. `None` means a pre-aggregation may not be crossed at all.
+    """
+    best: tuple[int, tuple, list[str]] | None = None
+
+    def visit(n: dict[str, Any], path: tuple, reads: dict[str, str] | None) -> None:
+        nonlocal best
+        op = n.get("op")
+        if op == "filter":
+            visit(n["input"], (*path, "input"), _opaque(reads, _ir_columns(n.get("predicate"))))
+        elif op == "project":
+            visit(n["input"], (*path, "input"), reads if _renames(n) else None)
+        elif op == "aggregate" and reads is not None and _decomposes(n):
+            if all(
+                reads.get(spec["alias"], _COMBINE[spec["func"]]) == _COMBINE[spec["func"]]
+                for spec in n.get("aggregates") or []
+            ):
+                visit(n["input"], (*path, "input"), _agg_reads(n))
+        elif op == "hash_join" and n.get("join_type") in ("inner", "semi"):
+            # The build is the side that does not read the driving scan -- for a semi join only
+            # the right side may be restricted, for an inner join either may be the build.
+            sides = ("right",) if n["join_type"] == "semi" else ("right", "left")
+            for side in sides:
+                keys = n.get(f"{side}_keys")
+                if not keys or driving in _scans(n[side]):
+                    continue
+                size = sum(input_bytes_of(i) for i in _scans(n[side]))
+                if best is None or size > best[0]:
+                    best = (size, (*path, side), list(keys))
+            visit(n["left"], (*path, "left"), _side_reads(n, "left", reads))
+            if n["join_type"] == "inner":
+                visit(n["right"], (*path, "right"), _side_reads(n, "right", reads))
+
+    visit(node, (), reads)
+    return None if best is None else (best[1], best[2], best[0])
+
+
+def _run_passes(
+    agg: dict[str, Any],
+    side_path: tuple,
+    keys: list[str],
+    passes: int,
+    sources: list[Source],
+    opt: PhysicalPlan,
+    run_stage: Callable[[list[Source], PhysicalPlan], list[pa.RecordBatch] | None],
+) -> list[pa.RecordBatch] | None:
+    """Every pass's partial groups with the build at `side_path` split `passes` ways, or `None`
+    as soon as one pass does not fit."""
+    partials: list[pa.RecordBatch] = []
+    for p in range(passes):
+        stage = copy.deepcopy(agg)
+        parent, side = _at(stage["input"], side_path[:-1]), side_path[-1]
+        restrict = _in_part(keys, passes, p)
+        parent[side] = {"op": "filter", "input": parent[side], "predicate": restrict}
+        out = run_stage(sources, _stage(opt, stage))
+        if out is None:
+            return None
+        partials.extend(b for b in out if b.num_rows)
+    return partials
+
+
+def _pass_count(needed: int, budget: int, side_bytes: int) -> int | None:
+    """The first pass count to try with one build side split, or `None` with nothing to split.
+
+    The side, by its scanned bytes capped at what the engine reported, against eight tenths
+    of the budget; the caller doubles from there while a pass is refused, which costs little
+    because a refusal comes while the builds are built, before the probe streams. The other
+    builds are deliberately not charged from `needed`: that is only what the engine had
+    counted when it stopped, and it overstates them -- TPC-H q9 under a 0.65 GB cap reported
+    470 MB, which priced the other builds at nearly the whole budget and asked for 120 passes,
+    where 2 fit and ran in 2.6 s.
+    """
+    side = min(side_bytes, needed)
+    if side <= 0 or budget <= 0:
+        return None
+    return min(_MAX_PASSES, max(2, -(-side // int(budget * 0.8))))
+
+
+def _in_part(keys: list[str], parts: int, p: int) -> dict[str, Any]:
+    """`((hash(keys) mod parts) + parts) mod parts == p`: the row hash is signed."""
+
+    def lit(v: int) -> dict[str, Any]:
+        return {"e": "lit", "value": {"int": v}}
+
+    hashed = {"e": "hash", "inputs": [{"e": "col", "name": k} for k in keys]}
+    rem = {"e": "binary", "op": "mod", "left": hashed, "right": lit(parts)}
+    shifted = {"e": "binary", "op": "add", "left": rem, "right": lit(parts)}
+    part = {"e": "binary", "op": "mod", "left": shifted, "right": lit(parts)}
+    return {"e": "binary", "op": "eq", "left": part, "right": lit(p)}
 
 
 def _stage(opt: PhysicalPlan, ir: dict[str, Any]) -> PhysicalPlan:

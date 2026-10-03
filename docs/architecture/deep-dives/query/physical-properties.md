@@ -1,54 +1,28 @@
 # Physical properties: ordering and partitioning
 
-This page describes the two physical properties Batcher tracks through a plan, what each one
-lets the optimizer remove, and the rules that decide when a property is safe to claim.
+This page describes the two physical properties Batcher tracks through a plan, what each one lets the optimizer remove, and the rules that decide when a property is safe to claim.
 
-Cardinality estimation answers "how many rows". Physical properties answer the other
-question a mature optimizer needs: "in what shape". A relation that already arrives in the
-order you asked for needs no sort, and a relation whose rows are already grouped on the
-right key needs no shuffle. Both are pure savings, and both are invisible unless the
-property is propagated.
+Cardinality estimation answers "how many rows". Physical properties answer "in what shape". A relation that already arrives in the order you asked for needs no sort, and a relation whose rows are already grouped on the right key needs no shuffle.
 
-The code is `batcher/kyber/properties.py` for the property algebra, `plan/stats.py` for the
-vocabulary, and `batcher/kyber/stats/estimator.py` for the propagation.
+The property algebra is in `batcher/kyber/properties.py`, the vocabulary in `plan/stats.py`, and the propagation in `batcher/kyber/stats/estimator.py`.
 
 ## What an ordering is
 
-An ordering is a sequence of `SortOrder` keys. Each key names a column, whether it descends,
-and where its nulls sit:
-
-```python
-from batcher.plan.stats import SortOrder
-
-SortOrder("ts", descending=True, nulls_first=False)
-```
-
-All three parts matter. `ts ASC` and `ts DESC` are different orderings and neither satisfies
-the other, so the direction cannot be dropped. Null placement decides where the null rows
-land, so two orderings differing only there interleave their rows differently.
-
-Recording the direction is what makes the property pay for itself. An ordering restricted to
-ascending keys cannot describe `ORDER BY ts DESC`, which is how nearly every recent-first
-query is written, so the most common ordered shape in analytics used to deliver no ordering
-at all and every consumer of the property was blind to it.
-
-You can ask any dataset what ordering it is known to be in:
+An ordering is a sequence of `SortOrder` keys, each naming a column, its direction, and where its nulls sit. You can ask any dataset what ordering it is known to be in:
 
 ```python
 import batcher as bt
 
 ds = bt.from_pydict({"ts": [3, 1, 2], "v": [30, 10, 20]})
 print(ds.sort("ts", descending=True).meta.sorted_by())
+# (SortOrder(column='ts', descending=True, nulls_first=False),)
 ```
 
-An empty result means "no recorded ordering", which is not the same as "unordered". Only a
-declared or derived ordering is tracked.
+All three parts matter. `ts ASC` and `ts DESC` don't satisfy each other, and two orderings that differ only in null placement interleave their rows differently. Recording the direction is what lets the most common analytic shape, `ORDER BY ts DESC`, carry an ordering at all. An empty result means "no recorded ordering", not "unordered".
 
 ## What the ordering removes
 
-A sort is redundant when its input already delivers an ordering that satisfies it. An
-ordering satisfies a requirement when it is a prefix extension of it: rows sorted by
-`(a, b)` are also sorted by `(a,)`, never the reverse.
+A sort is redundant when its input already delivers an ordering that satisfies it, meaning the delivered keys are a prefix extension of the required ones: rows sorted by `(a, b)` are also sorted by `(a,)`.
 
 ```python
 import batcher as bt
@@ -56,26 +30,22 @@ import batcher as bt
 ds = bt.from_pydict({"ts": [3, 1, 2], "v": [30, 10, 20]})
 once = ds.sort("ts", descending=True)
 twice = once.sort("ts", descending=True)
-print(once.collect().to_pydict() == twice.collect().to_pydict())
+print(once.collect().to_pydict() == twice.collect().to_pydict())  # True
+print(twice.explain().count("sort  ["))                           # 1
 ```
 
-The second sort does no work. The plan the engine runs holds one sort, not two.
-
-The rule declines whenever the claim is not exact. An ascending sort over a descending input
-keeps both sorts, because neither ordering satisfies the other:
+The plan the engine runs holds one sort, not two. The rule declines whenever the claim isn't exact, so an ascending sort over a descending input keeps both sorts:
 
 ```python
 import batcher as bt
 
 ds = bt.from_pydict({"ts": [3, 1, 2], "v": [30, 10, 20]})
-print(ds.sort("ts", descending=True).sort("ts").collect().to_pydict()["ts"])
+print(ds.sort("ts", descending=True).sort("ts").collect().to_pydict()["ts"])  # [1, 2, 3]
 ```
 
 ### A top-N becomes a limit
 
-The same reasoning removes more than a sort. When the input already delivers the ordering a
-top-N asks for, its first `n` rows *are* the top `n`, already in the right order, so the
-whole heap collapses to a limit:
+When the input already delivers the ordering a top-N asks for, its first `n` rows *are* the top `n`, so the heap collapses to a limit:
 
 ```text
 ORDER BY ts DESC LIMIT 10   over a table stored newest-first
@@ -84,126 +54,81 @@ ORDER BY ts DESC LIMIT 10   over a table stored newest-first
   after:   limit(10)      <- scan          reads 10 rows
 ```
 
-That is the standard recent-events query against a lakehouse table with a descending sort
-key, and it is the case that motivated recording the direction in the first place. An
-ordering that could only describe ascending keys never matched it.
+That is the standard recent-events query against a lakehouse table with a descending sort key. The rewrite falls out of sort elimination: the query reaches the rewrite phase as a `Limit` above a plain `Sort`, so removing the sort leaves the limit on the scan. `ORDER BY ts ASC LIMIT 10` over the same table keeps its sort.
 
-No separate top-N rule does this, and one would not fire if it existed. The query reaches the
-rewrite phase as a `Limit` sitting *above* a plain `Sort`, because a sort only acquires its own
-`limit` in a later phase, so eliminating the sort is what leaves the limit on the scan.
+When the input order isn't known, the limit still fuses into the sort as a top-N and is pushed to the scan as a hint:
 
-The rewrite declines whenever the ordering is not an exact prefix match, so
-`ORDER BY ts ASC LIMIT 10` over the same newest-first table keeps its sort.
+```python
+import batcher as bt
 
-### Null placement and columns that hold no nulls
+ds = bt.from_pydict({"ts": [3, 1, 2], "v": [30, 10, 20]})
+print(ds.sort("ts", descending=True).limit(2).explain())
+```
 
-Null placement is compared exactly, with one relaxation. When a column is *proven* to hold no
-nulls there is no null row whose position could distinguish the two spellings, so
-`NULLS FIRST` and `NULLS LAST` describe the same row order and either satisfies the other.
-The proof has to be exact. An estimated null count does not qualify, and an unknown one
-certainly does not.
+```text
+query plan (planned)                                 2 operators
+────────────────────────────────────────────────────────────────
+OPERATOR             ESTIMATE  NOTES
+sort  [top 2 by ts]     est≈2  (exact)
+└─ scan  [source 0]     est≈3  (exact)  pushed[top 2 by ts desc]
+```
+
+Null placement is compared exactly, with one relaxation: when a column is *proven* to hold no nulls, `NULLS FIRST` and `NULLS LAST` describe the same row order and either satisfies the other. An estimated null count doesn't qualify.
 
 ## Which operators carry an ordering
 
-An operator carries its input's ordering when it cannot move a row relative to another row.
+An operator carries its input's ordering when it can't move a row relative to another row:
 
 | Operator | Carries the ordering | Why |
 |---|---|---|
 | `Filter` | Yes | Dropping rows from a sorted relation leaves it sorted. |
-| `Project` | Yes, renamed | A projection reorders nothing. The prefix ends at the first order key the projection does not carry forward as a bare column. |
+| `Project` | Yes, renamed | The prefix ends at the first order key the projection does not carry forward as a bare column. |
 | `Limit` | Yes | A prefix of a sorted relation is sorted. |
 | `Sample` | Yes | Rows are only ever dropped, and the sampler preserves relative order in both modes. |
-| `Unnest` | Yes, truncated | Each input row becomes several output rows in place, which introduces ties rather than breaking the order. The exploded column itself ends the prefix. |
+| `Unnest` | Yes, truncated | Each input row becomes several output rows in place. The exploded column itself ends the prefix. |
 | `Window` | Yes | It appends columns and moves no row. |
 | `Aggregate` | No | A hash aggregate emits groups in no defined order. |
 | `Join` | No | A hash join emits rows in build and probe order, not input order. |
 | `Union` | No | The branches concatenate, so branch order dominates. |
 
-A computed sort key is never carried, whatever the operator. Sorting by `lower(name)` orders
-the relation by a value no column holds, so no consumer could name it.
+A computed sort key, such as `lower(name)`, is never carried, because no column holds that value.
 
 ## What a partitioning is
 
-A partitioning names the key set whose equal values are guaranteed to share a worker. It
-exists so a distributed plan can skip a shuffle it does not need.
+A partitioning names the key set whose equal values are guaranteed to share a worker, so a distributed plan can skip a shuffle it doesn't need. Partitioning and ordering contain in *opposite* directions:
 
-Partitioning and ordering contain in *opposite* directions, which is the most error-prone
-thing on this page:
+- an **ordering** satisfies a requirement when the delivered keys are a prefix *extension* of the required ones;
+- a **partitioning** satisfies a grouping requirement when the delivered keys are a *subset* of the required ones.
 
-- an **ordering** satisfies a requirement when the delivered keys are a prefix *extension* of
-  the required ones;
-- a **partitioning** satisfies a grouping requirement when the delivered keys are a *subset*
-  of the required ones.
+Rows partitioned by `hash(a)` keep every `(a, b)` group whole, so partitioning on `(a)` satisfies grouping by `(a, b)`. Partitioning on `hash(a, b)` does **not** satisfy grouping by `(a)`, because one `a` group straddles several buckets.
 
-Rows partitioned by `hash(a)` keep every `(a, b)` group whole, because equal `(a, b)` implies
-equal `a` and therefore one bucket. So partitioning on `(a)` satisfies grouping by `(a, b)`.
-Partitioning on the superset `hash(a, b)` does **not** satisfy grouping by `(a)`: two rows
-sharing `a` but differing in `b` hash to different buckets, the `a` group straddles them, and
-a reducer that skipped the shuffle emits a partial group. That is a wrong answer, not a slow
-one.
-
-A partitioning can also come from storage rather than a shuffle. A table partitioned on disk
-hands each partition's rows to one worker, which is the same guarantee, so the distributed
-scheduler supplies it as `clustered_on` and `satisfies` treats the two alike. It can't be
-derived from the plan alone, because it depends on the splits the read receives.
-
-An empty partitioning guarantees nothing and satisfies only an empty requirement. Leaving a
-partitioning unclaimed costs at most an unnecessary shuffle, so the safe answer is always to
-claim nothing.
-
-The two properties differ in shape as well as in their rules: an ordering is carried along the plan from operator to operator, while a partitioning is stored nowhere and recomputed by whoever needs it, at the point of decision.
+A partitioning can also come from storage: a table partitioned on disk hands each partition's rows to one worker, so the distributed scheduler supplies it as `clustered_on` and `satisfies` treats it the same way. An empty partitioning guarantees nothing, and leaving one unclaimed costs at most an extra shuffle.
 
 ![Ordering and partitioning, which do not work alike. An ordering travels with the plan: Scan orders establishes the ordering (o_date) from a proved footer order, Filter preserves it, Project preserves it under the new column name as (day), and Aggregate destroys it, so an empty ordering leaves the far side and a later sort has to run. A partitioning is never carried, only recomputed: rows pass from a Join on k through a Filter to an Aggregate on (k, x) with no property riding along, and the point of decision, dist scheduling or the cost model, walks the plan again there and then. Nothing stores a partitioning and there is no Exchange node to enforce one. In that plan the delivered (k) sits inside the required (k, x), so the shuffle is skipped. The two contain in opposite directions: an ordering satisfies a requirement when it is longer, because rows sorted by (a, b) are also sorted by (a) while (a) alone does not satisfy (a, b); a partitioning satisfies one when it is a subset, because partitioning on (a) keeps every (a, b) group whole while partitioning on (a, b) does not keep an (a) group whole. Getting it backwards drops a sort that was needed or skips a shuffle that was not optional, and a wrong claim about either is a wrong answer, not a slow one.](/_static/diagrams/physical_properties.svg)
 
-## Why a wrong claim is worse than no claim
+## Claims are proved, never guessed
 
-Every other statistic in the planner is a bound, so being wrong about it makes a plan slower.
-An ordering claim is different: the optimizer *deletes* a sort on the strength of it, and the
-query then returns rows in the wrong order. Nothing raises, because a wrong order is not an
-error, and an order-independent comparison cannot see it.
-
-That is not hypothetical. A rule once rewrote `Sample(Sort(x))` to `Sample(x)` on the grounds
-that the sampled multiset does not depend on input order. The multiset argument is correct
-and it is not sufficient, because the multiset is not the only observable:
-`ds.sort("a").sample(fraction=0.3)` returned its rows in scan order. Every check on that rule
-used the order-independent comparison, so the one property that broke was the one nothing
-compared.
-
-Two habits follow, and both are enforced in the test suite:
+Every other statistic in the planner is a bound, so being wrong about it makes a plan slower. An ordering claim lets the optimizer *delete* a sort, so a wrong claim would return rows in the wrong order. Two habits follow, and the test suite enforces both:
 
 - claim a property only when it is *proved*, never when it is merely likely;
-- test an ordering with an order-*sensitive* assertion, because the default comparison in
-  [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential) is order-independent by design.
+- test an ordering with an order-*sensitive* assertion, because the default comparison in [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential) is order-independent by design.
 
-The sound form of that rewrite matches the consumer whose own output order is unspecified.
-`eliminate_sort_before_aggregate` removes a sort beneath a group-by, looking through an
-intervening sample, because an aggregate's output order is undefined in the original plan and
-in the rewritten one alike. Nothing observable changes.
+`eliminate_sort_before_aggregate` is the sound form of sort removal for consumers whose own output order is unspecified: it drops a sort beneath a group-by, looking through an intervening sample, because the aggregate's output order is undefined either way.
 
 ## Where a source ordering comes from
 
-A connector can declare the ordering its data is stored in, and Batcher then treats a sort on
-that prefix as free. For Parquet the declaration is proved rather than trusted, in
-`batcher/io/stats/sortedness.py`. All three conditions must hold:
+A connector can declare the ordering its data is stored in, and Batcher then treats a sort on that prefix as free. For Parquet the declaration is proved in `batcher/io/stats/sortedness.py`, and all three conditions must hold:
 
-1. every row group of every file declares the same leading sorting column running the same
-   direction;
-2. row groups are ordered within each file, checked against their own min and max bounds;
-3. files are ordered across the dataset, in the order the scan reads them.
+1. Every row group of every file declares the same leading sorting column running the same direction.
+1. Row groups are ordered within each file, checked against their own min and max bounds.
+1. Files are ordered across the dataset, in the order the scan reads them.
 
-Both directions are provable and both are claimed. Any missing statistic, any null in the
-key, or any unordered pair drops the claim, and the cost of declining is a sort that was
-going to happen anyway.
+Both directions are provable and both are claimed. A missing statistic, a null in the key, or an unordered pair drops the claim, and declining costs only the sort that was going to run anyway.
 
 ## See also
 
-- {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>`: how the sort that
-  does survive is executed.
-- {doc}`The plan IR </architecture/deep-dives/query/plan-ir>`: the contract the optimized plan
-  is lowered to.
-- {doc}`Query lifecycle </architecture/deep-dives/query/query-lifecycle>`: where in a query the
-  optimizer runs.
-- {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`: the
-  other half of what the optimizer knows about a relation.
-- {doc}`Partition-aware planning </architecture/deep-dives/distribution/partition-aware-planning>`:
-  how the distributed path uses a partitioning to skip a shuffle.
+- {doc}`Sort internals </architecture/deep-dives/operators/sort-internals>`: how the sort that does survive is executed.
+- {doc}`The plan IR </architecture/deep-dives/query/plan-ir>`: the contract the optimized plan is lowered to.
+- {doc}`Query lifecycle </architecture/deep-dives/query/query-lifecycle>`: where in a query the optimizer runs.
+- {doc}`Cardinality estimation </architecture/deep-dives/adaptive/cardinality-estimation>`: the other half of what the optimizer knows about a relation.
+- {doc}`Partition-aware planning </architecture/deep-dives/distribution/partition-aware-planning>`: how the distributed path uses a partitioning to skip a shuffle.

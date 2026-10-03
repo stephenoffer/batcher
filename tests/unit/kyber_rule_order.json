@@ -7,6 +7,7 @@
   "left_join_null_key_to_antijoin@3",
   "join_to_semijoin@2",
   "outer_to_inner_join@2",
+  "outer_to_inner_under_join@3",
   "eliminate_left_join@3",
   "runtime_join_filter@7",
   "count_distinct_to_distinct_count@2",

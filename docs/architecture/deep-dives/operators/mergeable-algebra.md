@@ -1,17 +1,8 @@
 # Mergeable algebra
 
-*Mergeable algebra* is the rule that a stateful operator is written once, and that the one
-implementation serves one core, many cores, bounded memory, and many machines. This page
-describes the three functions the aggregate is built from, the state shapes they force, the
-partitioning the other stateful operators reach the same guarantee through, and the single
-definition of key identity all of them depend on.
+*Mergeable algebra* is the rule that a stateful operator is written once, and that the one implementation serves one core, many cores, bounded memory, and many machines. This page covers the three functions an aggregate is built from, the state shapes they force, how the other stateful operators reach the same guarantee, and the single definition of key identity they all share.
 
-The failure it exists to prevent is specific. Write a stateful operator twice, once for a
-single core and once for a cluster, and the two implementations eventually disagree on a float
-key, or on nulls, or on ties. The bug only appears when the data is big enough to shuffle.
-
-Aggregation is the operator the rule is named after, and it is the one written as three
-functions:
+Aggregation is written as three functions:
 
 ```text
 partial(batch)   -> state
@@ -19,26 +10,40 @@ combine(states)  -> state         associative + commutative
 finalize(state)  -> rows
 ```
 
-Single-node execution is `finalize(partial(all_rows))`. Distributed execution is
-`finalize(combine(partial(p) for each partition p))` after a shuffle by key. The *only*
-difference is whether `combine` runs across partitions. There is no second distributed
-operator, so there is no second set of semantics that could drift.
+Single-node execution is `finalize(partial(all_rows))`. Distributed execution is `finalize(combine(partial(p) for each partition p))` after a shuffle by key. The only difference is whether `combine` runs across partitions, so there is no second distributed operator whose semantics could drift.
+
+From the API, that means the schedule never shows up in the answer. One core with one partial and eight cores with dozens of partials merged in arbitrary order return the same rows:
+
+```python
+import dataclasses
+
+import batcher as bt
+from batcher import Config, config_context
+
+ds = bt.from_pydict({"g": [i % 3 for i in range(10_000)], "x": list(range(10_000))})
+
+
+def run(morsel_rows, parallelism):
+    ex = dataclasses.replace(Config().execution, morsel_rows=morsel_rows, parallelism=parallelism)
+    with config_context(Config().replace(execution=ex)):
+        return ds.group_by("g").agg(s=bt.col("x").sum()).sort("g").to_pydict()
+
+
+print(run(1024, 1) == run(256, 8), run(1024, 1))
+# True {'g': [0, 1, 2], 's': [16668333, 16661667, 16665000]}
+```
 
 ```text
    ONE CORE                MANY CORES                    MANY MACHINES
    ────────                ──────────                    ─────────────
    all rows                m0   m1   m2   m3             node A        node B
-      │                     │    │    │    │              rows          rows
       │                     │    │    │    │                │             │
    partial              partial on each morsel           partial       partial
-      │                     │    │    │    │                │             │
       │                     └──┬─┘    └─┬──┘         shuffle by hash(key)
       │                     combine   combine          ┌────┴────┐   ┌────┴────┐
       │                        └────┬────┘             │ combine │   │ combine │
       │                          combine               └────┬────┘   └────┬────┘
-      │                             │                       │             │
    finalize                     finalize                finalize      finalize
-      │                             │                       │             │
       ▼                             ▼                       ▼             ▼
    ┌─────────────────────────────────────────────────────────────────────────┐
    │                    the same rows. every time. by construction.          │
@@ -51,49 +56,25 @@ The invariant, stated as the test that must stay green:
 combine_finalize(partition(partial(p_k))) over all partitions  ==  single-node result
 ```
 
-`DISTINCT` is the same shape, with an empty aggregate list. The other stateful operators reach
-the same guarantee a different way, and it is worth being exact about which is which, because
-"everything is partial/combine/finalize" is the claim this page used to make and the code does
-not support it. A join, a partitioned window and a sort hold state that does not fold: a hash
-table of build rows, a partition's row set, an ordering. What they do instead is *partition* so
-that no fold is needed. A join co-partitions both sides by the join key, so bucket `i` of the
-left joins only bucket `i` of the right. A window partitions on its `PARTITION BY` keys, so a
-partition is computed wherever it lands. A sort range-partitions the leading key, so
-concatenating the buckets in range order is the sorted relation. `bc-interp::dist` exposes both
-families: `partial_aggregate`/`combine_finalize` for the first, and `partition_batches`,
-`range_partition_batches` and `salted_partition_batches` for the second. Top-N is the odd one
-out again, bounded by a shared cut-off (`bc-runtime/src/topn.rs`) rather than by either.
+## Fold or partition
 
-What all of them guarantee is the same: the rows, every column name, and every column type
-match the single-node result. Four things the query itself does not pin down are allowed to
-differ, and they are not defects. A float reduction reassociates, because `combine` is
-associative in exact arithmetic and IEEE addition is not. A window function that must break a
-tie its `ORDER BY` leaves open may break it differently. A `LIMIT` over a relation with no
-order may keep a different set of rows, because a hash-table walk order is not part of the
-query. An `array_agg` with no `order_by` may list a group's elements in a different order,
-though never a different multiset of them. Anything else that differs is a bug.
+`DISTINCT` is the same shape with an empty aggregate list. A join, a partitioned window, and a sort hold state that doesn't fold (a hash table of build rows, a partition's row set, an ordering), so they *partition* instead, so that no fold is needed:
+
+- A join co-partitions both sides by the join key, so bucket `i` of the left joins only bucket `i` of the right.
+- A window partitions on its `PARTITION BY` keys, so a partition is computed wherever it lands.
+- A sort range-partitions the leading key, so the buckets concatenated in range order are the sorted relation.
+
+`bc-interp::dist` exposes both families: `partial_aggregate`/`combine_finalize` for the first, and `partition_batches`, `range_partition_batches` and `salted_partition_batches` for the second. Top-N is bounded by a shared cut-off (`bc-runtime/src/topn.rs`) instead.
+
+Every one of them guarantees the same rows, column names, and column types as single-node. Four things the query itself doesn't pin down may differ: a float reduction reassociates, a window function may break a tie its `ORDER BY` leaves open differently, a `LIMIT` over an unordered relation may keep a different set of rows, and an `array_agg` with no `order_by` may list a group's elements in a different order (never a different multiset). Anything else that differs is a bug.
 
 ## Why associative *and* commutative
 
 :::{important}
-`combine` MUST be associative **and** commutative. Associativity lets partials merge in a tree
-instead of a chain. Commutativity means the merge order doesn't matter, which is what makes
-the result independent of thread scheduling and of network arrival order. If `combine` were
-only associative, a cluster would have to impose a total order on its reducers' inputs, and
-the answer would depend on which worker finished first.
+`combine` MUST be associative **and** commutative. Associativity lets partials merge in a tree instead of a chain. Commutativity makes the result independent of thread scheduling and network arrival order, so the answer never depends on which worker finished first.
 :::
 
-Commutativity is exact for most states, and holds only up to an equivalence for two. A float
-sum commutes but does not associate, which is the reassociation exception above. The list
-state of `array_agg` combines by concatenation, and `[a] ++ [b]` is not `[b] ++ [a]`. It
-commutes as a multiset, so an unordered `array_agg` promises the multiset of a group's elements
-and leaves their order open. `array_agg(order_by=...)` sorts at finalize, which turns the
-multiset back into one list, so its result does not depend on the merge order. The
-list-state aggregates that finalize to a scalar (`median`, `quantile`, `count_distinct`) sort
-or deduplicate first, so their answers are exact whatever order the lists arrived in.
-
-This is what forces the *shape* of the partial state. The state isn't the answer. It's
-whatever is enough to compute the answer from any partition:
+That forces the shape of the partial state. The state isn't the answer. It's whatever is enough to compute the answer from any partition:
 
 | Aggregate | Partial state | Finalize |
 |---|---|---|
@@ -107,50 +88,42 @@ whatever is enough to compute the answer from any partition:
 | `approx_quantile` | a DDSketch | query |
 | `corr`, `covar` | co-moments, as `(n, mean_x, mean_y, C2, M2x, M2y)` | the closed form |
 
-`mean` emitting `(sum, count)` rather than an average is the whole idea in miniature: an
-average of averages is wrong, a sum of sums over a sum of counts is right.
+`mean` emitting `(sum, count)` is the whole idea in miniature: an average of averages is wrong, while a sum of sums over a sum of counts is right.
 
-Variance carries Welford's `(mean, M2, count)` and merges it with Chan's parallel formula. The
-obvious state, `(sum, sum_of_squares, count)`, is also mergeable, but it catastrophically
-cancels when the mean is large relative to the spread. Mergeability alone isn't enough. The
-state also has to stay numerically sound under merging.
+The list-state aggregates are exact and mergeable at the cost of memory linear in the group's values. When that's too much, the sketch states have a size that doesn't grow with the row count:
 
-`approx_quantile` carries a DDSketch rather than a KLL sketch for a reason that belongs on this
-page: DDSketch's merge is **exactly** order-independent, so a distributed result is bit-identical
-to a single-node one. KLL's compaction is order-sensitive and would agree only within its error
-bounds, which breaks the guarantee this whole design exists to give. KLL still ships in
-`bc-sketches` for estimates, where an answer that varies within its bounds costs nothing.
+```python
+d = bt.from_pydict({"g": ["a"] * 100 + ["b"] * 100, "v": list(range(200))})
+out = d.group_by("g").agg(
+    exact=bt.col("v").count_distinct(),  # list state, exact
+    approx=bt.col("v").approx_count_distinct(),  # fixed-size HLL state
+)
+print(out.sort("g").to_pydict())
+# {'g': ['a', 'b'], 'exact': [100, 100], 'approx': [100, 100]}
+```
 
-The list-state aggregates (`median`, `count_distinct`) are **exact and mergeable, at the cost
-of memory linear in the group's values**. That is a real trade. When you can't afford it,
-`approx_count_distinct` and `approx_quantile` give you a bounded-error sketch state instead
-([`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches)), whose size does not grow with the row count. An HLL is a fixed register array. A DDSketch stores only occupied logarithmic buckets, so its size grows with the data's dynamic range and with `1/α`: at the default 1% accuracy, values spanning `1e-9` to `1e9` occupy at most 2,074 buckets per sign.
+:::{dropdown} Numerical soundness and merge-order independence
+Variance carries Welford's `(mean, M2, count)` and merges with Chan's parallel formula. The obvious state, `(sum, sum_of_squares, count)`, is also mergeable but catastrophically cancels when the mean is large relative to the spread, so mergeability alone isn't enough.
 
-Both of those sketches reach the *same state* in any merge order, which is stronger than
-merging correctly and is why they are the two the aggregates use. A HyperLogLog folds
-register-wise by `max`. A DDSketch sums counts in fixed logarithmic buckets. Neither operation
-cares what order it sees its inputs in, and
-`agg/mod.rs::approx_quantile_is_merge_order_independent` pins it. KLL and TDigest are the
-contrast: they compact and re-cluster as they merge, so they stay on the estimate side.
+`approx_quantile` carries a DDSketch rather than a KLL sketch because DDSketch's merge is exactly order-independent, so a distributed result is bit-identical to a single-node one. An HLL folds register-wise by `max` and a DDSketch sums counts in fixed logarithmic buckets, so both reach the same state in any merge order (`agg/mod.rs::approx_quantile_is_merge_order_independent`). KLL and TDigest compact and re-cluster as they merge, so they stay on the estimate side in [`crates/bc-sketches/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches). A DDSketch stores only occupied logarithmic buckets: at the default 1% accuracy, values spanning `1e-9` to `1e9` occupy at most 2,074 buckets per sign.
+
+A float sum commutes but doesn't associate, which is the reassociation exception above. The list state of `array_agg` combines by concatenation, which commutes only as a multiset, so an unordered `array_agg` promises the multiset and leaves the order open. `array_agg(order_by=...)` sorts at finalize, so its result doesn't depend on merge order. `median`, `quantile` and `count_distinct` sort or deduplicate first, so their answers are exact in any order.
+:::
 
 ## One canonical key
 
-Mergeability is worthless if two code paths disagree about what makes two keys "the same".
-The group assigner, the radix combine, the shuffle, the join, and the window are separate code
-paths for performance reasons, but they answer one semantic question, so the answer lives in
-exactly one place: [`crates/bc-runtime/src/keys.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/keys.rs).
+Mergeability is worthless if two code paths disagree about what makes two keys the same. The group assigner, the radix combine, the shuffle, the join, and the window are separate code paths for performance, but they answer one semantic question, so the answer lives in one place: [`crates/bc-runtime/src/keys.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-runtime/src/keys.rs). If the shuffle disagreed with the assigner, one group would land on two reducers and the query would return two groups where the oracle returns one.
 
-:::{warning}
-Getting this wrong doesn't reorder rows. It splits a group. If the shuffle disagrees with the
-assigner about key identity, two rows that are one group land on different reducers and the
-query returns **two groups where the oracle returns one**. Both directions have actually
-happened here: a float key split across `-0.0` and `0.0`, because Arrow's `RowConverter`
-encodes them to different bytes, and null integer keys scattered across every bucket.
-:::
+The policy is visible from the API: `-0.0` and `0.0` are one group, and all NaNs are one group, matching DuckDB.
 
-So the policy is written once. The float half lives in `bc-arrow` (`float_ident.rs`), the
-lowest crate that both `bc-runtime` and `bc-expr` see, so grouping keys and scalar comparisons
-cannot drift apart. `keys.rs` re-exports it beside the null rule:
+```python
+d = bt.from_pydict({"k": [0.0, -0.0, float("nan"), float("nan")], "v": [1, 2, 3, 4]})
+print(d.group_by("k").agg(n=bt.count()).to_pydict())
+# {'k': [0.0, nan], 'n': [2, 2]}
+```
+
+:::{dropdown} The canonical key, in Rust
+The float half lives in `bc-arrow` (`float_ident.rs`), the lowest crate that both `bc-runtime` and `bc-expr` see, so grouping keys and scalar comparisons can't drift apart. `keys.rs` re-exports it beside the null rule:
 
 ```rust
 // bc-arrow: canonical u64 key bits for an f64 (all NaNs one group, +/-0.0 one group)
@@ -164,135 +137,54 @@ pub fn canon_f64_bits(v: f64) -> u64 {
 pub(crate) const NULL_HASH: u64 = 0xa5a5_5a5a_dead_beef;
 ```
 
-`canonicalize_float_keys` rewrites float key columns into canonical form *before* the general
-shuffle path encodes them, so `RowConverter` and the raw-hash fast paths can't disagree. And
-`float_total_cmp` gives `min`/`max` the same total order `ORDER BY` sorts in (NaN last),
-because otherwise `max(x)` would silently ignore NaN and contradict
-`SELECT x ORDER BY x DESC LIMIT 1` on the same column.
-
-You can see the policy from the API:
-
-```python
-import batcher as bt
-
-# -0.0 and 0.0 are one group; all NaNs are one group. This matches DuckDB.
-d = bt.from_pydict({"k": [0.0, -0.0, float("nan"), float("nan")], "v": [1, 2, 3, 4]})
-print(d.group_by("k").agg(n=bt.count()).to_pydict())
-```
-
-```text
-{'k': [0.0, nan], 'n': [2, 2]}
-```
+`canonicalize_float_keys` rewrites float key columns into canonical form before the general shuffle path encodes them, so Arrow's `RowConverter` and the raw-hash fast paths agree. `float_total_cmp` gives `min`/`max` the same total order `ORDER BY` sorts in (NaN last), so `max(x)` agrees with `SELECT x ORDER BY x DESC LIMIT 1`.
+:::
 
 ## The same algebra, four ways
 
-The point of doing this once is that the same three functions serve every execution mode.
-
-The figure below puts the four modes on one bus, so that what separates them shows up as the
-single thing it is: what carries a partial state from `partial` to `combine`.
+The same three functions serve every execution mode. The figure puts the four on one bus, so what separates them shows up as the one thing it is: what carries a partial state from `partial` to `combine`.
 
 ![One operator, written once, and the four transports that carry its partial state. Along the top rail, partial(batch) takes rows in and returns a state that is not the answer, combine(states) merges those states associatively and commutatively into one merged state per group, and finalize(state) takes the state in and returns rows. Below it, four execution modes feed that same combine and differ in nothing but what carries the partial to it: one core (bc-interp::execute) carries nothing and has one partial with nothing to merge, many cores (bc-interp::par) carry a thread hand-off of one partial per morsel, bounded memory (agg::spill) carries an IPC spill file read one partition at a time, and many machines (bc-interp::dist) carry a Flight stream hash-partitioned by key. The test that must stay green is that combine_finalize(partition(partial(p_k))) equals the single-node result, because arrival order cannot change the answer.](/_static/diagrams/mergeable_algebra.svg)
 
 ::::{tab-set}
 :::{tab-item} One core
-`bc-interp::execute` calls `partial` on the whole input and `finalize`. The sequential oracle,
-and the answer everything else is compared against.
+`bc-interp::execute` calls `partial` on the whole input and `finalize`. This is the sequential oracle everything else is compared against.
 :::
 
 :::{tab-item} Many cores
-`bc-interp::par` calls `partial` on each morsel in parallel, then `combine`, then `finalize`.
-Same functions, different scheduler.
+`bc-interp::par` calls `partial` on each morsel in parallel, then `combine`, then `finalize`. Same functions, different scheduler.
 :::
 
 :::{tab-item} Bounded memory
-`agg::spill` (grace aggregation) routes per-morsel partials to one of P partitions by a hash
-of the group key and writes them to a `SpillStore`. Because a key always hashes to the same
-partition, every partial row for a group lands together, so running `combine` + `finalize`
-**one partition at a time** is the global aggregate, with peak memory bounded to one
-partition.
+`agg::spill` (grace aggregation) routes per-morsel partials to one of P partitions by a hash of the group key and writes them to a `SpillStore`. A key always hashes to the same partition, so running `combine` + `finalize` one partition at a time is the global aggregate, with peak memory bounded to one partition. The same grace machinery, on the `PARTITION BY` keys, bounds a window ([`crates/bc-interp/src/window_spill.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/window_spill.rs)).
 
-That bound is only as small as the largest group. No hash split separates one key from
-itself, so a partition always holds all of a group's partial state. For a fixed-size state
-such as `sum` or `mean` that's one row. For a list state such as `median`, `count_distinct` or
-`array_agg` it's every value of the group, so one hot key's list can exceed the budget on its
-own. The same holds for a window partition, and for a join whose output for one key is the
-product of both sides' rows for it. {doc}`Spilling </architecture/deep-dives/memory/spilling>`
-covers what the engine does when a bucket stays over budget.
+```python
+from batcher.config import MemoryConfig
 
-This isn't a special spilling algorithm. It's the distributive equivalence property, used
-locally to bound memory. The same grace machinery, on the `PARTITION BY` keys, bounds a window
-([`crates/bc-interp/src/window_spill.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-interp/src/window_spill.rs)).
+big = bt.from_pydict({"k": [i % 50 for i in range(2000)], "v": list(range(2000))})
+q = big.group_by("k").agg(total=bt.col("v").sum()).sort("k")
+with config_context(Config().replace(memory=MemoryConfig(max_memory_bytes=1))):
+    spilled = q.to_pydict()  # a one-byte budget forces the out-of-core path
+print(spilled == q.to_pydict())
+# True
+```
 :::
 
 :::{tab-item} Many machines
-`bc-interp::dist` exposes `partial_aggregate`, `partition_batches`, and `combine_finalize` at
-the granularity a Ray orchestrator can map over partitions. The Python side in
-[`python/batcher/dist/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/dist) composes them. It is the same `bc-runtime` code underneath.
+`bc-interp::dist` exposes `partial_aggregate`, `partition_batches`, and `combine_finalize` at the granularity a Ray orchestrator can map over partitions. [`python/batcher/dist/`](https://github.com/stephenoffer/batcher/tree/main/python/batcher/dist) composes them over the same `bc-runtime` code.
 :::
 ::::
 
-Disk and network are two sinks for one mechanism, and the parallel executor's in-memory
-bucket shuffle is that mechanism with neither.
+## Practical limits
 
-## Proving it, not asserting it
+- A partition always holds all of one group's partial state, so spilling is bounded by the largest group. For a fixed-size state such as `sum` that's one row; for a list state such as `median` or `array_agg` it's every value of the group. {doc}`Spilling </architecture/deep-dives/memory/spilling>` covers what happens when a bucket stays over budget.
+- An operator with neither a mergeable form nor a partitioning would cap the engine at one node, which is why the `add-relational-operator` and `add-distributed-operator` skills both start at `bc-runtime`.
 
-Three layers of test hold this up, and none of them are optional.
+## How it's tested
 
-1. **Rust unit tests** in `bc-runtime` assert the mergeable invariant directly: partial each
-   partition, combine in an arbitrary order, finalize, and compare against the single-node
-   result.
-1. **`seq == par`**. The parallel executor's output must equal the sequential oracle's, as a
-   multiset for unordered relations and exactly for ordered ones.
-1. **Differential vs DuckDB**, in [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential). If Batcher and DuckDB disagree, Batcher
-   is wrong until proven otherwise.
-
-The cross-product matters more than any single case. The bugs that got through were not
-"aggregation is broken". They were an operator with a non-default flag on a non-default
-execution path: `sort(descending=True)` under spill, a distributed `GROUP BY` on a float key.
-[`tests/differential/test_diff_operator_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_operator_matrix.py) exists to run
-`{collect, spill, iter_batches, distributed}` x `{nulls, empty, one row, duplicates, -0.0/NaN,
-descending}` for exactly this reason.
-
-The user-visible consequence, which is the whole point:
-
-```python
-import dataclasses
-import batcher as bt
-from batcher import Config, config_context
-
-ds = bt.from_pydict({"g": [i % 3 for i in range(10_000)], "x": list(range(10_000))})
-base = Config()
-
-
-def run(morsel_rows, parallelism):
-    cfg = base.replace(
-        execution=dataclasses.replace(
-            base.execution, morsel_rows=morsel_rows, parallelism=parallelism
-        )
-    )
-    with config_context(cfg):
-        return ds.group_by("g").agg(s=bt.col("x").sum()).sort("g").to_pydict()
-
-
-one_core = run(1024, 1)  # one partial, no combine
-eight = run(256, 8)  # ~40 partials, combined in an arbitrary order
-print(one_core == eight, one_core)
-```
-
-```text
-True {'g': [0, 1, 2], 's': [16668333, 16661667, 16665000]}
-```
-
-## The rule when you add an operator
-
-A stateful operator with neither a mergeable form nor a partitioning caps the engine at a
-single node. That isn't an acceptable trade here, and it's why the `add-relational-operator`
-and `add-distributed-operator` skills both start at `bc-runtime`. If the state folds, write
-`partial`/`combine`/`finalize` and prove `combine` associates and commutes. If it doesn't,
-find the key that makes the buckets independent. Either way the parallel path, the spill path,
-and the distributed path all follow from it.
-
-If your operator genuinely has no mergeable form, that's a design conversation, not a `TODO`.
+1. **Rust unit tests** in `bc-runtime` partial each partition, combine in an arbitrary order, finalize, and compare against the single-node result.
+1. **`seq == par`**: the parallel executor must equal the sequential oracle, as a multiset for unordered relations and exactly for ordered ones.
+1. **Differential vs DuckDB** in [`tests/differential/`](https://github.com/stephenoffer/batcher/tree/main/tests/differential), including [`test_diff_operator_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_operator_matrix.py), which runs `{collect, spill, iter_batches, distributed}` x `{nulls, empty, one row, duplicates, -0.0/NaN, descending}`.
 
 ## Where the code lives
 

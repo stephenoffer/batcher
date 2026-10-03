@@ -26,7 +26,7 @@ from batcher.plan.expr_ir import Binary, Col, Expr, InList, Not
 from batcher.plan.logical import Aggregate, Filter, Join, LogicalPlan
 from batcher.plan.source_stats import source_stats_key
 from batcher.plan.types import logical_bytes
-from batcher.plan.visitor import walk_with_base_names
+from batcher.plan.visitor import NO_BASE, walk_with_base_names
 
 __all__ = [
     "collect_source_metadata",
@@ -292,6 +292,7 @@ def _ndv_columns(plan: LogicalPlan) -> frozenset[str]:
             )
         elif isinstance(node, Filter):
             wanted.update(base.get(c, c) for c in _equality_columns(node.predicate))
+    wanted.discard(NO_BASE)
     return frozenset(wanted)
 
 

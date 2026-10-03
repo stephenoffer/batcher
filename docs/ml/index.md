@@ -1,8 +1,8 @@
 # Machine learning
 
-This section covers running models where the data already lives: batch inference, embeddings and retrieval, LLM generation, media decoding, feature preparation, evaluation, and feeding a training loop.
+This section covers running models where the data already lives, from batch inference and LLM generation to media decoding, evaluation, and the loop that feeds training.
 
-Most ML pipelines pay a tax at the seam. A query engine produces rows, something converts them, and a separate system runs the model. Batcher removes the seam. The {py:class}`Dataset <batcher.Dataset>` you filtered and joined is the one the model reads, and the `.ml` accessor hands your model whole Arrow batches rather than one row at a time. The engine places that work on GPUs and across worker actors, and because inference is an operator rather than a separate job, it streams. Scoring more data than fits in memory is the ordinary case.
+The model reads the same {py:class}`Dataset <batcher.Dataset>` you filtered and joined. Its `.ml` accessor hands your model whole Arrow batches, and the engine places that work on GPUs and worker actors. Inference is an operator in the plan, so it streams. Scoring more data than fits in memory is the ordinary case.
 
 ## One pipeline, from raw files to predictions
 
@@ -28,26 +28,75 @@ print(scored.sort("id").to_pydict())
 # {'id': [1, 2, 3], 'x': [0.5, 1.0, 1.5], 'score': [1.0, 2.0, 3.0]}
 ```
 
-Everything around that call stays ordinary dataset work. Read Parquet or a directory of images, filter, join labels, score, then write the result or aggregate it, all in one lazy plan.
-
-The following diagram shows that plan and what running it as one plan buys:
+Everything around that call is ordinary dataset work. The read, the label join and the write sit in the same lazy plan as the model. The following diagram shows that plan:
 
 ![Raw files to predictions as one lazy plan, where nothing runs until a write or a collect. Read takes Parquet or images and hands bytes to decode, which runs as an .image expression in Rust. Decode hands tensors to a filter and a join that attaches labels. Decode, filter and join run on CPU cores. The rows go to infer, ds.ml.infer with your model class, which runs in a GPU actor pool, and the rows come out with a score and go to a write or an aggregate. Running it as one plan buys three things. The model loads once per worker, in its constructor. The model scores partition k while the CPU stages prepare partition k+1. Batches stream, so scoring more data than fits in memory is the ordinary case.](/_static/diagrams/ml_one_plan.svg)
 
-## What Batcher brings to an ML workload
+## The toolbox in a few lines
 
-Media decoding runs in the engine. Image decode, resize, crop and normalize, perceptual hashes, curation measures, and audio mel spectrograms and MFCCs are expressions on the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`, {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>` and {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>` namespaces, implemented in Rust and parallel across cores. Daft decodes and resizes natively too, but its users write the hashes, curation measures and audio features as per-row Pillow or torch UDFs, and Ray Data runs all of it as UDFs. The mel spectrogram and MFCC match `torchaudio` to 1e-6.
+Each step of an ML workflow is a short call on one lazy dataset. The cells below share a small sales table:
 
-Models load once per session. Inference actor pools stay warm across `collect()` calls, so re-running a scoring cell in a notebook doesn't reload the checkpoint.
+```python
+sales = bt.from_pydict(
+    {
+        "region": ["eu", "eu", "us", "us"],
+        "ads": [1.0, 2.0, 3.0, 4.0],
+        "revenue": [3.1, 4.9, 7.0, 9.1],
+    }
+)
+train, test = sales.ml.train_test_split(test_size=0.25, seed=7)
+print(train.count(), test.count())
+# 3 1
+```
 
-The CPU stage and the GPU stage overlap. A `map_batches` chain that crosses from CPU work to GPU work splits into per-stage actor pools, so the model runs partition *k* while the stage below prepares *k+1*. That is the default, `distributed.stream_inference=True`. It holds a two-stage JPEG-to-ResNet-50 pipeline at 81% GPU utilization, as the measurements below show.
+Scale features with a fitted preprocessor, which keeps its statistics for the held-out split:
 
-Training ingest is deterministic and resumable. {py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` gives every rank the same number of batches in a seed-reproducible global order that doesn't depend on `world_size`. The shuffle is a computed permutation rather than a materialized index, so the order itself costs constant memory at any corpus size. A job restarts mid-epoch, even on a differently sized cluster, with no repeated or skipped samples.
+```python
+from batcher.ml.preprocessors import StandardScaler
 
-## Measured
+scaler = StandardScaler(["ads"]).fit(sales)
+print([round(v, 2) for v in scaler.transform(sales).to_pydict()["ads"]])
+# [-1.34, -0.45, 0.45, 1.34]
+```
 
-Every figure below passed a correctness gate before it was timed: the same predictions, or the same frame count at the same shape, as the comparison. The source is [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md), and {doc}`/benchmarks/results/ai-and-gpu` and {doc}`/benchmarks/results/multimodal-ingest` walk through them.
+Fit a baseline in the engine, in one scan, and score with it:
 
+```python
+from batcher.ml.linear import LinearRegression
+
+model = LinearRegression(["ads"], "revenue").fit(sales)
+print(round(model.coef_[0], 2), round(model.intercept_, 2))
+# 2.01 1.0
+scored = model.predict(sales)
+```
+
+Evaluate per segment in the same pass. Metrics are aggregates, so `by=` is a group-by:
+
+```python
+report = scored.ml.evaluate("revenue", y_pred="prediction", by="region", metrics=["rmse"])
+print({r: round(v, 3) for r, v in zip(*report.sort("region").to_pydict().values())})
+# {'eu': 0.106, 'us': 0.047}
+```
+
+Search vectors with an ordinary column of embeddings:
+
+```python
+docs = bt.from_pydict({"id": [1, 2, 3], "vec": [[1.0, 0.0], [0.0, 1.0], [0.8, 0.2]]})
+print(docs.ml.nearest_neighbors([1.0, 0.0], column="vec", k=2).select("id").to_pydict())
+# {'id': [1, 3]}
+```
+
+## Why it is fast
+
+Media decoding runs in Rust. Image decode, resize, perceptual hashes and curation measures are expressions on the {py:class}`.image <batcher.plan.expr_ir.image._ImageNamespace>`, {py:class}`.audio <batcher.plan.expr_ir.audio._AudioNamespace>` and {py:class}`.video <batcher.plan.expr_ir.video._VideoNamespace>` namespaces, parallel across cores, and so are audio mel spectrograms and MFCCs. Those two match `torchaudio` to 1e-6.
+
+Models load once per session. Inference actor pools stay warm across `collect()` calls, so re-running a scoring cell doesn't reload the checkpoint. When a chain crosses from CPU work to GPU work, it splits into per-stage actor pools, and the model scores partition *k* while the stage below prepares *k+1*. The GPU rarely waits.
+
+Training ingest is deterministic too. {py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` gives every rank the same number of batches in a seed-reproducible order, and a job restarts mid-epoch with no repeated or skipped samples.
+
+On an 8xT4 Ray cluster, sentence-transformers MiniLM embeds 33,611 texts per second. A two-stage JPEG-to-ResNet-50 pipeline holds 81% GPU utilization.
+
+::::{dropdown} Headline measurements
 The following table lists single-node media results on 96 cores with a release build, 2,000 JPEG frames or audio clips per run:
 
 | Workload | Batcher | Comparison |
@@ -67,7 +116,8 @@ The following table lists GPU workload families on an 8xT4 Ray cluster with real
 | LLM batch inference | HF gpt2 | 814.8 prompt/s |
 | Training-data ingest | `iter_torch_batches`, zero-copy DLPack, no shuffle | 1.06 M rows/s |
 
-Against Ray Data on a compute-bound inference pipeline, 17 nodes and 8 T4s, warm pools decide the small and medium jobs. A 125,000-row job finishes in 1.2 s against Ray Data's 10.5 s, 8.6x, and a 500,000-row job in 4.0 s against 10.2 s, 2.5x. The two engines meet at about 2M rows, and at 4M Ray Data is ahead, 22.6 s against 29.8 s. Quote a factor on this shape only with its row count.
+{doc}`/benchmarks/results/ai-and-gpu` and {doc}`/benchmarks/results/multimodal-ingest` have the full results.
+::::
 
 ## Find your workload
 
@@ -88,7 +138,7 @@ The following table maps common ML tasks to the entry point and the page that co
 
 ## In this section
 
-The guide has five groups. Start at inference if you already have a model, and at preparing if the data isn't yet in shape for one.
+Start at inference if you already have a model, and at preparing if the data isn't yet in shape for one.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -96,25 +146,25 @@ The guide has five groups. Start at inference if you already have a model, and a
 :::{grid-item-card} {octicon}`cpu;1.1em` Run a model
 :link: /ml/inference/index
 :link-type: doc
-Batch inference over Arrow on CPU or GPU, tabular models, exported runtimes, and streaming sources.
+Batch inference over Arrow on CPU or GPU, including tabular models and exported runtimes.
 :::
 
 :::{grid-item-card} {octicon}`filter;1.1em` Prepare the data
 :link: /ml/preparing/index
 :link-type: doc
-Feature preprocessors, image, audio and video decode, and tokenization.
+Feature preprocessors, media decode for every modality, and tokenization.
 :::
 
 :::{grid-item-card} {octicon}`graph;1.1em` Measure the model
 :link: /ml/evaluation/index
 :link-type: doc
-Metrics per segment in one pass, model selection, honest splits, and drift.
+Metrics per segment in one pass, model selection over leak-free splits, and drift monitoring for a deployed model.
 :::
 
 :::{grid-item-card} {octicon}`search;1.1em` Embeddings, retrieval, and LLMs
 :link: /ml/retrieval/index
 :link-type: doc
-Encode, search, retrieve, generate, and evaluate what came back.
+Encode and search vectors, then generate text and grade what came back.
 :::
 
 :::{grid-item-card} {octicon}`workflow;1.1em` Serve and train
@@ -126,11 +176,15 @@ Call served models, and feed training ranks a balanced, resumable stream.
 
 ## Requirements and limitations
 
+Three practical constraints apply:
+
 - The engine installs with `pip install batcher-engine`. Model frameworks are extras: `torch`, `transformers`, `st` for sentence-transformers, `vllm`, `tabular` for the gradient-boosting and scikit-learn stack, and `multimodal` for the image, audio, video and PDF readers.
 - GPU reservation with `num_gpus` and multi-worker actor pools run on a Ray cluster. Without one, the same pipeline runs on a single machine.
 - Models are fitted and engines are registered from Python. SQL calls them as table functions: `ML_PREDICT` scores a registered model, `AI_GENERATE`, `AI_CLASSIFY` and `AI_EXTRACT` call a registered language-model engine, and `AI_EMBED` runs a sentence-transformers encoder. {doc}`/user-guide/analyze/sql-model-functions` lists the syntax and the calls that stay DataFrame-only.
 
 ## See also
+
+Read next:
 
 - {doc}`/getting-started/tutorials/ml/index`: four end-to-end tutorials that run on a laptop.
 - {doc}`/cookbook/ml/index`: shorter recipes for the workloads above.

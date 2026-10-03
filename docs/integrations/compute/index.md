@@ -1,8 +1,28 @@
 # ML and compute
 
-Batcher plugs into the systems on either side of a model: the cluster that schedules the work, the scheduler that granted the hardware, the training loop that consumes tensors, and the registries the weights come from. The data work stays in Batcher's Rust engine over Arrow, and each of these integrations hands off at the boundary where the other system is strongest.
+Batcher plugs into the systems on either side of a model: the cluster that schedules the work, the scheduler that granted the hardware, the training loop that consumes tensors, and the registries the weights come from. The data work stays in Batcher's Rust engine over Arrow.
 
-On a Ray cluster, Ray schedules and Arrow Flight carries the shuffle, so bulk data never touches the object store. Under Slurm, PBS, LSF, Kubernetes, or a managed job service, Batcher sizes itself to the allocation you were granted, with no configuration. A PyTorch loop gets `{column: tensor}` batches already on the device, and a model from the Hugging Face Hub or an MLflow registry loads once per worker by its id or URI. A fitted scikit-learn, XGBoost, or LightGBM model needs no wrapper at all: `ds.ml.predict` calls the scikit-learn contract on whatever object you hand it.
+A fitted scikit-learn, XGBoost, or LightGBM model needs no wrapper. `ds.ml.predict` calls the scikit-learn contract on whatever object you hand it:
+
+```python
+import batcher as bt
+from sklearn.linear_model import LogisticRegression
+
+model = LogisticRegression().fit([[0.0], [1.0], [2.0], [3.0]], [0, 0, 1, 1])
+print(bt.from_pydict({"x": [0.5, 2.5]}).ml.predict(model, features=["x"]).to_pydict())
+# {'x': [0.5, 2.5], 'prediction': [0, 1]}
+```
+
+On a Ray cluster, one argument distributes the same plan. Ray schedules, and Arrow Flight carries the shuffle, so bulk data never touches the object store. This block needs a cluster, so it is shown but not executed:
+
+```python
+# docs: skip
+result = bt.read.parquet("s3://<your-bucket>/events/").group_by("user").agg(
+    n=bt.count()
+).collect(distributed=True, num_workers=8)
+```
+
+Under Slurm, PBS, LSF, Kubernetes, or a managed job service, Batcher sizes itself to the allocation, with no configuration. A PyTorch loop gets `{column: tensor}` batches on the device, and a Hugging Face Hub or MLflow model loads once per worker by its id or URI.
 
 ::::{grid} 1 2 2 3
 :gutter: 3

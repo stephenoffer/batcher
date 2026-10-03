@@ -18,9 +18,7 @@ import math as _math
 import operator
 from collections.abc import Callable
 
-from batcher.kyber.registry import DEFAULT_REGISTRY
-from batcher.kyber.rule import Phase, plan_rule
-from batcher.kyber.rules.leaf_rewrite import whole_plan_expr_rule
+from batcher.kyber.rules.leaf_rewrite import register_leaf_rule
 from batcher.plan.expr_ir import Binary, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import DateFunc, DateOffset
 
@@ -177,9 +175,13 @@ def fold_temporal_comparison(expr: Expr) -> Expr:
     return Lit(_COMPARISONS[expr.op](a, b))
 
 
-for _name, _fn in (
-    ("fold_date_func_of_literal", fold_date_func),
-    ("fold_date_offset_of_literal", fold_date_offset),
-    ("fold_temporal_literal_comparison", fold_temporal_comparison),
-):
-    DEFAULT_REGISTRY.add(plan_rule(_name, Phase.NORMALIZE, whole_plan_expr_rule(_fn)))
+# Fused leaves, each offered only the one root shape it rewrites. As whole-plan rules with
+# no declared shape they walked every expression of every node on every NORMALIZE iteration.
+register_leaf_rule("fold_date_func_of_literal", fold_date_func, expr_matches=(DateFunc,))
+register_leaf_rule("fold_date_offset_of_literal", fold_date_offset, expr_matches=(DateOffset,))
+register_leaf_rule(
+    "fold_temporal_literal_comparison",
+    fold_temporal_comparison,
+    expr_matches=(Binary,),
+    expr_ops=tuple(_COMPARISONS),
+)

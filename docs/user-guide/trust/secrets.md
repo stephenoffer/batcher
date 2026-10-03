@@ -9,34 +9,42 @@ The functions that take a key are covered in {doc}`/user-guide/trust/governance`
 
 ## Keys by reference
 
-Pass a key reference rather than the raw key:
+Pass a key reference rather than the raw key. `env:NAME` reads an environment variable:
 
 ```python
-# docs: skip
-enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "env:AES_KEY"))  # from the environment
-enc = ds.select(c=bt.aes_encrypt(bt.col("ssn"), "file:/run/secrets/aes"))  # from a mounted secret
+import os
+
+import batcher as bt
+
+os.environ["AES_KEY"] = "11" * 32  # your platform sets this
+
+people = bt.from_pydict({"ssn": ["123-45-6789", "987-65-4321"]})
+encrypted = people.select(c=bt.aes_encrypt(bt.col("ssn"), "env:AES_KEY"))
+print(encrypted.select(s=bt.aes_decrypt(bt.col("c"), "env:AES_KEY")).to_pydict())
+# {'s': ['123-45-6789', '987-65-4321']}
 ```
 
-`env:NAME` reads an environment variable and `file:PATH` reads a mounted secret file. Only
-the reference travels in the plan IR. Plan logs, the profile, `explain()`, and the FFI
-boundary never see the secret, and the data plane resolves it on the machine that runs the
-query, so a distributed query reads the key on each worker rather than shipping it over the
-wire.
+Only the reference travels in the plan IR. Plan logs, the profile, `explain()`, and the FFI boundary never see the secret:
+
+```python
+plan_json = encrypted.explain(format="json")
+print("env:AES_KEY" in plan_json, os.environ["AES_KEY"] in plan_json)
+# True False
+```
+
+The data plane resolves the reference on the machine that runs the query, so a distributed query reads the key on each worker rather than shipping it over the wire.
 
 The reference and the key take different routes, and only one of them leaves the machine it started on:
 
 ![Three columns: the driver, what travels, and each worker. On the driver, ds.select(c=bt.aes_encrypt(bt.col('ssn'), 'env:AES_KEY')) lowers to the plan IR, which is shipped to every worker. The plan carries only the reference env:AES_KEY, never the key, so plan logs, the profile, explain() and the FFI boundary never see the key. An inline key instead of a reference puts the key in the plan and raises a SecurityWarning, or a PlanError at plan-build time when BATCHER_REQUIRE_KEY_REFS=1 is set. When the plan arrives on a worker, bc-secrets resolves the reference in the data plane by its scheme: env: reads an environment variable, file: reads a mounted file, and cmd: takes the stdout of the operator's BATCHER_SECRET_COMMAND run with NAME as its argument, failing if that variable is unset. The secret is cached per process for BATCHER_SECRET_TTL_SECONDS, 300 seconds by default, because key references resolve per batch, and the kernel uses the key on the machine that runs it. A missing reference fails naming the reference, never the key. Connector passwords and storage_options take the same references, resolved once per connection and not cached.](/_static/diagrams/secret_reference_flow.svg)
 
-A `file:` reference is an ordinary path, so the round trip runs anywhere:
+`file:PATH` reads a mounted secret file:
 
 ```python
 import pathlib
 
-import batcher as bt
-
 pathlib.Path("aes.key").write_text("00" * 32)  # 32 bytes as hex; your platform mounts this
 
-people = bt.from_pydict({"ssn": ["123-45-6789", "987-65-4321"]})
 encrypted = people.select(c=bt.aes_encrypt(bt.col("ssn"), "file:aes.key"))
 print(encrypted.select(s=bt.aes_decrypt(bt.col("c"), "file:aes.key")).to_pydict())
 # {'s': ['123-45-6789', '987-65-4321']}
@@ -44,15 +52,31 @@ print(encrypted.select(s=bt.aes_decrypt(bt.col("c"), "file:aes.key")).to_pydict(
 
 No `SecurityWarning` is raised here, because no key entered the plan.
 
-An inline literal key still works for local development but emits a `SecurityWarning`,
-because it embeds the secret in the query and its serialized plan. A missing reference (an
-unset `env:` variable, an absent `file:` path) fails loudly, naming the *reference*, never
-the key.
+An inline literal key still works for local development, but it embeds the secret in the plan, so it emits a `SecurityWarning`:
+
+```python
+import warnings
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    people.select(c=bt.aes_encrypt(bt.col("ssn"), "22" * 32)).collect()
+print([w.category.__name__ for w in caught if w.category.__name__ == "SecurityWarning"])
+# ['SecurityWarning']
+```
+
+A missing reference fails loudly, naming the *reference*, never the key:
+
+```python
+try:
+    people.select(c=bt.aes_encrypt(bt.col("ssn"), "env:NOT_SET_ANYWHERE")).collect()
+except bt.BatcherError as err:
+    print(err)
+# aes_encrypt: could not resolve key reference env:NOT_SET_ANYWHERE
+```
 
 ## Connection credentials
 
-The same indirection works for every connector password, token, API key, and connection
-URI. That is the larger secret surface in most deployments.
+The same references work for every connector password, token, API key, and connection URI:
 
 ```python
 # docs: skip
@@ -72,15 +96,7 @@ bt.read.parquet(
 )
 ```
 
-All three schemes work for connector options, including `cmd:`, and so do the `storage_options` an object store takes. A connector resolves once when it opens its connection rather than per batch,
-so there is no cache in this path and a rotated secret is picked up by the next connection.
-
-The reference is resolved on the machine that *opens the connection*, not on the driver
-that builds the plan. The source object and the pickled split that reaches a Ray worker
-carry only the reference, so the secret never crosses the wire, never sits in driver
-memory, and cannot surface in a traceback or a log line that renders a split.
-
-A literal password still works unchanged. This is additive, not a migration.
+All three schemes, `cmd:` included, work for connector options and `storage_options`. A connector resolves its reference once, on the machine that *opens the connection*, so a rotated secret is picked up by the next connection and the secret never sits in driver memory or a pickled split. A literal password still works unchanged.
 
 ## Reaching Vault, KMS, or Secret Manager
 
@@ -106,12 +122,7 @@ export BATCHER_SECRET_COMMAND=/usr/local/bin/fetch-secret   # your wrapper aroun
 ds.select(c=bt.aes_encrypt(bt.col("ssn"), "cmd:prod/aes-key"))
 ```
 
-`cmd:` is inert unless the operator sets `BATCHER_SECRET_COMMAND`, and the reference
-supplies only the *argument*, never the program. That asymmetry is the security property.
-A plan is data and may arrive from somewhere less trusted than the cluster, so letting it
-name a program to execute would turn a secret reference into arbitrary code execution. The
-argument is passed as an argument, never through a shell, so metacharacters in a reference
-are inert.
+`cmd:` is inert unless the operator sets `BATCHER_SECRET_COMMAND`, and the reference supplies only the *argument*, never the program, so a plan can't name a program to execute. The argument never goes through a shell, so metacharacters in a reference are inert.
 
 ### Naming a key store directly
 
@@ -170,12 +181,7 @@ per connection.
 
 ## Enforcing references in a regulated deployment
 
-The warning is a weak control on its own. `SecurityWarning` is a `UserWarning`, so Python
-prints it once per call site and a process that filtered warnings never sees it. Meanwhile
-an inline key still travels verbatim in the serialized IR, into `explain(format="json")`
-and the plan fingerprint, and out to every worker the plan is shipped to.
-
-Set `BATCHER_REQUIRE_KEY_REFS=1` to refuse inline keys outright. {py:func}`aes_encrypt <batcher.aes_encrypt>`,
+`SecurityWarning` is a `UserWarning`, so a process that filters warnings never sees it, while the inline key still travels in the serialized plan. Set `BATCHER_REQUIRE_KEY_REFS=1` to refuse inline keys outright. {py:func}`aes_encrypt <batcher.aes_encrypt>`,
 {py:func}`aes_decrypt <batcher.aes_decrypt>`, and {py:func}`hmac_sha256 <batcher.hmac_sha256>` then raise {py:exc}`PlanError <batcher.PlanError>` at plan-build time unless the key
 is an `env:`, `file:`, or `cmd:` reference. Set it in the pod spec or node environment for the whole
 deployment, and leave it unset in notebooks and tests, where an inline key is legitimate.
@@ -190,15 +196,7 @@ Prefer `file:` over `env:` where a user-supplied UDF may run. A UDF on the proce
 
 ## Data at rest on the node
 
-A query that spills writes its actual rows to the local scratch directory. A large
-aggregate, join, sort, or window can all do this. Batcher creates that directory `0o700`,
-so another local user on a shared node cannot read a spilled join off disk.
-
-That is access control, not encryption: the bytes on disk are plaintext Arrow IPC. If your
-threat model includes the disk itself (a seized volume, a snapshot, a multi-tenant host you
-do not control), use an encrypted filesystem or an encrypted instance volume for
-`memory.spill_dir`. Column-level `aes_encrypt` protects a column end to end, including
-through a spill, but costs a decrypt wherever the value is used.
+A query that spills writes its rows to the local scratch directory, which Batcher creates `0o700` so another local user can't read it. The bytes are plaintext Arrow IPC. If your threat model includes the disk itself, use an encrypted volume for `memory.spill_dir`. Column-level `aes_encrypt` protects a column end to end, including through a spill.
 
 ## Requirements and limitations
 

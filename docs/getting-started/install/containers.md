@@ -4,24 +4,24 @@ This page describes the prebuilt Batcher container images, how to extend them or
 
 ## What's in the images
 
-Each release publishes two images to the GitHub Container Registry. Both are multi-architecture, so the same tag pulls the right build on an x86_64 host and on an Arm host such as AWS Graviton or an Apple silicon Mac:
+Each release publishes two multi-architecture images to the GitHub Container Registry:
 
 | Image | Extras installed | Use it for |
 |---|---|---|
 | `ghcr.io/stephenoffer/batcher:<version>` | `cloud` | Single-node jobs, including reads and writes to `s3://`, `gs://`, and `az://` |
 | `ghcr.io/stephenoffer/batcher:<version>-ray` | `cloud`, `ray` | The driver, head, and worker nodes of a Ray cluster |
 
-`latest` and `latest-ray` track the newest release. Pin a version tag in production, so a new release can't change a running job underneath you.
+`latest` and `latest-ray` track the newest release. Pin a version tag in production.
 
 :::{important}
-The images are pushed only by a tagged release, and no release has been tagged, so none of these tags exist on the registry. Build the image from a clone of the repository instead, as {ref}`the Dockerfile section below <containers-build-from-source>` shows.
+No release has been tagged yet, so these tags aren't on the registry. Build the image from a clone instead, as {ref}`the Dockerfile section below <containers-build-from-source>` shows.
 :::
 
-Both images start from the official `python:3.12-slim-bookworm` image, install the same wheel that PyPI serves, and run as a non-root user named `batcher` with UID 1000. The default command is `python`. The images carry no CUDA libraries, so GPU work needs its own image, as {ref}`install-build-your-own-image` describes.
+Both images build on `python:3.12-slim-bookworm` and run as the non-root user `batcher` (UID 1000). They carry no CUDA libraries; for GPU work see {ref}`install-build-your-own-image`.
 
 ## Run a query with Docker
 
-To check that the image runs on your host, start a container and run a query in it:
+Run a query in a throwaway container:
 
 ```bash
 docker run --rm ghcr.io/stephenoffer/batcher:latest \
@@ -30,15 +30,13 @@ docker run --rm ghcr.io/stephenoffer/batcher:latest \
 
 The container prints `{'total': [6]}`.
 
-To work on files from the host, mount a directory and run a script from it. The `batcher` user must be able to read the mount, and to write to it if the job writes output there:
+Mount a host directory to run a script from it:
 
 ```bash
 docker run --rm -v "$PWD:/work" -w /work ghcr.io/stephenoffer/batcher:latest python pipeline.py
 ```
 
-Batcher reads the container's CPU quota and memory limit from its cgroup. It sizes its thread count to the quota and measures memory pressure against the limit, rather than against the whole host, so `--cpus` and `--memory` change how much Batcher uses.
-
-When a query spills to disk, Batcher writes to the directory in `BATCHER_SCRATCH_DIR`. Without it, Batcher picks the fastest local volume it can measure, and falls back to the system temporary directory, which in a container is the writable layer. The images include an empty `/scratch` directory owned by the `batcher` user, so a named volume mounted there starts out writable. Mount one for spill and name it:
+Batcher sizes its threads and memory to the container's cgroup limits, so `--cpus` and `--memory` set how much it uses. Spill goes to `BATCHER_SCRATCH_DIR`; the images include a writable `/scratch` for a volume:
 
 ```bash
 docker run --rm -v "$PWD:/work" -w /work -v batcher-spill:/scratch -e BATCHER_SCRATCH_DIR=/scratch \
@@ -90,7 +88,10 @@ docker build -f packaging/docker/Dockerfile --build-arg EXTRAS=cloud,delta -t my
 
 ## Run on Kubernetes
 
-A Batcher job on Kubernetes is an ordinary container workload. Set memory and CPU limits on the container, because those limits are what Batcher sizes itself to. The following Job runs a pipeline script mounted from a ConfigMap:
+A Batcher job on Kubernetes is an ordinary container workload, sized to the container's limits.
+
+:::{dropdown} Example Kubernetes Job
+A Job running a pipeline script mounted from a ConfigMap, with node-local spill:
 
 ```yaml
 apiVersion: batch/v1
@@ -123,8 +124,9 @@ spec:
         - name: spill
           emptyDir: {}
 ```
+:::
 
-The `emptyDir` mounted at `/scratch`, named by `BATCHER_SCRATCH_DIR`, gives spill files node-local disk rather than the container's writable layer. For object-store credentials, set the environment variables {doc}`/user-guide/moving-data/cloud-storage` lists, from a Kubernetes Secret, or rely on the node's instance or role credentials.
+For object-store credentials, set the environment variables {doc}`/user-guide/moving-data/cloud-storage` lists from a Kubernetes Secret, or use the node's role credentials.
 
 To run one job across several pods, use a Ray cluster on Kubernetes through KubeRay, which {doc}`clusters-and-servers` covers.
 

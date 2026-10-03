@@ -452,7 +452,7 @@ def _join_key_base_columns(plan: LogicalPlan) -> frozenset[str]:
     from batcher.plan.expr_ir import Binary, Col
     from batcher.plan.expr_rewrite.algebra import split_conjuncts
     from batcher.plan.logical import Filter, Join
-    from batcher.plan.visitor import walk_with_base_names
+    from batcher.plan.visitor import NO_BASE, walk_with_base_names
 
     keys: set[str] = set()
     for node, base in walk_with_base_names(plan):
@@ -467,6 +467,7 @@ def _join_key_base_columns(plan: LogicalPlan) -> frozenset[str]:
                     and isinstance(term.right, Col)
                 ):
                     keys.update(base.get(c.name, c.name) for c in (term.left, term.right))
+    keys.discard(NO_BASE)
     return frozenset(keys)
 
 
@@ -531,7 +532,7 @@ def _column_bounds_needed(plan: LogicalPlan) -> frozenset[str]:
     """`column_bounds_needed`, uncached."""
     from batcher.plan.expr_ir import Col, referenced_columns
     from batcher.plan.logical import Aggregate, AsofJoin, Filter, Join, Sort
-    from batcher.plan.visitor import walk_with_base_names
+    from batcher.plan.visitor import NO_BASE, walk_with_base_names
 
     # Names come off the plan and are looked up in a *source's* schema, so each is resolved
     # back through renaming projections first — otherwise every aliased or self-joined table
@@ -557,6 +558,7 @@ def _column_bounds_needed(plan: LogicalPlan) -> frozenset[str]:
         elif isinstance(node, Sort):
             found = {k.expr.name for k in node.keys if isinstance(k.expr, Col)}
         needed |= {base.get(name, name) for name in found}
+    needed.discard(NO_BASE)
     return frozenset(needed)
 
 

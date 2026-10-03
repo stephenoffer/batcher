@@ -2,7 +2,7 @@
 
 This section covers running Batcher from a workflow scheduler: Apache Airflow, Dagster, and Prefect.
 
-There is no Batcher operator, plugin, or provider package to install, and that is the whole integration story rather than a gap in it. Batcher is a library with no daemon, no cluster to start, and no session to open, so a task that runs it is a Python function that imports `batcher`. Everything an orchestrator needs from a task — did it succeed, what did it produce, is it safe to retry — comes from ordinary return values.
+There is no operator, plugin, or provider package to install. Batcher is a library with no daemon and no session to open, so a task that runs it is a Python function that imports `batcher`. Whether it succeeded, what it produced, and whether it is safe to retry all come from ordinary return values and exceptions.
 
 ```python
 import batcher as bt
@@ -32,7 +32,7 @@ That function is the same object in all three schedulers. What changes between t
 
 **What did it produce?** A write returns a {py:obj}`WriteManifest <batcher.io.WriteManifest>` carrying `total_rows`, `num_files`, `total_bytes`, and the file list. Return it, log it, or push it into the scheduler's own metadata store. It is what makes a downstream task's "did anything change" check cheap.
 
-**Is it safe to retry?** This is the question orchestrators actually exist to ask, and the answer is a property of how you write rather than of the scheduler. {doc}`retries-and-idempotency` covers it: save modes, the `_SUCCESS` marker, `replace_where` for a partition backfill, and `merge_on` for a keyed upsert that lands the same rows however many times it runs.
+**Is it safe to retry?** That depends on how you write, not on the scheduler. {doc}`retries-and-idempotency` covers save modes, the `_SUCCESS` marker, `replace_where` for a partition backfill, and `merge_on` for a keyed upsert that lands the same rows however many times it runs.
 
 ## The pages
 
@@ -45,9 +45,7 @@ That function is the same object in all three schedulers. What changes between t
 
 ## Where the work runs
 
-A task that calls `collect()` runs the query in the worker process that called it, across that machine's cores. A task that calls `collect(distributed=True, num_workers=N)` schedules it across a Ray cluster and returns when the result is back; the scheduler's worker is then a driver holding a handle, not a machine doing the work.
-
-The choice is one argument and it does not change the pipeline, so it is reasonable to leave it as a parameter of the task and decide per environment. {doc}`/user-guide/operate/running/index` covers sizing, and {doc}`/integrations/compute/schedulers` covers what Batcher reads from an HPC or cloud batch allocation when it lands inside one.
+A task that calls `collect()` runs the query in the worker process that called it, across that machine's cores. A task that calls `collect(distributed=True, num_workers=N)` schedules it across a Ray cluster, and the scheduler's worker becomes a driver holding a handle. The choice is one argument that doesn't change the pipeline, so leave it as a task parameter and decide per environment. {doc}`/user-guide/operate/running/index` covers sizing, and {doc}`/integrations/compute/schedulers` covers what Batcher reads from an HPC or cloud batch allocation when it lands inside one.
 
 ## See also
 

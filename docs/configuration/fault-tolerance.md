@@ -1,12 +1,21 @@
 # Fault-tolerance options
 
-This page documents the `fault_tolerance` configuration section: what Batcher does when nodes and devices fail underneath a running job. The `distributed` section tunes a cluster that mostly works. This one tunes what happens when it doesn't.
+This page documents the `fault_tolerance` configuration section: what Batcher does when nodes and devices fail underneath a running job.
 
-Both mechanisms are on by default and sized so a healthy fleet never notices them. The quarantine thresholds are permissive enough that ordinary noise never trips them, and the retry budget is generous enough that only a systematically broken run exhausts it. {doc}`/user-guide/operate/running/unstable-nodes` is the task-oriented walkthrough, and this page is the field reference.
+Both mechanisms are on by default and sized so a healthy fleet never notices them. {doc}`/user-guide/operate/running/unstable-nodes` is the task-oriented walkthrough, and this page is the field reference.
+
+```python
+from batcher import Config
+
+ft = Config().fault_tolerance
+print(ft.retry_budget_fraction, ft.retry_budget_floor, ft.quarantine.failure_threshold)
+# 0.1 16 3.0
+```
+
+Tighten the retry budget by deriving a new config:
 
 ```python
 import dataclasses
-from batcher import Config
 
 base = Config()
 cfg = base.replace(
@@ -14,6 +23,16 @@ cfg = base.replace(
 )
 print(cfg.fault_tolerance.retry_budget_fraction)
 # 0.05
+```
+
+Or change one field by its dotted name, for the length of a block:
+
+```python
+from batcher.config import get_option, option_context
+
+with option_context("fault_tolerance.quarantine.failure_threshold", 5.0):
+    print(get_option("fault_tolerance.quarantine.failure_threshold"))
+# 5.0
 ```
 
 ## Top level
@@ -24,27 +43,15 @@ print(cfg.fault_tolerance.retry_budget_fraction)
 | `retry_budget_floor` | `16` | Retries authorized regardless of job size, so a short job is not failed by one flaky node. |
 | `fail_on_untrusted_results` | `True` | Fail the run when a device reports a fault that corrupts data already computed on it, rather than retrying past it. |
 
-These fields are the
-{py:class}`FaultToleranceConfig <batcher.config.FaultToleranceConfig>` dataclass, with the
-nested quarantine section below.
+These fields are the {py:class}`FaultToleranceConfig <batcher.config.FaultToleranceConfig>` dataclass, with the nested quarantine section below.
 
-A per-task retry limit bounds a task and bounds nothing about a job. `task_max_retries=2` over
-a hundred thousand partitions authorizes two hundred thousand retries, and a fleet broken in
-some way no probe catches will use every one of them. What you see then is a run that takes
-hours at a fraction of its rate and fails with whatever error happened to be last, long after
-the first one said exactly what was wrong. The budget is what turns that into a bounded loss.
+A per-task retry limit bounds a task, not a job. The budget caps retries across the whole job, so a fleet broken in a way no probe catches fails fast with the first clear error instead of retrying for hours.
 
-`fail_on_untrusted_results` is not a performance trade. Almost every failure loses work, and
-losing work is what a retry is for; a double-bit or uncontained ECC fault does something else,
-because the device kept running and returned a wrong number. Retrying past one produces a job
-that completes successfully and writes out the corruption.
+`fail_on_untrusted_results` guards against a double-bit or uncontained ECC fault, where the device kept running and returned a wrong number. Retrying past one would write the corruption out, so the run fails instead.
 
 ## Quarantine
 
-Which nodes and devices stop being scheduled, learned from task outcomes rather than from
-telemetry. Telemetry catches the failures hardware knows how to report; these thresholds catch
-the ones it doesn't, such as a driver that no longer matches its runtime, a half-deployed
-container image, or a disk that has started returning `EIO`.
+Which nodes and devices stop being scheduled, learned from task outcomes rather than telemetry. This catches the failures hardware can't report, such as a mismatched driver, a half-deployed container image, or a disk returning `EIO`.
 
 | Field | Default | Meaning |
 |-------|---------|---------|
@@ -57,24 +64,13 @@ container image, or a disk that has started returning `EIO`.
 
 These fields are the {py:class}`QuarantineConfig <batcher.config.QuarantineConfig>` dataclass.
 
-`max_blocked_fraction` is the safety valve on the whole mechanism. When the cause is systemic,
-such as an expired credential or a model file that returns 404, every node fails every task.
-Without a cap the ledger condemns the entire cluster in the first minute and turns a degraded
-job into a dead one. Past the cap only the worst offenders stay quarantined, and the run
-reports that the failures have gone systemic.
+`max_blocked_fraction` is the safety valve. When every node fails every task, such as with an expired credential, the cap stops the ledger from condemning the whole cluster, and the run reports that the failures have gone systemic.
 
-Failures are weighted by cause. A failure that blames the placement, such as a device fault or
-a filesystem error, counts fully. One that doesn't, such as an accelerator running out of
-memory or a throttled model endpoint, counts nothing at all: quarantining a node over the
-workload's own behavior would take out the next node the retry lands on too.
+::::{dropdown} How failures are weighted
+Failures are weighted by cause. A failure that blames the placement, such as a device fault or a filesystem error, counts fully. One that doesn't, such as an accelerator running out of memory or a throttled model endpoint, counts nothing, because the next node the retry lands on would hit it too.
 
-The cause is read from the exception's type and message, walking the cause chain, because the
-real error arrives wrapped by an SDK, an HTTP client, or Ray. Object-store throttling is
-matched by code as well as by phrase: `SlowDown` on S3, `RateLimitExceeded` on Google Cloud
-Storage, `ServerBusy` and `TooManyRequests` on Azure. That is what makes a large write survive
-a prefix being pushed harder than it will take. An unrecognized failure is treated as the
-workload's own and is not retried, because wrongly retrying a deterministic bug across a fleet
-costs the whole recovery budget and hides the real error.
+The cause is read from the exception's type and message, walking the cause chain, because the real error usually arrives wrapped by an SDK, an HTTP client, or Ray. Object-store throttling is matched by code as well as by phrase: `SlowDown` on S3, `RateLimitExceeded` on Google Cloud Storage, `ServerBusy` and `TooManyRequests` on Azure. An unrecognized failure is treated as the workload's own and is not retried, so a deterministic bug doesn't spend the recovery budget across the fleet.
+::::
 
 ## See also
 

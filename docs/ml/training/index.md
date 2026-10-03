@@ -2,13 +2,13 @@
 
 This section covers the two ends of the model lifecycle that sit outside inference: feeding a training loop, and reaching a model that is served somewhere else.
 
-Batcher doesn't run your deep-learning training loop or host your endpoints. It owns the data on both sides of them. That is where most of the operational pain lives. A training run at 512 ranks is mostly a data problem, because every rank needs a disjoint slice, the same number of batches, and an order it can reproduce after a crash. A backfill against a served model is a batching and retry problem. Both are data-plane work, and the trainer and the server see ready tensors and well-sized requests.
+Batcher doesn't run your training loop or host your endpoints. It owns the data on both sides of them. Every rank of a training run needs a disjoint slice, the same number of batches, and an order it can reproduce after a crash. A backfill against a served model needs batching and retries. Batcher does both, so the trainer and the server see ready tensors and well-sized requests.
 
 ## Training ingest that survives a restart
 
-{py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` hands each PyTorch rank an `IterableDataset` over its slice of one global order, and holds four guarantees. Every rank yields the same number of batches, so none stalls the all-reduce. The order depends only on `seed` and `epoch`, not on `world_size`, so a job that dies on 64 GPUs resumes on 32 against the same permutation. Passing `global_consumed` from a checkpoint resumes mid-epoch with no repeated or skipped samples. No coordinator sits in the middle.
+{py:meth}`ds.ml.stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` hands each PyTorch rank an `IterableDataset` over its slice of one global order. Every rank yields the same number of batches, the order depends only on `seed` and `epoch` rather than `world_size`, and passing `global_consumed` from a checkpoint resumes mid-epoch with no repeated or skipped samples.
 
-The shuffle behind it is a keyed pseudorandom bijection, not a stored index list. A shuffled list of 10 billion indices would need about 280 GB of driver RAM before a row is read. The bijection needs constant memory. Seeking is one computation. You can inspect the order directly:
+The order is a computed permutation, not a stored index list, so it costs constant memory at any corpus size:
 
 ```python
 from batcher.ml import epoch_order
@@ -19,13 +19,41 @@ print(epoch_order(8, seed=42, epoch=1))
 # [4, 0, 6, 5, 7, 3, 1, 2]
 ```
 
-The shuffle is exact over the whole corpus, where WebDataset and MosaicML Streaming shuffle shards plus a local buffer.
+Each rank gets a disjoint, equal-sized share of that order:
 
-`stream_loader` keeps one rank's slice resident. Once a slice outgrows memory, {py:meth}`ds.ml.write_shards <batcher.api.dataset.ml.DatasetML.write_shards>` writes the corpus to Arrow IPC shards and {py:func}`shard_stream_loader <batcher.ml.shard_stream_loader>` streams them back with the same balanced, resumable per-rank order and a bounded shard cache, trading the global shuffle for a seeded shuffle of shards and of rows within them. A single-process loop gets tensors from {py:meth}`ds.ml.iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`, which reached 1.06 M rows/s with zero-copy DLPack views and no shuffle on an 8xT4 cluster.
+```python
+from batcher.ml import rank_index_batches
+
+for rank in (0, 1):
+    print(rank, list(rank_index_batches(8, batch_size=2, world_size=2, rank=rank, seed=42)))
+# 0 [[6, 7], [2, 0]]
+# 1 [[4, 3], [5, 1]]
+```
+
+Resuming after four samples skips exactly what was consumed:
+
+```python
+print(list(rank_index_batches(8, batch_size=2, world_size=2, rank=0, seed=42, global_consumed=4)))
+# [[2, 0]]
+```
+
+A framework-free loop takes NumPy batches:
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"x": list(range(6)), "y": [0, 1] * 3})
+for batch in ds.ml.to_numpy_batches(batch_size=4):
+    print(batch["x"].tolist())
+# [0, 1, 2, 3]
+# [4, 5]
+```
+
+Once a slice outgrows memory, {py:meth}`ds.ml.write_shards <batcher.api.dataset.ml.DatasetML.write_shards>` writes Arrow IPC shards and {py:func}`shard_stream_loader <batcher.ml.shard_stream_loader>` streams them back with the same balanced, resumable per-rank order. A single-process loop gets tensors from {py:meth}`ds.ml.iter_torch_batches <batcher.api.dataset.ml.DatasetML.iter_torch_batches>`, which reaches 1.06 M rows/s with zero-copy DLPack views on an 8xT4 cluster.
 
 ## Calling a served model
 
-When another team owns the model, or the same endpoint must also serve online traffic, call it instead of loading it. The adapters in `batcher.ml.serving`, such as `triton_client`, are load-once class UDFs for {py:meth}`ds.ml.map_batches <batcher.api.dataset.ml.DatasetML.map_batches>`. Preprocessing stays on CPU workers, requests are sized to the server's batch window, and results come back in input order. Still, load the weights in the worker whenever you can. A 10-million-row backfill through an HTTP endpoint is 10 million round trips.
+When another team owns the model, or the same endpoint also serves online traffic, call it instead of loading it. The adapters in `batcher.ml.serving`, such as `triton_client`, are load-once class UDFs for {py:meth}`ds.map_batches <batcher.Dataset.map_batches>`. Requests are sized to the server's batch window and results come back in input order. When you can load the weights in the worker, prefer that: it skips a network round trip per batch.
 
 ## In this section
 

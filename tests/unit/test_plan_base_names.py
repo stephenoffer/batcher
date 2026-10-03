@@ -96,3 +96,35 @@ def test_an_unrenamed_plan_is_unchanged():
         .agg(s=col("a").sum())
     )
     assert ndv_columns(ds._plan) == {"a", "b"}
+
+
+def _lists():
+    return bt.from_pydict({"k": [1, 2], "qs": [[1.0], [2.0, 3.0]], "a": [1.0, 2.0]})
+
+
+def test_a_name_an_explode_keeps_is_not_the_source_list_column():
+    # `explode("qs")` keeps the name `qs` for the *elements*. Resolved as "stands for itself"
+    # it named the source's list column, and the post-run learner sketched whole lists --
+    # 210 ms of a 4 ms query's first run. Positive control: the same group-by over the list
+    # column itself, with no explode, does collect `qs`.
+    assert "qs" in ndv_columns(_lists().group_by("qs").agg(n=col("k").count())._plan)
+    exploded = _lists().explode("qs").group_by("qs").agg(n=col("k").count())._plan
+    assert "qs" not in ndv_columns(exploded)
+    assert "qs" not in column_bounds_needed(exploded)
+    assert "" not in ndv_columns(exploded) | column_bounds_needed(exploded)
+
+
+def test_a_column_carried_through_an_explode_still_resolves():
+    plan = _lists().explode("qs").filter(col("k") > 1).filter(col("a") == 2.0)._plan
+    assert {"k", "a"} <= column_bounds_needed(plan)
+    assert "a" in ndv_columns(plan)
+
+
+def test_the_columns_an_unpivot_creates_have_no_base_column():
+    ds = bt.from_pydict({"k": [1, 2], "value": [5.0, 6.0], "b": [3.0, 4.0]})
+    plan = ds.unpivot(index="k", on=["value", "b"]).filter(col("value") > 1)
+    plan = plan.group_by("variable", "k").agg(n=col("value").count())._plan
+    needed = column_bounds_needed(plan) | ndv_columns(plan)
+    # `value` is also a source column here, which is what makes the shadowing observable.
+    assert "value" not in needed and "variable" not in needed
+    assert "k" in needed

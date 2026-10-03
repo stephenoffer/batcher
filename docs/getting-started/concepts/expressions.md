@@ -1,6 +1,6 @@
 # Expressions run in Rust
 
-You describe column work in Python, and Rust does it. An {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` built from {py:obj}`bt.col(...) <batcher.col>` and {py:obj}`bt.lit(...) <batcher.lit>` is a *description* of a computation, not a loop. When the plan runs, the Rust data plane evaluates it over whole Arrow batches with vectorized kernels. Numeric filters and projections go further: the engine compiles them to native code with Cranelift once per query shape, and falls back to the interpreter for anything the compiler doesn't cover. No part of it walks rows in Python.
+You describe column work in Python, and Rust does it. An {py:class}`Expr <batcher.plan.expr_ir.core.Expr>` built from {py:obj}`bt.col(...) <batcher.col>` and {py:obj}`bt.lit(...) <batcher.lit>` is a *description* of a computation, not a loop. The engine evaluates it over whole Arrow batches with vectorized kernels, and compiles numeric filters and projections to native code with Cranelift.
 
 ```python
 import batcher as bt
@@ -12,7 +12,7 @@ print(ds.select(scaled=total).to_pydict())
 # {'scaled': [10, 20, 30, 40]}
 ```
 
-Operators such as `+`, `==`, and `&`, methods such as `.sum()` and `.cast(...)`, and every accessor namespace build up the same expression tree. Python ships that tree to the engine as part of the plan, and the optimizer can reason about it: push a filter into a Parquet scan, drop a column nobody reads, or fold a constant before any data moves. None of that is possible with a Python lambda, which the optimizer can't see inside.
+Because the expression ships inside the plan, the optimizer can push a filter into a Parquet scan, drop a column nobody reads, or fold a constant before any data moves. A Python lambda is opaque to it.
 
 The difference is easiest to see stage by stage, with the same multiply-by-ten written both ways:
 
@@ -20,13 +20,43 @@ The difference is easiest to see stage by stage, with the same multiply-by-ten w
 
 ## Conditionals and reuse
 
-An expression is a value, so you build it once and reuse it in `select`, `with_columns`, `filter`, or an aggregate. Conditionals read like SQL's `CASE WHEN`:
+An expression is a value. Build it once and reuse it in `select`, `with_columns`, `filter`, or an aggregate:
+
+```python
+big = bt.col("x") > 2
+print(ds.filter(big).to_pydict())
+# {'x': [3, 4]}
+print(ds.select(big=big).to_pydict())
+# {'big': [False, False, True, True]}
+```
+
+Conditionals read like SQL's `CASE WHEN`:
 
 ```python
 grades = bt.from_pydict({"score": [91, 72, 55]})
 grade = bt.when(bt.col("score") >= 80).then(bt.lit("A")).otherwise(bt.lit("B"))
 print(grades.select(grade=grade).to_pydict())
 # {'grade': ['A', 'B', 'B']}
+```
+
+## Nulls, casts, and windows
+
+Null handling and casts are methods on the expression:
+
+```python
+n = bt.from_pydict({"v": [1, None, 3]})
+print(n.select(v=bt.col("v").fill_null(0), missing=bt.col("v").is_null()).to_pydict())
+# {'v': [1, 0, 3], 'missing': [False, True, False]}
+print(ds.select(f=bt.col("x").cast("float64")).to_pydict())
+# {'f': [1.0, 2.0, 3.0, 4.0]}
+```
+
+Any aggregate becomes a window function with `.over(...)`, keeping every row:
+
+```python
+sales = bt.from_pydict({"g": ["a", "b", "a"], "v": [1, 2, 3]})
+print(sales.with_columns(group_total=bt.col("v").sum().over(partition_by="g")).to_pydict())
+# {'g': ['a', 'b', 'a'], 'v': [1, 2, 3], 'group_total': [4, 2, 4]}
 ```
 
 ## Accessors match the column type
@@ -55,7 +85,21 @@ print(
 
 ## When you need your own Python
 
-Some work has no expression, such as calling a model or a library you already have. {py:meth}`map_batches <batcher.Dataset.map_batches>` runs your function on a whole batch at a time, as a PyArrow, pandas, or NumPy batch, so the per-call overhead is paid once per batch rather than once per row. Reach for it after checking the expression surface, because an expression stays visible to the optimizer and a function does not.
+Some work has no expression, such as calling a model or a library you already have. {py:meth}`map_batches <batcher.Dataset.map_batches>` runs your function on a whole Arrow batch at a time, so the call overhead is paid once per batch rather than once per row:
+
+```python
+import pyarrow.compute as pc
+
+
+def add_tax(batch):
+    return batch.append_column("tax", pc.multiply(batch.column("x"), 0.5))
+
+
+print(ds.map_batches(add_tax).to_pydict())
+# {'x': [1, 2, 3, 4], 'tax': [0.5, 1.0, 1.5, 2.0]}
+```
+
+Reach for an expression first: it stays visible to the optimizer, and a function does not.
 
 ## See also
 

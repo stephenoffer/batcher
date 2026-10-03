@@ -381,6 +381,26 @@ def test_on_bad_lines_default_still_refuses() -> None:
 
 
 @pytest.mark.parametrize(
+    "message",
+    [
+        "CSV parse error: Expected 2 columns, got 3: 2,2,",
+        # pyarrow names the row when it knows it; the 3.11 Anyscale image's build does.
+        "CSV parse error: Row #3: Expected 2 columns, got 3: 2,2,",
+    ],
+)
+def test_a_ragged_line_is_diagnosed_with_or_without_its_row_number(message: str) -> None:
+    """Both spellings of pyarrow's ragged-row failure get the ragged-row advice.
+
+    Matching only the bare form sent the row-numbered one to the type-mismatch error, whose
+    fix (declare the column's type) does nothing for a line with the wrong field count.
+    """
+    from batcher.io.formats.structured._csv_diagnostics import mismatch_reported
+
+    with pytest.raises(FormatError, match="on_bad_lines='skip'"), mismatch_reported("t.csv"):
+        raise pa.ArrowInvalid(message)
+
+
+@pytest.mark.parametrize(
     ("kw", "pointer"),
     [("mode", "on_bad_lines='skip'"), ("ignore_errors", "on_bad_lines='skip'")],
 )

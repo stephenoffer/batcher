@@ -50,9 +50,15 @@ impl InflightGauge {
     /// proof pass while the bound it certifies was not being enforced.
     pub(crate) fn on_ack(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        let _ = self
-            .current
-            .fetch_update(Relaxed, Relaxed, |c| Some(c.saturating_sub(1).max(0)));
+        // A CAS loop rather than `fetch_update`, which Rust 1.99 deprecates in favour of
+        // `try_update` -- and that is newer than this workspace's 1.89 MSRV.
+        let mut cur = self.current.load(Relaxed);
+        while let Err(seen) =
+            self.current
+                .compare_exchange_weak(cur, cur.saturating_sub(1).max(0), Relaxed, Relaxed)
+        {
+            cur = seen;
+        }
     }
 
     /// One credit-grant control message arrived from the consumer (independent of

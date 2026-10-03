@@ -194,16 +194,26 @@ pub(crate) fn gather_join_output(
     // ordering question at all — `par_iter().collect()` keeps `output` order. It is worth doing:
     // on a 20M-row self-join this loop was 2.1s of a 4.0s join, the single largest serial block
     // in the whole query, while the hash build and probe beside it were already parallel.
+    //
+    // A side gathered by exactly `0, 1, .., n-1` reproduces its columns, so they are shared
+    // rather than copied -- the check `gather_join_output_with` makes, missing here. Every
+    // as-of join emits each left row once and in order, so its whole left side was a copy:
+    // 1M left rows over two columns, every query.
+    let left_ident = is_identity_permutation(&idx.left, left.num_rows());
+    let right_ident = is_identity_permutation(&idx.right, right.num_rows());
     let columns: Vec<ArrayRef> = output
         .par_iter()
         .map(|col| -> Result<ArrayRef, InterpError> {
-            let (batch, indices) = match col.side {
-                JoinSide::Left => (left, &idx.left),
-                JoinSide::Right => (right, &idx.right),
+            let (batch, indices, ident) = match col.side {
+                JoinSide::Left => (left, &idx.left, left_ident),
+                JoinSide::Right => (right, &idx.right, right_ident),
             };
             let source = batch
                 .column_by_name(&col.name)
                 .ok_or_else(|| InterpError::UnknownJoinColumn(col.name.clone()))?;
+            if ident {
+                return Ok(Arc::clone(source));
+            }
             gather_column(source.as_ref(), indices)
         })
         .collect::<Result<_, _>>()?;
@@ -296,6 +306,12 @@ fn is_identity_permutation(indices: &UInt32Array, rows: usize) -> bool {
             .all(|(i, &v)| v as usize == i)
 }
 
+/// Source rows per selected row past which [`ascending_selection`] leaves the column to the
+/// gather. A mask costs a bit per source row to clear and count; a gather costs a copy per
+/// selected row per column, so one selected row in 32 is still a small mask, and a sparser
+/// selection is cheaper gathered whatever the column count.
+const SELECTION_MAX_SPARSITY: usize = 32;
+
 /// A filter predicate equivalent to gathering by `indices`, when `indices` is **strictly
 /// ascending** and null-free over a `rows`-row source.
 ///
@@ -310,11 +326,22 @@ fn is_identity_permutation(indices: &UInt32Array, rows: usize) -> bool {
 ///
 /// `None` for anything else, including a descending or repeating index (a one-to-many match),
 /// which leaves the gather in charge. Deciding costs one pass over a morsel-sized `u32` buffer.
+///
+/// `None` too for a selection sparser than one row in [`SELECTION_MAX_SPARSITY`]: the mask is
+/// as long as the *source*, so its cost is the source's length, while the gather's is the
+/// selection's. That is the build side of a streamed join, whose source is the whole resident
+/// relation and whose matches in one probe morsel are a morsel's worth. When both sides are
+/// ordered on the key (`lineitem JOIN orders`) those matches are strictly ascending, and without
+/// this bound every 16K-row morsel set, counted and filtered a mask over all of `orders`: at
+/// TPC-H sf1000 that was hundreds of millions of bits per morsel, and the largest cost of q12.
 fn ascending_selection(
     indices: &UInt32Array,
     rows: usize,
 ) -> Option<arrow::compute::FilterPredicate> {
-    if indices.null_count() > 0 || indices.is_empty() {
+    if indices.null_count() > 0
+        || indices.is_empty()
+        || rows > indices.len().saturating_mul(SELECTION_MAX_SPARSITY)
+    {
         return None;
     }
     let idx = indices.values();
@@ -678,6 +705,24 @@ mod tests {
         assert!(ascending_selection(&UInt32Array::from(Vec::<u32>::new()), 4).is_none());
     }
 
+    /// A selection is a filter only while its mask, a bit per *source* row, is small beside it.
+    /// A morsel's matches in a resident build side many times its size are gathered instead:
+    /// the ascending, null-free shape below qualified before the bound and cost a mask over
+    /// the whole source per morsel. One row in [`SELECTION_MAX_SPARSITY`] is the edge.
+    #[test]
+    fn a_sparse_selection_over_a_large_source_is_gathered() {
+        let picks: Vec<u32> = (0..1_000u32).map(|i| i * 100).collect();
+        let sparse = UInt32Array::from(picks.clone());
+        assert!(ascending_selection(&sparse, 100_000).is_none());
+        let edge = 1_000 * SELECTION_MAX_SPARSITY;
+        let dense: Vec<u32> = (0..1_000u32)
+            .map(|i| i * SELECTION_MAX_SPARSITY as u32)
+            .collect();
+        let dense = UInt32Array::from(dense);
+        assert!(ascending_selection(&dense, edge).is_some());
+        assert!(ascending_selection(&dense, edge + 1).is_none());
+    }
+
     /// A band range join's two conditions name the *same* right column, and the band
     /// algorithm in `bc-runtime` detects that by `Arc::ptr_eq` on the two key arrays. That
     /// only works because `columns_by_name` hands out `Arc` clones rather than copies, so
@@ -751,6 +796,8 @@ mod tests {
         )
         .expect("gather");
         assert_eq!(out.column(0).as_ref(), left.column(0).as_ref());
+        // Shared, not copied: an equal copy passes the line above, and copying was the cost.
+        assert!(Arc::ptr_eq(out.column(0), left.column(0)));
 
         // A shorter buffer selects a subset, so it must not be treated as the identity.
         assert!(!is_identity_permutation(

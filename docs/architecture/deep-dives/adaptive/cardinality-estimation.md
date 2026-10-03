@@ -2,17 +2,11 @@
 
 This page describes how Kyber estimates the rows a plan will produce, how it tracks how far to trust each estimate, and how measured runs correct it.
 
-Every cost-based decision the optimizer makes rests on one number: how many rows will this
-subtree produce? Join order, build-side choice, broadcast eligibility, memory admission,
-worker fan-out. All of them are downstream of a row count nobody has counted yet.
-
-The number is usually wrong. The discipline is in knowing *how* wrong, and in never letting
-an inexact number answer a question that demands an exact one.
+Join order, build side, broadcast eligibility, memory admission, and worker fan-out all rest on one number: how many rows will this subtree produce? The number is usually a guess. The discipline is in knowing how good the guess is, and in never letting an inexact number answer a question that demands an exact one.
 
 ## Provenance
 
-Every estimate carries a tag saying where it came from. This is the single most important
-type in the estimator.
+Every estimate carries a tag saying where it came from, ordered strongest-first so trust composes with `max`:
 
 ```python
 # docs: skip
@@ -25,36 +19,11 @@ class Provenance(IntEnum):
     DEFAULT = 4  # Selinger heuristic / an unconstrained guess
 ```
 
-Ordered strongest-first, so trust composes with `max`. There is exactly one combiner:
-
-```python
-# docs: skip
-def weakest(*provenances) -> Provenance:  # == max(provenances)
-```
-
 :::{important}
-No call site may hand-set `EXACT` on a derived facet. That one rule is the firewall: a statistic
-can only ever be *weakened* as it propagates up a plan. It is what lets the metadata-answer path
-(`count()` from a Parquet footer, `min()` from a zone map) short-circuit a query without ever
-risking a wrong answer. An inexact statistic may inform cost. It may never answer an exact
-terminal.
+No call site may hand-set `EXACT` on a derived facet, so a statistic can only be *weakened* as it propagates up a plan. That is what lets `count()` from a Parquet footer or `min()` from a zone map short-circuit a query safely. An inexact statistic may inform cost. It may never answer an exact terminal.
 :::
 
-```text
-   strongest ──────────────────────────────────────────────────────► weakest
-   EXACT        HISTOGRAM        SKETCH        LEARNED        DEFAULT
-   a footer,    a KLL / t-digest HLL / Count-  a prior from   a Selinger
-   a manifest   quantile sketch  Min, approx   a past run     heuristic
-
-
-        aggregate     est≈8      (default)   ◄── the weakest input wins
-            │
-        filter        est≈1,900  (default)   ◄── derived, so no longer exact
-            │
-        scan          est≈2,000  (exact)     ◄── an in-memory source: the count is known
-```
-
-You can see it in `explain()`:
+You can read the tags in `explain()`:
 
 ```python
 import batcher as bt
@@ -68,69 +37,46 @@ query plan (planned)                                    3 operators
 ───────────────────────────────────────────────────────────────────
 OPERATOR                         ESTIMATE  NOTES
 aggregate  [by g · count_star]      est≈8  (default)
-└─ filter  [x > 100]            est≈1,900  (default)
+└─ filter  [x > 100]              est≈667  (default)
    └─ scan  [source 0]          est≈2,000  (exact)  pushed[x > 100]
 ```
 
-The scan is `exact`: an in-memory source with a known row count. The filter's number is close,
-because the source's exact `[min, max]` bounds let a range predicate be interpolated, but it is
-derived rather than counted, so it can't inherit `exact`. The aggregate inherits the weakest
-tag below it. On a repeated run of a shape the hub has measured, the same tree shows `sketch`
-or `learned` above the leaves.
+The scan is `exact` because an in-memory source knows its row count. The filter above it is derived, so it can't inherit `exact`, and the aggregate takes the weakest tag below it.
 
-## Cold start: Selinger
+## Cold start: Selinger constants
 
-With nothing measured, the estimator falls back to constants that have been the industry's
-answer since System R. They live in {py:class}`CardinalityConfig <batcher.config.config.CardinalityConfig>`:
+With nothing measured, the estimator falls back to the System R constants in {py:class}`CardinalityConfig <batcher.config.config.CardinalityConfig>`:
 
 ```python
-# docs: skip
-eq_selectivity: float = 0.1  # col = literal
-range_selectivity: float = 1.0 / 3.0  # col < | <= | > | >= literal
-null_selectivity: float = 0.05  # col IS NULL
-substring_selectivity: float = 0.05  # LIKE '%x%' / contains / regex
-prefix_selectivity: float = 0.10  # LIKE 'x%' / starts_with / ends_with
-default_filter_selectivity: float = 0.5
+import batcher as bt
+
+c = bt.CardinalityConfig()
+print(c.eq_selectivity, c.range_selectivity)          # 0.1 0.3333333333333333
+print(c.substring_selectivity, c.prefix_selectivity)  # 0.05 0.1
 ```
 
-The string-pattern ones earn their place. Without a string histogram a `LIKE '%green%'` is
-genuinely unknowable, and 0.05 is a prior about workloads rather than a property of the data:
-analytic substring filters are usually selective. It is wrong for the queries that search for
-a common pattern, such as a validation check for `'@'` in an email column or a routing rule on
-a shared URL prefix, which can keep most of the table. The learned selectivity corrects such a
-filter after its first run. Falling back to 0.5 made Kyber believe TPC-H Q9's
-`p_name LIKE '%green%'` kept 100k of 200k parts (it keeps 10.7k), which hid the most
-selective join in the query and steered the order into gigabyte intermediates.
+A `LIKE '%x%'` is unknowable without a string histogram, so 0.05 is a prior about workloads: analytic substring filters are usually selective. After one run, the measured selectivity replaces it:
 
-`unknown_rows = 1e12` is not an estimate. It is a sentinel meaning "unbudgeted", and the
-downstream consumers know it: `annotate.py` refuses to budget memory for a plan whose rows
-are at or above it, and the aggregate/distinct estimators deliberately do not *shrink* it,
-because shrinking a placeholder would make an unbudgeted guess look like a real, admissible
-estimate.
+```python
+import batcher as bt
+
+names = bt.from_pydict({"name": [f"n{i}" for i in range(2000)]})
+q = names.filter(bt.col("name").str.contains("7"))
+print(q.collect().num_rows)  # 542
+print(q.explain())           # the filter now reads est≈542 (learned), not est≈100 (default)
+```
+
+`unknown_rows = 1e12` is a sentinel meaning "unbudgeted", not an estimate. Memory admission refuses to budget a plan at or above it, and the aggregate estimators never shrink it into something that looks admissible.
 
 ## Composing predicates
 
-Two conjuncts are almost never independent. `country = 'US' AND state = 'CA'` multiplied
-naively gives 0.01. The real figure is nearer 0.1, because the second predicate implies the first.
-
-`kyber/stats/selectivity/combine.py` uses exponential backoff over the ascending-sorted
-selectivities rather than a product:
+Two conjuncts are rarely independent: `country = 'US' AND state = 'CA'` multiplied naively gives 0.01 where the truth is nearer 0.1. `kyber/stats/selectivity/combine.py` uses exponential backoff over the ascending-sorted selectivities instead:
 
 ```text
 s₁ · s₂^(1/2) · s₃^(1/4) · …
 ```
 
-The most selective conjunct counts fully, and each subsequent one is damped by a further
-square root. Because every exponent is at most 1, the result is never below the independence
-product and never above the most selective conjunct alone, which is the true selectivity's
-upper bound: `P(A and B) <= min(P(A), P(B))`. The independence product is *not* a lower bound
-on the truth. The true lower bound is Frechet's, `max(0, P(A) + P(B) - 1)`, and two mutually
-exclusive predicates reach it at 0. Backoff is a heuristic that assumes positive correlation,
-which makes it dramatically less wrong than independence on correlated columns, the common
-case in real schemas, and makes it overestimate exclusive predicates. Two range
-conjuncts on the same column are recognized first and combined as a single interval, since
-two bounds on one column carve one range rather than two independent predicates. `OR` uses
-honest inclusion-exclusion. `NOT` subtracts the null mass first, because SQL keeps only TRUE.
+The most selective conjunct counts fully and each further one is damped by another square root, so the result sits between the independence product and the most selective conjunct alone. Two range conjuncts on one column are combined as a single interval first. `OR` uses inclusion-exclusion, and `NOT` subtracts the null mass first, because SQL keeps only TRUE.
 
 ## Joins
 
@@ -140,36 +86,11 @@ honest inclusion-exclusion. `NOT` subtracts the null mass first, because SQL kee
 |L| · |R| / max(d_L, d_R)     capped at the cartesian bound |L| · |R|
 ```
 
-where `d` is the key's distinct count. With a composite key whose combined NDV saturates
-its row count (ratio ≥ 0.95), it short-circuits to `max(|L|, |R|)`, the PK-FK answer of one
-row per FK row. That is an assumption, not a proof of a key. A ratio of 0.95 still allows 5% of
-the rows to share one value, and if the other side is hot on that value too, the output grows
-with the product of the two duplicate counts. Nothing declares uniqueness to the estimator, so
-it can't tell a near-key from a key with one heavy duplicate; the learned correction and the
-adaptive loop are what catch the miss.
+where `d` is the key's distinct count. A composite key whose combined NDV saturates its row count (ratio ≥ 0.95) short-circuits to `max(|L|, |R|)`, the PK-FK answer. With no NDV at all it also returns `max(|L|, |R|)`. A semi join keeps `min(1, d_R/d_L)` of the left rows and an anti join the complement, and outer joins take the appropriate floor.
 
-With no NDV at all it also returns `max(|L|, |R|)`, which assumes many-to-one.
+Resident in-memory sources get source-side HLL NDV on their join keys before the optimizer runs, at no extra I/O (`api/terminal/_metadata.py::seed_column_ndv`). A file-backed source learns its NDV from the post-run pass instead. On TPC-H q5, the learned NDV takes the query from 7,115 ms cold to 300 ms warm.
 
-:::{warning}
-That assumption is the known cold-start failure. A genuinely many-to-many low-NDV join gets
-estimated **64 to 80 times low**, and the join order that follows drives into intermediates of
-12M to 18M rows. TPC-H q5 cold takes 7,115 ms. Warm, with the NDV learned, it takes 300 ms.
-:::
-
-Seeding source-side HLL NDV on base join keys closes that gap before the optimizer runs, but
-only for *resident* sources that are already in memory, where sketching costs no extra I/O
-(`api/terminal/_metadata.py::seed_column_ndv`). A file-backed source is skipped, because
-re-reading it purely to sketch would double the query's I/O, so it still plans blind on its
-first run and learns its NDV from the post-run pass.
-
-A semi join keeps the matched fraction `min(1, d_R/d_L)` of the left rows, and an anti join
-takes the complement, so the two partition `|L|` exactly. Outer joins take the appropriate
-floor, so `left` becomes `max(inner, |L|)`.
-
-Multi-column key sets combine through one shared function, `combine_ndv`, and it uses the
-same exponential-backoff shape.
-
-:::{dropdown} `combine_ndv`, and the bounds it respects
+:::{dropdown} `combine_ndv`, shared by joins, group-by and `DISTINCT`
 ```python
 # docs: skip
 ordered = sorted((d for d in per_column if d > 0), reverse=True)
@@ -180,79 +101,31 @@ for d in ordered:
 return max(1.0, min(combined, cap))
 ```
 
-Bounded below by `max_i d_i` and above by `∏ d_i` (the Fréchet bounds), capped at the
-relation's row count. One definition serves join keys, group-by keys, and `DISTINCT` column
-sets, so they cannot disagree.
+Bounded below by `max_i d_i` and above by `∏ d_i`, capped at the relation's row count. One definition serves join keys, group-by keys, and `DISTINCT` column sets, so they cannot disagree.
 :::
 
 ## Aggregates
 
-A grouped aggregate's row count is the distinct combinations of its group keys, so it shares
-`combine_ndv` with joins and `DISTINCT`. Its *column* statistics are derived separately, in
-`kyber/stats/aggregate_columns.py`, and the distinction that governs them is which outputs
-grouping leaves alone.
+A grouped aggregate's row count is the distinct combinations of its keys, through the same `combine_ndv`. Its *column* statistics are derived in `kyber/stats/aggregate_columns.py`, and the rule that governs them is which outputs grouping leaves alone.
 
-A bare-column group key appears verbatim in the output, holding that column's distinct
-values. Grouping invents no value and drops no extreme, so the key's `min` and `max` carry
-through at the child's provenance. The distinct count does not: the number of groups is an
-estimate, and tagging it exact would let `count_distinct` answer from a guess. The frequency
-distribution does not either, because every group is one row.
+:::{dropdown} What carries through a group-by, and what doesn't
+- A bare-column group key keeps the child's `min` and `max` at the child's provenance. Its distinct count does not stay exact, because the group count is an estimate.
+- Grouping collapses every null key into one group, so the null count is pinned in two cases only: zero nulls in means zero out, and with a single key the nulls become exactly one group. With several keys nothing is claimed.
+- `min`, `max`, `avg` and `median` outputs stay inside their column's range. A per-group count lies between one and the child's row count, and that upper bound is published only when the child's count is exact, because a pruning rule may fold a `HAVING count(*) > n` on it.
+- A global aggregate emits one row, so `count(*)`, `min`, `max`, `sum` and `count_distinct` become constants whenever the child's exact statistics determine them.
 
-The null count is the interesting one, because grouping collapses every null key into a
-single group. The input's count is therefore not the output's, but two cases are still
-pinned:
-
-```python
-# docs: skip
-# python/batcher/kyber/stats/aggregate_columns.py
-if src.null_count == 0:
-    return 0  # no nulls in, none out, for any key count
-return 1 if len(node.group_keys) == 1 else None  # one key: the nulls are one group
-```
-
-With several keys the group is a tuple, so a null in one key can appear in as many groups as
-there are distinct combinations of the others. That is a lower bound rather than a count, and
-a `ColumnStat` records counts, so nothing is claimed. Only an exact input count is used,
-because a derived count is read by the paths that decide whether a predicate is provably
-true, where a guess does not merely mis-plan, it deletes rows.
-
-Dropping the null count outright, which is what the estimator used to do, cost more than a
-missing statistic. A known-zero null count is what `constant_value` and `_predicate_status`
-require before either will call a key provably constant or a predicate provably true, so an
-aggregate erased a proof its own input carried. A relation joined to an aggregate over its
-own single-valued key then cycled through the pushdown phase: the join-key inference rules
-re-derived a predicate the zone-map rule kept deleting, because neither could see that the
-aggregate's key was already pinned. Every rule involved is semantics preserving, so the
-answers stayed correct, and the only symptoms were a "phase did not reach a fixpoint" warning
-and a plan that depended on `OptimizerConfig.fixpoint_iterations`.
-
-A grouped aggregate's *value* outputs vary by group, so none of them is a constant, but two
-families still carry bounds. `min`, `max`, `avg` and `median` of a column return a value
-inside that column's own range whatever the grouping is. A per-group count lies between one
-and the child's row count, and that upper bound is published only when the child's row count
-is exact: an estimated count can be smaller than the truth, and `zonemap_prune_filter` folds
-a `HAVING count(*) > n` whose bound cannot reach `n` into the empty relation. An estimate may
-choose a plan. It may never decide which rows exist.
-
-A global aggregate is the opposite case. It emits exactly one row, and each output becomes a
-constant column whenever the child's exact statistics determine it, so `count(*)`, `min`,
-`max`, `sum` and `count_distinct` can be answered without reading a row.
+The pinned null counts matter beyond estimation: `constant_value` and `_predicate_status` need a known-zero null count before they will call a key constant or a predicate provably true.
+:::
 
 ## Sketches
 
-Once a query has run, sketches from `bc-sketches` supersede the constants. They are all
-`Mergeable` and they all hash with the same fixed seed, so a sketch built on partition 3 of
-worker 7 merges with one built anywhere else:
+Once a query has run, sketches from `bc-sketches` supersede the constants. All of them are `Mergeable` and hash with the same fixed, portable seed, so a sketch built on one worker merges with one built anywhere else:
 
 ```rust
 // crates/bc-sketches/src/lib.rs
 pub(crate) const SEED: bc_arrow::PortableBuildHasher =
     bc_arrow::PortableBuildHasher::with_seed(0x534B_4554_4348_4553);
 ```
-
-The hasher is portable on purpose. It used to be an `ahash::RandomState`, which picks an AES-NI
-backend from the compile-time target features, so two workers built for different CPUs hashed
-the same value differently and merged their registers into a wrong estimate without complaint.
 
 | Sketch | Answers | Default | Error |
 |---|---|---|---|
@@ -261,79 +134,30 @@ the same value differently and merged their registers into a wrong estimate with
 | `FrequentItems` | *find* the hot keys (Misra-Gries) | capacity | ≥ N/(cap+1) guaranteed found |
 | `BloomFilter` | membership (data skipping) | `fp_rate` | one-sided |
 
-What merging "in any order" buys you is not the same for all four, and the line runs where the
-algorithm does. HyperLogLog folds by register-wise max and Bloom by
-bitwise OR. Each of those is associative and commutative on the nose, so any merge order reaches
-a bit-identical state, and two runs' distinct counts are directly comparable. The quantile
-sketches don't work that way. KLL compacts and TDigest re-clusters its centroids, both of which
-depend on what has already been folded in, so a reduce that sees the partials in a different
-order returns a different estimate. [`crates/bc-sketches/tests/merge_order.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-sketches/tests/merge_order.rs) pins both halves:
-bit-identity for the first two, and for the quantile sketches the property a caller actually
-needs, which is that two orders agree to within the sketch's own rank error. Don't write code,
-or a test, that expects a KLL to merge to an identical state.
-
-That line, and what each side of it is asked for:
+HyperLogLog folds by register-wise max and Bloom by bitwise OR, so any merge order reaches a bit-identical state. KLL compacts and TDigest re-clusters, so two merge orders agree only to within the sketch's own rank error, which [`crates/bc-sketches/tests/merge_order.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-sketches/tests/merge_order.rs) pins. `FrequentItems` isn't covered by that test either way. The HLL uses Ertl's improved maximum-likelihood estimator, which needs neither a linear-counting handover nor HyperLogLog++'s bias tables.
 
 ![The sketches behind an estimate, split by how they merge. Two of them reach the same state in any merge order: HyperLogLog, for distinct counts, folds by register-wise max; and Bloom, for membership and data skipping, folds by bitwise OR. ColumnStats' min, max, count and ndv fold the same way, and exact counts from that side feed the cardinality estimate of row counts and per-column stats. The quantile sketches only agree within their own rank error: KLL's merge compacts and TDigest re-clusters its centroids, so two merge orders give two answers. The worst gap measured in rank was 0.0097 for KLL at k equals 200 and 0.0050 for TDigest at compression 100, which is the error those sketches already promise rather than a defect. They feed quantiles and range selectivity. Never assert that a quantile sketch merges to an identical state, and never set out to fix the fact that it does not.](/_static/diagrams/cardinality_sketches.svg)
 
-`FrequentItems` sits on neither side of that line yet. `frequent.rs` argues in its own comments
-that the algorithm is order-independent, because `merge` sums counts and `reduce_to_capacity`
-thresholds on a sorted count, and no test in `merge_order.rs` covers it either way. Treat it as
-unpinned rather than as settled, and don't cite it as an example of either behaviour.
-
-No sketch measures the frequency of a given key. Misra-Gries never over-counts and is
-guaranteed to *contain* every key above `N/(capacity+1)`, which is what the distributed join
-needs: `heavy_hitters` finds the hot keys it salts before the shuffle.
-
-One detail in the HLL is worth knowing. Its estimator is Ertl's improved maximum-likelihood
-form, with the `sigma` and `tau` corrections. That form is continuous and essentially unbiased
-across the whole range, so the sketch needs neither a handover from linear counting, whose
-discontinuity is where a classic HLL picks up a systematic bias, nor HyperLogLog++'s tables of
-empirical bias-correction constants.
-
-### The rule that keeps sketches honest
-
-A distinct count is the one statistic that has to be tracked apart from the rest of its bundle.
-A Parquet footer gives exact min, max, and null counts but never a trustworthy distinct count,
-so the only NDV such a column can carry is an HLL estimate. When a `ColumnStat` carried a single
-provenance for the whole bundle, attaching that estimate to an otherwise `EXACT` column tagged
-the NDV `EXACT` too, which would let an approximate count answer a {py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>`.
-
 :::{important}
-`ColumnStat.ndv_provenance` carries the distinct count's *own* tag, separately from the bundle's
-([`python/batcher/plan/stats.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/stats.py)). A sketched NDV rides alongside exact bounds, and
-`ndv_is_exact` is the gate every exact-answer path reads, so the sketch informs cost while it
-still refuses to answer a terminal. `kyber/stats/columns.py::scan_columns` merges a measured NDV
-onto a column that has none and tags it `SKETCH` whatever the bounds are worth.
+A distinct count carries its own provenance. `ColumnStat.ndv_provenance` tags a sketched NDV separately from the column's exact bounds ([`python/batcher/plan/stats.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/stats.py)), and `ndv_is_exact` is the gate every exact-answer path reads. A sketch informs cost but can never answer a {py:meth}`count_distinct <batcher.plan.expr_ir.core.Expr.count_distinct>`.
 :::
-
-The purely descriptive stats, meaning quantiles, most-common-values, and average bytes, attach
-to any column without disturbing provenance.
 
 ## The correction loop
 
-Structural estimation only gets you so far. The last layer is empirical: Core reports, per
-operator, the rows it actually produced against the rows Kyber estimated *before* correction.
-The geometric mean of that q-error, per operator signature, multiplies the next estimate.
+The last layer is empirical. Core reports, per operator, the rows it produced against the rows Kyber estimated *before* correction, and the geometric mean of that q-error, per operator signature, multiplies the next estimate. A join Kyber under-estimated 8x is next planned for at 8x.
 
-A join Kyber has consistently under-estimated 8× is next planned for at 8×.
+The knobs live on `OptimizerConfig`:
 
-Guardrails: `cardinality_correction_min_samples` (2) before a factor is trusted;
-`cardinality_correction_max_factor` (32) clamps it both ways; `cardinality_correction_window`
-(8) averages only the recent past, because the structural estimator itself sharpens as NDVs
-accumulate and an all-history mean would keep applying a correction it has outgrown.
+```python
+import batcher as bt
 
-`_CORRECTABLE` is `(Aggregate, Distinct, Join, MapBatches, Unnest)`. `Filter` is excluded on
-purpose, because its selectivity is already learned per-signature and correcting it again
-would count the same error twice. `Scan` is excluded because `plan_signature` structures every
-scan as the bare token `["scan"]`, so all scans in a process would collide on one entry.
+opt = bt.active_config().optimizer
+print(opt.cardinality_correction_min_samples)  # 2
+print(opt.cardinality_correction_max_factor)   # 32.0
+print(opt.cardinality_correction_window)       # 8
+```
 
-`MapBatches` belongs for the same reason as `Unnest`. A UDF may filter, explode, or pass rows
-through one for one, and which one it does is a property of the code rather than of the plan,
-so the structural estimator can only assume 1:1. That is safe to correct only because a
-`map_batches` signature carries the UDF's identity by qualified name
-(`kyber.signature._udf_identity`), so one UDF's learned fan-out cannot answer for another's.
-An anonymous lambda still collides, and that is the floor.
+A factor needs two samples before it's trusted, is clamped to 32x either way, and averages only the last eight runs, because the structural estimator sharpens as NDVs accumulate. `_CORRECTABLE` is `(Aggregate, Distinct, Join, MapBatches, Unnest)`. `Filter` is left out because its selectivity is already learned per signature. `MapBatches` qualifies because its signature carries the UDF's qualified name, so one UDF's fan-out can't answer for another's.
 
 ## Cold and warm, side by side
 
@@ -362,26 +186,13 @@ provenance: SKETCH / LEARNED. The same q5 takes 300 ms.
 :::
 ::::
 
-## Limits
+## Practical limits
 
-The estimator has no multi-column histograms and no correlation model. Exponential backoff
-is a stand-in for both, and on a query where a filter's columns are strongly correlated it
-will still be off by an order of magnitude on the first run.
+- There are no multi-column histograms and no correlation model. Exponential backoff stands in for both until a run measures the truth.
+- A UDF's or an `Unnest`'s fan-out is structurally unknowable, so the first run assumes rows pass through one for one and the correction loop learns the rest.
+- On a query large enough to stage, the engine also re-plans at a pipeline breaker once it has counted. See {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`.
 
-A UDF's fan-out and an `Unnest`'s fan-out are both structurally unknowable, so the estimator
-assumes rows pass through unchanged and leaves the learned loop to correct them. The first run
-of an exploding `flat_map` is therefore planned as if it explodes not at all.
-
-And the thing every estimator shares: it is a prediction. What makes it survivable is that
-Core measures the truth on every run and feeds it back, and that on a query large enough to
-stage, the engine re-plans at a pipeline breaker once it has counted. See
-{doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`.
-
-## Code map
-
-Each estimate described above has one owning file. Start here when you want to see how
-a number is actually derived:
-
+:::{dropdown} Code map
 | Concern | File |
 |---|---|
 | The estimator | [`python/batcher/kyber/stats/estimator.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/kyber/stats/estimator.py) |
@@ -391,15 +202,15 @@ a number is actually derived:
 | `Provenance`, `RelStats`, `ColumnStat` | [`python/batcher/plan/stats.py`](https://github.com/stephenoffer/batcher/blob/main/python/batcher/plan/stats.py) |
 | The sketches | [`crates/bc-sketches/src/`](https://github.com/stephenoffer/batcher/tree/main/crates/bc-sketches/src) |
 | Cold-start constants | `python/batcher/config/config.py::CardinalityConfig` |
+:::
 
 ## See also
 
 - {doc}`Architecture </architecture/index>`: Kyber's lane, where it decides and never executes or measures.
 - {doc}`Kyber optimizer </architecture/internals/kyber>`: the passes these estimates feed.
-- `docs/architecture/internals/mathematical_foundations.md` (in the repo, not a site page). It is the v1-era design paper with an errata list at its top, and where it and the code differ the code decides. It covers the sketch error bounds, derived.
 - {doc}`Reading a plan </user-guide/operate/tuning/explain-plans>`: the `est≈` and provenance tags in the tree.
-- {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`: what to do when an estimate is badly wrong.
-- {doc}`TPC-H benchmarks </benchmarks/results/tpch>`: q5 and q9, the two queries this page keeps naming.
+- {doc}`Optimizing a slow query </getting-started/tutorials/foundations/optimizing-a-slow-query>`: what to do when an estimate is badly off.
+- {doc}`TPC-H benchmarks </benchmarks/results/tpch>`: the join shapes this page names.
 - {doc}`Cost model </architecture/deep-dives/adaptive/cost-model>`: what consumes these row counts.
 - {doc}`Adaptive re-optimization </architecture/deep-dives/adaptive/adaptive-reoptimization>`: measuring the truth at a breaker.
 - {doc}`Learned metadata </architecture/deep-dives/adaptive/learned-metadata>`: where the NDVs and corrections are stored.

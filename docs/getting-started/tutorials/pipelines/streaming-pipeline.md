@@ -1,11 +1,6 @@
 # A streaming pipeline
 
-Build a continuous pipeline: read an unbounded stream, dedupe it, window it by event time,
-and write each micro-batch out. The point of this tutorial is what you *don't* have to
-learn. Batch is the bounded special case of streaming, so the operators are the ones you
-already know, and only the source and the trigger change.
-
-Everything here runs as written, with a generator standing in for Kafka.
+Build a continuous pipeline: read an unbounded stream, dedupe it, window it by event time, and write each micro-batch out. Batch is the bounded special case of streaming, so the operators are the ones you already know. Only the source and the trigger change. A generator stands in for Kafka, so everything runs as written.
 
 | You need | For |
 |---|---|
@@ -18,8 +13,7 @@ Each step below adds one stage, and the numbers in the diagram are the step numb
 
 ## 1. A stream
 
-An unbounded source is any function yielding Arrow batches. `bounded=False` is what tells
-the engine this thing never ends.
+An unbounded source is any function yielding Arrow batches, marked with `bounded=False`:
 
 ```python
 import datetime as dt
@@ -55,14 +49,20 @@ print(events.is_streaming)
 # True
 ```
 
+An in-memory table is the bounded case:
+
+```python
+print(bt.from_pydict({"amount": [1]}).is_streaming)
+# False
+```
+
 In production the source is {py:meth}`bt.read.kafka(...) <batcher.api.io_namespace.reader.Reader.kafka>`, {py:meth}`bt.read.kinesis(...) <batcher.api.io_namespace.reader.Reader.kinesis>`,
 {py:meth}`bt.read.delta(uri, stream=True) <batcher.api.io_namespace.reader.Reader.delta>`, or {py:meth}`bt.read.files_incremental(...) <batcher.api.io_namespace.reader.Reader.files_incremental>`. Nothing below this
-line changes when you swap it.
+line changes when you swap it in.
 
 ## 2. Transform it exactly like a table
 
-There is no streaming dialect. `filter`, `select`, `with_columns`, `group_by`, and `join` are
-the operators you already use on a table.
+There is no streaming dialect. `filter`, `select`, `with_columns`, `group_by`, and `join` work as they do on a table:
 
 ```python
 big = events.filter(bt.col("amount") > 4)
@@ -70,17 +70,18 @@ print(sum(batch.num_rows for batch in big.iter_batches()))
 # 3
 ```
 
-:::{warning}
-An unbounded dataset cannot {py:meth}`collect() <batcher.Dataset.collect>`. It would never finish, and it raises a clear
-{py:exc}`PlanError <batcher.PlanError>` if you try. Consume it with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, take a bounded peek with `limit(n)`, or
-write it to a sink.
-:::
+Consume a stream with {py:meth}`iter_batches() <batcher.Dataset.iter_batches>` or a sink, or peek at it with `limit(n)`:
+
+```python
+print(events.limit(3).to_pydict()["user"])
+# ['a', 'b', 'a']
+```
+
+{py:meth}`collect() <batcher.Dataset.collect>` on an unbounded dataset raises {py:exc}`PlanError <batcher.PlanError>`, since it would never finish.
 
 ## 3. Deduplicate, in bounded memory
 
-Streams redeliver. {py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` keeps the first row per key seen
-inside the watermark window and *forgets* keys the watermark has passed, so its state cannot
-grow without bound.
+{py:meth}`drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` keeps the first row per key inside the watermark window and forgets keys the watermark has passed, so its state stays bounded:
 
 ```python
 deduped = bt.from_batches(feed, schema, bounded=False).drop_duplicates_within_watermark(
@@ -95,13 +96,7 @@ User `a` appears twice in the feed and once in the output.
 
 ## 4. Window by event time
 
-`bt.window(time_col, duration)` assigns each row to an event-time window. Group by it like
-any other key. Event time is the timestamp *in the row*, not the clock on the machine, which
-is the only definition that survives a replay.
-
-The watermark (`max(event_time) - lateness`) is what lets the engine emit a window and evict
-its state: once the watermark passes a window's end, that window is closed and its memory is
-released. Rows later than that are dropped rather than reopening it.
+`bt.window(time_col, duration)` assigns each row to an event-time window, using the timestamp *in the row*, so a replay gives the same answer. Group by it like any other key. The watermark (`max(event_time) - lateness`) closes a window once it passes the window's end, which emits the window and frees its state.
 
 ```python
 hourly = (
@@ -116,12 +111,7 @@ Nothing has run yet. It is still a lazy plan.
 
 ## 5. Write it, with a trigger
 
-{py:obj}`ds.write <batcher.Dataset.write>` is the one write surface. Give it a `trigger` and it runs as a streaming query,
-appending each micro-batch and handing you back a `StreamingQuery`.
-
-{py:meth}`Trigger.available_now() <batcher.Trigger.available_now>` drains everything the source has at that moment and stops, which is
-the incremental-batch and backfill cadence, and the one that makes a tutorial finish.
-{py:meth}`Trigger.processing_time("30 seconds") <batcher.Trigger.processing_time>` is the continuous one.
+Give {py:obj}`ds.write <batcher.Dataset.write>` a `trigger` and it runs as a streaming query that returns a `StreamingQuery` handle. {py:meth}`Trigger.available_now() <batcher.Trigger.available_now>` drains what is there and stops. {py:meth}`Trigger.processing_time("30 seconds") <batcher.Trigger.processing_time>` runs continuously.
 
 | Choice | Emits | Use it for |
 |---|---|---|
@@ -146,9 +136,7 @@ Two windows: 09:00 holds `10 + 5`, 10:00 holds `7 + 3`.
 
 ## 6. Land it in files, and survive a restart
 
-A file sink writes one part file per micro-batch. Pass `checkpoint=` and the query records
-its source offsets and sink commits, so a restart resumes at the last committed offset
-instead of reprocessing from the beginning.
+A file sink writes one part file per micro-batch. `checkpoint=` records source offsets and sink commits, so a restart resumes at the last committed offset.
 
 ```python
 import os
@@ -177,18 +165,12 @@ print(q.is_active, q.exception())
 ```
 
 :::{important}
-Give the query a stable `query_name`. Writing to Delta, it becomes the transaction id the
-sink checks the log for, and a replayed micro-batch that finds its own transaction already
-committed writes nothing. That is what turns at-least-once replay into end-to-end
-exactly-once. Change the name between restarts and the sink has no way to recognize a
-replay, so the batch is written twice and the duplicate is yours to find.
+Keep `query_name` stable across restarts. On a Delta sink it becomes the transaction id that makes a replayed micro-batch a no-op, which gives end-to-end exactly-once.
 :::
 
 ## 7. Custom per-batch logic
 
-{py:meth}`for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>` hands you the whole Arrow table for each micro-batch, never a row. It is the
-hook for a custom upsert, a fan-out to several sinks, or a commit protocol the built-in sinks
-do not cover.
+{py:meth}`for_each_batch <batcher.api.io_namespace.writer.Writer.for_each_batch>` hands you each micro-batch as a whole Arrow table, for a custom upsert or a fan-out to several sinks:
 
 ```python
 batches = []
@@ -230,9 +212,7 @@ Manage it with the handle: `q.status`, `q.recent_progress`, `q.stop()`, and
 
 ## Where to go next
 
-The watermark is the piece to settle before anything else here. It bounds the memory of
-every stateful streaming operator, and it turns late data into a decision instead of a
-leak.
+Settle the watermark first. It bounds the memory of every stateful streaming operator and decides what counts as late.
 
 ::::{grid} 1 3 3 3
 :gutter: 3

@@ -8,9 +8,7 @@ Aggregation, join, distinct, and window all carry state across rows. Batcher imp
 
 ![Mergeable algebra: each partition computes a partial state, an associative combine merges them in any order, and finalize produces the result. The same code runs on one core or many machines.](/_static/diagrams/mergeable.svg)
 
-That one implementation serves a single core, every core on the machine, and many machines. On one machine the parallel executor splits the input into Arrow batches of up to 16,384 rows, runs the partials on every core, and merges them. On a cluster the distributed path partitions the data, runs the partials on each worker, and combines the results. The operator doesn't know which of the three it's running under.
-
-So distribution is a scheduling decision, not a second set of semantics. There's no separate distributed implementation that could drift from the single-node one.
+The same implementation serves one core, every core on the machine, and many machines. Distribution is a scheduling decision, not a second set of semantics.
 
 ```python
 import batcher as bt
@@ -22,26 +20,38 @@ print(counts.to_pydict())
 # {'g': ['a', 'b'], 'n': [2, 2]}
 ```
 
+Every built-in aggregate has a mergeable form, including averages and distinct counts:
+
+```python
+stats = ds.group_by("g").agg(
+    avg=bt.col("x").mean(), hi=bt.col("x").max(), uniq=bt.col("x").count_distinct()
+)
+print(stats.sort("g").to_pydict())
+# {'g': ['a', 'b'], 'avg': [2.0, 3.0], 'hi': [3, 4], 'uniq': [2, 2]}
+```
+
 ## Scale out with one argument
 
-{py:meth}`collect() <batcher.Dataset.collect>` defaults to `distributed="auto"`, which uses Ray when you're connected to a multi-node cluster and runs single-node otherwise. Pass `distributed=True` to force it. The plan is the same and so are the rows:
+{py:meth}`collect() <batcher.Dataset.collect>` defaults to `distributed="auto"`: Ray when you're connected to a multi-node cluster, single-node otherwise. Pass `distributed=True` to force it:
 
 ```python
 # docs: skip
 counts.collect(distributed=True)  # same plan, many machines, same rows
 ```
 
-Ray only schedules the tasks. Bulk Arrow data moves between workers over Arrow Flight with credit-based flow control, and never passes through the Ray object store.
+Ray only schedules the tasks. Bulk Arrow data moves between workers over Arrow Flight with credit-based flow control, never through the Ray object store.
 
-The mergeable form also bounds memory. State lives per partition, and when memory runs short the engine spills to disk instead of failing, on one machine or many. Spilling needs no flag. `collect(spill=True)` exists only to force it.
+The mergeable form also bounds memory. State lives per partition, and when memory runs short the engine spills to disk, on one machine or many. Spilling needs no flag:
+
+```python
+print(counts.collect(spill=True).num_rows)  # force a spill, same answer
+# 2
+```
 
 ## Requirements and limitations
 
-Distributed execution needs the `ray` extra and a Ray cluster. The rows, column names, and column types match a single-node run, with three exceptions where the query itself leaves the answer open:
-
-- Floating-point sums and averages can differ in the last bits, because partitioning changes the order of addition.
-- `row_number()` over rows that tie on the `ORDER BY` key can number the tied rows differently.
-- A `limit` over data with no defined order, such as an unsorted `group_by`, can keep different rows. Add a `sort` first when you need the same rows every time.
+- Distributed execution needs the `ray` extra and a Ray cluster.
+- Rows, column names, and column types match a single-node run. Where the query itself leaves the answer open, the result can vary: floating-point sums in the last bits, `row_number()` over tied `ORDER BY` keys, and a `limit` over unordered data. Add a `sort` when you need the same rows every time.
 
 ## See also
 

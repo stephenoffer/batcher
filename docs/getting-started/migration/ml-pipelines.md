@@ -1,12 +1,30 @@
 # Batch inference and ML pipelines
 
-This page covers the ML half of a port: running a model over batches, feeding a distributed trainer, and writing results back out. The model code you already have keeps working. What changes is that the data work around it runs in the same optimized engine as every other query.
+This page covers the ML half of a port: running a model over batches, feeding a trainer, and writing results back out. Your model code keeps working, and the data work around it runs in the same optimized engine as every other query.
 
 ## Running a model over batches
 
-{py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` runs a function over Arrow batches. {py:meth}`ds.ml.infer(model) <batcher.api.dataset.ml.DatasetML.infer>` and {py:meth}`ds.ml.embed(model) <batcher.api.dataset.ml.DatasetML.embed>` run a model. Pass a class instead of an instance and the model loads once per worker, with `num_gpus=` and `concurrency=` sizing a GPU actor pool. The relational work around the model goes through Kyber, the optimizer, and Carbonite, the resource manager, like any other query.
+{py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` runs a function over Arrow batches. Pass a class and the model loads once per worker:
 
-The entry points below cover the common ML shapes.
+```python
+import pyarrow.compute as pc
+
+import batcher as bt
+
+
+class Scorer:
+    def __init__(self):
+        self.weight = 2.0  # load the model once per worker
+
+    def __call__(self, batch):
+        return batch.append_column("score", pc.multiply(batch.column("x"), self.weight))
+
+
+print(bt.from_pydict({"x": [1, 2, 3]}).map_batches(Scorer).to_pydict())
+# {'x': [1, 2, 3], 'score': [2.0, 4.0, 6.0]}
+```
+
+On a GPU, `num_gpus=` and `concurrency=` size an actor pool. The entry points below cover the common ML shapes:
 
 | Task | Batcher | Note |
 |------|---------|------|
@@ -19,12 +37,20 @@ The entry points below cover the common ML shapes.
 | Bounded output files | {py:meth}`ds.write.parquet(max_rows_per_file=) <batcher.api.io_namespace.writer.Writer.parquet>` | honored even with `partition_by` |
 | Resumable writes | `ds.write.parquet(resume=True)` | skips committed shards on re-run |
 
-Several settings you tune by hand elsewhere are measured here. Batch size adapts toward throughput under a VRAM cap, and `num_gpus` adapts across runs to observed GPU utilization. There's no object-store fraction to set, because bulk data never enters the Ray object store.
+Batch size adapts toward throughput under a VRAM cap, and there's no object-store fraction to set, because bulk data never enters the Ray object store.
+
+Splits are hash-based, so they don't depend on how the data is partitioned:
+
+```python
+data = bt.from_pydict({"x": list(range(100))})
+train, test = data.ml.train_test_split(test_size=0.2, seed=0)
+print(train.count() + test.count())
+# 100
+```
 
 ## Where the time goes
 
-`ds.stats()` answers "where is my time going". It runs the query and reports measured
-rows, wall time, peak bytes, and spill per operator, plus which one was the bottleneck:
+`ds.stats()` runs the query and reports measured rows, wall time, peak bytes, and spill per operator, plus the bottleneck:
 
 ```python
 import batcher as bt
@@ -38,8 +64,7 @@ print(stats.rows, stats.bottleneck is not None)
 
 ## Writing results back out
 
-Batch writes are atomic and resumable, so a job killed by a spot preemption re-runs
-without losing or duplicating data, and `max_rows_per_file` bounds each output file:
+Batch writes are atomic and resumable, so a preempted job re-runs without losing or duplicating data:
 
 ```python
 import batcher as bt
@@ -53,11 +78,7 @@ print(bt.read.parquet("/tmp/bt_resume_demo").count())
 
 ## Feeding a distributed trainer
 
-Feeding a distributed PyTorch trainer, whether DDP, FSDP, or DeepSpeed, uses
-{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>`. It gives every rank the same number of batches in a seed-reproducible
-order that's independent of world size, so a job can resume on a differently sized
-cluster with no repeated or skipped samples. Disable the framework's own sampler,
-because `stream_loader` is the single shard authority.
+{py:meth}`stream_loader <batcher.api.dataset.ml.DatasetML.stream_loader>` feeds DDP, FSDP, or DeepSpeed. Every rank gets the same number of batches in a seed-reproducible order independent of world size, so a job resumes on a differently sized cluster with no repeated or skipped samples. Disable the framework's own sampler.
 
 ```python
 # docs: skip  (requires torch; shown for reference)
@@ -68,9 +89,7 @@ for batch in loader:  # {column: torch.Tensor}, this rank's shard
 
 ## Offline LLM generation
 
-Offline LLM batch inference wraps any text-generation engine, such as vLLM behind the
-`batcher-engine[vllm]` extra. The engine is built once per worker, and `template` and
-`parse_json` handle prompt templating and structured-output parsing:
+Offline LLM batch inference wraps a text-generation engine such as vLLM (`batcher-engine[vllm]`), built once per worker:
 
 ```python
 # docs: skip  (requires a GPU + batcher-engine[vllm]; shown for reference)

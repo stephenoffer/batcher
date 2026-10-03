@@ -1183,6 +1183,34 @@ fn a_mid_spine_limit_matches_the_oracle_in_order() {
 }
 
 #[test]
+fn left_joins_over_a_high_cardinality_spine_aggregate_match_the_oracle() {
+    // TPC-DS q78's shape: a per-key aggregate with as many groups as it has rows, left-joined
+    // onward. The aggregate is materialized first and is now the *sharded* driving relation —
+    // its 200,000 groups are cut across the workers rather than streamed through the joins on
+    // one thread — so this is the case where a shard that replayed the whole leaf, or dropped a
+    // slice of it, would show: every group must come back exactly once.
+    let agg = format!(
+        r#"{{"op":"aggregate","input":{SCAN},
+            "group_keys":[{{"expr":{},"alias":"v"}},{{"expr":{},"alias":"k"}}],
+            "aggregates":[{{"func":"count_star","alias":"n"}}]}}"#,
+        col("v"),
+        col("k")
+    );
+    let left = |input: &str, alias: &str| {
+        format!(
+            r#"{{"op":"hash_join","left":{input},"right":{{"op":"scan","source_id":1}},
+                "left_keys":["k"],"right_keys":["k"],"join_type":"left",
+                "output":[{{"side":"left","name":"v","alias":"v"}},
+                          {{"side":"left","name":"k","alias":"k"}},
+                          {{"side":"left","name":"n","alias":"n"}},
+                          {{"side":"right","name":"d","alias":"{alias}"}}],
+                "strategy":"hash"}}"#
+        )
+    };
+    assert_multiset(&left(&agg, "d"), &[facts(), dim()]);
+}
+
+#[test]
 fn nested_breakers_on_the_spine_match_the_oracle() {
     // A breaker under a breaker: `join(aggregate(sort(scan)), dim)`. Materializing the outer one
     // re-enters the parallel executor on its subtree, which runs its own pass and finds the inner

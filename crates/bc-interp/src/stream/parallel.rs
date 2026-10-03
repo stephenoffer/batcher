@@ -589,10 +589,11 @@ fn run_with_cache(
     };
     let driving_rows: usize = driving
         .iter()
-        .map(|&d| {
-            sources
-                .get(d)
-                .map_or(0, |b| b.iter().map(|b| b.num_rows()).sum::<usize>())
+        .map(|d| {
+            d.batches(sources, mats)
+                .iter()
+                .map(|b| b.num_rows())
+                .sum::<usize>()
         })
         .sum();
     // `nothing_to_parallelize` joins the two existing reasons not to cut the source up: a plan
@@ -618,20 +619,14 @@ fn run_with_cache(
     // the worker count for every other source.
     let per_source: Vec<Vec<Vec<RecordBatch>>> = driving
         .iter()
-        .map(|&d| {
-            let mut sh = shard(&sources[d], shard_workers);
+        .map(|d| {
+            let mut sh = shard(d.batches(sources, mats), shard_workers);
             sh.resize_with(shard_workers, Vec::new);
             sh
         })
         .collect();
-    let shard_sources: Vec<Vec<Vec<RecordBatch>>> = (0..shard_workers)
-        .map(|k| {
-            let mut view = sources.to_vec();
-            for (slot, &d) in per_source.iter().zip(&driving) {
-                view[d] = slot[k].clone();
-            }
-            view
-        })
+    let shard_sources: Vec<Shard> = (0..shard_workers)
+        .map(|k| Shard::of(k, sources, mats, &driving, &per_source))
         .collect();
 
     // (3)+(4) One streaming pipeline per shard; combine at the root.
@@ -654,8 +649,8 @@ fn run_with_cache(
             let jit: std::sync::OnceLock<ops::AggJit> = std::sync::OnceLock::new();
             let folded: Vec<(Option<agg::Partial>, u64)> = shard_sources
                 .par_iter()
-                .map(|srcs| {
-                    let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
+                .map(|sh| {
+                    let ctx = sh.ctx(cache, meter, budget, mats);
                     fold_partial(
                         with_cancellation(build_with(input, ctx)?, cancel),
                         group_keys,
@@ -752,8 +747,8 @@ fn run_with_cache(
                 type Probe = (Option<RecordBatch>, Vec<RecordBatch>, bool);
                 let probes: Vec<Probe> = shard_sources
                     .par_iter()
-                    .map(|srcs| {
-                        let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
+                    .map(|sh| {
+                        let ctx = sh.ctx(cache, meter, budget, mats);
                         let mut acc = bc_runtime::agg::DistinctPrefix::new(*k);
                         let mut held: Vec<RecordBatch> = Vec::new();
                         let mut gave_up = false;
@@ -834,8 +829,8 @@ fn run_with_cache(
 
             let parts: Vec<Vec<RecordBatch>> = shard_sources
                 .par_iter()
-                .map(|srcs| {
-                    let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
+                .map(|sh| {
+                    let ctx = sh.ctx(cache, meter, budget, mats);
                     with_cancellation(build_with(input, ctx)?, cancel)
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -874,8 +869,8 @@ fn run_with_cache(
         _ => {
             let parts: Vec<Vec<RecordBatch>> = shard_sources
                 .par_iter()
-                .map(|srcs| {
-                    let ctx = Ctx::new(srcs, cache, meter, budget).with_mats(mats);
+                .map(|sh| {
+                    let ctx = sh.ctx(cache, meter, budget, mats);
                     with_cancellation(build_with(plan, ctx)?, cancel).collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, InterpError>>()?;
@@ -1025,6 +1020,83 @@ pub(super) fn effective_shard_count(workers: usize, driving_rows: usize) -> usiz
 }
 
 /// Split a relation into `workers` contiguous, in-order shards of whole morsels.
+/// What a sharded plan cuts across its workers: a scanned source, or a spine breaker already
+/// evaluated whole (a [`MatCache`] entry, keyed by its node).
+///
+/// The second is what keeps the spine above a materialized breaker on every core. TPC-DS q78
+/// left-joins three per-channel aggregates; the breakers were evaluated in parallel, and the two
+/// joins over the 4.9M-row `store_sales` aggregate then ran on one thread for ~570 of the query's
+/// ~1,160 ms (sf10), because the spine bottomed out at a finished relation instead of a scan and
+/// nothing was cut. A finished relation is cut exactly as a scan's batches are: it was computed
+/// over every row before any sharding began, so a worker streaming its slice sees a slice of the
+/// right answer, and the slices in worker order are that answer in its own row order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Driving {
+    Source(usize),
+    Leaf(usize),
+}
+
+impl Driving {
+    /// The whole relation this driver stands for, before it is cut.
+    fn batches<'s>(
+        self,
+        sources: &'s [Vec<RecordBatch>],
+        mats: Option<&'s MatCache>,
+    ) -> &'s [RecordBatch] {
+        match self {
+            Driving::Source(id) => sources.get(id).map_or(&[], Vec::as_slice),
+            Driving::Leaf(key) => mats.and_then(|m| m.get(&key)).map_or(&[], |b| b.as_slice()),
+        }
+    }
+}
+
+/// One worker's view of the plan's inputs: every source, with the driving ones replaced by this
+/// worker's shard, and -- when a materialized leaf drives -- the [`MatCache`] with that leaf's
+/// entry replaced the same way. `None` when no leaf drives, so the shared cache is used as is.
+struct Shard {
+    sources: Vec<Vec<RecordBatch>>,
+    mats: Option<MatCache>,
+}
+
+impl Shard {
+    /// Worker `k`'s view, given each driver's shards in `per_driver` (same order as `driving`).
+    fn of(
+        k: usize,
+        sources: &[Vec<RecordBatch>],
+        mats: Option<&MatCache>,
+        driving: &[Driving],
+        per_driver: &[Vec<Vec<RecordBatch>>],
+    ) -> Self {
+        let mut view = sources.to_vec();
+        let mut overlay: Option<MatCache> = None;
+        for (slot, d) in per_driver.iter().zip(driving) {
+            match *d {
+                Driving::Source(id) => view[id] = slot[k].clone(),
+                Driving::Leaf(key) => {
+                    overlay
+                        .get_or_insert_with(|| mats.cloned().unwrap_or_default())
+                        .insert(key, std::sync::Arc::new(slot[k].clone()));
+                }
+            }
+        }
+        Self {
+            sources: view,
+            mats: overlay,
+        }
+    }
+
+    /// The streaming context this worker runs its pipeline in.
+    fn ctx<'a>(
+        &'a self,
+        cache: &'a BuildCache,
+        meter: Option<&'a Meter>,
+        budget: usize,
+        mats: Option<&'a MatCache>,
+    ) -> Ctx<'a> {
+        Ctx::new(&self.sources, cache, meter, budget).with_mats(self.mats.as_ref().or(mats))
+    }
+}
+
 pub(super) fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     let per = total.div_ceil(workers).max(1);
@@ -1059,16 +1131,18 @@ pub(super) fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBa
 /// Every source the shardable spine drives, or `None` when one of them cannot be reached.
 ///
 /// One entry for a plain spine; one **per branch** under a `UNION ALL`, which is the whole
-/// reason this exists beside [`leftmost_scan`]. A branch that dead-ends without a scan — an
-/// already-materialized subtree, most often — makes the union unshardable rather than
-/// partially so: sharding the other branch alone would replay the materialized one in every
-/// worker and duplicate its rows.
-fn driving_scans(plan: &RelOp, mats: Option<&MatCache>) -> Option<Vec<usize>> {
+/// reason this exists beside [`leftmost_scan`]. A spine or branch that bottoms out at an
+/// already-materialized subtree is driven by that leaf ([`Driving::Leaf`]): its batches are cut
+/// like a scan's, so no worker replays it whole. A branch that dead-ends anywhere else makes
+/// the union unshardable rather than partially so.
+fn driving_scans(plan: &RelOp, mats: Option<&MatCache>) -> Option<Vec<Driving>> {
+    // A finished relation at the bottom of the spine drives it as a scan would: its batches are
+    // cut into shards and each worker streams its own, so nothing is replayed per worker.
     if is_materialized(plan, mats) {
-        return None;
+        return Some(vec![Driving::Leaf(node_key(plan))]);
     }
     match plan {
-        RelOp::Scan { source_id } => Some(vec![*source_id]),
+        RelOp::Scan { source_id } => Some(vec![Driving::Source(*source_id)]),
         RelOp::Union { inputs, .. } => {
             let mut out = Vec::with_capacity(inputs.len());
             for branch in inputs {
@@ -1101,7 +1175,7 @@ fn shardable_source(
     plan: &RelOp,
     cache: &BuildCache,
     mats: Option<&MatCache>,
-) -> Option<Vec<usize>> {
+) -> Option<Vec<Driving>> {
     // An `Aggregate` is a breaker, and a breaker that sees only a shard computes the wrong
     // answer — *unless* it is the root, where each worker's `Partial` is combined rather than
     // finalized. So the root aggregate is allowed and checked through to its input; an aggregate
@@ -1126,7 +1200,12 @@ fn shardable_source(
     // Every driving source read exactly once in the whole plan — condition 2 above, now asked
     // of each of them. A union whose branches scan the *same* source is refused by the same
     // test: that source's count is 2, so slicing it for one branch would slice it for both.
-    if driving.iter().any(|d| counts.get(d) != Some(&1)) {
+    let read_twice = |d: &Driving| match d {
+        Driving::Source(id) => counts.get(id) != Some(&1),
+        // One node: the plan cannot reach it twice, and its rows come from `mats`, not a scan.
+        Driving::Leaf(_) => false,
+    };
+    if driving.iter().any(read_twice) {
         return None;
     }
     Some(driving)
@@ -1933,6 +2012,53 @@ mod tests {
     /// decline the shape it exists for. Both directions are asserted, because a function that
     /// always returned zero would pass an assertion on the no-breaker case alone.
     ///
+    /// A spine that bottoms out at a materialized breaker is driven by that leaf; one that
+    /// bottoms out at a scan is driven by the scan. The first used to be `None` -- no sharding
+    /// at all -- which is what left every join above a materialized aggregate on one thread.
+    #[test]
+    fn a_materialized_spine_bottom_drives_the_shards() {
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+
+        let plan = RelOp::HashJoin {
+            left: Box::new(RelOp::Aggregate {
+                input: Box::new(RelOp::Scan { source_id: 0 }),
+                group_keys: vec![],
+                aggregates: vec![],
+            }),
+            right: Box::new(RelOp::Scan { source_id: 1 }),
+            left_keys: vec!["k".into()],
+            right_keys: vec!["k".into()],
+            join_type: bc_ir::JoinType::Left,
+            output: vec![],
+            strategy: bc_ir::JoinStrategy::Hash,
+        };
+        let RelOp::HashJoin { left, .. } = &plan else {
+            unreachable!("just built a join")
+        };
+        assert_eq!(
+            driving_scans(&plan, None),
+            Some(vec![Driving::Source(0)]),
+            "nothing materialized: the aggregate's scan drives"
+        );
+        let col: ArrayRef = Arc::new(Int64Array::from_iter_values(0..10));
+        let mut mats = MatCache::new();
+        mats.insert(
+            node_key(left.as_ref()),
+            Arc::new(vec![
+                RecordBatch::try_from_iter(vec![("k", col)]).expect("batch")
+            ]),
+        );
+        assert_eq!(
+            driving_scans(&plan, Some(&mats)),
+            Some(vec![Driving::Leaf(node_key(left.as_ref()))]),
+            "the finished aggregate drives, so the joins above it are sharded"
+        );
+        assert_eq!(
+            Driving::Leaf(node_key(left.as_ref())).batches(&[], Some(&mats))[0].num_rows(),
+            10
+        );
+    }
+
     /// `node_key` is **address** identity, so every key here is taken from the node in the
     /// position it will be looked up in — moving a node into a `Box` gives it a new key, which
     /// is a way to write a test that silently checks nothing.

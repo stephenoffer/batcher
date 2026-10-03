@@ -1,5 +1,275 @@
 # Batcher CPU benchmark results
 
+## Reshaping verbs raced against DuckDB and Polars, a late filter and a spilling join that stopped stalling, and GPU inference on four A10Gs (2026-10-02, later)
+
+**Conditions.** The operator figures are `benchmarks/run.py --benchmark operators --scale 1
+--engines batcher,duckdb,polars` on an 8-core head node, best of 5, every result checked against
+DuckDB first; this box is shared, so read them as a ratio taken in one process, not as absolute
+times. The GPU runs are Anyscale jobs on four `g5.2xlarge` workers (one A10G each), image
+`anyscale/ray:2.58.0-py311-cu128`. The cluster runs are `m6id.16xlarge` jobs as in the section
+below.
+
+### Three public verbs had no competitor case
+
+`Dataset.join_asof`, `Dataset.explode` and `Dataset.unpivot` exist in DuckDB and Polars and were
+timed against neither. They are now `op-asof-join` (`suites/operators/joins.py`), `op-explode`
+and `op-unpivot` (`suites/operators/projection.py`), each a native callable per engine, since no
+one SQL string runs on all three. DuckDB's as-of inputs are loaded into native tables: over
+registered Arrow views its `ASOF JOIN` took 6.9 s for 100,000 rows against 28 ms on its own
+storage. The first reading lost two of the three:
+
+| case | batcher before | batcher after | duckdb | polars |
+|---|---:|---:|---:|---:|
+| op-asof-join | -- | 435 ms | 887 ms | 312 ms |
+| op-explode | 24 ms | 4.5 ms | 16.5 ms | 31.0 ms |
+| op-unpivot | 163 ms | 130 ms | 213 ms | 250 ms |
+
+The as-of "before" is the general kernel, measured outside the harness: on 1M rows with `by`
+over 10,000 keys it took 1,054 ms against Polars' 38 ms.
+
+- **As-of join** (`bc_runtime::join::asof`). The kernel row-encoded both sides and walked an
+  `IndexMap` of groups: 743 ms at 100,000 rows, 1,054 ms at 1M, 1,234 ms at 6M. Integer
+  `on`/`by` keys under backward or forward matching with no tolerance now group the right
+  side with a stable counting sort (dense keys) and send each left row straight to its own
+  group; sparse keys sort and merge both sides. Every other shape keeps the general kernel.
+  Same input: **6, 53 and 366 ms against Polars' 4, 35 and 276 ms**. It still loses to Polars
+  by 1.3-1.5x past a million rows and beats DuckDB 2x at sf1.
+- **Explode** (`bc_interp::ops::reshape`). A non-`outer` explode built an `Option<u32>` per
+  element and gathered through it. When no null row owns elements, the element column is the
+  list's child values between its first and last offsets, so it is now that slice, zero-copy.
+- **Unpivot.** The index columns were gathered through a tiled `0..n` index (now a
+  concatenation), and `variable` was built from one `&str` per output row (now written into its
+  buffers). CPU 1,428 -> 825 ms, and the median 466 -> 142 ms.
+
+### GPU inference against Ray Data
+
+Both from `benchmarks/`, both correctness-gated by the script:
+
+| case | rows | batcher | ray data | speedup |
+|---|---:|---:|---:|---:|
+| Parquet scoring (`gpu_backend/vs_raydata_parquet_inference.py`) | 10M | 2.82 s | 10.28 s | 3.64x |
+| Parquet scoring, `BENCH_PI_ROWS=40000000` | 40M | 29.12 s | 49.77 s | 1.71x |
+| ResNet-50 images (`cluster/gpu_inference.py`) | 8,192 | 3.99 s | 9.65 s | 2.42x |
+
+The 40M run's checksums agree to 1.4e-11; the model is 7.62 s of Batcher's 29.12 s, the rest read,
+batch assembly and dispatch. ResNet predictions agree on 100% of images. The script's
+GPU-utilization column read 0% for both engines, so its sampler did not reach the workers' NVML
+and no utilization figure is quoted. The cu128 image has no `torch` on its workers, and Ray's
+actors died in their constructors (`ModuleNotFoundError`) until each node had it installed.
+
+### Two alarms that were not regressions
+
+- **The JOB board read 1.059x slower after the changes below.** A four-arm interleaved A/B
+  over all 113 queries at sf1 (base `4ff4acc8` engine; `a2d7fda5` with the keyed read; the same
+  plus leaf sharding; `926ba7b1`) puts the branch at **0.983x** of the base and leaf sharding
+  alone at 0.964x. The board's figure was run-to-run spread between two jobs. q9c is bimodal
+  (~55 or ~150 ms) in every arm, the base included.
+- **Five distributed integration tests timed out in `ray.wait` on the gate run at `612c9aa0`.**
+  Rerun serially on their own node at `926ba7b1`: 132 passed in 488 s. The timeouts came from
+  contention on the full gate, not from the leaf-sharding change.
+
+### Four more changes, and an A/B of the day
+
+- **A late filter explored with the scan's concurrency, not its samples**
+  (`bc_io::late::LateFilter::install`). Undecided, it alternated on every read that *started*,
+  and row groups are read in parallel, so half of everything in flight took the filtered path
+  before the first samples finished. Each scan decides afresh, so every query paid it. On TPC-H
+  q6 that path cost ~120 ns a row against ~42 without the filter, and it was the slower one.
+  Now only the first `2 * SAMPLES` starts alternate. Three sf10 `lineitem` files, 8 cores: q6
+  213-234 -> 178-188 ms, CPU ~1,380 -> ~1,055 ms; the filter disabled is 137 ms, the gap being
+  the three sampled row groups a fresh scan still pays.
+- **A spilling join partitioned its inputs in 8 MiB morsels** (`dist.spill_breakers.join`).
+  `partition_batches` returns one batch per bucket for whatever it is given, so each spill
+  write was 8 MiB / buckets, a few KB at the 1,024-bucket ceiling. The sf1000 q9 run below
+  spent its hours in exactly that loop. It now reads through `iter_spill_chunks` as the
+  aggregate's partition phase does; a side of three ~19 MB batches went from 9 writes per
+  bucket to 1.
+- **A rounding difference decided a semijoin's place** (`kyber.rules.joins.outer_float`). On
+  TPC-H q18 both candidate filters on `orders` were estimated to keep it all, the inner join by
+  7e-6 rows less, so the exact comparison kept the semijoin above `customer ⋈ orders`. At sf100
+  that join was 21 s of the query's 31 s of CPU. Compared with a relative slack of 1e-9, the
+  semijoin sinks. Three sf10 `lineitem` files with full `orders`/`customer`: q18 596 -> 389 ms
+  (CPU 3,391 -> 2,232), DuckDB 503 ms on the same files.
+- **A column an explode or unpivot creates resolved to a source column of the same name**
+  (`plan.visitor.walk_with_base_names`). `explode("qs")` keeps the name `qs` for the elements,
+  so the statistics learner sketched the source's list column: 210 ms on top of a 4 ms query's
+  first run. `op-explode`'s first run 131 -> 104 ms; the rest is a one-time import of 179
+  modules.
+
+An interleaved A/B (three rounds, best of three per round, one `m6id.16xlarge`) of the
+morning's tree (`6ef7a691` with its engine) against `4149251b`, which carries every change
+above but the semijoin tie:
+
+| suite | queries | after / before | largest moves |
+|---|---:|---:|---|
+| TPC-H sf10 (scan) | 22 | 0.978 | q6 150 -> 94, q4 120 -> 104, q21 245 -> 226 ms |
+| TPC-H sf100 (scan) | 22 | 0.985 | q6 598 -> 505, q15 1,036 -> 904 ms; q17 1,292 -> 1,378 |
+| TPC-DS sf10 (in-memory) | 99 | 1.002 | q64 852 -> 768; q85 40 -> 225 (below) |
+
+q85 is not a regression: arm a ran 220, 40 and 225 ms, arm b 225-227, and one fast round set
+arm a's best.
+
+The semijoin tie has its own A/B, same engine, Python at `4149251b` against `40b9d8cc`:
+
+| suite | queries | after / before | largest moves |
+|---|---:|---:|---|
+| TPC-H sf10 (scan) | 22 | 1.004 | within noise |
+| TPC-H sf100 (scan) | 22 | 0.970 | q18 3,838 -> 2,742 ms in every round; q13 2,652 -> 2,847 |
+| TPC-DS sf10 (in-memory) | 99 | 0.995 | q64 1,047 -> 791; q85 39 -> 226 and q69 105 -> 114 (below) |
+
+q85 and q69 read as regressions in every round and are not. Run alone in a fresh process,
+five times each, the two Python trees give the same trajectory -- q85 2,212, 219, 222, 37,
+38 ms against 2,184, 214, 224, 41, 42 ms; q69 likewise -- so the A/B's best-of-three caught
+q85's third run on either side of its convergence, depending on what the 84 queries before it
+had left in the process. q13 is the one row not explained here.
+
+### A wrong answer the optimizer-invariance property test found
+
+`x IN (a, b)` must mean `x = a OR x = b`, and for a Float64 column it did not: the IN-list
+kernel (and the JIT, which mirrored it) keyed membership on raw bits while `=` compares by
+float identity, so `-0.0 IN (0, 5)` was false and `-0.0 = 0` true. The optimizer rewrites a
+one-member list to `=`, so the same predicate kept or dropped a `-0.0` row by the length of
+its list. `test_prop_optimizer_result_invariance` caught it whenever `test_prop_rule_families`
+ran first in the same process; it reproduces at `d5ebcc8b` with that tree's engine. Both tiers
+now key on `bc_arrow::canon_f64_bits` (`050c91a3`). **Batcher now differs from DuckDB here**,
+and DuckDB is inconsistent with itself: its `f IN (0)` keeps `-0.0`, its `f IN (0, 5)` drops it,
+and its `f IN (-0.0, 7.0)` returns `0.0` but not `-0.0`.
+
+### Planning time
+
+Cold planning remains the largest systematic cost on TPC-DS: q64 plans in 5.9 s cold at sf1
+and re-plans in ~1.2 s, and a repeated query re-plans two or three times as its measurements
+arrive. Eleven rules that walked every expression on their own now ride the fused expression
+traversal (`522ece87`, `6be6ae9e`): warm re-plan q64 1,256 -> 1,139 ms, q72 261 -> 214,
+q4 728 -> 641, q14 2,127 -> 1,936 (TPC-DS sf1, 8 cores; each commit measured against its own
+parent, the two steps chained). The rest of the planner's profile
+is flat: ~47,000 expression traversals for q85, ~490,000 for q64, spread over many rules.
+
+### Found and not fixed
+
+- **TPC-H sf1000 q9 did not finish in four hours** at `d5ebcc8b` on one `m6id.16xlarge`,
+  where DuckDB runs q9, q13, q17 and q18 in 49.7, 27.1, 15.3 and 29.8 s. Sampled every four
+  minutes at `6ef7a691`, it sat in `spill_to_disk` -> `execute_spilling_join` -> `_spill_side`
+  from minute ~25 on, the main thread in pyarrow's IPC serializer, reading and writing ~26 MB/s
+  each on NVMe at a load average of 1.5-2.8 on 64 cores: the 8 MiB morsel above. Rerun at `4149251b` with the chunked partition phase, the partition phase wrote ~111 MB/s against ~27 (spill bytes between consecutive samples), and over a matching ~54-minute window from the first sample the process read 176 GB and wrote 198 GB against 86 GB and 88 GB before; but q9 still did not finish inside its one-hour budget: the bucket-join phase that follows (`read_reserved_bucket`, re-splitting oversized buckets) ran at a load average of 1.2-2.4 on 64 cores. q18 was SIGKILLed within five minutes on the same node, as in the first run.
+- **A repeated query converges over three runs, and the cost is planning.** TPC-DS q85 at sf1
+  runs 1,411, 263, 406, then ~20 ms. The plan cache works as designed -- run 2 re-plans from
+  run 1's measurements and run 3 once more -- but each re-plan costs 250-380 ms against ~20 ms
+  of execution. The planner's profile is flat: ~47,000 expression traversals across many rules.
+- **The spilling sort's bucketing pass writes one bucket batch per staged batch**, the shape
+  just fixed in the join. Nothing has measured it.
+- **`op-join-full-outer` is 1.5x DuckDB** (89 against 57 ms on synthetic sf1 keys). Building
+  the smaller side does not help (written swapped by hand it runs 94-99 ms); the time is spread
+  over the probe, the partitioning and a checked-modulo kernel.
+- **TPC-H q12 decodes `l_shipmode` to plain strings for every scanned row**
+  (`extend_from_dictionary`, 13% of its CPU). The late filter's dictionary read would avoid it
+  but is slower on this shape when forced on (314 against 258 ms), so its verdict is right.
+- **First runs are slow on small operator cases**: `op-explode` takes 104 ms on its first run
+  against a 3.6 ms best, where DuckDB's first run is 19 ms. Best-of boards hide it.
+
+## Serial spines over finished breakers, runtime filters tested during the decode, and one learned entry per in-memory relation (2026-10-02)
+
+**Conditions.** Boards are Anyscale jobs on one `m6id.16xlarge` each (64 vCPU, 247 GiB, local
+NVMe), image `anyscale/ray:2.58.0-py311`, DuckDB 1.5.6, Polars 1.40.0, pyarrow 23.0.1, Daft
+from PyPI, `benchmarks/run.py` with every result checked against DuckDB before it was timed.
+TPC-H sf10 and sf100 read `tpch_zstd` Parquet copied to the NVMe, in `--scan --isolate` mode;
+TPC-DS sf10 is in-memory Arrow. The before board is `d5ebcc8b`, the after board `612c9aa0`.
+Every speed claim per change is an **interleaved A/B** on one such node: the same Python tree,
+two prebuilt engines (or the same engine and two Python trees), arms alternated in fresh
+processes over three rounds, best of three runs per query per round.
+
+### What changed, and what each change measured
+
+- **The spine above a materialized breaker ran on one thread** (`bc_interp::stream::parallel`).
+  The parallel streaming executor evaluates a spine breaker once over the unsharded sources and
+  caches it as a leaf, but it sharded only scans, so a spine that bottomed out at the leaf had
+  no driving source and every join above it ran sequentially. `perf stat -I 10` on TPC-DS sf10
+  q78: ~140 ms at 10-40 CPUs, then ~570 ms at exactly 1.0, inside a 1,160 ms query. A finished
+  relation is now cut across the workers as a scan's batches are (`Driving::Leaf`). A/B, TPC-DS
+  sf10 99-query sum **18,412 -> 17,322 ms**: q61 217 -> 43, q78 1,233 -> 718, q99 106 -> 64,
+  q23 962 -> 592, q11 367 -> 282. TPC-H sf10 1.012x and sf100 0.996x, i.e. neutral.
+- **A runtime join filter was applied only after the Parquet decode** (`UnitSource::read_keyed`,
+  `bc-py` `chunked/late.rs`). The executor now hands the filters placed on its lazily-read scan
+  to the reader, which installs them as late-materialization stages ahead of the plan's own
+  `Filter`: the key is decoded and tested first, the remaining columns only for rows the digest
+  does not refute. `LateFilter`'s byte gate and timing decide per scan whether it pays, the
+  post-scan filter still runs, and the scan is marked `runtime_filtered`. A/B, TPC-H sum sf10
+  4,106 -> 3,993 ms, sf100 31,507 -> 30,926 ms; sf100 q19 **1,461 -> 1,220 ms** (CPU 70.6 ->
+  57.5 s); no query slower by more than 7%.
+- **A left join survived an inner join keyed on its null-supplied side**
+  (`kyber.rules.joins.rewrites.outer_to_inner_under_join`). TPC-DS q93's `WHERE sr_reason_sk =
+  r_reason_sk` becomes the inner join's key during pushdown, so `outer_to_inner_join`, which
+  matches a `Filter`, never saw it, and the plan materialized all 28.8M `store_sales` rows to
+  keep 61,752. A/B, sf10 q93 **118 -> 66 ms** (CPU 2.7 -> 1.1 s), the 99-query sum otherwise
+  neutral (1.004x sf1, 0.995x sf10).
+- **Every in-memory relation shared one learned entry per predicate shape**
+  (`kyber.signature`). The scan token was `""` for any relation without a durable key, so a
+  measurement over one in-memory relation answered for the same filter over any other. Inside one
+  TPC-DS session, `d_year = 1999` over `date_dim` (365 rows) learned 41,649 from an earlier
+  query's materialized intermediate, and q72 joined `inventory` to `catalog_sales` first: 939M
+  estimated rows, **7.3 s and 240 s of CPU at sf1 against ~240 ms**, and 22 GB RSS on an 8-core
+  box. A bisection over q1..q71 found no single culprit -- either half alone left q72 fast --
+  which is what an accumulated shared entry looks like. The token now falls back to the
+  relation's column names. A/B over all 99 queries at sf1, one process per arm per round: q72
+  slow in 2 of 3 sessions before (7,348, 7,206 ms), in 0 of 3 after (231-241 ms); q40 57 -> 7,
+  q99 71 -> 10, q26 58 -> 10, q48 80 -> 15, q21 47 -> 14, q23 304 -> 164 ms. **The cost is
+  one extra slow run while a query converges**: with its own entries a query re-plans once more
+  on its third run. q52 runs 48, 41, 9, 8 ms before and 47, 39, **68**, 9, 8 ms after; q77
+  871, 234, 28 before and 878, 220, **178**, 32 after; settled times are equal or better. A
+  best-of-three comparison reads that as q77 7.9x and q52 5.3x slower, which is why it is
+  stated here.
+- **Three fixes the gate found.** `cargo clippy -D warnings` failed the workspace on Rust 1.99
+  (`AtomicI64::fetch_update` is deprecated; replaced with a CAS loop that keeps the 1.89 MSRV).
+  A ragged CSV line was reported as a type mismatch whenever pyarrow named the row (`Row #3:
+  Expected 2 columns`). `test_batcher_table_is_fresh` failed on Python 3.11, the CI version: the
+  codemod tables recorded CPython's own enum constructor signature, which differs between 3.11
+  and 3.13, and now record `["value"]`.
+
+### The board, before and after
+
+Per-suite geomean of Batcher against its own before time, and of Batcher against the fastest
+competitor that ran the case (below 1.0 is a win):
+
+| suite | cases | after / before | vs best rival, before -> after | losses > 5%, before -> after |
+|---|---:|---:|---:|---:|
+| TPC-H sf1 | 22 | 0.990 | 0.720 -> 0.715 | 4 -> 3 |
+| TPC-H sf10 (scan) | 22 | 0.953 | 1.169 -> 1.134 | 13 -> 11 |
+| TPC-H sf100 (scan, vs DuckDB/Polars) | 22 | 0.973 | 1.165 -> 1.130 | -- |
+| TPC-DS sf10 (vs DuckDB) | 99 | 0.989 | 0.946 -> 0.938 | -- |
+| operator mix | 58 | 0.986 | 0.642 -> 0.634 | 15 -> 14 |
+| H2O groupby | 10 | 0.991 | 0.840 -> 0.844 | 5 -> 5 |
+| H2O join, JSON | 10 | -- | -- | 0 -> 0 |
+
+The after board predates the signature fix. TPC-DS sf10 moved as the A/Bs predicted: q93
+0.44x, q78 0.52x, q23 0.55x, q11 and q74 0.77x. Its one alarming row, q64 at 169 -> 1,017 ms, is
+the best-of reading of a bimodal query: the **median** is 1,576 ms before and 1,508 ms after,
+and one fast run set the before figure. That makes q64 a loss the best-of hides on both boards
+(~1.5 s typical against DuckDB's 160 ms), not a regression.
+
+### Found and not fixed
+
+- **Only one Parquet scan streams; every other one is read whole first.** `chunked.py` drives
+  the scan with the most projected bytes through the engine and reads the rest resident with
+  `read_scanned`. A query that reads the same large table twice holds the second copy in memory
+  -- TPC-H q18's second `lineitem` is 600M rows at sf100 -- and an sf1000 run at `730cc071`
+  SIGKILLed q9, q13, q17 and q18 on a 240 GiB node.
+- **The Parquet decode zero-fills its value buffers.** On 64 cores TPC-H sf10 q6/q12/q1 spend
+  6-8% in `memset` and 13-16% in `memmove` inside arrow-rs `PrimitiveArrayReader`. Batcher's own
+  per-row cost equals pyarrow decoding the same four columns; closing the rest of the gap means
+  changing the decoder, not the engine.
+- **Cold planning costs seconds on large TPC-DS plans.** First run at sf1 (in-memory, 64 cores):
+  q64 4.7 s, q4 3.1 s, q14 2.4 s, against warm runs of 0.16-0.95 s and DuckDB's 50-80 ms. Locally
+  q64's 12 s cold is 7.7 s of Kyber: `common_subplans` normalizes three candidates through the
+  full logical optimizer (5.7 s), and every rebuilt `Join` re-derives its children's schemas to
+  validate key types (1.1 s over 3,408 constructions). Best-of boards never show it.
+- **TPC-DS q95's shared CTE is a 74.8M-row self-join** (`ws_wh`) that only semi joins on
+  `ws_order_number` read; q39's learned CTE row filter engages at sf1 (379 -> 60 ms) but its
+  sf10 materialization stayed at ~400 ms per run; q21, q37 and q82 mask 11.7M-133M `inventory`
+  keys a morsel at a time where DuckDB skips row groups by zone map.
+- **Harness.** A row is `FAILED` whenever any engine disagrees with the reference, which on this
+  board is Daft on 14 TPC-DS queries, TPC-H q15 and ClickBench q3 (column naming and wrong values);
+  Batcher's own ratio is then withheld although Batcher matched DuckDB on every one of them.
+
 ## Sideways restriction on every executor, a join-order search priced by its best cheap order, and learned statistics that stop poisoning other queries (2026-09-27)
 
 **Conditions.** Two kinds of measurement, kept apart on purpose. Every speed claim below is an

@@ -1,6 +1,6 @@
 # Data scientist learning path
 
-This path is for interactive analysis. You shape data with expressions, ask questions in SQL or through the DataFrame API, and summarize the answers with aggregations. Nothing runs while you compose. The API is lazy and immutable, and a terminal operation materializes the result.
+Interactive analysis: shape data with expressions, ask questions in SQL or the DataFrame API, and summarize with aggregations. Nothing runs while you compose; a terminal operation materializes the result.
 
 ## Reading order
 
@@ -52,6 +52,27 @@ print(counts.to_pydict())
 # {'category': ['a', 'b', 'c'], 'n': [3, 2, 1]}
 ```
 
+## Example: share of category total
+
+A window aggregate compares each row to its group without collapsing rows:
+
+```python
+share = sales.with_columns(
+    share=(bt.col("price") / bt.col("price").sum().over("category")).round(2)
+)
+print(share.select("category", "share").to_pydict())
+# {'category': ['a', 'b', 'a', 'b', 'a', 'c'], 'share': [0.11, 0.33, 0.33, 0.67, 0.56, 1.0]}
+```
+
+## Example: medians and filters
+
+```python
+print(sales.filter(bt.col("category").is_in(["a", "b"]))
+      .group_by("category").agg(p50=bt.col("price").median())
+      .sort("category").to_pydict())
+# {'category': ['a', 'b'], 'p50': [30.0, 30.0]}
+```
+
 ## Runnable examples
 
 Run any of these directly with `python examples/<name>.py`:
@@ -64,7 +85,7 @@ Run any of these directly with `python examples/<name>.py`:
 
 ## Recipes
 
-The {doc}`analytics cookbook </cookbook/analytics/index>` works through the queries you write, and the trap in each one: the cohort query that puts one user in three cohorts, the 3-sigma rule that never fires because the outlier inflates its own sigma, the funnel self-join that cross-products inside each user.
+The {doc}`analytics cookbook </cookbook/analytics/index>` works through the analyses you write every week: cohorts, funnels, sessions, and experiments.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -78,7 +99,7 @@ Assign the cohort once, not per row.
 :::{grid-item-card} {octicon}`filter;1.1em` Funnel analysis
 :link: /cookbook/analytics/behavior/funnel-analysis
 :link-type: doc
-Ordering matters, and the naive join explodes.
+Ordered steps per user, without a self-join.
 :::
 
 :::{grid-item-card} {octicon}`versions;1.1em` Sessionization
@@ -90,7 +111,7 @@ A gap, a flag, a cumulative sum.
 :::{grid-item-card} {octicon}`check;1.1em` A/B testing
 :link: /cookbook/analytics/inference/ab-testing
 :link-type: doc
-Per-event and per-user disagree, and one of them is wrong.
+Compare variants at the right unit of analysis.
 :::
 ::::
 

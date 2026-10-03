@@ -18,23 +18,27 @@ read*, this decides *what to say when that fails*.
 from __future__ import annotations
 
 import contextlib
+import re
 
 import pyarrow as pa
 
 from batcher._internal.errors import FormatError, SchemaError
 
 __all__ = [
-    "RAGGED_ROW_MARKER",
+    "RAGGED_ROW_PATTERN",
     "duplicate_header_error",
     "invalid_utf8_error",
     "mismatch_reported",
     "ragged_row_error",
 ]
 
-#: What pyarrow's ragged-row failure says. Matched rather than parsed: the counts are in
-#: the message and nowhere else, and all this has to decide is which of two opposite fixes
-#: to offer.
-RAGGED_ROW_MARKER = "csv parse error: expected"
+#: What pyarrow's ragged-row failure says, lowercased. Matched rather than parsed: the counts
+#: are in the message and nowhere else, and all this has to decide is which of two opposite
+#: fixes to offer. pyarrow names the row (``CSV parse error: Row #3: Expected 2 columns``)
+#: only when it knows the row number, and whether it does varies by build and reader
+#: options -- matching the bare ``... error: expected`` form alone sent every message that
+#: carried a row number to the type-mismatch advice, which cannot fix a ragged line.
+RAGGED_ROW_PATTERN = re.compile(r"csv parse error: (?:row #\d+: )?expected \d+ columns")
 
 
 def invalid_utf8_error(path: str, detail: str) -> FormatError:
@@ -159,7 +163,7 @@ def mismatch_reported(path: str):
             ) from exc
         if "invalid utf8" in lowered:
             raise invalid_utf8_error(path, str(exc)) from exc
-        if RAGGED_ROW_MARKER in lowered:
+        if RAGGED_ROW_PATTERN.search(lowered):
             raise ragged_row_error(path, str(exc)) from exc
         raise SchemaError(
             f"CSV value does not fit the inferred column type in {path!r}: {exc}. "

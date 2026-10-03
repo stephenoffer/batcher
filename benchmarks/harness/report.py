@@ -9,6 +9,7 @@ report with it.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -279,15 +280,26 @@ def run_isolated(case_names: list[str]) -> list[CompareResult]:
     Returns:
         One result per name, in the same order.
     """
+    # `BENCH_CASE_TIMEOUT_S` bounds each case: at sf1000 one query that will not finish would
+    # otherwise hold every case after it, and the run reports nothing at all.
+    raw = os.environ.get("BENCH_CASE_TIMEOUT_S")
+    budget = float(raw) if raw else None
     results: list[CompareResult] = []
     for i, case in enumerate(case_names, start=1):
         print(f"[{i}/{len(case_names)}] {case} ...", flush=True)
-        proc = subprocess.run(
-            _child_argv(case),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                _child_argv(case),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=budget,
+            )
+        except subprocess.TimeoutExpired:
+            note = f"timed out after {budget:.0f}s (BENCH_CASE_TIMEOUT_S)"
+            print(f"    {note}", flush=True)
+            results.append(CompareResult(name=case, status="KILLED", note=note))
+            continue
         line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(RESULT_PREFIX)), None)
         if line is None:
             note = _death(proc.returncode)

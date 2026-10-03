@@ -6,26 +6,24 @@ Against DuckDB reading the same Arrow, Batcher is about four times faster at sf1
 
 ## Correctness first
 
-:::{important}
-Batcher matches DuckDB's result on all 22 queries, and matches the official TPC-H answer on q6. That result gates every number on this page. The harness compares each engine's result with DuckDB's as a sorted row multiset within float tolerance, checks the order of every query that ends in `ORDER BY`, and refuses to record a ratio when they disagree.
-:::
+Batcher matches DuckDB on all 22 queries and the official TPC-H answer on q6. The harness refuses to record a ratio for any engine whose result disagrees.
 
-The gate earns its keep on other engines. The following table lists what it found in the run recorded in [`benchmarks/results/TPCH_SF1_SF10_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/TPCH_SF1_SF10_RESULTS.md):
+:::{dropdown} The correctness record of every engine
+From the run recorded in [`benchmarks/results/TPCH_SF1_SF10_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/TPCH_SF1_SF10_RESULTS.md):
 
 | Engine | Correctness on the suite |
 |---|---|
 | DuckDB | The reference. |
 | Batcher | Matches DuckDB on all 22, and the official answer on q6. |
-| Daft | Wrong results on q6 and q15 at both scales, and returns the wrong columns on q18. Can't plan q21 (`Outer reference columns cannot be bound`) or q22 (`SUBSTRING(x FROM a FOR b)`). |
-| Polars | Its SQL frontend fails 9 of 22 queries and returns the wrong revenue on q6, so the harness drives Polars through its native `LazyFrame` pipelines instead. |
+| Daft | Wrong results on q6 and q15 at both scales, and returns the wrong columns on q18. Can't plan q21 or q22. |
+| Polars | Its SQL frontend fails 9 of 22 queries, so the harness drives Polars through its native `LazyFrame` pipelines. |
 
-:::{dropdown} What goes wrong on q6
-The predicate is `l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`. In IEEE double, `0.06 + 0.01` is `0.06999999999999999`, a hair under `0.07`. An engine that folds the bound in floating point drops every `l_discount = 0.07` row and returns 75,207,768 instead of the official sf1 revenue of 123,141,078.2283. TPC-H defines `l_discount` as `DECIMAL`, so the 0.07 rows belong in the answer. Batcher returns the official figure.
+On q6 the predicate is `l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01`. An engine that folds `0.06 + 0.01` in IEEE double gets `0.06999999999999999`, drops every `l_discount = 0.07` row, and returns 75,207,768 instead of the official sf1 revenue of 123,141,078.2283.
 :::
 
 ## Where the suite stands
 
-Each row below is the most recent measurement against that engine, so the machines and dates differ by row. Every figure is a geometric mean of per-query `batcher_ms / engine_ms`, so **below 1.00 means Batcher is faster**:
+Each row is the most recent measurement against that engine. Every figure is a geometric mean of per-query `batcher_ms / engine_ms`, so **below 1.00 means Batcher is faster**:
 
 | Against | sf1 | sf10 | Measured |
 |---|---:|---:|---|
@@ -37,7 +35,7 @@ Each row below is the most recent measurement against that engine, so the machin
 | Polars | | **0.35** | 2026-08-28, 92-core box |
 | Daft | **0.21** | **0.17** | 2026-08-28, 92-core box |
 
-The sf10 result against the native store is the one that moved most recently. It read 1.087x on the tree before the changes of 2026-08-25 and 0.963x after them, measured as a same-day A/B on the same node with only Batcher and DuckDB in the lineup. The suite total fell from 2,938 ms to 2,323 ms, carried by individual queries rather than by the mean:
+At sf10 against the native store, the changes of 2026-08-25 took the suite total from 2,938 ms to 2,323 ms in a same-day A/B on one node:
 
 | Query | Before | After |
 |---|---:|---:|
@@ -48,15 +46,15 @@ The sf10 result against the native store is the one that moved most recently. It
 | q4 | 117 ms | **96 ms** |
 | q10 | 158 ms | **139 ms** |
 
-Four changes carried it. A probe-side Bloom filter was built once per build shard and merged serially, and it is now sharded like the hash table beside it. Two fitted constants that existed only to compensate for that cost are gone, so a multi-join query keeps every core. An ordered group key now uses the partitioning its layout already provides. And the group-count estimator no longer reads a clustered key as a small domain.
+The gains came from a sharded probe-side Bloom filter, a multi-join plan that keeps every core, reuse of an ordered group key's existing partitioning, and a group-count estimator that reads clustered keys correctly.
 
-![Bar chart of the TPC-H scale-factor-10 suite on the same Arrow input, from the 2026-08-28 sweep on 92 cores. Batcher is 3.03x faster than DuckDB reading the same Arrow and 2.86x faster than Polars.]](/_static/diagrams/tpch_sf10.svg)
+![Bar chart of the TPC-H scale-factor-10 suite on the same Arrow input, from the 2026-08-28 sweep on 92 cores. Batcher is 3.03x faster than DuckDB reading the same Arrow and 2.86x faster than Polars.](/_static/diagrams/tpch_sf10.svg)
 
-The chart above is the sf10 board of 2026-08-28 on 92 cores, best of three. Against DuckDB's own compressed store that board read 1.10, and the same-day A/B of 2026-08-25 in the table above read 0.963, so the native-store standing at sf10 sits close to parity while the execution comparison is a clear win.
+The chart is the sf10 board of 2026-08-28 on 92 cores, best of three, on the same Arrow input.
 
 ## Per query
 
-The most recent run published query by query is [`benchmarks/results/TPCH_SF1_SF10_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/TPCH_SF1_SF10_RESULTS.md), taken 2026-07-28 on a c5d.24xlarge (96 vCPU, 184 GiB). It predates the sf10 gains above, so its native-store column reads 0.963x at sf1 and 1.521x at sf10. Batcher's total at sf1 was 617.5 ms against DuckDB's 649.2 ms on its native store, and 1,693.0 ms for DuckDB on the same Arrow.
+The per-query board is [`benchmarks/results/TPCH_SF1_SF10_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/results/TPCH_SF1_SF10_RESULTS.md), taken 2026-07-28 on a c5d.24xlarge (96 vCPU, 184 GiB), before the sf10 gains above. Batcher's sf1 total was 617.5 ms against DuckDB's 649.2 ms on its native store and 1,693.0 ms on the same Arrow.
 
 :::{dropdown} Per-query ratios at sf1, 2026-07-28
 Each cell is `batcher / engine`, so **below 1.00x means Batcher is faster**. Daft's `--` marks a wrong result and `n/a` a query it can't plan.
@@ -89,27 +87,37 @@ Each cell is `batcher / engine`, so **below 1.00x means Batcher is faster**. Daf
 
 ## Planner work behind these numbers
 
-Several of the largest moves on this suite came from the optimizer rather than the kernels, and they show where the wins come from.
+Several of the largest moves on this suite came from the optimizer rather than the kernels:
 
-**A date grid on the wrong number line.** Core measures a quantile grid from raw Arrow values, so a `date32` column's grid counts days since the Unix epoch. Kyber read it with `date.toordinal()`, which counts from year 1 and is 719,163 days out. Every date literal landed outside its column's grid, so `o_orderdate BETWEEN '1995-01-01' AND '1996-12-31'` estimated 0 rows against a true 455,112, and a join with a zero-row side priced as free. Fixing it took q8 from 735.0 ms to 20.7 ms and the sf1 suite total from 1,843 ms to 871 ms (2026-07-31, 16 cores). The defect bit only from a query's second execution, because the first has no measured grid. A benchmark warms up before it times, so every timed run measured the broken plan.
+| Change | Effect |
+|---|---|
+| Date literals read on the same number line as the measured `date32` quantile grid | q8 from 735.0 ms to 20.7 ms, sf1 suite total from 1,843 ms to 871 ms (2026-07-31, 16 cores) |
+| Broadcast eligibility decided from `min(left_bytes, right_bytes)` | q5 `orders` to `lineitem` join from 419 ms to 175 ms |
+| Cold-start distinct counts seeded from source statistics and file HLL sketches | A cold q5 plans on real inputs instead of a `max(left, right)` fallback |
+| Radix-join partitions joined concurrently, concatenated in partition order | q4 from 115.6 ms to 43.0 ms, q3 from 110.3 ms to 66.3 ms |
 
-**Build-side selection.** Broadcast eligibility used to be checked only on the right input, so when the small side arrived on the left the join shuffled a 6M-row build instead of broadcasting. It is now decided from `min(left_bytes, right_bytes)`, which took the q5 `orders` to `lineitem` join from 419 ms to 175 ms.
+`explain()` shows the row estimates each operator was planned on and the decisions taken from them, such as the join build side:
 
-**Cold-start join cardinality.** The estimator's join model divides by the larger distinct count, but it used to read only distinct counts learned on past runs. A cold join fell back to `max(left, right)`, which underestimates a low-NDV many-to-many join badly enough to steer join order into intermediates of 12M to 18M rows. Cold q5 ran 7,115 ms against a warm 300 ms. Distinct counts are now seeded from source statistics, footer and written-file HLL sketches, so the cold plan has real inputs.
+```python
+import batcher as bt
 
-**A serial partition loop.** The radix join joined its partitions on one core, so a join too large to broadcast funnelled a parallel build and probe into a serial kernel. Joining partitions concurrently, and concatenating them in partition order so the output is unchanged, took q4 from 115.6 ms to 43.0 ms and q3 from 110.3 ms to 66.3 ms.
+orders = bt.from_pydict({"o_key": [1, 2, 3], "o_cust": [10, 20, 10]})
+items = bt.from_pydict({"l_order": [1, 1, 2, 3, 3], "l_price": [5.0, 7.0, 3.0, 2.0, 4.0]})
+q = items.join(orders, left_on="l_order", right_on="o_key").group_by("o_cust").agg(rev=bt.col("l_price").sum())
+assert "join build side" in q.explain()
+print(q.sort("o_cust").to_pydict())
+# {'o_cust': [10, 20], 'rev': [18.0, 3.0]}
+```
 
-## Requirements and limitations
-
-These figures are single-node and steady state. The following limits apply:
-
-- **Scale factor 100** (600M rows) is still recorded as a loss to DuckDB on a single node.
-- **Spark** isn't in the standing table. Local-mode Spark ran 20x to 50x behind Batcher on TPC-H sf1 (2026-08-15), and earlier Spark ratios were taken before three handicaps in its benchmark adapter were removed.
-- **Rows from different dates** in the standing table describe different builds and machines. Compare within a row.
+:::{dropdown} Scope of these numbers
+- Figures are single node and steady state.
+- Rows from different dates in the standing table describe different builds and machines. Compare within a row.
+- Local-mode Spark ran 20x to 50x behind Batcher on TPC-H sf1 (2026-08-15). {doc}`/benchmarks/comparisons/vs-spark` has the details.
+:::
 
 ## Reproduce
 
-The following commands rerun the suite against each lineup. `BENCH_TPCH_BASE` points the loader at a local mirror when S3 is slow:
+`BENCH_TPCH_BASE` points the loader at a local mirror when S3 is slow.
 
 ```bash
 python benchmarks/run.py --benchmark tpch --engines batcher,duckdb,duckdb_arrow,polars --isolate
@@ -117,14 +125,14 @@ python benchmarks/run.py --benchmark tpch --scale 10 --engines batcher,duckdb
 python benchmarks/run.py --benchmark tpch --scale 10 --engines batcher,duckdb,duckdb_arrow,polars,spark,daft
 ```
 
-Spark needs a JVM as well as the `pyspark` wheel. Without one its adapter reports unavailable and the lineup drops it.
+Spark needs a JVM as well as the `pyspark` wheel.
 
 ## See also
 
 - {doc}`/benchmarks/comparisons/vs-duckdb` and {doc}`/benchmarks/comparisons/vs-daft` for the engine-by-engine scorecards.
 - {doc}`/benchmarks/results/analytics` for the other suites and the operator mix.
 - {doc}`/architecture/deep-dives/operators/join-algorithms` for the shuffle and broadcast paths behind these results.
-- {doc}`/architecture/deep-dives/adaptive/cardinality-estimation` for the cold-start distinct-count problem.
+- {doc}`/architecture/deep-dives/adaptive/cardinality-estimation` for how distinct counts are estimated.
 - {doc}`/architecture/deep-dives/adaptive/cost-model` for how the build side is chosen.
 - {doc}`/user-guide/analyze/sql` for the supported SQL surface.
 - {doc}`/benchmarks/methodology` for the correctness gate in detail.

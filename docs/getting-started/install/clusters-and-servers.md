@@ -4,13 +4,11 @@ This page covers installing Batcher on cloud VMs, Ray clusters including KubeRay
 
 ## Cloud VMs
 
-A cloud VM installs Batcher exactly as a workstation does, with pip or uv into a virtual environment, as {doc}`python-environments` shows. The only choice the cloud adds is the processor architecture, and both kinds of instance have a wheel. x86_64 instances use the x86_64 wheel. Arm instances, such as AWS Graviton, Google Axion, and Azure Cobalt, use the aarch64 wheel, and pip picks the right one on its own.
-
-The x86_64 wheel requires the `x86-64-v2` instruction set, which every x86_64 instance type provides, and it uses AVX2 or AVX-512 on the instances that have them. {doc}`index` has the details.
+A cloud VM installs Batcher exactly as a workstation does, as {doc}`python-environments` shows. pip picks the x86_64 or aarch64 wheel on its own, so Arm instances such as AWS Graviton, Google Axion, and Azure Cobalt work the same way.
 
 ## Ray clusters
 
-Batcher runs distributed queries on Ray, so a cluster needs the `ray` extra on the machine that starts the query, which Ray calls the driver:
+Batcher runs distributed queries on Ray. Install the `ray` extra on the machine that starts the query, which Ray calls the driver:
 
 ```bash
 pip install "batcher-engine[ray]"
@@ -18,26 +16,20 @@ pip install "batcher-engine[ray]"
 
 ### How the engine reaches the workers
 
-By default you don't install Batcher on the worker nodes yourself. When the driver connects to a cluster, Batcher uploads its own installed package, compiled engine included, to every worker through Ray's `runtime_env`. Ray caches the upload by its contents, so a cluster receives each build of Batcher once. {doc}`/integrations/compute/ray` describes the connection options.
-
-The upload is the driver's own build of the engine, and two requirements follow from that:
+You don't install Batcher on the workers yourself. When the driver connects, Batcher uploads its own package, compiled engine included, to every worker through Ray's `runtime_env`, cached by content. {doc}`/integrations/compute/ray` describes the connection options. Because the upload is the driver's build, two requirements follow:
 
 1. Every worker must run the same operating system, processor architecture, and C library as the driver. A driver on a macOS laptop, or on an x86_64 machine attached to Arm workers, uploads an engine the workers can't load.
 1. Every worker must already have Batcher's dependencies, such as PyArrow and NumPy, because the upload carries Batcher's package and not the packages it depends on. Ray itself also requires the driver and the workers to run the same Python minor version.
 
 ### Use one image for the whole cluster
 
-The arrangement that satisfies both requirements everywhere is to run the driver, the head, and every worker from the same image, and tell Batcher to trust it rather than upload its own copy. The `-ray` image, described in {doc}`containers`, carries Batcher, its dependencies, and Ray for exactly this purpose.
-
-Set the following environment variable wherever the driver runs, such as in the image or the job's environment:
+The simplest arrangement runs the driver, the head, and every worker from the same `-ray` image ({doc}`containers`), and tells Batcher to trust it instead of uploading a copy:
 
 ```bash
 export BATCHER_DISTRIBUTED_TRUST_CLUSTER_IMAGE=true
 ```
 
-With it set, the driver skips the upload and uses the engine each node already has. The same setting is available in code as `DistributedConfig(trust_cluster_image=True)`. Only set it when every node really does carry the same Batcher version, because a worker with a different engine from the driver fails at the first task.
-
-A Ray job submission runs the driver on the head node rather than on the machine that submits it, so with this arrangement a laptop of any operating system or architecture can submit work to the cluster.
+The same setting is `DistributedConfig(trust_cluster_image=True)` in code. Set it only when every node carries the same Batcher version. A Ray job submission then runs the driver on the head node, so a laptop of any operating system can submit work.
 
 ### KubeRay
 
@@ -47,7 +39,8 @@ On Kubernetes, the KubeRay operator runs a Ray cluster from a `RayCluster` resou
 docker run --rm ghcr.io/stephenoffer/batcher:<version>-ray python -c "import ray; print(ray.__version__)"
 ```
 
-The following `RayCluster` runs one head and a group of workers, all on the same image, with the trust setting in every container's environment:
+:::{dropdown} Example `RayCluster` manifest
+One head and a group of workers, all on the same image, with the trust setting in every container:
 
 ```yaml
 apiVersion: ray.io/v1
@@ -83,6 +76,7 @@ spec:
               resources:
                 limits: {cpu: "16", memory: 64Gi}
 ```
+:::
 
 Batcher inside each pod sizes itself to that container's limits. {doc}`/integrations/compute/schedulers` describes what it reads from a Kubernetes allocation.
 
@@ -99,11 +93,10 @@ Batcher reads the scheduler's grant, not the whole node, when it sizes threads, 
 
 ## Air-gapped and on-premises networks
 
-A network that can't reach PyPI installs from files carried in. There are three ways to do that, depending on what the network already runs.
+A network that can't reach PyPI installs from a private mirror, a wheelhouse, or an image archive.
 
-### A private package index
-
-If your organization mirrors PyPI through a proxy such as Artifactory, Nexus, or devpi, install through the mirror:
+::::{dropdown} A private package index
+If your organization mirrors PyPI through Artifactory, Nexus, or devpi, install through the mirror:
 
 ```bash
 pip install --index-url https://<your-mirror>/simple batcher-engine
@@ -111,7 +104,9 @@ pip install --index-url https://<your-mirror>/simple batcher-engine
 
 Here `<your-mirror>` is your index's host and path. To make the mirror the default, set `PIP_INDEX_URL`, or `UV_INDEX_URL` for uv, instead of passing the flag.
 
-### A wheelhouse
+::::
+
+::::{dropdown} A wheelhouse
 
 A *wheelhouse* is a directory holding Batcher's wheel and the wheel of every dependency. Build it on a machine with internet access, carry it in, and install from it with no index.
 
@@ -130,7 +125,9 @@ On the target machine, install with the index turned off:
 pip install --no-index --find-links wheelhouse "batcher-engine[cloud]"
 ```
 
-### A container image archive
+::::
+
+::::{dropdown} A container image archive
 
 If the network runs containers, save the image to a file on a connected machine and load it on the other side:
 
@@ -144,6 +141,7 @@ docker load -i batcher-<version>.tar
 ```
 
 Use `--platform linux/arm64` for Arm hosts. To place the image in an internal registry instead, tag and push it there after loading.
+::::
 
 ## See also
 

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1557 Python modules across 220 packages and 327 Rust files across 14 crates.
+Covering 1558 Python modules across 220 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -176,7 +176,7 @@ The public, fluent, lazy, expression-first API surface.
 | `groupby.py` | 1159 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 259 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `multi_group.py` | 431 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
-| `source_stats.py` | 737 | Per-source statistics collection for the conductor. |
+| `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 | `subplan_reuse.py` | 669 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
@@ -346,8 +346,8 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 124 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `chunked.py` | 254 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
-| `chunked_sideways.py` | 251 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
+| `chunked.py` | 321 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
+| `chunked_sideways.py` | 647 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
 | `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
@@ -428,7 +428,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 
 | module | lines | what it is |
 |---|---|---|
-| `_metadata.py` | 735 | Post-execution column-statistics learning (Core measures, Kyber persists). |
+| `_metadata.py` | 736 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
 | `core.py` | 1517 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
@@ -991,10 +991,11 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `analysis.py` | 487 | Which part of a plan can run whole on each worker, over one key range of its inputs. |
 | `hoist.py` | 163 | Evaluate the parts of an aligned cut that read no aligned source, once, before its units. |
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
+| `memory_fit.py` | 86 | How many aligned units a node may run at once, from its memory as well as its cores. |
 | `reduce.py` | 216 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
 | `rewrite.py` | 232 | Push each join against a broadcast input down to the broadcast input it keys on. |
 | `route.py` | 458 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
-| `run.py` | 473 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
+| `run.py` | 479 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
 | `transfer.py` | 306 | Moving an aligned run's inputs and results between the driver and the fleet. |
 | `units.py` | 295 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
 
@@ -1135,7 +1136,7 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 
 | module | lines | what it is |
 |---|---|---|
-| `join.py` | 443 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
+| `join.py` | 449 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
 | `sort.py` | 374 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
 | `window.py` | 176 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 
@@ -1183,7 +1184,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `properties.py` | 305 | Physical properties — what a plan node *delivers*, and what its parent *requires*. |
 | `registry.py` | 282 | The Kyber rule registry — where rules are discovered and assembled. |
 | `rule.py` | 262 | The Kyber rule abstraction — one small, pure unit of optimization. |
-| `signature.py` | 230 | Structural plan signatures. |
+| `signature.py` | 244 | Structural plan signatures. |
 | `spill_rates.py` | 203 | What the spill device *measured*, against what its class claimed. |
 | `storage_cost.py` | 76 | What spilling costs on *this* machine's storage. |
 | `streaming.py` | 336 | Streaming analysis for the optimizer — what is unbounded, and what that forbids. |
@@ -1276,7 +1277,7 @@ Kyber rule modules.
 | `agg_algebra.py` | 159 | Algebraic rewrites over *aggregate* expressions — share a base scan across a |
 | `equi_expr_keys.py` | 202 | Equi-join keys over *expressions*: `a.x = b.y - 52` as a hash key, not a post-join filter. |
 | `fusion.py` | 396 | FUSION-phase rewrites — top-N fusion and per-partition top-N (`QUALIFY`). |
-| `leaf_rewrite.py` | 318 | The shared machinery every leaf-level expression rule is built from. |
+| `leaf_rewrite.py` | 293 | The shared machinery every leaf-level expression rule is built from. |
 | `literals.py` | 56 | Literal-value predicates shared by the expression rules: the i64 range and boolean literals. |
 | `ordering.py` | 109 | Ordering rewrites — drop work that the input's known order already provides. |
 | `projections.py` | 909 | Projection rewrites — collapse stacked projections and prune unread columns. |
@@ -1368,7 +1369,7 @@ Extended Kyber rule families.
 | `adaptive_meta.py` | 160 | Adaptive metadata rules — simplifications a provably-EXACT cardinality unlocks. |
 | `agg_extra.py` | 505 | Extra aggregate / GROUP BY rewrites — small, local, always-correct simplifications. |
 | `agg_rules.py` | 504 | Aggregate rewrites driven by *proven* metadata — uniqueness, constancy, exact counts. |
-| `arith_algebra.py` | 354 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
+| `arith_algebra.py` | 421 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
 | `arith_extra.py` | 546 | NORMALIZE-phase arithmetic the other families leave on the table — math-function |
 | `boolean_algebra.py` | 427 | NORMALIZE-phase boolean / CASE / COALESCE / NULL simplifications. |
 | `casts.py` | 456 | NORMALIZE-phase rules for `CAST` — the shapes a SQL front end and the type-coercion |
@@ -1392,8 +1393,8 @@ Extended Kyber rule families.
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 482 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
 | `temporal_date_cast.py` | 186 | ``CAST(ts AS DATE) <op> DATE 'd'`` — the timestamp-to-date cast, turned into a range. |
-| `temporal_extra.py` | 462 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
-| `temporal_folds.py` | 185 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
+| `temporal_extra.py` | 465 | NORMALIZE-phase temporal rewrites — the sargability gaps `temporal_sargable` leaves. |
+| `temporal_folds.py` | 187 | Constant folding for the temporal expressions the engine's `ConstantFolding` skips. |
 | `temporal_sargable.py` | 279 | NORMALIZE-phase rewrites: temporal extraction predicates → sargable ranges. |
 | `topn_limit.py` | 213 | LIMIT / OFFSET rewrites that the base limit rules don't already cover. |
 | `window_extra.py` | 375 | Window rewrites — prune keys, frames and functions a window does not actually need. |
@@ -1449,10 +1450,10 @@ The join rule family — every rewrite that reshapes a join, in one package.
 | `order_goo.py` | 133 | Greedy operator ordering: the bushy fallback when the join-order DP cannot afford a graph. |
 | `order_residual.py` | 178 | Non-equi predicates inside a join region: hoist them, then re-attach where they fit. |
 | `order_search.py` | 538 | Join-order search: pick a tree over an extracted join graph, and build it. |
-| `outer_float.py` | 247 | Float a left/semi/anti join above the inner joins that only read its preserved side. |
+| `outer_float.py` | 255 | Float a left/semi/anti join above the inner joins that only read its preserved side. |
 | `projection.py` | 191 | Push a derived projection through a join onto the side it reads, so the join |
 | `range_join.py` | 365 | Rewrite a cartesian join plus an inequality filter into a `RangeJoin`. |
-| `rewrites.py` | 520 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
+| `rewrites.py` | 579 | Join rewrites — change a join's type, push aggregates below it, and prune a side. |
 | `runtime_range.py` | 227 | Runtime join filters — the key range one side of a join implies about the other. |
 
 ### `batcher/kyber/rules/math_algebra/` — 3 · subsystem
@@ -2125,7 +2126,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 
 | module | lines | what it is |
 |---|---|---|
-| `_csv_diagnostics.py` | 169 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
+| `_csv_diagnostics.py` | 173 | Turning pyarrow's CSV read failures into errors that say what to do about them. |
 | `_csv_ranges.py` | 110 | Where a CSV file may be cut into byte ranges without cutting a record in half. |
 | `_parquet_native.py` | 225 | Native Rust Parquet reads (via `bc_io` through `batcher._native`), with PyArrow fallback. |
 | `arrow_ipc.py` | 280 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
@@ -2399,7 +2400,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `schema.py` | 174 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 442 | `plan.source_stats` — what a connector declares about a source, cheaply. |
 | `stats.py` | 650 | `plan.stats` — the neutral statistics algebra shared across every layer. |
-| `visitor.py` | 356 | Shared traversal for `LogicalPlan` trees. |
+| `visitor.py` | 374 | Shared traversal for `LogicalPlan` trees. |
 
 ### `batcher/plan/distribution/` — 1 · contract
 
@@ -3042,7 +3043,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `chunked.rs` | 712 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
+| `chunked/mod.rs` | 611 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
@@ -3079,7 +3081,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `metrics.rs` | 387 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/byte_sort.rs` | 715 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `ops/external_sort.rs` | 465 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
-| `ops/joins.rs` | 630 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
+| `ops/joins.rs` | 657 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
 | `ops/mod.rs` | 1897 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
@@ -3091,7 +3093,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/radix_sort/msd.rs` | 95 | A comparison sort for records ordered by a `u64` key, cut first into buckets by the key's live high bits. |
 | `ops/radix_sort/packed.rs` | 578 | The **composite** packed key: several sort columns narrowed into one integer. |
 | `ops/repartition.rs` | 600 | Hash-partition a relation held as morsels, gathering each row exactly **once**. |
-| `ops/reshape.rs` | 548 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
+| `ops/reshape.rs` | 631 | Row-reshaping per-batch primitives: `unnest`/`explode`, `unpivot`/`melt`, and content-hash `sample`. |
 | `ops/run_sort.rs` | 275 | Natural-run detection for the fixed-width sort permutations. |
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 772 | Single-node parallel full sort by **sample-sort**. |
@@ -3105,16 +3107,16 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
-| `stream/chunked/units.rs` | 57 | The driving relation as a sequence of units read on demand by the workers that scan it. |
+| `stream/chunked/units.rs` | 83 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
 | `stream/folds.rs` | 646 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 429 | Per-operator metrics for the streaming executor. |
-| `stream/mod.rs` | 774 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
+| `stream/mod.rs` | 786 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
-| `stream/parallel.rs` | 1604 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
-| `stream/pipeline.rs` | 280 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
+| `stream/parallel.rs` | 1683 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/pipeline.rs` | 284 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
-| `stream/runtime_filter.rs` | 574 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
+| `stream/runtime_filter.rs` | 587 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `stream/union_all.rs` | 114 | `UNION ALL` as a pipeline operator: yield each branch's morsels in turn, hold none of them. |
 | `union_coerce.rs` | 174 | One common column type for the branches of a set operation, before they are combined. |
 | `window_spill.rs` | 177 | Bounded-memory window execution via grace partitioning. |
@@ -3155,7 +3157,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 761 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `gather/spans.rs` | 136 | Copying a sequence of source byte spans into one output buffer, as few copies as possible. |
-| `join/asof.rs` | 248 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
+| `join/asof.rs` | 539 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 237 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 444 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
@@ -3201,7 +3203,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `analyze.rs` | 450 | Validate a [`bc_expr::Expr`] against the JIT's supported subset and infer the scalar type each sub-expression evaluates to, recording referenced columns. |
 | `cache.rs` | 97 | A process-wide memo for compiled expressions. |
 | `compile.rs` | 485 | Build and JIT-compile a Cranelift function that evaluates an `Expr` element-wise over the row index, returning the finalized function pointer. |
-| `emit.rs` | 624 | Per-element IR emitter: recurses over a validated `Expr` building Cranelift values at the current loop index, producing one output element per row. |
+| `emit.rs` | 637 | Per-element IR emitter: recurses over a validated `Expr` building Cranelift values at the current loop index, producing one output element per row. |
 | `kleene.rs` | 111 | Kleene / null-propagation support analysis for the JIT. |
 | `lib.rs` | 154 | `bc-codegen` — a Cranelift JIT backend for `bc-expr` scalar expressions. |
 | `simd.rs` | 360 | Vector (SIMD) emitter for the JIT's vectorizable `Expr` subset. |
@@ -3382,7 +3384,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `lib.rs` | 120 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 409 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 412 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
-| `store.rs` | 434 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
+| `store.rs` | 440 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 93 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 207 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |
@@ -3409,7 +3411,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
-| `late.rs` | 379 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
+| `late.rs` | 388 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
 | `lib.rs` | 799 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `mapped.rs` | 130 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |

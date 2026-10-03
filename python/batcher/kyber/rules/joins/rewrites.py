@@ -58,6 +58,7 @@ __all__ = [
     "join_to_semijoin",
     "left_join_null_key_to_antijoin",
     "outer_to_inner_join",
+    "outer_to_inner_under_join",
 ]
 
 
@@ -377,6 +378,64 @@ def outer_to_inner_join(node: Filter, _ctx: OptimizerContext) -> LogicalPlan | N
     if projection is None:
         return Filter(new_join, node.predicate)
     return Filter(dataclasses.replace(projection, input=new_join), node.predicate)
+
+
+@rule(name="outer_to_inner_under_join", phase=Phase.PUSHDOWN, matches=(Join,))
+def outer_to_inner_under_join(node: Join, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """`Join(Join(L, R, outer), S, inner, keys)` → the same join over a stronger outer join
+    when the inner join's keys reject the outer join's null-extended rows.
+
+    An equi-join key never matches a NULL, so an `inner` or `semi` join drops every row whose
+    key is null -- exactly the rows a `left` join pads when its key column comes from the
+    null-supplied side. That is `outer_to_inner_join`'s argument with the join's own keys as the
+    predicate, and it needs its own rule because the predicate usually reaches the join only
+    *as a key*: TPC-DS q93 writes `store_sales LEFT JOIN store_returns ..., reason WHERE
+    sr_reason_sk = r_reason_sk`, the `WHERE` sits over the comma join rather than over the
+    outer one, and pushdown turns it into the inner join's key. Kept a `LEFT JOIN`, the plan
+    materialized all 28.8M `store_sales` rows (sf10) to keep 61,752; as an inner join the
+    reorder is free to join the selective `store_returns ⋈ reason` side first.
+
+    Both of an `inner` join's sides are checked, and both of a `semi` join's: a null key on
+    either side of a semi join matches nothing. An `anti` join keeps its null-keyed left rows,
+    so it is left alone. Looks through one pass-through projection, as `outer_to_inner_join`
+    does. Returns None when nothing changes, so the rule is idempotent.
+    """
+    if node.join_type not in {"inner", "semi"}:
+        return None
+    left = _strengthen_by_keys(node.left, node.left_keys)
+    right = _strengthen_by_keys(node.right, node.right_keys)
+    if left is None and right is None:
+        return None
+    return dataclasses.replace(
+        node,
+        left=node.left if left is None else left,
+        right=node.right if right is None else right,
+    )
+
+
+def _strengthen_by_keys(child: LogicalPlan, keys: tuple[str, ...]) -> LogicalPlan | None:
+    """`child` with its outer join strengthened by `keys` never being null, or None."""
+    projection: Project | None = None
+    inner = child
+    if isinstance(inner, Project) and isinstance(inner.input, Join):
+        projection, inner = inner, inner.input
+    if not isinstance(inner, Join) or inner.join_type not in {"left", "right", "full"}:
+        return None
+    if projection is None:
+        rejected = set(keys)
+    else:
+        # A key the projection computes rather than passes through is dropped, not guessed at.
+        renames = passthrough_renames(projection.items)
+        rejected = {renames[k] for k in keys if k in renames}
+    left_aliases = {o.alias for o in inner.output if o.side == "left"}
+    right_aliases = {o.alias for o in inner.output if o.side == "right"}
+    new_type = _strengthened(
+        inner.join_type, bool(rejected & left_aliases), bool(rejected & right_aliases)
+    )
+    if new_type == inner.join_type:
+        return None
+    joined = dataclasses.replace(inner, join_type=new_type)
+    return joined if projection is None else dataclasses.replace(projection, input=joined)
 
 
 def _strengthened(join_type: str, rejects_left: bool, rejects_right: bool) -> str:

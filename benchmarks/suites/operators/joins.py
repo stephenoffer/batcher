@@ -3,6 +3,11 @@
 A join followed by a small grouped aggregate (revenue by order priority) keeps the
 result tiny, so the correctness gate compares a handful of rows rather than the
 multi-million-row join output.
+
+The as-of join (DuckDB ``ASOF JOIN``, Polars ``join_asof``) is not the same SQL string on every
+engine -- Batcher's parser has no ``ASOF JOIN`` -- so it is a native callable per engine, over
+inputs built once outside the timed region. Its right side holds one row per ``(key, time)``, so
+the backward match is unique and two correct engines cannot disagree on a tie.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ from typing import TYPE_CHECKING
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from registry import suite
+from registry import EngineQueries, suite
 
 from .base import sql_fanout
 
@@ -195,3 +200,86 @@ def join_full_outer(ctx: Context):
         "ON o.o_orderkey = l.l_orderkey"
     )
     return sql_fanout(ctx, sql)
+
+
+def _asof_inputs(ctx: Context) -> tuple[pa.Table, pa.Table]:
+    """Each `lineitem` row, and per supplier the price of its latest commit on or before.
+
+    Both sorted on their time column, which Polars requires of an as-of join and which every
+    engine is then handed alike.
+    """
+    line = ctx.table("lineitem")
+    left = line.select(["l_suppkey", "l_shipdate", "l_quantity"]).sort_by("l_shipdate")
+    events = (
+        line.select(["l_suppkey", "l_commitdate", "l_extendedprice"])
+        .group_by(["l_suppkey", "l_commitdate"])
+        .aggregate([("l_extendedprice", "max")])
+        .rename_columns(["l_suppkey", "l_commitdate", "px"])
+        .sort_by("l_commitdate")
+    )
+    return left, events
+
+
+@joins.case("op-asof-join")
+def asof_join(ctx: Context) -> EngineQueries:
+    """Backward as-of join on time within a supplier, then a count and a sum of the match."""
+    left, events = _asof_inputs(ctx)
+    names = ctx.names()
+    fns: EngineQueries = {}
+    if "batcher" in names:
+        import batcher as bt
+
+        l_ds, r_ds = bt.from_arrow(left), bt.from_arrow(events)
+
+        def batcher() -> pa.Table:
+            joined = l_ds.join_asof(
+                r_ds, left_on="l_shipdate", right_on="l_commitdate", by="l_suppkey"
+            )
+            return joined.agg(
+                n=bt.col("l_suppkey").count(),
+                matched=bt.col("px").count(),
+                px_sum=bt.col("px").sum(),
+            ).to_arrow()
+
+        fns["batcher"] = batcher
+    if "duckdb" in names:
+        import duckdb
+
+        # Native tables, as the `duckdb` engine runs everywhere else: over registered Arrow views
+        # DuckDB's ASOF join took 6.9 s for 100,000 rows against 28 ms on its own storage.
+        con = duckdb.connect()
+        con.register("l_arrow", left)
+        con.register("r_arrow", events)
+        con.execute("CREATE TABLE l AS SELECT * FROM l_arrow")
+        con.execute("CREATE TABLE r AS SELECT * FROM r_arrow")
+        sql = (
+            "SELECT count(*) AS n, count(px) AS matched, sum(px) AS px_sum "
+            "FROM l ASOF LEFT JOIN r "
+            "ON l.l_suppkey = r.l_suppkey AND l.l_shipdate >= r.l_commitdate"
+        )
+        fns["duckdb"] = lambda: con.sql(sql).to_arrow_table()
+    if "polars" in names:
+        import polars as pl
+
+        l_pl, r_pl = pl.from_arrow(left), pl.from_arrow(events)
+
+        def polars() -> pa.Table:
+            joined = l_pl.lazy().join_asof(
+                r_pl.lazy(),
+                left_on="l_shipdate",
+                right_on="l_commitdate",
+                by="l_suppkey",
+                strategy="backward",
+            )
+            return (
+                joined.select(
+                    pl.len().alias("n"),
+                    pl.col("px").count().alias("matched"),
+                    pl.col("px").sum().alias("px_sum"),
+                )
+                .collect()
+                .to_arrow()
+            )
+
+        fns["polars"] = polars
+    return fns

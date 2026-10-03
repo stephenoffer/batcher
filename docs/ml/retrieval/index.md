@@ -2,7 +2,7 @@
 
 This section covers the vector and language-model half of an ML pipeline: encoding columns into embeddings, searching them, building RAG, running LLMs over millions of rows, and parsing and scoring what the model says.
 
-Vectors are ordinary columns in Batcher, not a separate store you sync to. An embedding is a fixed-size list column, the distance functions are expressions, and a top-k search is a projection and a sort. That puts the whole retrieval stack inside one engine. A single pipeline can clean and chunk a corpus, embed it, retrieve against it, and call a model on the result, and every step streams, distributes, and joins against your other tables like any other relation.
+Vectors are ordinary columns in Batcher, not a separate store you sync to. An embedding is a list column, the distance functions are expressions, and a top-k search is a projection and a sort. One pipeline can chunk a corpus, embed it, retrieve against it, and call a model on the result, and every step streams, distributes, and joins like any other relation.
 
 ## A retrieval pipeline in miniature
 
@@ -30,13 +30,30 @@ print(answers.sort("id").to_pydict()["response"])
 
 In production the vectors come from {py:meth}`ds.ml.embed <batcher.api.dataset.ml.DatasetML.embed>` and the engine from {py:func}`bt.ml.vllm_engine <batcher.ml.vllm_engine>` or {py:func}`bt.ml.http_engine <batcher.ml.http_engine>`. The pipeline shape doesn't change.
 
+## Score, threshold, and monitor
+
+{py:meth}`ds.ml.similarity_to <batcher.api.dataset.ml.DatasetML.similarity_to>` scores every row without the top-k cut, which is what thresholding and reranking need:
+
+```python
+scored = docs.ml.similarity_to([1.0, 0.0], column="vec")
+print(scored.filter(bt.col("score") > 0.9).select("id").to_pydict())
+# {'id': [1, 3]}
+```
+
+Retrieval-quality metrics are aggregates, so they group by model, source, or day like any other measure:
+
+```python
+pairs = bt.from_pydict({"q": [[1.0, 0.0]], "doc": [[0.6, 0.8]]})
+print(pairs.agg(sim=bt.mean_cosine_similarity("q", "doc")).to_pydict())
+# {'sim': [0.6]}
+```
+
 ## What you get
 
-Embedding and generation both run on warm, load-once actor pools, the same scheduling as batch inference. On an 8xT4 Ray cluster with real models and full output agreement, sentence-transformers MiniLM embedded 33,611 texts per second and HF gpt2 generated at 814.8 prompts per second. {doc}`/benchmarks/results/ai-and-gpu` has the measurements.
-
-An LLM engine is a callable from a list of prompts to a list of completions. Local vLLM and SGLang, any OpenAI-compatible endpoint, Anthropic, Bedrock and Gemini all satisfy that contract, so switching backends is a one-argument change, and a lambda is enough to test a pipeline in CI. Around the call, Batcher builds prompts from row columns, parses structured output back into typed columns with {py:meth}`ds.ml.extract <batcher.api.dataset.ml.DatasetML.extract>` and {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>`, and scores the generations with metrics that run as aggregates.
-
-Retrieval scales from brute force to an index. Scoring a candidate set exactly is a sort in the engine, and the same functions work in SQL as `ORDER BY list_cosine_similarity(...) LIMIT k`. Past a few million vectors, {py:func}`build_vector_index <batcher.ml.build_vector_index>` and {py:func}`vector_search <batcher.ml.vector_search>` put an approximate index over a Lance dataset, and the hits come back as a `Dataset` you can join.
+- **Warm, load-once actor pools** for embedding and generation. On an 8xT4 Ray cluster, sentence-transformers MiniLM embeds 33,611 texts per second.
+- **One engine contract.** An LLM engine is a callable from a list of prompts to a list of completions. vLLM, SGLang, any OpenAI-compatible endpoint, Anthropic, Bedrock and Gemini all satisfy it, and a lambda is enough to test a pipeline in CI.
+- **Typed outputs.** {py:meth}`ds.ml.extract <batcher.api.dataset.ml.DatasetML.extract>` and {py:meth}`ds.ml.classify <batcher.api.dataset.ml.DatasetML.classify>` parse generations back into typed columns.
+- **Brute force to an index.** Exact search is a sort in the engine, and SQL spells it `ORDER BY list_cosine_similarity(...) LIMIT k`. Past a few million vectors, {py:func}`build_vector_index <batcher.ml.build_vector_index>` and {py:func}`vector_search <batcher.ml.vector_search>` put an approximate index over a Lance dataset.
 
 ## In this section
 

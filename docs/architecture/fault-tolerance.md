@@ -3,10 +3,7 @@
 This page describes how a distributed Batcher query survives failure, and which knob
 controls each layer of recovery.
 
-A distributed query runs across many workers, and at scale something is always failing.
-A node is preempted, a task hits a transient error, or a network connection drops
-mid-shuffle. Batcher's distributed path is built so those failures slow a query down
-rather than kill it, and a recovered result is identical to one that never failed.
+At scale something is always failing: a node is preempted, a task hits a transient error, a connection drops mid-shuffle. Batcher's distributed path makes those failures slow a query down rather than kill it, and a recovered result is identical to one that never failed.
 
 Two invariants make recovery sound:
 
@@ -20,20 +17,18 @@ Two invariants make recovery sound:
 
 ## Layered retries
 
-Recovery is defense in depth. The cheapest mechanism handles the common case, and
-heavier machinery engages only when it can't. The knobs live in `config.distributed`,
-documented in {doc}`../configuration/options`.
+The cheapest mechanism handles the common case, and heavier machinery engages only when it can't. Every knob lives in `config.distributed` ({doc}`../configuration/options`). The blocks on this page share one base config:
 
-Every layer below is a mechanism for *repeating* work that was lost. Two things bound them,
-because repetition alone is not recovery. A failure is classified first into one of three
-verdicts: retry here, retry elsewhere, or do not retry. A failure local to one machine that
-is retried in place walks the whole queue onto it. Retries are also drawn from a job-wide
-budget, so a fleet broken in some way no probe catches fails quickly with the first real
-error rather than slowly with the last one. Both are configured in
-{doc}`../configuration/fault-tolerance`.
+```python
+# docs: run
+import dataclasses
 
-The figure below shows that classification, the three verdicts it reaches, and the three
-prices a recompute can cost depending on what was arranged beforehand.
+import batcher as bt
+
+base = bt.Config()
+```
+
+A failure is classified before anything retries: retry here, retry elsewhere, or don't retry. Retries draw from a job-wide budget, so a fleet broken in a way no probe catches fails fast with the first real error. Both are configured in {doc}`../configuration/fault-tolerance`. The figure shows the classification and the three prices a recompute can cost.
 
 ![Recovery classifies a failure before it retries, and only one of the three verdicts is a retry. A task that raised, or whose worker stopped answering, is classified as lost data to be recomputed when it is a RayError that is not a RayTaskError, meaning an actor, a worker or a node died, and likewise for a RetryableShuffleError from an unreachable peer or a ResourceError from a spill file on an ephemeral disk. A deterministic bug, such as a UDF exception, a bad cast, a schema mismatch or a broken runtime environment, is re-raised instead, because every retry re-runs it, burns the job-wide budget, and reports a resource error for a Python bug. An uncontained ECC fault, where the device kept running and answered wrongly, leaves results untrusted and recovery refuses to continue at all, since work already finished there is as suspect as the task that failed. A recompute then costs one of three prices: re-read the source partition and re-run the map by default, usually the longest phase; fetch an off-node replica when shuffle_replication is above 1 and the copy was acknowledged before the bucket was advertised; or migrate while the worker is still alive, given advance notice from spot metadata, a SIGTERM or a Slurm deadline. Recovery introduces its own hazard, a worker presumed dead that is not, so each round carries a higher epoch and a reducer discards any batch arriving under a stale one.](/_static/diagrams/fault_recovery.svg)
 
@@ -44,11 +39,7 @@ failure, such as a flaky node or a dropped connection, before any app-level reco
 engages, because a shuffle task is deterministic and recomputed from a durable source.
 
 ```python
-# Illustrative: the fault-tolerance section of config.distributed.
-import dataclasses
-from batcher import Config
-
-base = Config()
+# docs: run
 cfg = base.replace(
     distributed=dataclasses.replace(
         base.distributed,
@@ -58,6 +49,8 @@ cfg = base.replace(
         actor_max_task_retries=1,  # rerun the in-flight call on the respawned actor
     )
 )
+print(cfg.distributed.task_max_retries)
+# 2
 ```
 
 `task_max_retries` covers worker death, and `retry_on_transient` extends it to
@@ -72,7 +65,7 @@ its output partition is recomputed from its durable source partition and re-fetc
 This is the lineage-recovery path the mergeable algebra makes safe.
 
 ```python
-# Illustrative.
+# docs: run
 cfg = base.replace(
     distributed=dataclasses.replace(
         base.distributed,
@@ -82,39 +75,22 @@ cfg = base.replace(
 )
 ```
 
-`recovery_max_attempts` bounds the recompute and retry rounds, so a still-broken
-shuffle fails with a clear error rather than looping. The exponential backoff keyed on
-`recovery_backoff_base_s` keeps a flaky network from being hammered in a tight loop. A
-larger cluster with a higher background failure rate raises both.
+`recovery_max_attempts` bounds the rounds, so a still-broken shuffle fails with a clear error rather than looping, and the exponential backoff keeps a flaky network from being hammered.
 
 ### Detecting a dead peer
 
-A worker can stop responding without an explicit failure. The Flight transport treats a
-peer as dead when the gap between batches in a fetch exceeds `flight_idle_timeout_s`.
-That timeout is generous, so a long GC pause isn't misread as death, but bounded, so a
-truly dead peer is detected and its partition recomputed. Setting `flight_keepalive_s`
-adds an HTTP/2 keepalive ping that notices a silently dropped connection faster than
-the idle timeout alone.
+The Flight transport treats a peer as dead when the gap between batches in a fetch exceeds `flight_idle_timeout_s` (60 seconds by default), long enough that a GC pause isn't misread as death. `flight_keepalive_s` adds an HTTP/2 keepalive ping that notices a silently dropped connection sooner.
 
 ## Epoch fencing
 
-Recovery introduces a hazard: a worker presumed dead may not actually be dead, and a
-recomputed partition must not be double-counted with a straggling original. Each
-recovery round runs under a monotonically increasing *epoch*. A reducer accepts a
-partition tagged with the current epoch and fences out any batch arriving under a stale
-epoch, discarding it. A zombie producer can wake up after its work was reassigned. It
-can't corrupt the result. Its late bytes are ignored. Fencing and the
-deterministic-task invariant together make a recomputed partition safe to merge back in.
+A worker presumed dead may not be, and a recomputed partition must not be double-counted with a straggling original. Each recovery round runs under a higher *epoch*, and a reducer discards any batch tagged with a stale one. A zombie producer that wakes up late can't corrupt the result.
 
 ## Straggler mitigation
 
-A node that is degraded but alive is worse than a dead one. It never failed, so
-nothing recomputes it. It still stalls a shuffle barrier. Speculative execution backs
-up a slow survivor and takes whichever copy finishes first. Because shuffle tasks are
-deterministic, the two copies are identical, so the result is unchanged.
+A degraded but live node never fails, so nothing recomputes it, yet it stalls a shuffle barrier. Speculative execution backs up a slow task and takes whichever copy finishes first. Shuffle tasks are deterministic, so both copies are identical.
 
 ```python
-# Illustrative.
+# docs: run
 cfg = base.replace(
     distributed=dataclasses.replace(
         base.distributed,
@@ -125,22 +101,14 @@ cfg = base.replace(
 )
 ```
 
-The default is `speculation_max_backups=1`, so one backup chases the single worst
-straggler and nothing else. Set it to `0` and the barrier becomes a plain wait. The
-bound is what keeps a uniformly slow stage from spawning a backup per task and
-oversubscribing the cluster.
+One backup chases the single worst straggler, which keeps a uniformly slow stage from spawning a backup per task. `0` turns speculation off.
 
 ## Credit-based backpressure
 
-Backpressure is fault tolerance against the most common failure of all, running out of
-memory. The shuffle uses credit-based flow control. One credit is one in-flight
-`RecordBatch` slot, so a channel's credit window is a direct bound on its buffered
-memory. A producer blocks when its peer's credits reach zero, so a fast stage can't
-flood a slow one and blow up memory. Carbonite is the authority that grants the window
-and clamps any request to `default_credits` times `credit_ceiling_factor`.
+Backpressure guards against the most common failure of all, running out of memory. One credit is one in-flight `RecordBatch` slot, so a channel's credit window bounds its buffered memory, and a producer blocks when its peer's credits reach zero. Carbonite grants the window and clamps any request to `default_credits` times `credit_ceiling_factor`.
 
 ```python
-# Illustrative: config.flow_control.
+# docs: run
 cfg = base.replace(
     flow_control=dataclasses.replace(
         base.flow_control,
@@ -148,33 +116,23 @@ cfg = base.replace(
         credit_ceiling_factor=4,  # max window = default_credits x this
     )
 )
+print(cfg.flow_control.default_credits * cfg.flow_control.credit_ceiling_factor)
+# 64
 ```
 
-The grant is a starting point rather than a fixed window. `config.distributed.adaptive_credits`,
-on by default, runs a TCP-like AIMD controller that grows the window by
-`config.flow_control.aimd_alpha` per round trip and multiplicatively shrinks it by
-`config.flow_control.aimd_beta` when it sees memory backpressure, so the shuffle backs
-off under pressure instead of holding a fixed window. Flow control never changes the
-merged output, which keeps the guarantee that a distributed result equals a single-node
-one intact.
-
-The data plane bypasses the Ray object store entirely. Bulk Arrow batches move over
-Arrow Flight (`bc-transport`), and only small control-plane strings transit Ray. The
-object store is where the serialization overhead and OOM risk of a shuffle would
-otherwise come from.
+`config.distributed.adaptive_credits`, on by default, runs a TCP-like AIMD controller on top: it grows the window by `aimd_alpha` per round trip and shrinks it by `aimd_beta` under memory backpressure. Flow control never changes the merged output. Bulk batches move over Arrow Flight and never through the Ray object store.
 
 ## Resilience profiles
 
-Rather than tune each knob, pick a `config.distributed.resilience` profile. `"default"`
-keeps conservative budgets tuned for a stable on-demand cluster. `"spot"` hardens them
-as a bundle for a churning preemptible cluster. It raises actor restarts, task retries
-and recompute attempts to ride out repeated loss, spaces the recovery backoff so a
-preemption *wave* isn't retried in a tight loop, turns on the HTTP/2 keepalive so a
-dropped peer is noticed fast, lets a stage wait briefly for the autoscaler to replace
-churned capacity. It leaves `shuffle_replication` at 1, for the reason under Requirements and limitations. A profile applies *below* any value
-you set explicitly, so an explicit override beats the profile, and the profile beats
-the default. A preemptible environment is auto-detected and switched to `"spot"` when
-`resilience` is left at `"default"`.
+Rather than tune each knob, pick a `config.distributed.resilience` profile. `"default"` suits a stable on-demand cluster. `"spot"` hardens the budgets as a bundle for a preemptible one: more actor restarts, task retries and recompute attempts, a spaced backoff so a preemption wave isn't retried in a tight loop, the HTTP/2 keepalive, and a brief wait for the autoscaler to replace churned capacity. An explicit value beats the profile, and the profile beats the default. A preemptible environment is detected and switched to `"spot"` automatically.
+
+```python
+# docs: run
+spot = base.replace(distributed=dataclasses.replace(base.distributed, resilience="spot"))
+with bt.config_context(spot):
+    print(bt.from_pydict({"a": [1, 2]}).to_pydict())
+# {'a': [1, 2]}
+```
 
 ## Draining before a node goes away
 
@@ -185,6 +143,13 @@ output to a survivor while the worker is still alive, which costs one copy rathe
 full re-read of the source. Batcher checks three kinds of advance notice, because a given
 cluster offers only one of them:
 
+Batcher watches three sources of advance notice: cloud spot metadata (AWS, Google Cloud, Azure and Alibaba Cloud), an orchestrator signal (`SIGTERM` from Kubernetes or Slurm, `SIGUSR1` as Slurm's early warning), and a wall-clock deadline such as `SLURM_JOB_END_TIME`. Draining begins `config.distributed.drain_lead_s` seconds before a known deadline. On a scheduler that publishes only a wall-clock limit, export the lease:
+
+```bash
+export BATCHER_DEADLINE_EPOCH_S=$(( $(date +%s) + 4 * 3600 ))
+```
+
+:::{dropdown} How each notice source works
 Cloud metadata answers on a spot instance. Batcher polls the AWS `instance-action`
 endpoint, the Google Cloud `preempted` flag, Azure Scheduled Events, and the Alibaba Cloud
 spot `termination-time`, treating only `Preempt` and `Terminate` as reclamation so routine
@@ -241,9 +206,13 @@ than a year out, so an unlimited job is left on the default budgets.
 
 Draining changes *where* a partial result lives, never what it holds. The output is
 unchanged.
+:::
 
-## Not scheduling onto capacity that is leaving
+## Capacity that is leaving
 
+Batcher reads Ray's drain list and excludes nodes being scaled in or evicted from every fan-out, so a query mid scale-in is provisioned against the nodes that will still be there. Under a known deadline, each wait for the head, the autoscaler or a placement group shrinks to the time actually left.
+
+:::{dropdown} Details
 A node the autoscaler is scaling in, or whose pod Kubernetes is evicting, stays alive and
 keeps advertising its full resources so the work already on it can finish. Sizing a *new*
 fleet onto it is what costs: the placement group reserves bundles on a node being removed,
@@ -255,7 +224,7 @@ It never narrows to nothing. If every remaining node is draining, the fleet is p
 anyway, because running on capacity that is going away beats not running, and the recovery
 machinery above exists for exactly that case.
 
-## Waits under a deadline
+**Waits under a deadline.**
 
 The scheduler waits in three places before any work happens: for the head to answer, for
 the autoscaler to deliver capacity, and for a placement group to become satisfiable. Each
@@ -278,8 +247,13 @@ Being killed is also what leaks an autoscaler floor. `request_resources` is stic
 lives in the autoscaler rather than the driver, so a job killed before its teardown runs
 leaves the cluster pinned at full size with nothing running against it. The drain hook
 drops the floor, which is why it is armed for preemptible deployments.
+:::
 
 ## Shuffle-output replication
+
+:::{warning}
+Leave `shuffle_replication` at 1. The practical limits below say why.
+:::
 
 Losing a mapper normally forces a recompute: re-read its source partition from object
 storage and re-run the map, usually the longest phase of a query. Setting
@@ -287,9 +261,7 @@ storage and re-run the map, usually the longest phase of a query. Setting
 on an off-node survivor, so a reducer fetches the byte-identical bucket instead, at the
 cost of one extra network copy.
 
-The mergeable algebra makes that trade affordable. A mapper publishes pre-aggregated
-partial state, typically far smaller than the source that produced it, so copying it is
-much cheaper than regenerating it. A replica is advertised only once
+A mapper publishes pre-aggregated partial state, typically far smaller than its source, so copying it is cheaper than regenerating it. A replica is advertised only once
 its copy has been acknowledged, and a source's replicas are retired when it's
 recomputed, so a reducer can never read a stale replica under a superseded epoch.
 
@@ -299,42 +271,18 @@ before the next level is built on them, so losing a combiner costs a re-fetch ra
 than discarding every level built so far. That is the cheapest copy in the shuffle,
 because a level's output is several partials already merged into one.
 
-## Requirements and limitations
+## Practical limits
 
-Fault tolerance applies to the distributed path, which needs the optional `[ray]`
-extra. Single-node execution has none of the machinery on this page and none of the
-overhead.
+Fault tolerance applies to the distributed path, which needs the optional `[ray]` extra. Single-node execution has none of this machinery and none of its overhead.
 
-- Shuffle output lives on the worker that produced it. `bc-transport`'s partition store
-  holds it in memory and spills to that worker's local disk under pressure. There is no
-  external shuffle service, so a lost worker's buckets are gone and are recomputed unless
-  replication placed a copy elsewhere.
-- `shuffle_replication` defaults to 1, meaning no replica, and no profile raises it. Setting
-  it above 1 is not safe yet: on worker loss it can drop that worker's share of the rows
-  instead of failing, while replication off recovers exactly. The measurements are in
-  [`tests/integration/test_shuffle_replication.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_shuffle_replication.py).
-- Draining runs only under the `"spot"` profile, so a stable cluster starts no monitor
-  and pays nothing. A preemptible or time-limited environment selects that profile
-  automatically, but a cluster whose signals Batcher can't see needs `BATCHER_SPOT=1`,
-  an exported `BATCHER_DEADLINE_EPOCH_S`, or an explicit `resilience="spot"`.
-- The signal traps need the main thread. A worker that can't install them, which is the
-  usual case inside a Ray actor, falls back to the metadata and deadline polls. Those run
-  every 5 seconds (`PreemptionMonitor`'s `poll_interval_s`), each metadata probe bounded at
-  0.3 seconds, so a notice is seen within about 5 seconds plus one probe per endpoint the node
-  can answer. That fits inside the 30 seconds or more that the cloud providers give before
-  reclamation. A notice the poll never sees, because the node is gone before the next poll,
-  isn't lost work either: it degrades to the reactive recompute described above.
-- Which profile and replication factor a run got is stated where the cluster is first
-  seen. The once-per-session `attached to Ray` INFO line carries `resilience` and
-  `shuffle_replication` alongside the node count, so a preemptible site that Batcher didn't
-  recognize, still on the `"default"` budgets, is visible before anything is lost rather
-  than after.
-- Everything on this page recovers *workers*. The driver holds the plan, the stage handles
-  and the fleet's ownership, and nothing replicates them: if the driver process dies, the
-  batch query fails and its fleet actors, which the driver owns, go with it. The resumable
-  boundary for a job that must survive its driver is a streaming query with `checkpoint=`,
-  which restarts from its last committed offset, as
-  {doc}`Streaming </user-guide/moving-data/streaming/index>` describes.
+- Shuffle output lives on the worker that produced it, in memory with a local-disk spill. A lost worker's buckets are recomputed.
+- Keep `shuffle_replication` at its default of 1, which recovers exactly. Above 1, worker loss can drop that worker's share of the rows instead of failing, as [`tests/integration/test_shuffle_replication.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_shuffle_replication.py) records.
+- Draining runs under the `"spot"` profile. A cluster whose signals Batcher can't see needs `BATCHER_SPOT=1`, an exported `BATCHER_DEADLINE_EPOCH_S`, or `resilience="spot"`.
+- Recovery covers workers, not the driver. A job that must survive its driver runs as a streaming query with `checkpoint=`, which restarts from its last committed offset ({doc}`Streaming </user-guide/moving-data/streaming/index>`).
+
+:::{dropdown} Signal handling inside Ray actors
+The signal traps need the main thread. A worker that can't install them, the usual case inside a Ray actor, falls back to the metadata and deadline polls. Those run every 5 seconds (`PreemptionMonitor`'s `poll_interval_s`), each metadata probe bounded at 0.3 seconds, which fits inside the 30 seconds or more that cloud providers give before reclamation. The once-per-session `attached to Ray` INFO line reports `resilience` and `shuffle_replication` alongside the node count.
+:::
 
 ## See also
 

@@ -1,12 +1,6 @@
 # Your first pipeline
 
-Build a complete pipeline from an in-memory dataset: a five-row sales table, a derived
-`total` column, a per-category revenue rollup, and a sorted result. Everything here runs
-as written.
-
-You need `pip install batcher-engine`. No cluster, no GPU, no files on disk. The closing
-block swaps the in-memory source for a Parquet path and changes nothing else, which is
-the point of the whole tutorial. It needs a real file, so it's shown rather than run.
+Build a complete pipeline in five minutes: a five-row sales table, a derived `total` column, a per-category rollup, and a sorted result. All you need is `pip install batcher-engine`.
 
 ## Build a dataset
 
@@ -28,15 +22,42 @@ print(ds.columns)
 # ['category', 'price', 'qty']
 ```
 
+Peek at a few rows with `limit`, or count them:
+
+```python
+print(ds.limit(2).to_pydict())
+# {'category': ['a', 'b'], 'price': [10.0, 20.0], 'qty': [1, 2]}
+print(ds.count())
+# 5
+```
+
+## Filter rows
+
+`filter` keeps the rows where a boolean expression is true:
+
+```python
+print(ds.filter(bt.col("price") > 25).to_pydict())
+# {'category': ['a', 'b', 'a'], 'price': [30.0, 40.0, 50.0], 'qty': [3, 4, 5]}
+print(ds.filter(bt.col("price").between(20, 40)).count())
+# 3
+```
+
 ## Derive a column
 
 Column work is expressed with {py:class}`Expr <batcher.plan.expr_ir.core.Expr>`. {py:meth}`with_columns <batcher.Dataset.with_columns>` adds or replaces columns and
-keeps the rest. The arithmetic runs in the Rust data plane, not in Python.
+keeps the rest. The arithmetic runs in Rust, not Python.
 
 ```python
 priced = ds.with_columns(total=bt.col("price") * bt.col("qty"))
 print(priced.to_pydict())
 # {'category': ['a', 'b', 'a', 'b', 'a'], 'price': [10.0, 20.0, 30.0, 40.0, 50.0], 'qty': [1, 2, 3, 4, 5], 'total': [10.0, 40.0, 90.0, 160.0, 250.0]}
+```
+
+`select` picks the full output instead, mixing names and expressions:
+
+```python
+print(ds.select("category", total=bt.col("price") * bt.col("qty")).limit(2).to_pydict())
+# {'category': ['a', 'b'], 'total': [10.0, 40.0]}
 ```
 
 ## Group and aggregate
@@ -68,8 +89,15 @@ print(same.sort("category").to_pydict())
 :::
 ::::
 
-Both spellings build the same plan, run through the same optimizer, and execute on the same
-Rust engine. Pick whichever reads better.
+Both spellings build the same plan and run on the same engine. Pick whichever reads better.
+
+Any aggregate can also run *over* a partition without collapsing rows, which is a window function:
+
+```python
+ranked_rows = ds.with_columns(rank=bt.col("price").rank().over("category"))
+print(ranked_rows.select("category", "price", "rank").to_pydict())
+# {'category': ['a', 'b', 'a', 'b', 'a'], 'price': [10.0, 20.0, 30.0, 40.0, 50.0], 'rank': [1, 1, 2, 2, 3]}
+```
 
 ## Sort and collect
 
@@ -113,8 +141,7 @@ print(result.to_pydict())
 
 ## Inspect the plan
 
-`explain()` gives you the optimized plan as text without executing it. Use it to check
-what the optimizer did.
+`explain()` renders the optimized plan as text without executing it.
 
 ```python
 print(isinstance(result.explain(), str))
@@ -139,9 +166,15 @@ sort  [revenue]                                   est≈1  (default)
 
 ## The same pipeline over files
 
-Only the source changes when the data lives in files or object storage. Every transform
-and terminal op below it is identical. This block needs a real file, so it is shown but
-not run.
+Only the source changes when the data lives in files. Write the result and read it back:
+
+```python
+result.write.parquet("revenue.parquet")
+print(bt.read.parquet("revenue.parquet").to_pydict())
+# {'category': ['a', 'b'], 'revenue': [350.0, 200.0], 'orders': [3, 2]}
+```
+
+The same chain over object storage:
 
 ```python
 # docs: skip
@@ -157,16 +190,8 @@ import batcher as bt
 )
 ```
 
-:::{warning}
-The one thing that trips people up on their first pipeline is expecting a transform to *do*
-something. It does not. `with_columns`, `filter`, `group_by`, and `sort` all return a new
-`Dataset` and run nothing at all. The work happens at the terminal op ({py:meth}`to_pydict <batcher.Dataset.to_pydict>`,
-`collect`, `count`, `write`). If your timing shows a transform taking no time, that is
-because it took no time.
-:::
-
 :::{tip}
-Column work belongs in an expression, not in a Python callback. `bt.col("price") * bt.col("qty")` runs in Rust, and the optimizer can see through it. The same arithmetic in a `map_batches` blocks predicate pushdown and costs throughput on every batch. The {doc}`slow query tutorial </getting-started/tutorials/foundations/optimizing-a-slow-query>` shows exactly that.
+Transforms such as `with_columns`, `filter`, and `group_by` build the plan and return instantly. The work happens at the terminal op: {py:meth}`to_pydict <batcher.Dataset.to_pydict>`, `collect`, `count`, or `write`. Keep column work in expressions so it runs in Rust and the optimizer can see through it.
 :::
 
 ## Where to go next

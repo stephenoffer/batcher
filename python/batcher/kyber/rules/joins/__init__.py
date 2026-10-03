@@ -33,6 +33,7 @@ from batcher.kyber.rules.joins.rewrites import (
     eliminate_left_join,
     join_to_semijoin,
     outer_to_inner_join,
+    outer_to_inner_under_join,
 )
 from batcher.kyber.rules.joins.runtime_range import _FILTERABLE_SIDES as _FILTERABLE_SIDES
 from batcher.kyber.rules.joins.runtime_range import runtime_join_filter
@@ -43,5 +44,6 @@ __all__ = [
     "eliminate_left_join",
     "join_to_semijoin",
     "outer_to_inner_join",
+    "outer_to_inner_under_join",
     "runtime_join_filter",
 ]

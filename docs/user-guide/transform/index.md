@@ -1,8 +1,8 @@
 # Transform
 
-This section covers reshaping a dataset in Batcher. It splits along the line the API itself draws: the verbs that decide which rows survive and in what order, and the expression language that decides what a column contains.
+This section covers reshaping a dataset in Batcher. The API draws one line through it. Verbs pick the rows and their order, and expressions decide what a column holds.
 
-Both halves are lazy. Every call returns a new dataset and nothing executes until a terminal operation, so a whole chain reaches the optimizer as one plan. That is what lets Batcher move a filter you wrote last down into the Parquet scan, drop the columns nothing downstream reads, and fuse a run of arithmetic into one compiled pass. An expression is never a Python callback. It lowers to a Rust expression tree that runs over whole Arrow batches, and the Cranelift JIT compiles the arithmetic it supports, so column work on a billion rows never becomes a billion Python calls. When you truly need your own Python, a batch UDF hands it whole Arrow batches, zero-copy, across every core or a cluster.
+Both halves are lazy. A whole chain reaches the optimizer as one plan, so the filter you wrote last still moves down into the Parquet scan. Columns nobody reads get dropped. A run of arithmetic fuses into one compiled pass that Rust evaluates a batch at a time.
 
 ```python
 import batcher as bt
@@ -17,9 +17,19 @@ print(adults.to_pydict())
 # {'name': ['Carl', 'Ann'], 'age': [51, 34], 'decade': [5.0, 3.0]}
 ```
 
+Sometimes you need your own Python. A batch UDF gets it zero-copy Arrow batches:
+
+```python
+import pyarrow.compute as pc
+
+shout = people.map_batches(lambda batch: batch.set_column(0, "name", pc.utf8_upper(batch["name"])))
+print(shout.to_pydict())
+# {'name': ['ANN', 'BOB', 'CARL'], 'age': [34, None, 51]}
+```
+
 ## Two halves of one chain
 
-Each verb has one job. `filter`, `distinct`, and `sample` decide which rows survive, `sort` decides their order, and `select` and `with_columns` decide what the columns hold. None of them computes a value on its own. The expression you pass to `filter`, `select`, or `with_columns` does that, and the column language is how you write one.
+`filter`, `distinct` and `sample` drop rows. `sort` orders them. `select` and `with_columns` set what each column holds, though the expression you hand them does the actual computing.
 
 ![A matrix of six verbs against three properties of a table, beside a panel on the column language. filter, distinct and sample change which rows survive and leave row order and columns alone. sort sets the row order and changes neither which rows survive nor the columns. select and with_columns change what the columns hold and leave the rows and their order alone. Every call returns a new lazy Dataset, and nothing runs until a result is asked for. The column language panel shows three expressions: bt.col("age") >= 18, bt.col("name").str.to_case("title"), and (bt.col("age") / 10).floor(). An expression lowers to a Rust expression tree that runs over whole Arrow batches, never one Python call per row, and filter, select and with_columns evaluate it. A batch UDF is the escape hatch, running your Python over whole Arrow batches.](/_static/diagrams/transform_rows_vs_columns.svg)
 
@@ -29,13 +39,13 @@ Each verb has one job. `filter`, `distinct`, and `sample` decide which rows surv
 :::{grid-item-card} {octicon}`filter;1.1em` Working on rows
 :link: /user-guide/transform/rows/index
 :link-type: doc
-Select and derive, filter, sort, deduplicate, and sample. The verbs that change the shape of the table, with contracts precise enough to test against.
+The verbs that change the shape of a table, from `select` to `sample`, each with a contract you can test against.
 :::
 
 :::{grid-item-card} {octicon}`code;1.1em` The column language
 :link: /user-guide/transform/columns/index
 :link-type: doc
-{py:class}`Expr <batcher.plan.expr_ir.core.Expr>`, the typed accessor namespaces, the type system, and the batch UDF for when an expression genuinely cannot say it.
+{py:class}`Expr <batcher.plan.expr_ir.core.Expr>` and its typed accessors, the type system, and a batch UDF for anything an expression can't say.
 :::
 ::::
 
@@ -63,7 +73,9 @@ The pages below are listed in reading order, rows first and then columns.
 
 ## See also
 
-- {doc}`/user-guide/analyze/index`: grouping, joining, and windowing the rows you kept.
+These pages pick up where this section stops.
+
+- {doc}`/user-guide/analyze/index`: group, join or window the rows you kept.
 - {doc}`/cookbook/expressions/index`: the column language as runnable recipes.
 - {doc}`/api/relational/expressions`: every `Expr` method, enumerated.
 - {doc}`/examples/relational`: the same verbs as standalone scripts, each run on every commit.

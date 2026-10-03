@@ -1,6 +1,6 @@
 # Platform engineer learning path
 
-This path is for whoever runs the engine. You'll set parallelism and memory limits, inject defaults from the environment, and learn what the engine does when a query pushes past its budget.
+For whoever runs the engine: set parallelism and memory limits, inject defaults from the environment, and bound what a query may use.
 
 ## Reading order
 
@@ -48,6 +48,27 @@ print((cfg.execution.parallelism, cfg.memory.soft_limit))
 # (16, 0.7)
 ```
 
+## Example: a scoped memory budget
+
+`config_context` applies a config to one block only. With a budget set, stateful operators spill instead of exceeding it:
+
+```python
+from batcher.config import MemoryConfig, config_context
+
+budget = Config().replace(memory=MemoryConfig(max_memory_bytes=256 * 1024 * 1024))
+with config_context(budget):
+    print(bt.from_pydict({"x": [3, 1, 2]}).sort("x").to_pydict())
+# {'x': [1, 2, 3]}
+```
+
+## Example: check the build
+
+```python
+info = bt.versions()
+print(sorted(k for k in info if k in {"batcher", "engine", "engine_profile"}))
+# ['batcher', 'engine', 'engine_profile']
+```
+
 ## Runnable examples
 
 - `performance_caching.py` caches a reused result, then spills under a tiny budget.
@@ -61,9 +82,7 @@ See also {doc}`performance and memory </user-guide/operate/tuning/performance>` 
 
 ## How the engine spends your machine
 
-If you operate Batcher, the {doc}`deep dives </architecture/deep-dives/index>` are where the operational
-behavior is explained: what spills and when, how the shuffle applies backpressure, and how a
-plan re-tunes itself mid-query.
+The {doc}`deep dives </architecture/deep-dives/index>` explain the operational behavior: what spills and when, how the shuffle applies backpressure, and how a plan re-tunes itself mid-query.
 
 ::::{grid} 1 2 2 2
 :gutter: 3
@@ -71,7 +90,7 @@ plan re-tunes itself mid-query.
 :::{grid-item-card} {octicon}`database;1.1em` Spilling
 :link: /architecture/deep-dives/memory/spilling
 :link-type: doc
-Staying alive when the data does not fit.
+Finish queries larger than memory.
 :::
 
 :::{grid-item-card} {octicon}`broadcast;1.1em` Credit-based flow control
@@ -89,7 +108,7 @@ Re-planning on measured cardinalities, not estimates.
 :::{grid-item-card} {octicon}`meter;1.1em` Scaling benchmarks
 :link: /benchmarks/results/scaling
 :link-type: doc
-What actually happens when you add nodes.
+Throughput as you add nodes.
 :::
 ::::
 

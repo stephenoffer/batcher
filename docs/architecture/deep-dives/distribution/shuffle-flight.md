@@ -1,16 +1,23 @@
 # The shuffle over Arrow Flight
 
-The *shuffle* is the all-to-all redistribution that puts every row with the same key on the same machine, which is what a distributed group-by or join needs before it can reduce. This page describes how Batcher moves those batches over Arrow Flight, how a reducer picks the cheapest source for each bucket, how buckets are addressed and fetched, and when the disk shuffle runs instead.
-
-The shuffle is where distributed engines go to die. It moves the most bytes, it's the all-to-all that doesn't scale politely, and the obvious implementation, handing the batches to the cluster framework's object store, reintroduces the serialization cost a columnar engine was built to avoid.
+The *shuffle* is the all-to-all redistribution that puts every row with the same key on the same machine, which is what a distributed group-by or join needs before it can reduce. This page describes how Batcher moves those batches over Arrow Flight, how a reducer picks the cheapest source for each bucket, and when the disk shuffle runs instead.
 
 Batcher's shuffle moves Arrow record batches worker to worker over Arrow Flight on gRPC. Ray schedules the workers and carries their addresses. It doesn't carry their data.
 
 :::{important}
-The data plane bypasses the Ray object store. Bulk Arrow batches move over Arrow Flight with credit-based backpressure. What crosses Ray is addresses, tickets, paths, row counts, and a metrics string. Routing bulk data through Ray objects reintroduces the serialization and OOM overhead the columnar design removes.
+The data plane bypasses the Ray object store. What crosses Ray is addresses, tickets, paths, row counts, and a metrics string. Bulk Arrow batches move over Arrow Flight with credit-based backpressure, so they never pay the object store's serialization and memory cost.
 :::
 
-The two planes are physically separate channels between the same pair of workers, and that's the half of the note above a reader skims.
+From the user's side, a shuffle is just a distributed terminal op. The `transport` argument picks the shuffle, and `"auto"` is right almost always:
+
+```python
+# docs: skip
+import batcher as bt
+
+ds = bt.from_pydict({"k": [i % 10 for i in range(100_000)], "v": list(range(100_000))})
+out = ds.group_by("k").agg(s=bt.sum("v")).collect(distributed=True, num_workers=4, transport="auto")
+print(out.num_rows)  # 10
+```
 
 ![A shuffle runs on two separate channels between the same pair of workers. On the control plane, Ray schedules the tasks and actors and carries an address, a ticket, a file path, a row count and a metrics JSON string, and nothing else: the mapper's Flight address goes up through Ray and the reducer's ticket comes back down. On the data plane, the mappers' partition_batches publishes every bucket including the empty ones, and the Arrow record batches travel directly to the reducers over do_exchange on gRPC, LZ4 by default and credit-bounded, one credit being one batch slot with the producer blocking at zero. The reducers fold arrivals into a running partial in Rust through gather_combine, so the intermediate never crosses back into Python. Bulk batches never pass through the Ray object store, because routing them through it reintroduces the serialization the columnar design removes.](/_static/diagrams/shuffle_dataflow.svg)
 
@@ -42,11 +49,9 @@ The two planes are physically separate channels between the same pair of workers
 
 ## The three tiers
 
-A reducer fetching a bucket has three possible sources, and it picks the cheapest without any configuration. The selector is pure, taking placement in and returning a mode, so the whole decision is two comparisons.
+A reducer fetching a bucket has three possible sources, and it picks the cheapest without any configuration.
 
 ![Carbonite routes one shuffle partition by placement. The same Flight address means one process, so DIRECT_MEMORY reads from the local store with no serialization. The same node identity means one host, so SHARED_MEMORY reads the bucket back through Arrow IPC over a memory map. Anything else falls back to NETWORK over credit-bounded Arrow Flight.](/_static/diagrams/transfer_modes.svg)
-
-The following table lists each tier with the path it takes and what it costs:
 
 | Source | Path | Cost |
 |---|---|---|
@@ -54,40 +59,31 @@ The following table lists each tier with the path it takes and what it costs:
 | Same node, other process | `SHARED_MEMORY`: mmap a 64-byte-aligned Arrow IPC file | about a memcpy |
 | Another node | `NETWORK`: credit-bounded Arrow Flight | one gRPC stream |
 
-`carbonite/transfer/locality.py::select_mode` makes the choice from the peer's Flight address and node id. A matching, non-empty Flight address means the same process, so `DIRECT_MEMORY`. Otherwise, two known and equal node identities mean the same host, so `SHARED_MEMORY`. Everything else is `NETWORK`, including two addresses that are both still unknown: an empty address is "not bound yet", not a match, and `NETWORK` is the mode that is always correct and only ever slower.
+`carbonite/transfer/locality.py::select_mode` makes the choice from the peer's Flight address and node id. Two unknown addresses are `NETWORK`, the mode that is always correct and only ever slower. The same test runs in Rust inside the concurrent gather in [`crates/bc-py/src/shuffle/gather.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/shuffle/gather.rs), so same-host buckets are read from shared memory while cross-node buckets keep fanning out. The common GPU-cluster layout packs several workers per node, which makes most fetches same-node, cross-process.
 
-The same test is repeated in Rust inside the concurrent gather in [`crates/bc-py/src/shuffle/gather.rs`](https://github.com/stephenoffer/batcher/blob/main/crates/bc-py/src/shuffle/gather.rs), so a same-host bucket is read from shared memory *inside* the parallel fetch rather than being serialized ahead of it. Cross-node buckets keep fanning out while the local ones are copied.
+:::{dropdown} The shared-memory mirror
+The shared-memory file is a second copy of the bucket in tmpfs. `ShuffleSession._shm_mirror_ok()` skips it under memory pressure (`SPILL` or worse) and on a worker that shares its node with no other worker, where it has no possible reader. A skipped mirror is harmless: the shared-memory read misses and the fetch falls back to Flight with the same batches.
 
-The common GPU-cluster layout packs several worker actors onto each node, so most of a reducer's fetches are same-node but cross-process, which is the tier the shared-memory path accelerates. To measure the gap on your own hardware, run [`benchmarks/cluster/carbonite/xnode.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/carbonite/xnode.py), which moves an identical partition set both ways between a producer and a consumer actor and reports the delivered throughput.
+The mirror is charged to the worker's cgroup and stays until the plan is torn down (`clear_plan`). `ShuffleSession.stats()` reports it as `bytes_mirrored_shm`, and buckets the gate declined as `shm_mirrors_skipped`. The mmap read is zero-copy: `read_mmap_zero_copy` wraps the mapping as an Arrow `Buffer::from_custom_allocation`.
+:::
 
 ## The Flight server
 
-Each worker process hosts one Flight server. `bc_transport::ShuffleExchange::bind_tls` starts it over a shared `Arc<PartitionStore>`, binding `0.0.0.0:0` and advertising `{node_ip}:{port}`, with the IP coming from `ray.util.get_node_ip_address()` in `dist/flight_worker.py`.
+Each worker process hosts one Flight server. `bc_transport::ShuffleExchange::bind_tls` binds `0.0.0.0:0` over a shared `Arc<PartitionStore>` and advertises `{node_ip}:{port}`. Only `do_exchange` is on the production path; every other Flight method returns `unimplemented`. It serves one query's buckets to one query's reducers.
 
-`FlightHandler` implements `arrow_flight::FlightService`, and **only `do_exchange` is on the production path**. `do_get` is the un-credited fetch. It's kept for the crate's own round-trip tests, isn't reachable from `bc-py`, and isn't what a reducer calls. Everything else, including `handshake`, `get_flight_info`, `do_put`, and `do_action`, returns `unimplemented`. This isn't a general-purpose Flight endpoint. It serves one query's buckets to one query's reducers.
+A published bucket is held in the worker's heap until a reducer fetches it, and nobody reserved it, so the store keeps a running byte total and gives memory back two ways, spilling the largest buckets first to local Arrow IPC:
 
-### Where a published bucket lives
+- **A cap.** `carbonite/policies/flow_control.py::shuffle_store_cap` sets it per worker at a quarter of the memory envelope, never above `memory.hard_limit` of it.
+- **Cooperative spilling.** When an operator can't get a reservation, the {doc}`buffer pool </architecture/deep-dives/memory/buffer-pool>` asks the store to yield first. Published output is finished work, so spilling it costs one re-read.
 
-A published bucket is held in the worker's heap until a reducer fetches it:
+A spilled bucket returns the same batches, so spilling can't change an answer. The wire encodes with `FlightDataEncoderBuilder`, LZ4 by default under `distributed.flight_compression`:
 
-```rust
-// crates/bc-transport/src/store.rs
-enum Body { Memory(Arc<Vec<RecordBatch>>), Spilled(PathBuf) }
-pub(crate) struct Partition { body: Body, gauge: Arc<InflightGauge>, nbytes: usize }
+```python
+import batcher as bt
+
+dist = bt.Config().distributed
+print(dist.transport, dist.flight_compression, dist.shuffle_replication)  # auto lz4 1
 ```
-
-That memory is the largest thing Carbonite's buffer pool can't see on its own. An operator reserves memory before it allocates, but nobody reserves a published bucket. The mapper hands it over and it stays resident. With `workers` mappers each producing `workers` buckets, a node holds its whole share of the shuffle this way.
-
-So the store keeps a running byte total and has two ways to give memory back, both spilling the largest buckets first to local disk as Arrow IPC:
-
-- **A cap.** `carbonite/policies/flow_control.py::shuffle_store_cap` sets it per worker when the Flight server starts, at a quarter of the memory envelope and never above `memory.hard_limit` of it. Past the cap, a new registration spills buckets until the store is back under.
-- **Cooperative spilling.** When an operator can't get a reservation from the `bc-resource` pool, the pool asks the store to yield bytes before refusing. Published output is the right thing to ask first: it's finished work waiting to be collected, so spilling it costs one re-read and stalls nobody.
-
-A spilled bucket is read back from disk on fetch and isn't put back in the heap, because the store spilled it for want of memory. The round trip returns the same batches, so spilling can't change an answer.
-
-Arrow IPC appears in three places in the transport: the shared-memory mmap file, a spilled bucket, and the disk shuffle. The Flight wire path encodes with `FlightDataEncoderBuilder`, compressing with LZ4 by default under `distributed.flight_compression`.
-
-## Addressing a bucket
 
 :::{dropdown} `ShuffleTicket`: the wire address of one mapper-to-reducer edge
 ```rust
@@ -101,94 +97,70 @@ pub struct ShuffleTicket {
 }
 ```
 
-It serializes to `"{plan}/{stage}/{src}/{dst}/{epoch}"` and rides in `flight_descriptor.path[0]` of the first `DoExchange` message. `path[1]` is an auth token, and `path[2]` is an optional `"shard/nshards"` selector for striping one bucket across several connections.
+It serializes to `"{plan}/{stage}/{src}/{dst}/{epoch}"` in `flight_descriptor.path[0]` of the first `DoExchange` message. `path[1]` is an auth token, and `path[2]` is an optional `"shard/nshards"` selector for striping one bucket across several connections. `plan_id` is a 63-bit value from a uuid4, so a reused fleet actor never serves a prior query's leftovers; `epoch` does the same for a recompute after worker loss.
 
-`plan_id` is minted per query in `dist/flight_worker.py` as a 63-bit value from a uuid4, so it fits the ticket field. It exists because a session fleet actor is reused across queries, and a reducer must not be able to fetch a crashed prior query's leftovers. `epoch` does the same for a recompute after worker loss.
-:::
-
-:::{note}
-Mappers publish **every** bucket, including empty ones. That turns a failed fetch into an unambiguous signal: the worker is gone, never that the bucket happened to be empty.
+Mappers publish **every** bucket, including empty ones, so a failed fetch always means the worker is gone, never that the bucket was empty.
 :::
 
 ## Fetching
 
-The reducer's gather is `crates/bc-py/src/shuffle/gather.rs::drive`. It works in four steps:
+The reducer's gather, `crates/bc-py/src/shuffle/gather.rs::drive`, works in four steps:
 
-1. Buckets held by this worker are read straight from the local store, with no socket and no credit permit. That includes a *replica* that happens to live here.
-1. The remaining buckets are grouped by the peer that holds them, and each peer is pulled over a share of a fixed stream budget. Many small buckets are packed into one stream by bytes, and one large bucket is striped across several.
-1. Each remote fetch tries shared memory for a same-host peer, then falls back to Flight. When `distributed.shuffle_replication` placed copies of a bucket on other workers, those addresses follow the primary in the candidate list, so a lost mapper is re-fetched rather than recomputed.
-1. Arriving batches are folded into a running partial *in Rust* (`gather_combine`) or concatenated (`gather_concat`), so the reducer never materializes every mapper's bucket as a Python object first.
+1. Buckets held by this worker, including a replica that lives here, are read straight from the local store.
+1. The rest are grouped by peer, and each peer is pulled over a share of a fixed stream budget. Small buckets are packed into one stream by bytes, and one large bucket is striped across several.
+1. Each remote fetch tries shared memory for a same-host peer, then Flight. With `distributed.shuffle_replication` above 1, replica addresses follow the primary, so a lost mapper is re-fetched rather than recomputed.
+1. Arriving batches fold into a running partial *in Rust* (`gather_combine`) or concatenate (`gather_concat`), so the reducer never materializes every mapper's bucket as a Python object.
 
-Step 2 exists because a hash shuffle cuts one bucket per reducer out of every mapper. A cluster of `W` workers makes `W^2` buckets, each smaller as the cluster grows, and one stream per bucket makes the transfer rate a function of the cluster's width rather than the link. Holding the stream count fixed and packing buckets by bytes makes the rate width-independent. The rationale recorded beside the defaults in `config/config.py` measured 1.4 GiB across one 25 Gbps link at 1,608 MiB/s with 4,096 buckets, against 7,470 MiB/s at the same total when the stream count landed right. Those rates are *logical* bytes, the decoded Arrow data a reducer receives, with LZ4 on the wire. A 25 Gbps link carries at most about 2,980 MiB/s, so a rate above that is only possible because the wire bytes are compressed. The run recorded in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md) (2026-08-29, [`benchmarks/cluster/carbonite/bucket_shape.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/carbonite/bucket_shape.py)) puts the uncompressed wire at 2,684 MiB/s, 86% of line rate, and LZ4 at 2.67x on that data, so its roughly 7,400 MiB/s is the saturated NIC rather than headroom beyond it. Compare a rate against a link only after dividing by the compression ratio of the data it carried.
+Holding the stream count fixed and packing by bytes makes the transfer rate width-independent: a cluster of `W` workers makes `W^2` buckets, and one stream per bucket would tie the rate to the cluster's width rather than the link. On one 25 Gbps link, the run recorded in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md) (2026-08-29, [`benchmarks/cluster/carbonite/bucket_shape.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/carbonite/bucket_shape.py)) puts the uncompressed wire at 2,684 MiB/s, 86% of line rate, and LZ4 at 2.67x on that data.
 
-Step 4 matters more than it reads. Folding in Rust is what keeps the join reducer's intermediate out of Python. On TPC-H sf10 that intermediate is 3.75M rows and roughly 106 MB per reducer, which would otherwise be built as Python `RecordBatch` objects and handed straight back into the engine for the partial aggregate. The `execute_plan_aggregated` FFI entry runs the join and folds the aggregate inside the engine instead, so the intermediate never crosses the boundary.
+Folding in Rust keeps the join reducer's intermediate out of Python. On TPC-H sf10 that intermediate is 3.75M rows and roughly 106 MB per reducer, and `execute_plan_aggregated` runs the join and folds the aggregate inside the engine.
 
-:::{warning}
-Several fan-in numbers exist, and they bound different things.
+Four fan-in knobs bound different things:
+
+```python
+fc = bt.Config().flow_control
+print(fc.shuffle_fan_in, fc.shuffle_fetch_fan_in, fc.gather_streams, fc.gather_inflight_bytes >> 20)
+# 8 32 48 768
+```
 
 | Knob | Default | Bounds |
 |---|---|---|
-| `flow_control.shuffle_fan_in` | 8 | the *combiner tree* for an aggregate: how many partials one node folds, so per-node fan-in stays bounded as the cluster grows |
+| `flow_control.shuffle_fan_in` | 8 | the *combiner tree* for an aggregate: how many partials one node folds |
 | `flow_control.shuffle_fetch_fan_in` | 32 | how many channels a flat gather fetches at once, which also divides the per-channel byte budget |
 | `flow_control.gather_streams` | 48 | concurrent Flight streams one reducer runs across all its peers |
 | `flow_control.gather_inflight_bytes` | 768 MiB | decoded bytes those streams may hold between them |
 
-A flat gather holds all its data anyway, so throttling its fetch buys no memory. It only serializes the network. The way to hold less is not to gather flat at all: a breaker asked to leave its result in place publishes one bucket per reducer and hands back handles, and {py:meth}`iter_batches(distributed=True) <batcher.Dataset.iter_batches>` reads those one bucket at a time, as {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>` describes. Sharing one value of 8 between the tree and the flat fetch once made a 16-worker shuffle pull its buckets in two half-idle waves.
-:::
+To hold less than a flat gather, don't gather flat: {py:meth}`iter_batches(distributed=True) <batcher.Dataset.iter_batches>` reads a breaker's published buckets one at a time, as {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>` describes.
 
 ## Scaling
 
-A single reducer's inbound rate is bounded by its NIC, so there's no headroom to win back on one node once the fetch runs at line rate. The scaling is in the aggregate all-to-all, where every node reduces at once. The mergeable `partial -> combine -> finalize` algebra and credit flow control keep per-node memory bounded however wide the cluster gets, so adding nodes adds reducers rather than contention. Measure it for a given cluster shape with [`benchmarks/cluster/carbonite/xnode.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/carbonite/xnode.py).
+A single reducer's inbound rate is bounded by its NIC; the scaling is in the aggregate all-to-all, where every node reduces at once. The mergeable `partial -> combine -> finalize` algebra and credit flow control keep per-node memory bounded however wide the cluster gets.
 
-That holds while there's enough shuffled volume to divide. It doesn't license widening the exchange to match the cluster. An exchange of `m` mappers and `r` reducers opens `m x r` streams, so a reducer count taken from the node count makes the *coordination* quadratic in the cluster while the bytes stay fixed.
-
-That's why the reducer count is sized from the data rather than the fleet. `aggregate_reducer_count` sizes an aggregate, whose exchanged volume is the group count, and `row_shuffle_reducer_count` sizes a join, sort or window, whose exchanged volume is the rows. Measured on a 64-worker fleet, a 64-group aggregate given one reducer per worker spent 302 ms moving a few kilobytes through 4,096 streams, against 91 ms through one. {doc}`Distributed scheduling </architecture/deep-dives/distribution/distributed-scheduling>` has the full table.
+An exchange of `m` mappers and `r` reducers opens `m x r` streams, so the reducer count is sized from the data rather than the fleet. `aggregate_reducer_count` sizes an aggregate from its group count, and `row_shuffle_reducer_count` sizes a join, sort or window from its rows. Measured on a 64-worker fleet, a 64-group aggregate given one reducer per worker spent 302 ms moving a few kilobytes through 4,096 streams, against 91 ms through one. Measure a given cluster shape with [`benchmarks/cluster/carbonite/xnode.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/cluster/carbonite/xnode.py).
 
 ## The disk alternative
 
-`distributed.transport` takes three settings. The default, `"auto"`, picks between the other two, and `resolve_transport` in `dist/executors/ray_runtime/lifecycle.py` makes the call.
+`distributed.transport` takes three settings, resolved by `resolve_transport` in `dist/executors/ray_runtime/lifecycle.py`:
 
-Setting `"flight"` forces the network shuffle described above. `"auto"` chooses it whenever the cluster has more than one node.
+- `"flight"` forces the network shuffle. `"auto"` chooses it whenever the cluster has more than one node.
+- `"disk"` forces the Arrow IPC file shuffle, where only paths pass through Ray. `"auto"` chooses it on a single node, where there's no gRPC and the page cache does the work, and whenever `distributed.shared_filesystem` is set.
 
-Setting `"disk"` forces the Arrow IPC file shuffle, where only paths pass through Ray. It's safe only when every worker sees the same filesystem at the same path. `"auto"` chooses it on a single node, and whenever `distributed.shared_filesystem` is set. On one node the disk shuffle is the *better* choice: there's no gRPC and no server, and the page cache does the work. The work directory is driver-local, which is why `"auto"` won't choose it across nodes.
+Before the disk shuffle runs on more than one node, `dist/shuffle_io.py::verify_shared_scratch` proves the mount: the driver writes a random token, a task on each other node reads it back, and a node that can't fails the query up front with a {py:exc}`ConfigError <batcher.ConfigError>` naming it.
 
-`shared_filesystem = True` and an explicit `"disk"` both *assert* that every node sees the same files, and a mount missing on one node used to surface as a `FileNotFoundError` inside a reducer. So before the disk shuffle runs on more than one node, `resolve_transport` proves it: the driver writes a random token under the scratch base, a task pinned to each other worker node reads it back at the same path, and a node that can't open it or reads different bytes fails the query up front with a {py:exc}`ConfigError <batcher.ConfigError>` that names the node (`dist/shuffle_io.py::verify_shared_scratch`). A node that doesn't answer within 30 seconds proves nothing either way, so it's logged rather than failed. The check runs once per cluster shape per process, and a single-node cluster skips it, because the driver's own node reads its own write by construction.
-
-### Compressing what the disk shuffle writes
-
-The Flight wire compresses its batches under `distributed.flight_compression`. The disk shuffle makes the same trade the way the spill store does, by looking at where the bytes are going rather than at what's in them.
-
-A scratch directory on a **cluster-shared mount** is a network filesystem. Every byte a mapper writes crosses the wire twice, once out to the mount and once back to the reducer, so a cheap codec pays there for the same reason it pays on the remote spill tier. A scratch directory on node-local disk is fast, so it honors `memory.spill_compression` instead and stays uncompressed under that field's `"auto"` default.
-
-Nothing on the read side changes. An Arrow IPC message records its own codec, so a reducer decompresses whatever it's handed, and a file written by an earlier build still reads.
-
-`shuffle_ipc_options` in `dist/shuffle_io.py` makes the call from the path alone, on purpose. A Ray worker's `active_config()` is its own process default, not the driver's, so a codec chosen from configuration on a worker could silently disagree with the one the driver intended. The branch where compression matters reads no configuration and so agrees on every node.
-
-## The self-limiting shared-memory mirror
-
-The shared-memory file is a second copy of the bucket, in tmpfs, on top of the in-memory store Flight already serves from. That's a real memory cost, and on a churning spot node where recompute transiently doubles live state it could be the cost that kills the worker.
-
-So `ShuffleSession._shm_mirror_ok()` skips writing the mirror in two cases. The first is memory pressure, when the pressure monitor reports `SPILL` or worse. The second is a worker that shares its node with no other worker process. There the mirror has no possible reader: a same-address fetch is served from the local store and every other fetch comes from another machine.
-
-The mirror is charged to the worker's cgroup, because tmpfs pages count toward `memory.current`, so the pressure monitor's footprint reading sees it. The buffer pool and the shuffle store's cap don't. The mirror also outlives the bucket it copies: `release` evicts a fetched bucket from the in-memory store, and its tmpfs file stays until the plan is torn down (`clear_plan`). So a same-node shuffle can hold `bytes_retained` in the store plus every bucket mirrored for the plan so far in tmpfs. `ShuffleSession.stats()` reports the mirrored volume as `bytes_mirrored_shm`, cumulative over the session like `bytes_published`, and the buckets the gate declined to mirror as `shm_mirrors_skipped`. Size a node that packs several workers against the store and the mirror together.
-
-A skipped mirror is harmless. The reducer's shared-memory read misses, `fetch_shared` returns `Ok(None)`, and the fetch falls back to Flight, which carries the same batches. It costs a memcpy's worth of latency and changes nothing else.
-
-The mmap read itself is zero-copy. `read_mmap_zero_copy` wraps the mapping as an Arrow `Buffer::from_custom_allocation`, so the decoded arrays point *into* it and the mapping outlives the batches.
+:::{dropdown} Compressing what the disk shuffle writes
+`shuffle_ipc_options` in `dist/shuffle_io.py` decides from the path alone. A scratch directory on a cluster-shared mount is a network filesystem where every byte crosses the wire twice, so it gets LZ4. A node-local scratch directory honors `memory.spill_compression` and stays uncompressed under `"auto"`. Deciding from the path rather than configuration means every node agrees, since a Ray worker's config is its own process default. An Arrow IPC message records its own codec, so the read side never needs to know.
+:::
 
 ## Security
 
-Two independent layers protect the shuffle, and both are off by default.
+Two independent layers protect the shuffle, both off by default:
 
-A shuffle token, set as `distributed.shuffle_token` or through the `BATCHER_SHUFFLE_TOKEN` environment variable, is checked in constant time against `path[1]` before any data is served. Separately, `distributed.tls` enables TLS on the Flight channel through {py:class}`ShuffleTlsConfig <batcher.config.config.ShuffleTlsConfig>`, and setting `require_client_auth` there turns that into mutual TLS.
+- A shuffle token, `distributed.shuffle_token` or `BATCHER_SHUFFLE_TOKEN`, checked in constant time against `path[1]` before any data is served. It's one shared secret for the fleet, authenticating membership rather than a principal or a query, and it is read when the fleet is spawned.
+- `distributed.tls`, through {py:class}`ShuffleTlsConfig <batcher.config.config.ShuffleTlsConfig>`, with `require_client_auth` for mutual TLS.
 
-Off by default means a fleet serves shuffle data to anything that can reach a worker's port, which binds on every interface. `distributed.require_secure_shuffle=True` turns that into a startup failure: a config with TLS off fails validation, and a fleet with no token raises {py:exc}`ConfigError <batcher.ConfigError>` before any worker is spawned (`config/validation/distributed.py::require_secure_shuffle`).
-
-The token is one shared secret for the whole cluster. It authenticates a peer as a member of the fleet, not as a principal or a query, so it grants no per-query authorization, and any process holding it can fetch any partition it can name. It's read when the fleet is spawned, so rotating it takes effect for the next fleet and doesn't revoke a running one.
+`distributed.require_secure_shuffle=True` makes an unsecured fleet a startup failure: TLS off fails validation, and a missing token raises {py:exc}`ConfigError <batcher.ConfigError>` before any worker is spawned.
 
 ## Code map
-
-Each concern below has a single owning file, so the transport path this page describes can be traced end to end:
 
 | Concern | File |
 |---|---|

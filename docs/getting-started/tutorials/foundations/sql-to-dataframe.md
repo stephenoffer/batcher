@@ -1,17 +1,6 @@
 # From SQL to DataFrames
 
-You know SQL. This tutorial takes one query and rewrites it as a DataFrame chain, then
-proves the two are the *same query*: same plan, same optimizer, same Rust engine. After
-that, mixing them is not a compromise. It is choosing a spelling.
-
-Everything here runs as written.
-
-:::{note}
-**What you'll build.** One aggregate query, written twice, with `explain()` used as the
-proof that both spellings produce the identical optimized plan. Then a {py:class}`Session <batcher.Session>` with a
-registered catalog, a view, and a Python function callable from SQL. You need `pip install
-batcher-engine` and nothing else: no cluster, no files, no GPU.
-:::
+You know SQL. This tutorial rewrites one query as a DataFrame chain and proves the two are the *same query*: same plan, same optimizer, same engine. Then it builds a {py:class}`Session <batcher.Session>` with a catalog, a view, and a Python function callable from SQL. All you need is `pip install batcher-engine`.
 
 ## 1. The data
 
@@ -51,8 +40,25 @@ print(revenue.to_pydict())
 # {'region': ['us'], 'revenue': [225.0], 'orders': [3]}
 ```
 
-Nothing has executed until {py:meth}`to_pydict() <batcher.Dataset.to_pydict>`. {py:obj}`bt.sql <batcher.sql>` returns a lazy {py:class}`Dataset <batcher.Dataset>`, exactly like
-every other operation.
+{py:obj}`bt.sql <batcher.sql>` returns a lazy {py:class}`Dataset <batcher.Dataset>`, so nothing runs until {py:meth}`to_pydict() <batcher.Dataset.to_pydict>`. CTEs and window functions work as you'd expect:
+
+```python
+print(bt.sql(
+    "WITH big AS (SELECT * FROM o WHERE amount >= 40) "
+    "SELECT region, COUNT(*) AS n FROM big GROUP BY region ORDER BY region",
+    o=orders,
+).to_pydict())
+# {'region': ['eu', 'us'], 'n': [2, 2]}
+```
+
+```python
+print(bt.sql(
+    "SELECT order_id, RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS rk "
+    "FROM o WHERE region = 'us' ORDER BY rk",
+    o=orders,
+).to_pydict())
+# {'order_id': [1, 3, 6], 'rk': [1, 2, 3]}
+```
 
 ## 3. Write it as a DataFrame
 
@@ -80,14 +86,17 @@ print(same.to_pydict())
 # {'region': ['us'], 'revenue': [225.0], 'orders': [3]}
 ```
 
-`HAVING` is not a special operator. It filters after the aggregate, and that is exactly how
-you write it.
+`HAVING` is just a `filter` after the aggregate. The window from step 2 is an expression with `.over(...)`:
+
+```python
+us = orders.filter(bt.col("region") == "us")
+print(us.select("order_id", rk=bt.col("amount").rank(descending=True).over("region")).sort("rk").to_pydict())
+# {'order_id': [1, 3, 6], 'rk': [1, 2, 3]}
+```
 
 ## 4. Prove they are the same query
 
-Both spellings build one `LogicalPlan`, push it through one optimizer, and run on one Rust
-data plane. `explain()` renders the optimized plan without executing it, so comparing the
-two renderings settles the question:
+`explain()` renders the optimized plan without executing it, so comparing the two settles the question:
 
 ```python
 print(revenue.explain() == same.explain())
@@ -98,14 +107,11 @@ The two spellings differ only until the plan exists. SQL is parsed with sqlglot 
 
 ![Two inputs, a SQL string passed to bt.sql, ds.sql, or Session.sql and a DataFrame chain such as filter, group_by, and agg, both build one LogicalPlan. The SQL string gets there through a sqlglot parse, and the DataFrame chain adds one node per call. The LogicalPlan goes through the Kyber optimizer, and the optimized plan travels as JSON IR to the Rust engine. explain() renders that optimized plan, which is why it is identical for both spellings. Nothing runs until a terminal such as to_pydict().](/_static/diagrams/sql_dataframe_one_plan.svg)
 
-There is no separate SQL engine to fall behind the DataFrame one. Pick whichever reads
-better for the query in front of you.
+There is no separate SQL engine. Pick whichever reads better.
 
 ## 5. Cross the boundary in either direction
 
-A SQL result is an ordinary Dataset, and a Dataset can be queried with SQL. Neither
-direction is a conversion, because there is nothing to convert: both are the same
-`LogicalPlan`. This is the thing that is awkward in a SQL-only tool.
+A SQL result is an ordinary Dataset, and a Dataset can be queried with SQL. Neither direction is a conversion.
 
 ::::{tab-set}
 :::{tab-item} SQL, then DataFrame
@@ -124,8 +130,7 @@ print(ranked.to_pydict())
 # {'rank': [1, 2], 'tier': ['gold', 'silver'], 'revenue': [225.0, 115.0]}
 ```
 
-The join and the rollup are SQL, because SQL says them well. The row numbering is a
-DataFrame method, because SQL would need a window function for it.
+The join and rollup are SQL; the row numbering is a DataFrame method.
 :::
 
 :::{tab-item} DataFrame, then SQL
@@ -138,8 +143,7 @@ print(
 # {'region': ['eu', 'us'], 'n': [2, 3]}
 ```
 
-{py:meth}`ds.sql(...) <batcher.Dataset.sql>` queries the current dataset, which `self` names. The filter is a DataFrame
-call, the rollup is SQL, and the plan does not know the difference.
+{py:meth}`ds.sql(...) <batcher.Dataset.sql>` queries the current dataset as `self`.
 :::
 ::::
 
@@ -159,11 +163,16 @@ print(s.sql("SELECT order_id, amount FROM big ORDER BY amount").to_pydict())
 # {'order_id': [5, 3, 1], 'amount': [60.0, 80.0, 120.0]}
 ```
 
-`CREATE VIEW` registers a lazy table. Nothing is materialized until a terminal op.
+`CREATE VIEW` registers a lazy table. The session lists everything it holds:
+
+```python
+print(sorted(s.list()))
+# ['big', 'orders']
+```
 
 ## 7. Call Python from SQL
 
-A registered function is vectorized by default: it receives an Arrow array and returns one. It lowers to a `map_batches` stage, the same one the DataFrame API builds, so SQL and Python share one plan rather than one calling into the other.
+A registered function is vectorized: it receives an Arrow array and returns one, and lowers to the same `map_batches` stage the DataFrame API builds.
 
 ```python
 import pyarrow.compute as pc
@@ -173,15 +182,13 @@ print(s.sql("SELECT order_id, net(amount) AS net FROM big ORDER BY order_id").to
 # {'order_id': [1, 3, 5], 'net': [102.0, 68.0, 51.0]}
 ```
 
-:::{warning}
-Per-row Python is the thing to avoid, not Python itself. A vectorized function sees the whole array at once and returns an array. Registering with `vectorized=False` calls your function once per row, which puts a Python interpreter in the inner loop of a Rust engine. The same rule governs `map_batches`: whole batches, never rows.
+:::{tip}
+Keep functions vectorized. `vectorized=False` calls your function once per row, which puts Python in the inner loop.
 :::
 
 ## 8. Point it at real files
 
-Only the source changes. Every transform and terminal below it is identical, whether the
-table came from a dict, a Parquet directory, or a Delta table. This block needs a real
-bucket, so it is shown but not run.
+Only the source changes, whether the table came from a dict, a Parquet directory, or a Delta table:
 
 ```python
 # docs: skip

@@ -1,10 +1,20 @@
 # Models and features
 
-These tutorials put a model inside a Batcher pipeline. The model runs in the engine rather than in a loop beside it: your function receives whole Arrow batches, a model class loads once per worker and the inference pools stay warm across a session, and the data around it stays columnar from the scan to the tensor.
+These tutorials put a model inside a Batcher pipeline. Your function receives whole Arrow batches, a model class loads once per worker, and the data stays columnar from the scan to the tensor.
 
-The core of every tutorial runs on a laptop with `pip install batcher-engine`. A stub stands in wherever a GPU or a model download would otherwise be needed, and the real call is shown beside it, so you can learn the pipeline shape first and swap in the model later without changing it.
+```python
+import batcher as bt
+import pyarrow.compute as pc
 
-The following table lists the four tutorials and what each one builds:
+ds = bt.from_pydict({"feature": [0.5, 1.5, 2.5]})
+scored = ds.map_batches(lambda b: b.append_column("score", pc.multiply(b.column("feature"), 2.0)))
+print(scored.to_pydict())
+# {'feature': [0.5, 1.5, 2.5], 'score': [1.0, 3.0, 5.0]}
+```
+
+Every tutorial runs on a laptop with `pip install batcher-engine`. A stub stands in wherever a GPU or a model download would be needed, with the real call shown beside it, so you learn the pipeline shape first and swap in the model later.
+
+The following table lists the four tutorials:
 
 | Tutorial | What you build |
 |---|---|
@@ -13,7 +23,7 @@ The following table lists the four tutorials and what each one builds:
 | {doc}`Feature engineering <feature-engineering>` | A model-ready feature matrix from a raw table, with preprocessors fitted on train and replayed on test |
 | {doc}`A distributed training pipeline <distributed-training-pipeline>` | A loader that hands each data-parallel PyTorch rank a balanced, deterministic, resumable stream |
 
-Start with batch inference if you're new to the `.ml` accessor. The other three build on its batch contract and can be taken in any order.
+Start with batch inference if you're new to the `.ml` accessor. The other three can be taken in any order.
 
 ## See also
 

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import pyarrow as pa
 
+from batcher._internal.registry import MISSING, IdentityMemo
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
@@ -67,6 +68,30 @@ def _int_cols(schema: SchemaRef | None) -> frozenset[str]:
     if schema is None:
         return frozenset()
     return frozenset(f.name for f in schema.arrow if pa.types.is_signed_integer(f.type))
+
+
+#: `schema -> its signed-integer column names`, so the fused chain's per-expression calls
+#: (below) resolve the guard once per schema object rather than once per expression.
+_INT_COLS: IdentityMemo[frozenset[str]] = IdentityMemo(256)
+
+
+def _schema_leaf(leaf):
+    """`leaf(expr, int_cols)` as the `(expr, schema)` leaf the fused expression chain binds.
+
+    Each of the six rules below otherwise walked every expression of every `Filter` and
+    `Project` on its own, on every fixpoint iteration: on TPC-DS q64 that was 1,584 node
+    walks and 0.45 s of a 5.9 s cold plan. As fused leaves they ride the one traversal every
+    leaf rule shares, offered only `Binary` nodes of the operators each declares. The schema
+    the chain binds is the node's input schema, the one `_apply` reads.
+    """
+
+    def bound(expr: Expr, schema: SchemaRef | None) -> Expr:
+        cols = _INT_COLS.get(schema) if schema is not None else frozenset()
+        if cols is MISSING:
+            cols = _INT_COLS.put(schema, _int_cols(schema))
+        return leaf(expr, cols)
+
+    return bound
 
 
 def _is_int_lit(expr: Expr) -> bool:
@@ -176,7 +201,14 @@ def _combine_add_sub(expr: Expr, int_cols: frozenset[str]) -> Expr:
     return _offset(v, k_inner + k_outer)
 
 
-@rule(name="fold_add_sub_constants", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_add_sub_constants",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_schema_leaf(_combine_add_sub),
+    expr_matches=(Binary,),
+    expr_ops=("add", "sub"),
+)
 def fold_add_sub_constants(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold two nested additive integer constants into one: `(x + c1) + c2 → x + (c1+c2)`,
     `(x - c1) - c2 → x - (c1+c2)`, `(x + c1) - c2 → x + (c1-c2)`, and the cancellation
@@ -208,7 +240,14 @@ def _combine_two_offsets(expr: Expr, int_cols: frozenset[str]) -> Expr:
     return _offset(Binary("add", lv, rv), lk + rk)
 
 
-@rule(name="fold_add_across_two_offsets", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_add_across_two_offsets",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_schema_leaf(_combine_two_offsets),
+    expr_matches=(Binary,),
+    expr_ops=("add",),
+)
 def fold_add_across_two_offsets(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Gather the constants from *both* sides of a sum: `(x + c1) + (y + c2) →
     (x + y) + (c1 + c2)` (Spark's `ReorderAssociativeOperator`).
@@ -247,7 +286,14 @@ def _combine_mul(expr: Expr, int_cols: frozenset[str]) -> Expr:
     return v if prod == 1 else Binary("mul", v, Lit(prod))
 
 
-@rule(name="fold_mul_constants", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_mul_constants",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_schema_leaf(_combine_mul),
+    expr_matches=(Binary,),
+    expr_ops=("mul",),
+)
 def fold_mul_constants(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Fold two nested integer factors into one: `(x * c1) * c2 → x * (c1*c2)`, with the
     cancellation `(x * c1) * c2 → x` when `c1*c2 ≡ 1` (mod ``2**64``).
@@ -276,7 +322,14 @@ def _combine_const_minus_sum(expr: Expr, int_cols: frozenset[str]) -> Expr:
     return Binary("sub", Lit(_wrap_i64(expr.left.value - k)), v)
 
 
-@rule(name="fold_const_minus_sum", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_const_minus_sum",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_schema_leaf(_combine_const_minus_sum),
+    expr_matches=(Binary,),
+    expr_ops=("sub",),
+)
 def fold_const_minus_sum(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Canonicalize a constant minus a value-plus-constant: `c1 - (x + c2) → (c1-c2) - x`
     and `c1 - (x - c2) → (c1+c2) - x`.
@@ -307,7 +360,14 @@ def _combine_neg_sub(expr: Expr, int_cols: frozenset[str]) -> Expr:
     return expr
 
 
-@rule(name="fold_neg_sub", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="fold_neg_sub",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_schema_leaf(_combine_neg_sub),
+    expr_matches=(Binary,),
+    expr_ops=("sub",),
+)
 def fold_neg_sub(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Peel a negation of a difference: `0 - (a - b) → b - a` (which also collapses the
     double negation `-(-x)`, since `-x` desugars to `0 - x`, so `-(-x) = 0 - (0 - x) → x - 0`).
@@ -339,7 +399,14 @@ def _combine_factor_mul(expr: Expr, int_cols: frozenset[str]) -> Expr:
     return v1 if coeff == 1 else Binary("mul", v1, Lit(coeff))
 
 
-@rule(name="factor_common_mul", phase=Phase.NORMALIZE, matches=(Filter, Project))
+@rule(
+    name="factor_common_mul",
+    phase=Phase.NORMALIZE,
+    matches=(Filter, Project),
+    expr_schema=_schema_leaf(_combine_factor_mul),
+    expr_matches=(Binary,),
+    expr_ops=("add", "sub"),
+)
 def factor_common_mul(node: LogicalPlan, _ctx: OptimizerContext) -> LogicalPlan | None:
     """Factor a common integer multiplicand out of a sum/difference of products:
     `x*c1 + x*c2 → x*(c1+c2)` and `x*c1 - x*c2 → x*(c1-c2)` (with `x` structurally equal

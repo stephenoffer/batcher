@@ -1,12 +1,6 @@
 # Building a lakehouse
 
-Build the three medallion layers on a real Delta table: raw files in, a transactional
-curated table in the middle, aggregates out. Along the way you get atomic commits, upserts,
-time travel, an idempotent backfill, and file skipping: the things that separate a lakehouse
-from a directory of Parquet.
-
-Everything here runs as written, in a temp directory, with the `delta` extra
-(`pip install 'batcher-engine[delta]'`).
+Build the three medallion layers on a real Delta table: raw files in, a transactional curated table in the middle, aggregates out. Along the way you get atomic commits, upserts, time travel, an idempotent backfill, and file skipping. Everything runs in a temp directory with the `delta` extra (`pip install 'batcher-engine[delta]'`).
 
 | You need | For |
 |---|---|
@@ -20,8 +14,7 @@ The following diagram shows the tables this page builds and the writes that chan
 
 ## 1. Somewhere to work
 
-Every runnable block below writes into one temp directory, so nothing lands in your
-project tree.
+Every block below writes into one temp directory.
 
 ```python
 import os
@@ -34,8 +27,7 @@ work = tempfile.mkdtemp()
 
 ## 2. Bronze: land the raw data
 
-Bronze is the raw drop, with no cleaning and no dedup. Get it stored so nothing is lost.
-Parquet files are fine here.
+Bronze is the raw drop, stored as-is in Parquet.
 
 ```python
 raw = os.path.join(work, "bronze")
@@ -55,10 +47,7 @@ print(bt.read.parquet(raw).count())
 
 ## 3. Silver: a transactional curated table
 
-Silver is where the table becomes trustworthy: filtered, typed, deduplicated, and
-transactional. {py:meth}`ds.write.delta(uri, mode="overwrite") <batcher.api.io_namespace.writer.Writer.delta>` commits the whole dataset as one
-Delta transaction, so a reader either sees the old table or the new one, never half of
-either.
+Silver is filtered, typed, and transactional. {py:meth}`ds.write.delta(uri, mode="overwrite") <batcher.api.io_namespace.writer.Writer.delta>` commits the whole dataset as one Delta transaction, so a reader sees the old table or the new one.
 
 ```python
 orders = os.path.join(work, "orders")
@@ -78,9 +67,7 @@ The refunded order is gone. Three rows survive.
 
 ## 4. The upsert
 
-Corrections arrive after the fact: order 2 was re-priced, and order 5 showed up late.
-`merge_on=` runs a native Delta `MERGE INTO` keyed on those columns: matched rows update,
-unmatched rows insert. This is one commit, not a read-modify-write race.
+Order 2 was re-priced and order 5 arrived late. `merge_on=` runs a native Delta `MERGE INTO` as one commit: matched rows update, unmatched rows insert.
 
 ```python
 updates = bt.from_pydict(
@@ -101,21 +88,25 @@ Order 2 is now 45.0 and order 5 exists. Nothing else moved.
 
 ## 5. Time travel
 
-Every commit is a version. Version 0 is the table as `overwrite` left it, before the merge.
-Pass `version=` (or `timestamp=`) to read it.
+Every commit is a version. Pass `version=` (or `timestamp=`) to read an earlier one:
 
 ```python
 print(bt.read.delta(orders, version=0).sort("order_id").to_pydict()["amount"])
 # [120.0, 40.0, 15.0]
 ```
 
-That is the audit trail, and it is also the fastest way to answer "what changed?" after a
-bad load.
+Diff two versions to see exactly what a load changed:
+
+```python
+before = set(bt.read.delta(orders, version=0).to_pydict()["order_id"])
+after = set(bt.read.delta(orders).to_pydict()["order_id"])
+print(sorted(after - before))
+# [5]
+```
 
 ## 6. Gold: the aggregate anyone can query
 
-Gold is the layer the dashboard reads. It is a plain query over silver, with no special
-machinery, because the curated table already guarantees what it is.
+Gold is the layer the dashboard reads, a plain query over silver:
 
 ```python
 daily = (
@@ -130,9 +121,7 @@ print(daily.to_pydict())
 
 ## 7. The idempotent backfill
 
-A backfill re-runs a day. If it appends, you get double-counted revenue; if it overwrites the
-table, you lose every other day. `replace_where=` is the answer: atomically replace exactly
-the rows matching a predicate and leave the rest alone. Re-running it is a no-op.
+A backfill re-runs a day. `replace_where=` atomically replaces exactly the rows matching a predicate and leaves the rest alone, so re-running it produces the same table. The four write modes cover every case:
 
 | The write you reach for | What it does | When it is right |
 |---|---|---|
@@ -141,11 +130,8 @@ the rows matching a predicate and leave the rest alone. Re-running it is a no-op
 | `merge_on="key"` | `MERGE INTO`: matched rows update, unmatched insert | Corrections and late arrivals keyed by an id |
 | `replace_where=pred` | Atomically replaces exactly the matching rows | Re-running one partition of a backfill |
 
-:::{important}
-A backfill written as an `append` is a data-correctness bug, not a performance one. Run it
-twice and the revenue doubles, silently, and the number reaches a dashboard before anyone
-notices. `replace_where=` is the one that survives being run twice, which is the only
-property that matters when the job is retried by a scheduler you do not control.
+:::{tip}
+Use `replace_where=` for any backfill a scheduler might retry. It is safe to run twice.
 :::
 
 ```python
@@ -163,18 +149,17 @@ print(bt.read.delta(orders).sort("order_id").to_pydict()["amount"])
 # [120.0, 45.0, 95.0, 60.0]
 ```
 
-Order 4 is the `2024-03-02` row, and it is now the corrected 95.0. The other days are
-untouched, and running that block again would produce the same table.
+Order 4 is now the corrected 95.0, and the other days are untouched. Run it again and nothing changes:
 
-## 8. File skipping, which is why any of this is fast
+```python
+fixed.write.delta(orders, replace_where=bt.col("day") == "2024-03-02", partition_by=["day"])
+print(bt.read.delta(orders).count())
+# 4
+```
 
-A lakehouse's transaction log already records, for every data file, its partition values and
-its per-column min/max. That is a zone map over the *file* dimension, and Batcher reads it at
-**plan time**. A file whose bounds prove it cannot hold a matching row is never opened,
-never split, never shipped to a worker.
+## 8. File skipping
 
-Write a table clustered by day, so each append lands its own file, and watch the predicate
-cut the file list rather than only the rows:
+The transaction log records every file's partition values and per-column min/max, and Batcher reads them at **plan time**. A file whose bounds rule out a match is never opened. Write one file per day and watch a predicate cut the file list:
 
 ```python
 from batcher.io.formats.lakehouse import DeltaSource
@@ -189,30 +174,18 @@ print(len(source.splits()), "->", len(source.splits(predicate=predicate)))
 # 4 -> 1
 ```
 
-Four files in the table, one file read. The pruning happens *before* I/O, so the eliminated
-files cost nothing at all: no footer read, no task, no bytes.
+Four files in the table, one file read, with no footer read or task for the other three.
 
 ```python
 print(bt.read.delta(by_day).filter(bt.col("day") == "2024-03-03").count())
 # 3
 ```
 
-:::{tip}
-Pruning is deliberately one-sided. A file is dropped only when the log *proves* it cannot
-match; a missing statistic keeps the file. Skipping can cost you extra I/O. It cannot cost
-you a row. That asymmetry is why you can trust it without checking it.
-:::
-
-On a 200-file Delta table, that mechanism takes a `count(*) WHERE day = 42` from 98.8 ms
-reading 200 files to 7.4 ms reading one, past DuckDB's `delta_scan` at 21.8 ms.
-See {doc}`vs DuckDB </benchmarks/comparisons/vs-duckdb>`.
+A file is dropped only when the log proves it cannot match, so skipping never costs a row. On a 200-file table it takes a `count(*) WHERE day = 42` from 98.8 ms to 7.4 ms, ahead of DuckDB's `delta_scan` at 21.8 ms ({doc}`vs DuckDB </benchmarks/comparisons/vs-duckdb>`).
 
 ## 9. Do it on a cluster
 
-Nothing above changes. The same plan runs distributed: workers write their shards as final
-data files and record each file's bounds while the data is still in memory, and the driver
-commits only the *add actions*: paths, sizes, statistics. The bytes move once, worker to
-storage, and the driver never re-encodes the result.
+The same plan runs distributed. Workers write final data files and their bounds, and the driver commits only the *add actions*: paths, sizes, statistics.
 
 ::::{tab-set}
 :::{tab-item} Local
@@ -242,20 +215,11 @@ import batcher as bt
 :::
 ::::
 
-The query is the same one. `distributed=True` and a bucket are the entire difference.
-
-A distributed write is **one** transaction. Workers produce files; the driver commits once.
-The commit is `O(files)`, not `O(rows)`. In [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md), the driver
-commits 16 shards totalling 240 MB in 4.1 ms, against 661.8 ms to re-encode them through the
-driver, and 0 MB of data passes through the driver.
+`distributed=True` and a bucket are the entire difference. The write is still **one** transaction, and the commit is `O(files)`, not `O(rows)`: 16 shards totalling 240 MB commit in 4.1 ms with no data passing through the driver ([`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md)).
 
 ## Where to go next
 
-Three write modes cover almost everything: `mode=` for a whole table, `merge_on=` for a
-keyed upsert, `replace_where=` for an idempotent partition backfill. Reach for the third
-more often than you expect. And the statistics each write leaves behind are exactly what
-the next read prunes against, so the two halves of this page are one mechanism rather than
-two features.
+Three write modes cover almost everything: `mode=` for a whole table, `merge_on=` for a keyed upsert, `replace_where=` for an idempotent backfill. The statistics each write leaves behind are what the next read prunes against.
 
 ::::{grid} 1 3 3 3
 :gutter: 3
@@ -284,8 +248,7 @@ Validate and quarantine before you commit.
 - {doc}`Delta Lake integration </integrations/lakehouse/delta-lake>` and
   {doc}`Iceberg </integrations/lakehouse/iceberg>`: the connectors underneath.
 - {doc}`Writing data </user-guide/moving-data/writing-data>`: every write mode, in one place.
-- {doc}`vs DuckDB </benchmarks/comparisons/vs-duckdb>`: the file-skipping measurement, and the optimizer
-  bug that used to break it.
+- {doc}`vs DuckDB </benchmarks/comparisons/vs-duckdb>`: the file-skipping measurement.
 - {doc}`Partition backfill </cookbook/data-engineering/maintenance/partition-backfill>` and
   {doc}`slowly changing dimensions </cookbook/data-engineering/modeling/slowly-changing-dimensions>`:
   the recipes step 7 generalizes to.

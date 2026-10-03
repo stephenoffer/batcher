@@ -315,7 +315,7 @@ print(
 
 ## What it costs
 
-Every `ST_*` function is a scalar expression evaluated per row in Rust over the WKB buffer, with no Python in the loop and no conversion to a separate geometry type. [`benchmarks/geospatial.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/geospatial.py) runs the functions on 2 million real places from Overture Maps, in Batcher and in DuckDB's spatial extension over the same Arrow table, and checks each result for correctness before timing either engine. The ratio is DuckDB's time over Batcher's, so above 1.00x means Batcher is faster:
+Every `ST_*` function is a scalar expression evaluated per row in Rust over the WKB buffer, with no Python in the loop and no conversion to a separate geometry type. On 2 million real places from Overture Maps, against DuckDB's spatial extension over the same Arrow table ([`benchmarks/geospatial.py`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/geospatial.py)):
 
 | Expression, 2M rows | Batcher | DuckDB spatial | Ratio |
 | --- | --- | --- | --- |
@@ -327,7 +327,7 @@ Every `ST_*` function is a scalar expression evaluated per row in Rust over the 
 | `geohash_encode`, precision 8 | 17.9 ms | not available | |
 | `st_s2_cell`, level 15 | 15.2 ms | not available | |
 
-The run used a 96-core Xeon 8275CL with DuckDB 1.5.5 on a box shared with other work, so read the ratios rather than the absolute times. At 250,000 rows the same cases range from 0.89x to 6.43x, because fixed per-query overhead weighs more on a small input. The full record is in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md).
+The ratio is DuckDB's time over Batcher's. Hardware, the 250,000-row results, and the full record are in [`benchmarks/BENCHMARK_RESULTS.md`](https://github.com/stephenoffer/batcher/blob/main/benchmarks/BENCHMARK_RESULTS.md) and {doc}`/benchmarks/index`.
 
 The ordering inside Batcher's column is the useful part. The grid encoders and accessors are cheap. A predicate costs several times more per row, because each row decodes two geometries and walks their segments, which is exactly why `st_intersects_extent` in front of `st_intersects` is worth the extra clause and why materializing the four bound columns is worth the storage.
 

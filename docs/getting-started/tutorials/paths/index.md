@@ -1,10 +1,6 @@
 # Learning paths
 
-This section holds four ordered reading lists, one per role. Pick the path that matches your job and follow it top to bottom. You land on the parts of Batcher your work uses and skip the rest.
-
-A path adds no material of its own. It sequences the guides and examples, with a few runnable scripts dropped in.
-
-The paths overlap in three places. The data engineer and data scientist paths share expressions, filtering, aggregations, and window functions. The data engineer and ML engineer paths both include Your first pipeline. The data engineer and platform engineer paths share cloud storage, best practices, and troubleshooting. Everything else belongs to one path:
+Four ordered reading lists, one per role. Pick yours and follow it top to bottom to cover exactly the parts of Batcher your work uses. The paths share a common core, shown here:
 
 ![A matrix of twelve topics against the four paths. Data engineer covers Your first pipeline, reading and writing data, expressions and filtering, aggregations and window functions, joins, lakehouse tables and data quality, cloud storage, and best practices and troubleshooting. Data scientist covers core concepts, expressions and filtering, aggregations and window functions, and SQL. ML engineer covers Your first pipeline and inference, features, and GPUs. Platform engineer covers installation and configuration, cloud storage, and best practices and troubleshooting. Every path starts at Getting started and ends at an API reference.](/_static/diagrams/learning_paths_matrix.svg)
 

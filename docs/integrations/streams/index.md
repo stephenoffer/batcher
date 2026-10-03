@@ -1,8 +1,23 @@
 # Streams
 
-Batcher reads the message brokers your platform already runs as unbounded datasets, and the operators you use on a table work on a stream unchanged. Kafka, Kinesis, Pulsar, Pub/Sub, and Event Hubs all deliver the same six-column schema, so a decode, a join, or a windowed aggregate written against one broker moves to another by changing the source line.
+Batcher reads message brokers as unbounded datasets, and the operators you use on a table work on a stream unchanged. Kafka, Kinesis, Pulsar, Pub/Sub, and Event Hubs all deliver the same six-column schema, so moving a pipeline to another broker means changing the source line:
 
-Every broker reader advances its position only after a micro-batch is published, so a crash replays a batch rather than dropping one. A checkpoint on local disk or object storage lets a restarted query pick up where it stopped. Readers take Spark's `max_offsets_per_trigger` and `max_bytes_per_trigger` by name, and they decode Avro, JSON, and Protobuf payloads in the source, Confluent Schema Registry framing included. Kafka, Kinesis, Pulsar, and Event Hubs split per partition or shard, so ingest spreads across the cluster.
+```python
+# docs: skip
+import batcher as bt
+
+clicks = bt.read.kafka("clicks", bootstrap_servers="broker-1:9092")
+# clicks = bt.read.kinesis("clicks", region="us-east-1")
+# clicks = bt.read.pulsar("clicks", service_url="pulsar://pulsar:6650")
+
+query = clicks.write.delta(
+    "lake/bronze/clicks",
+    trigger=bt.Trigger.processing_time("30 seconds"),
+    checkpoint="/var/lib/batcher/ckpt/clicks",
+)
+```
+
+A reader advances its position only after a micro-batch is published, so a crash replays a batch rather than dropping one, and the checkpoint lets a restarted query resume where it stopped. Readers take Spark's `max_offsets_per_trigger` and `max_bytes_per_trigger` by name, decode Avro, JSON, and Protobuf in the source, and split per partition or shard so ingest spreads across the cluster.
 
 ::::{grid} 1 2 2 3
 :gutter: 3
