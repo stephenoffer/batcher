@@ -704,16 +704,15 @@ fn is_nan_over_an_integer_column_falls_back() {
     );
 }
 
-/// `x IN (...)` must compile for a small set, and must match the interpreter's raw-bit
-/// float membership rather than an IEEE float compare.
+/// `x IN (...)` must compile for a small set, and must match the interpreter's float
+/// membership, which is `=`'s float identity rather than an IEEE compare.
 ///
-/// The float case is the one that matters. The interpreter keys membership on
-/// `f64::to_bits`, because the `col = lit` chain this folds from compares by *total*
-/// order and total-order equality is bit equality. So `-0.0` must NOT match a `0.0`
-/// literal, and a NaN column value must match only a bit-identical NaN literal -- both
-/// of which an `fcmp Equal` lowering would get wrong in the opposite direction.
+/// The float case is the one that matters. The interpreter keys membership on canonical
+/// bits (`bc_arrow::canon_f64_bits`), so `-0.0` matches a `0.0` literal and any NaN
+/// matches a NaN literal -- an `fcmp Equal` lowering would get the NaN case wrong, and a
+/// raw-bit one (what both tiers did before) the zero case.
 #[test]
-fn in_list_compiles_and_matches_raw_bit_float_membership() {
+fn in_list_compiles_and_matches_canonical_float_membership() {
     let mut rng = Rng(0xfeed_4321);
     let batch = make_batch(65, &mut rng);
     let cases = vec![
@@ -725,7 +724,7 @@ fn in_list_compiles_and_matches_raw_bit_float_membership() {
             input: Box::new(col("c")),
             set: vec![Literal::Float(0.0), Literal::Float(1.0)],
         },
-        // `-0.0` and a NaN as members: bit equality, not numeric equality.
+        // `-0.0` and a NaN as members: float identity, not raw bits or IEEE `==`.
         Expr::InList {
             input: Box::new(col("c")),
             set: vec![Literal::Float(-0.0), Literal::Float(f64::NAN)],
@@ -743,6 +742,33 @@ fn in_list_compiles_and_matches_raw_bit_float_membership() {
         if let Some(why) = diff(&jit, &oracle) {
             panic!("JIT != interpreter\n  expr: {expr:?}\n  diff: {why}");
         }
+    }
+}
+
+/// The values themselves, not only JIT == interpreter: both zeros and NaNs of two bit
+/// patterns, against a set holding `0` and a NaN.
+#[test]
+fn in_list_float_identity_values() {
+    let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)]));
+    let other_nan = f64::from_bits(0x7ff0_0000_0000_0001);
+    let f = Float64Array::from(vec![0.0, -0.0, f64::NAN, other_nan, 1.0]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(f) as ArrayRef]).expect("batch");
+    let expr = Expr::InList {
+        input: Box::new(col("f")),
+        set: vec![Literal::Int(0), Literal::Float(f64::NAN)],
+    };
+    let want = [true, true, true, true, false];
+    let oracle = expr.eval(&batch).expect("interpreter eval");
+    let jit = bc_codegen::compile_expr(&expr, &batch)
+        .expect("compiles")
+        .eval(&batch)
+        .expect("compiled eval");
+    for out in [oracle, jit] {
+        let got = out
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("bool");
+        assert_eq!(got.iter().map(Option::unwrap).collect::<Vec<_>>(), want);
     }
 }
 

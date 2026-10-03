@@ -1368,7 +1368,7 @@ Extended Kyber rule families.
 | `adaptive_meta.py` | 160 | Adaptive metadata rules — simplifications a provably-EXACT cardinality unlocks. |
 | `agg_extra.py` | 505 | Extra aggregate / GROUP BY rewrites — small, local, always-correct simplifications. |
 | `agg_rules.py` | 504 | Aggregate rewrites driven by *proven* metadata — uniqueness, constancy, exact counts. |
-| `arith_algebra.py` | 354 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
+| `arith_algebra.py` | 421 | Arithmetic algebraic simplification — integer constant reassociation & factoring. |
 | `arith_extra.py` | 546 | NORMALIZE-phase arithmetic the other families leave on the table — math-function |
 | `boolean_algebra.py` | 427 | NORMALIZE-phase boolean / CASE / COALESCE / NULL simplifications. |
 | `casts.py` | 456 | NORMALIZE-phase rules for `CAST` — the shapes a SQL front end and the type-coercion |
@@ -3202,7 +3202,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `analyze.rs` | 450 | Validate a [`bc_expr::Expr`] against the JIT's supported subset and infer the scalar type each sub-expression evaluates to, recording referenced columns. |
 | `cache.rs` | 97 | A process-wide memo for compiled expressions. |
 | `compile.rs` | 485 | Build and JIT-compile a Cranelift function that evaluates an `Expr` element-wise over the row index, returning the finalized function pointer. |
-| `emit.rs` | 624 | Per-element IR emitter: recurses over a validated `Expr` building Cranelift values at the current loop index, producing one output element per row. |
+| `emit.rs` | 637 | Per-element IR emitter: recurses over a validated `Expr` building Cranelift values at the current loop index, producing one output element per row. |
 | `kleene.rs` | 111 | Kleene / null-propagation support analysis for the JIT. |
 | `lib.rs` | 154 | `bc-codegen` — a Cranelift JIT backend for `bc-expr` scalar expressions. |
 | `simd.rs` | 360 | Vector (SIMD) emitter for the JIT's vectorizable `Expr` subset. |
