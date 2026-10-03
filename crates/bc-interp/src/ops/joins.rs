@@ -306,6 +306,12 @@ fn is_identity_permutation(indices: &UInt32Array, rows: usize) -> bool {
             .all(|(i, &v)| v as usize == i)
 }
 
+/// Source rows per selected row past which [`ascending_selection`] leaves the column to the
+/// gather. A mask costs a bit per source row to clear and count; a gather costs a copy per
+/// selected row per column, so one selected row in 32 is still a small mask, and a sparser
+/// selection is cheaper gathered whatever the column count.
+const SELECTION_MAX_SPARSITY: usize = 32;
+
 /// A filter predicate equivalent to gathering by `indices`, when `indices` is **strictly
 /// ascending** and null-free over a `rows`-row source.
 ///
@@ -320,11 +326,22 @@ fn is_identity_permutation(indices: &UInt32Array, rows: usize) -> bool {
 ///
 /// `None` for anything else, including a descending or repeating index (a one-to-many match),
 /// which leaves the gather in charge. Deciding costs one pass over a morsel-sized `u32` buffer.
+///
+/// `None` too for a selection sparser than one row in [`SELECTION_MAX_SPARSITY`]: the mask is
+/// as long as the *source*, so its cost is the source's length, while the gather's is the
+/// selection's. That is the build side of a streamed join, whose source is the whole resident
+/// relation and whose matches in one probe morsel are a morsel's worth. When both sides are
+/// ordered on the key (`lineitem JOIN orders`) those matches are strictly ascending, and without
+/// this bound every 16K-row morsel set, counted and filtered a mask over all of `orders`: at
+/// TPC-H sf1000 that was hundreds of millions of bits per morsel, and the largest cost of q12.
 fn ascending_selection(
     indices: &UInt32Array,
     rows: usize,
 ) -> Option<arrow::compute::FilterPredicate> {
-    if indices.null_count() > 0 || indices.is_empty() {
+    if indices.null_count() > 0
+        || indices.is_empty()
+        || rows > indices.len().saturating_mul(SELECTION_MAX_SPARSITY)
+    {
         return None;
     }
     let idx = indices.values();
@@ -686,6 +703,24 @@ mod tests {
         assert!(ascending_selection(&UInt32Array::from(vec![Some(0u32), None]), 4).is_none());
         assert!(ascending_selection(&UInt32Array::from(vec![0u32, 4]), 4).is_none());
         assert!(ascending_selection(&UInt32Array::from(Vec::<u32>::new()), 4).is_none());
+    }
+
+    /// A selection is a filter only while its mask, a bit per *source* row, is small beside it.
+    /// A morsel's matches in a resident build side many times its size are gathered instead:
+    /// the ascending, null-free shape below qualified before the bound and cost a mask over
+    /// the whole source per morsel. One row in [`SELECTION_MAX_SPARSITY`] is the edge.
+    #[test]
+    fn a_sparse_selection_over_a_large_source_is_gathered() {
+        let picks: Vec<u32> = (0..1_000u32).map(|i| i * 100).collect();
+        let sparse = UInt32Array::from(picks.clone());
+        assert!(ascending_selection(&sparse, 100_000).is_none());
+        let edge = 1_000 * SELECTION_MAX_SPARSITY;
+        let dense: Vec<u32> = (0..1_000u32)
+            .map(|i| i * SELECTION_MAX_SPARSITY as u32)
+            .collect();
+        let dense = UInt32Array::from(dense);
+        assert!(ascending_selection(&dense, edge).is_some());
+        assert!(ascending_selection(&dense, edge + 1).is_none());
     }
 
     /// A band range join's two conditions name the *same* right column, and the band
