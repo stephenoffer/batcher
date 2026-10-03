@@ -8,6 +8,26 @@ chronological log follows the "Resume here" section. A mirror lives at
 
 ## Resume here (state at 2026-10-02 ~22:30 PDT)
 
+**Update 2026-10-02 ~23:15 PDT**
+
+- `39127198` fix(dist): `dist/executors/aligned/memory_fit.py` sizes aligned unit tasks by
+  node memory as well as cores (task need = 4.5x the largest unit; per-task share passed as
+  the engine `memory_bytes`, so an overrun re-runs on the spilling materializing executor),
+  and caps a warm actor's calls in flight. Unit-tested. Why: the q9 diagnostic showed units
+  are whole files (39 per cut regardless of `BATCHER_ALIGNED_UNIT_BYTES`; 1 GiB only split
+  the other cut to 147), broadcasts are 82 MiB, and two tasks a node at 28 GB each OOM.
+  With 1 GiB units the query instead failed later: `ResourceError: no surviving worker to
+  recover the join shuffle on` (a shuffle-join stage after node losses).
+- Validation jobs at 39127198: c98-dist4-4w prodjob_fgqe7xdlqcw9cvurilaqf9qycf (distributed
+  sf1000 full suite, live timestamped log), c98-disttest-fit prodjob_mr8iuf4j299dkuigv5a7sxd9ka
+  (aligned integration tests on a 2-worker cluster; local Ray has no CPUs here),
+  c98-sf1000-b prodjob_1vbuhtfqf4x4ne3a83qt4p4vds (single-node q12,q16,q10,q9 incl. the
+  78640bfe join fix), c98-route-q9x3 prodjob_h83gkhqa8j1ui346zuljdt5jwl (q9 x3 in one process).
+- sf1000 profiles read: **q13** is 70% `fold_partial`, half of it `combine_sized`
+  re-hashing ~150M `c_custkey` groups (fold already doubles, O(log n) rehash); the lever is
+  eager aggregation of `orders` by `o_custkey` below the LEFT join (a Kyber rewrite).
+  **q17** is 55% Parquet zstd decode and 40% join probe; lineitem is scanned twice.
+
 **Latest commits on the branch, newest first:**
 
 - `78640bfe` perf(interp): a join's build-side selection sparser than 1 in 32 of its source
