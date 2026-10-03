@@ -8,6 +8,19 @@ chronological log follows the "Resume here" section. A mirror lives at
 
 ## Resume here (state at 2026-10-02 ~22:30 PDT)
 
+**Update 2026-10-03 ~00:30 PDT**
+
+- Single-node sf1000 at 39127198 (c98-sf1000-b): q12 **41.0 s** (was 56.8; the 78640bfe join
+  fix helps, DuckDB 8.4), q16 8.7 s (was 11.0; DuckDB 4.3), q10 32.5 s (DuckDB 17.4), q9 KILLED.
+- **q9 single-node cause found** (c98-route-q9x3): in one process run 1 streams in 93 s; run 2's
+  plan needs 77.9 GB of builds vs a 64.8 GB budget, the partitioned fallback declined, and the
+  out-of-core route took 3,814 s. The decline was `_pass_count` charging `needed - side` to
+  the other builds; `needed` is only what the engine had counted when it stopped.
+- `60830567` fix: first pass guess = side / (0.8 budget), double on refusal up to 32
+  (refusals cost 0.3-0.7 s). Validation launched: c98-route-q9x3b
+  prodjob_jjj64xamn4hdwfb2r99n491lsa (q9 x3 at sf1000). Still open: why run 2's plan differs
+  from run 1's (learned stats changing the plan for the worse).
+
 **Update 2026-10-02 ~23:50 PDT**
 
 - 39127198 is **not sufficient**: c98-dist4-4w q1-q8 OK, q9 ran 30 min (timeout) with 9
