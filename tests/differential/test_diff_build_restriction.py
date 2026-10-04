@@ -30,6 +30,12 @@ _QUERIES = [
     "SELECT l_flag, count(*) AS n, sum(l_qty * ps_cost) AS v "
     "FROM lineitem JOIN part ON l_pk = p_pk JOIN partsupp ON l_pk = ps_pk AND l_sk = ps_sk "
     "WHERE p_name LIKE '%green%' GROUP BY l_flag",
+    # q9's full spine: `supplier` also shares a column with `partsupp`, keeps every key, and is
+    # the smaller provider; `part` must still restrict.
+    "SELECT l_flag, count(*) AS n, sum(l_qty * ps_cost) AS v "
+    "FROM lineitem JOIN part ON l_pk = p_pk JOIN supplier ON l_sk = s_sk "
+    "JOIN partsupp ON l_pk = ps_pk AND l_sk = ps_sk "
+    "WHERE p_name LIKE '%green%' GROUP BY l_flag",
     # The same with the joins in the other order on the spine.
     "SELECT count(*) AS n, sum(ps_cost) AS v "
     "FROM lineitem JOIN partsupp ON l_pk = ps_pk AND l_sk = ps_sk JOIN part ON l_pk = p_pk "
@@ -71,6 +77,8 @@ _PART = pa.table(
     }
 )
 
+_SUPPLIER = pa.table({"s_sk": pa.array(range(_SUPPS), pa.int64())})
+
 # Every (part, supplier) pair a lineitem row can carry, plus a few NULL part keys.
 _PARTSUPP = pa.table(
     {
@@ -102,6 +110,7 @@ def test_a_restricted_build_matches_duckdb(
     duck.register("lineitem", lineitem)
     duck.register("part", _PART)
     duck.register("partsupp", _PARTSUPP)
+    duck.register("supplier", _SUPPLIER)
     session = bt.Session()
     session.register(
         "lineitem",
@@ -109,4 +118,5 @@ def test_a_restricted_build_matches_duckdb(
     )
     session.register("part", _PART)
     session.register("partsupp", _PARTSUPP)
+    session.register("supplier", _SUPPLIER)
     assert_same_for_query(session.sql(query).collect(), duck.sql(query), query)

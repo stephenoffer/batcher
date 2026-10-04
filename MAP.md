@@ -3102,7 +3102,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 631 | The breakers: operators that must see all of their input before they can emit any output. |
-| `stream/builds.rs` | 771 | Preparing a hash join's build side once, for every worker that will probe it. |
+| `stream/builds.rs` | 770 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/chunked/mod.rs` | 789 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
@@ -3116,7 +3116,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/parallel.rs` | 1683 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 284 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
-| `stream/runtime_filter.rs` | 725 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
+| `stream/runtime_filter.rs` | 733 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
 | `stream/union_all.rs` | 114 | `UNION ALL` as a pipeline operator: yield each branch's morsels in turn, hold none of them. |
 | `union_coerce.rs` | 174 | One common column type for the branches of a set operation, before they are combined. |
 | `window_spill.rs` | 177 | Bounded-memory window execution via grace partitioning. |

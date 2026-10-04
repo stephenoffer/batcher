@@ -426,9 +426,9 @@ fn collect_builds(
         .collect();
     let restrictions = runtime_filter::restrict_builds(&spine, sources);
     let (later, first): (Vec<usize>, Vec<usize>) =
-        (0..pending.len()).partition(|&i| restrictions[i].is_some());
-    let unrestricted: Vec<(usize, Option<runtime_filter::PendingFilter>)> =
-        first.into_iter().map(|i| (i, None)).collect();
+        (0..pending.len()).partition(|&i| !restrictions[i].is_empty());
+    let unrestricted: Vec<(usize, Vec<runtime_filter::PendingFilter>)> =
+        first.into_iter().map(|i| (i, Vec::new())).collect();
     prepare_together(
         &pending,
         unrestricted,
@@ -445,12 +445,11 @@ fn collect_builds(
     let restricted = later
         .into_iter()
         .map(|i| {
-            let r = restrictions[i].as_ref();
-            let filter = r.and_then(|r| {
-                let provider = cache.get(&pending[r.provider].key)?;
-                r.digest(&provider.side)
-            });
-            (i, filter)
+            let filters = restrictions[i]
+                .iter()
+                .filter_map(|r| r.digest(&cache.get(&pending[r.provider].key)?.side))
+                .collect();
+            (i, filters)
         })
         .collect();
     prepare_together(
@@ -469,7 +468,7 @@ fn collect_builds(
 #[allow(clippy::too_many_arguments)]
 fn prepare_together(
     pending: &[PendingBuild<'_>],
-    which: Vec<(usize, Option<runtime_filter::PendingFilter>)>,
+    which: Vec<(usize, Vec<runtime_filter::PendingFilter>)>,
     sources: &[Vec<RecordBatch>],
     cache: &mut BuildCache,
     meter: Option<&Meter>,
@@ -485,7 +484,7 @@ fn prepare_together(
                 .map(|(i, restrict)| {
                     prepare_build(
                         &pending[*i],
-                        restrict.as_ref(),
+                        restrict,
                         sources,
                         meter,
                         budget,
@@ -566,12 +565,12 @@ fn gather_builds<'a>(
 
 /// Execute one build side and hash it, or `None` when it cannot be materialized.
 ///
-/// `restrict` is another build side's key set over this one's key column
-/// (`runtime_filter::restrict_builds`): rows it refutes are dropped before the side is
+/// `restrict` holds other build sides' key sets over this one's key columns
+/// (`runtime_filter::restrict_builds`): rows they refute are dropped before the side is
 /// materialized and hashed, so neither the copy nor the table ever holds them.
 fn prepare_build(
     p: &PendingBuild<'_>,
-    restrict: Option<&runtime_filter::PendingFilter>,
+    restrict: &[runtime_filter::PendingFilter],
     sources: &[Vec<RecordBatch>],
     meter: Option<&Meter>,
     budget: usize,
@@ -598,9 +597,10 @@ fn prepare_build(
         }
         None => parallel::run(p.right, sources, workers, meter, budget, false, None, opts)?,
     };
-    let batches = match restrict {
-        Some(filter) => restrict_batches(batches, filter)?,
-        None => batches,
+    let batches = if restrict.is_empty() {
+        batches
+    } else {
+        restrict_batches(batches, restrict)?
     };
     let built = match ops::materialize(&batches) {
         Ok(side) => {
@@ -613,13 +613,12 @@ fn prepare_build(
     Ok(built)
 }
 
-/// `batches` with the rows `filter` refutes removed, one batch per pool worker at a time.
+/// `batches` with the rows `filters` refute removed, one batch per pool worker at a time.
 fn restrict_batches(
     batches: Vec<RecordBatch>,
-    filter: &runtime_filter::PendingFilter,
+    filters: &[runtime_filter::PendingFilter],
 ) -> Result<Vec<RecordBatch>, InterpError> {
     use rayon::prelude::*;
-    let filters = std::slice::from_ref(filter);
     let kept: Vec<RecordBatch> = batches
         .into_par_iter()
         .map(|b| runtime_filter::apply(filters, b))
