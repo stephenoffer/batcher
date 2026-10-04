@@ -84,8 +84,8 @@ DIR_ALLOW: dict[str, str] = {
         "ml/tabular already are — this entry is debt, not a design"
     ),
     "python/batcher/kyber": (
-        "OVER BUDGET AND TRACKED: 23 modules against a cap of 12, and GROWING (21 when this "
-        "entry was written). The learned-adaptive family "
+        "OVER BUDGET AND TRACKED: 22 modules against a cap of 12 (21 when this entry was written, "
+        "23 at its peak). The learned-adaptive family "
         "(cost/cardinality/calibration/cpu_shares/learning/signature) is the natural subpackage "
         "to lift out; this entry is debt, not a design"
     ),
