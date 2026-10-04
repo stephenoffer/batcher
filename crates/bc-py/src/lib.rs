@@ -310,11 +310,13 @@ fn prepare_exec(
     } else {
         std::collections::HashMap::new()
     };
+    // Batches normalize independently, so across the pool rather than on the calling thread.
     let sources: Vec<Vec<RecordBatch>> = sources
         .into_iter()
         .map(|relation| {
+            use rayon::prelude::*;
             relation
-                .iter()
+                .par_iter()
                 .map(normalize_batch)
                 .collect::<PyResult<Vec<_>>>()
         })
