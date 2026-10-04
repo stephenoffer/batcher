@@ -381,7 +381,9 @@ pub(super) fn build_materializes_faster(
 /// One plain build side found on the probe spine, waiting to be prepared.
 struct PendingBuild<'a> {
     key: usize,
+    probe: &'a RelOp,
     right: &'a RelOp,
+    left_keys: &'a [String],
     right_keys: &'a [String],
     join_type: JoinType,
     admission: Admission,
@@ -410,18 +412,87 @@ fn collect_builds(
         opts,
         &mut pending,
     )?;
-    // The build sides of one spine are independent of one another, so they are prepared
-    // together. One at a time, a build that cannot fill the machine left it idle: at TPC-H
-    // sf100 `supplier` is one row group and `customer` fifteen, and q5 and q10 spent the first
-    // ~35% of their wall time below half the machine's cores while those builds ran in turn,
-    // then the probe pipeline ran at 94%. Together they share the pool by work stealing, so a
-    // build that can use every core still does.
+    // A build side whose rows another build's key set refutes is prepared after that one,
+    // restricted to it (`runtime_filter::restrict_builds`); every other side is prepared first.
+    let spine: Vec<runtime_filter::SpineJoin<'_>> = pending
+        .iter()
+        .map(|p| runtime_filter::SpineJoin {
+            probe: p.probe,
+            build: p.right,
+            left_keys: p.left_keys,
+            right_keys: p.right_keys,
+            join_type: p.join_type,
+        })
+        .collect();
+    let restrictions = runtime_filter::restrict_builds(&spine, sources);
+    let (later, first): (Vec<usize>, Vec<usize>) =
+        (0..pending.len()).partition(|&i| restrictions[i].is_some());
+    let unrestricted: Vec<(usize, Option<runtime_filter::PendingFilter>)> =
+        first.into_iter().map(|i| (i, None)).collect();
+    prepare_together(
+        &pending,
+        unrestricted,
+        sources,
+        cache,
+        meter,
+        budget,
+        workers,
+        opts,
+    )?;
+    if later.is_empty() {
+        return Ok(());
+    }
+    let restricted = later
+        .into_iter()
+        .map(|i| {
+            let r = restrictions[i].as_ref();
+            let filter = r.and_then(|r| {
+                let provider = cache.get(&pending[r.provider].key)?;
+                r.digest(&provider.side)
+            });
+            (i, filter)
+        })
+        .collect();
+    prepare_together(
+        &pending, restricted, sources, cache, meter, budget, workers, opts,
+    )
+}
+
+/// Prepare the listed build sides of `pending` together, each restricted by its filter if any.
+///
+/// The build sides of one spine are independent of one another, so they are prepared together.
+/// One at a time, a build that cannot fill the machine left it idle: at TPC-H sf100 `supplier`
+/// is one row group and `customer` fifteen, and q5 and q10 spent the first ~35% of their wall
+/// time below half the machine's cores while those builds ran in turn, then the probe pipeline
+/// ran at 94%. Together they share the pool by work stealing, so a build that can use every core
+/// still does.
+#[allow(clippy::too_many_arguments)]
+fn prepare_together(
+    pending: &[PendingBuild<'_>],
+    which: Vec<(usize, Option<runtime_filter::PendingFilter>)>,
+    sources: &[Vec<RecordBatch>],
+    cache: &mut BuildCache,
+    meter: Option<&Meter>,
+    budget: usize,
+    workers: usize,
+    opts: Option<&crate::par::ExecOptions>,
+) -> Result<(), InterpError> {
     use rayon::prelude::*;
     let built: Vec<Result<Option<(usize, JoinBuild)>, InterpError>> =
         crate::par::pool_for(workers.max(1))?.install(|| {
-            pending
+            which
                 .par_iter()
-                .map(|p| prepare_build(p, sources, meter, budget, workers, opts))
+                .map(|(i, restrict)| {
+                    prepare_build(
+                        &pending[*i],
+                        restrict.as_ref(),
+                        sources,
+                        meter,
+                        budget,
+                        workers,
+                        opts,
+                    )
+                })
                 .collect()
         });
     for build in built {
@@ -476,7 +547,9 @@ fn gather_builds<'a>(
         )?;
         pending.push(PendingBuild {
             key: node_key(plan),
+            probe: left,
             right,
+            left_keys,
             right_keys,
             join_type: *join_type,
             admission,
@@ -492,8 +565,13 @@ fn gather_builds<'a>(
 }
 
 /// Execute one build side and hash it, or `None` when it cannot be materialized.
+///
+/// `restrict` is another build side's key set over this one's key column
+/// (`runtime_filter::restrict_builds`): rows it refutes are dropped before the side is
+/// materialized and hashed, so neither the copy nor the table ever holds them.
 fn prepare_build(
     p: &PendingBuild<'_>,
+    restrict: Option<&runtime_filter::PendingFilter>,
     sources: &[Vec<RecordBatch>],
     meter: Option<&Meter>,
     budget: usize,
@@ -520,6 +598,10 @@ fn prepare_build(
         }
         None => parallel::run(p.right, sources, workers, meter, budget, false, None, opts)?,
     };
+    let batches = match restrict {
+        Some(filter) => restrict_batches(batches, filter)?,
+        None => batches,
+    };
     let built = match ops::materialize(&batches) {
         Ok(side) => {
             let probe = make_probe(&side, p.right_keys, p.join_type, p.admission)?;
@@ -529,6 +611,28 @@ fn prepare_build(
     };
     drop_across_pool(batches);
     Ok(built)
+}
+
+/// `batches` with the rows `filter` refutes removed, one batch per pool worker at a time.
+fn restrict_batches(
+    batches: Vec<RecordBatch>,
+    filter: &runtime_filter::PendingFilter,
+) -> Result<Vec<RecordBatch>, InterpError> {
+    use rayon::prelude::*;
+    let filters = std::slice::from_ref(filter);
+    let kept: Vec<RecordBatch> = batches
+        .into_par_iter()
+        .map(|b| runtime_filter::apply(filters, b))
+        .collect::<Result<_, _>>()?;
+    // An emptied side keeps one zero-row batch, so it still materializes (with its schema) into
+    // an empty build rather than reading as one that could not be built.
+    let empty = kept.first().map(|b| b.slice(0, 0));
+    let rows: Vec<RecordBatch> = kept.into_iter().filter(|b| b.num_rows() > 0).collect();
+    Ok(if rows.is_empty() {
+        empty.into_iter().collect()
+    } else {
+        rows
+    })
 }
 
 /// Rows in the relation the probe spine will be sharded over, or 0 when there is none.
