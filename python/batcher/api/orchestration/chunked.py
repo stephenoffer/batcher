@@ -17,15 +17,20 @@ the envelope, returns `None` here and takes the path it would have taken anyway.
 
 from __future__ import annotations
 
+import copy
+import math
 import re
 import time
 from contextvars import ContextVar
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
 from batcher import core
 from batcher.api.orchestration.chunked_sideways import (
+    _scans,
+    _stage,
+    _walk,
     run_partitioned_build,
     run_staged_held,
     run_staged_sideways,
@@ -163,6 +168,22 @@ def execute_chunked(
         )
         if staged is not None:
             return staged
+    # A selective build side over the driving scan runs first, so the join it feeds streams its
+    # probe side instead of hashing it (`run_staged_build`; TPC-H q12 at sf1000).
+    built = run_staged_build(
+        sources,
+        opt,
+        input_bytes_of,
+        lambda srcs, stage: execute_chunked(
+            srcs,
+            stage,
+            lambda i: projected_input_bytes(srcs, stage.source_projections, [i]),
+            python_chunks=python_chunks,
+        ),
+        _held_limit(),
+    )
+    if built is not None:
+        return built
     # An aggregate over an input too large to hold whole runs first, streaming that input, and
     # the rest reads its result (`chunked_sideways.run_staged_held`; TPC-H q18 at sf1000).
     held = run_staged_held(
@@ -221,6 +242,98 @@ def execute_chunked(
         # of its largest build (`chunked_sideways.run_partitioned_build`) before handing it to
         # the out-of-core route, which spills every join. Never from inside a pass.
         return _partitioned(sources, opt, input_bytes_of, python_chunks, str(exc))
+
+
+#: Relational operators a staged build side may hold. Row-wise only, so its output is a subset
+#: of the driving scan's rows and Kyber's estimate of it is a filter selectivity.
+_ROW_WISE = frozenset({"filter", "project", "scan"})
+
+#: How many times fewer rows than the driving scan a build side over it must be estimated to
+#: hold before it is staged rather than swapped onto the probe spine.
+_STAGED_BUILD_RATIO = 16
+
+
+def run_staged_build(
+    sources: list[Source],
+    opt: PhysicalPlan,
+    input_bytes_of,
+    run_stage,
+    held_limit: int,
+) -> list[pa.RecordBatch] | None:
+    """The plan's result with a selective build side over the driving scan run first, or `None`.
+
+    The chunked executors stream the driving relation through a join's *probe* side, so an inner
+    join whose build side reads it is swapped (`bc_interp::stream::chunked::orient`), and the
+    join's other input -- whatever its size -- becomes the hash table. When Kyber built the
+    driving side because a filter makes it small, that swap hashes the large side instead.
+    TPC-H q12 is the shape: `orders JOIN lineitem` with `lineitem` filtered to ~0.5% of its
+    rows. Swapped, sf1000 hashed all 1.5B `orders` rows and ran in 64-118 s against DuckDB's 9.
+
+    Here that build side -- filters and projections over the driving scan alone -- runs first as
+    its own streamed stage, and the plan reads its result as a held input; the next-largest
+    source then drives. Only a side Kyber estimates at most `1/_STAGED_BUILD_RATIO` of the
+    scan, and within `held_limit`, is staged, because the stage holds every row it keeps.
+
+    Args:
+        sources: The plan's bound sources.
+        opt: The optimized physical plan.
+        input_bytes_of: Maps a source id to its projected input bytes; picks the driving scan.
+        run_stage: Runs one stage on the chunked path (`execute_chunked`).
+        held_limit: Bytes the staged result may be estimated to hold.
+
+    Returns:
+        The result batches, or `None` when no build side qualifies or a stage declined.
+    """
+    scanned = _scans(opt.ir)
+    if len(set(scanned)) < 2:
+        return None
+    driving = max(set(scanned), key=input_bytes_of)
+    found = _selective_build(opt, driving, input_bytes_of(driving), held_limit)
+    if found is None or scanned.count(driving) != 1:
+        return None
+    path, subtree = found
+    out = run_stage(list(sources), _stage(opt, copy.deepcopy(subtree)))
+    if not out:
+        return None
+    from batcher.io.source import InMemorySource
+
+    staged = [*sources, InMemorySource(out, zone_maps=False, ephemeral=True)]
+    ir = copy.deepcopy(opt.ir)
+    parent = ir
+    for key in path[:-1]:
+        parent = parent[key]
+    parent[path[-1]] = {"op": "scan", "source_id": len(staged) - 1}
+    return run_stage(staged, _stage(opt, ir))
+
+
+def _selective_build(
+    opt: PhysicalPlan, driving: int, driving_bytes: int, held_limit: int
+) -> tuple[tuple, dict[str, Any]] | None:
+    """The path and subtree of an inner join's row-wise build side over `driving`, if selective."""
+    relations = [(path, node) for path, node in _walk(opt.ir) if "e" not in node]
+    if len(opt.ops) != len(relations):
+        return None  # the estimates are keyed by pre-order position; without them, no verdict
+    est = {path: opt.ops[i].properties.est_rows for i, (path, _) in enumerate(relations)}
+    scan_rows = next(
+        (est[p] for p, n in relations if n.get("op") == "scan" and n["source_id"] == driving),
+        math.nan,
+    )
+    if not scan_rows > 0:
+        return None
+    for path, node in relations:
+        if node.get("op") != "hash_join" or node.get("join_type") != "inner":
+            continue
+        build = node["right"]
+        kinds = [n.get("op") for _, n in _walk(build) if "e" not in n]
+        if set(kinds) - _ROW_WISE or "filter" not in kinds or _scans(build) != [driving]:
+            continue
+        rows = est[(*path, "right")]
+        if not rows * _STAGED_BUILD_RATIO <= scan_rows:
+            continue  # NaN, an unsized side, compares false too
+        if driving_bytes * rows / scan_rows > held_limit:
+            continue
+        return (*path, "right"), build
+    return None
 
 
 def _pushed(opt: PhysicalPlan, i: int) -> tuple[list[str] | None, dict | None]:

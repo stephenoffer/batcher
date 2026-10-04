@@ -346,7 +346,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 124 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `chunked.py` | 321 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
+| `chunked.py` | 434 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
 | `chunked_sideways.py` | 647 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
