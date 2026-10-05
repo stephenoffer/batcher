@@ -75,6 +75,9 @@ _REPLANS: dict[str, int] = {}
 # replacement, and the keys whose re-plan reproduced it (see `store`).
 _PRIOR: dict[str, Any] = {}
 _SETTLED: set[str] = set()
+# Consecutive re-plans of a key that reproduced the plan they replaced, and how many settle it.
+_REPRODUCED: dict[str, int] = {}
+_SETTLE_AFTER = 2
 
 
 def misses() -> int:
@@ -107,6 +110,7 @@ def clear() -> None:
         _REPLANS.clear()
         _PRIOR.clear()
         _SETTLED.clear()
+        _REPRODUCED.clear()
 
 
 def lookup(key: str | None, holds: Callable[[Any, int], bool] | None = None) -> Any | None:
@@ -190,14 +194,19 @@ def store(
     exact, learned_fp = _split(key)
     with _LOCK:
         prior = _PRIOR.pop(exact, None)
-        if prior is not None and _runs_identically(prior, _first(result)):
-            # The re-plan spent this key's newest measurements and rebuilt the plan it
-            # replaced, so the estimates it corrected are not ones this plan turns on. Those
-            # re-plan it again only by drifting (`plan_deps.dependencies_hold`'s `settled`):
-            # on TPC-DS at sf1, 315 of 389 re-plans reproduced their plan and 45 queries
-            # re-planned three times without a change, ~45 ms each against ~20 ms queries.
-            # A dependency first measured after this re-plan is still judged as usual.
-            _SETTLED.add(exact)
+        if prior is not None:
+            # Re-plans that keep spending this key's newest measurements and keep rebuilding
+            # the plan they replaced show the estimates still converging are not ones this
+            # plan turns on. Past `_SETTLE_AFTER` in a row, those re-plan it only by drifting
+            # (`plan_deps.dependencies_hold`'s `settled`): on TPC-DS at sf1, 315 of 389
+            # re-plans reproduced their plan, ~45 ms each against ~20 ms queries. One alone is
+            # not enough: q13's first re-plan reproduced its plan and its third found one 6x
+            # faster (102 -> 16 ms), as corrections that converge over several runs flipped a
+            # join. A dependency first measured afterwards is still judged as usual.
+            same = _runs_identically(prior, _first(result))
+            _REPRODUCED[exact] = _REPRODUCED.get(exact, 0) + 1 if same else 0
+            if _REPRODUCED[exact] >= _SETTLE_AFTER:
+                _SETTLED.add(exact)
         _CACHE[exact] = (result, keepalive, deps, _ROUNDS.pop(exact, (0, 0)), learned_fp)
         _CACHE.move_to_end(exact)
         while len(_CACHE) > max_entries:
@@ -208,6 +217,7 @@ def store(
             _REPLANS.pop(evicted, None)
             _PRIOR.pop(evicted, None)
             _SETTLED.discard(evicted)
+            _REPRODUCED.pop(evicted, None)
 
 
 def served(result: Any, key: str | None) -> None:

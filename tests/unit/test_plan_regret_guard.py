@@ -129,9 +129,10 @@ def test_a_replan_that_changed_what_runs_is_still_reverted():
 
 
 def test_a_replan_that_reproduced_its_plan_settles_the_key():
-    """A re-plan that rebuilt what it replaced tells `holds` the key is settled.
+    """Two re-plans in a row that rebuilt what they replaced tell `holds` the key is settled.
 
-    The positive control is the first re-plan: before it, the key is not settled.
+    One is not enough (TPC-DS q13's third re-plan found a 6x faster plan after its first
+    reproduced the original), so the lookup after the first reproduction is the control.
     """
     seen: list[bool] = []
 
@@ -145,4 +146,6 @@ def test_a_replan_that_reproduced_its_plan_settles_the_key():
     assert plan_cache.lookup(_KEY, holds) is None
     plan_cache.store(_KEY, (_physical(1_000.0), None, ()), None, 16)  # estimates moved only
     assert plan_cache.lookup(_KEY, holds) is None
-    assert seen == [False, True]
+    plan_cache.store(_KEY, (_physical(900.0), None, ()), None, 16)  # and again
+    assert plan_cache.lookup(_KEY, holds) is None
+    assert seen == [False, False, True]

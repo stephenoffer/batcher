@@ -1265,7 +1265,7 @@ Memoize the optimizer — the same query, planned once.
 | module | lines | what it is |
 |---|---|---|
 | `keys.py` | 574 | The plan-cache key: an exact half that decides meaning and a learned half that decides quality. |
-| `memo.py` | 305 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
+| `memo.py` | 315 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
 | `writes.py` | 128 | Advance the learning generation only when a write could change a plan. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -3072,7 +3072,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 146 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par/asof_stream.rs` | 454 | A keyless ASOF join that does not fit: a merge over two out-of-core sorted streams. |
-| `join_par/mod.rs` | 710 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `join_par/mod.rs` | 731 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `join_par/orient.rs` | 163 | Which side of a join to build on, once both sides' true sizes are known. |
 | `join_par/probe_stream.rs` | 223 | Streaming a join's probe side past a build side that is already resident. |
 | `join_par/range_blocked.rs` | 169 | A range join whose right side does not fit: block-nested over chunks of both sides. |
