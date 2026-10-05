@@ -189,6 +189,10 @@ def run_units_here(calls: list[tuple], held: dict, empties: dict) -> list[tuple]
                 rows = [engine().partial_aggregate(agg_spec[0], agg_spec[1], rows)]
             del inputs
             if more and not early:
+                # Tight enough that the read waited: give the unit just freed back first. The
+                # engine's allocator is reclaimed by its own guard; pyarrow's pool, which decoded
+                # the unit, is reachable only from here.
+                pa.default_memory_pool().release_unused()
                 pending = prefetch.submit(read_unit, calls[i + 1][1], empties)
             timing = (waited, time.perf_counter() - t1, in_bytes, started, setup)
             results.append((rows, metrics_json, timing))

@@ -56,6 +56,18 @@ pub const FLOOR_MIN_BYTES: u64 = 1 << 30;
 /// a decode loop can take a gigabyte in well under a hundred milliseconds.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 
+/// How close to the floor the sampler starts asking the allocator for its retained pages: at
+/// `RECLAIM_MARGIN` times the floor. Giving retained pages back is far cheaper than spilling,
+/// so it is tried well before the executors would give way.
+pub const RECLAIM_MARGIN: u64 = 2;
+
+/// The least time between two reclaims, so a node that stays near its floor is not walked on
+/// every sample: a forced collect visits every thread's heap.
+pub const RECLAIM_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Hands the process allocator's retained free pages back to the OS (`set_reclaimer`).
+static RECLAIMER: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
 /// `u64::MAX` until the first sample: "unknown" must never read as "low".
 static AVAILABLE: AtomicU64 = AtomicU64::new(u64::MAX);
 static FLOOR: AtomicU64 = AtomicU64::new(0);
@@ -88,9 +100,20 @@ pub fn arm() {
         ARMED.store(true, Ordering::Release);
         let spawned = std::thread::Builder::new()
             .name("bc-headroom".into())
-            .spawn(|| loop {
-                std::thread::sleep(SAMPLE_INTERVAL);
-                if let Some(s) = sample() {
+            .spawn(|| {
+                let mut last_reclaim: Option<std::time::Instant> = None;
+                loop {
+                    std::thread::sleep(SAMPLE_INTERVAL);
+                    let Some(mut s) = sample() else { continue };
+                    let near = s.available < s.floor.saturating_mul(RECLAIM_MARGIN);
+                    let due = last_reclaim.is_none_or(|t| t.elapsed() >= RECLAIM_INTERVAL);
+                    if near && due {
+                        if let Some(reclaim) = RECLAIMER.get() {
+                            reclaim();
+                            last_reclaim = Some(std::time::Instant::now());
+                            s = sample().unwrap_or(s);
+                        }
+                    }
                     AVAILABLE.store(s.available, Ordering::Relaxed);
                     FLOOR.store(s.floor, Ordering::Relaxed);
                 }
@@ -100,6 +123,19 @@ pub fn arm() {
             ARMED.store(false, Ordering::Release);
         }
     });
+}
+
+/// Register how this process hands its allocator's retained free pages back to the OS.
+///
+/// The sampler calls it when available memory comes within [`RECLAIM_MARGIN`] times the floor,
+/// at most every [`RECLAIM_INTERVAL`]. An allocator that keeps freed pages for reuse -- the
+/// engine's mimalloc holds them ten seconds, which is what lets consecutive queries reuse their
+/// buffers -- otherwise keeps counting memory nothing is using: a distributed TPC-H q9 unit task
+/// at SF1000 read a 7 GB unit at 34 GB resident, and Ray's memory monitor killed it at 95% of
+/// the node. This crate has no allocator of its own, so the caller that owns one supplies it.
+/// The first registration wins.
+pub fn set_reclaimer(reclaim: fn()) {
+    let _ = RECLAIMER.set(reclaim);
 }
 
 /// `Some` when the guard is armed and available memory is under the floor.

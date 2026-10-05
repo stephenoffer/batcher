@@ -80,6 +80,7 @@ fn shuffle_runtime_threads() -> usize {
 /// guard is armed: the estimates the budget is checked against cannot see what the machine
 /// actually has left, and `bc_resource::headroom` reads it.
 pub(crate) fn shared_memory_pool(budget: usize) -> Arc<MemoryPool> {
+    bc_resource::headroom::set_reclaimer(crate::hardware::collect_retained);
     bc_resource::headroom::arm();
     let pool = MEMORY_POOL.get_or_init(|| MemoryPool::new(budget));
     if budget > pool.limit() {

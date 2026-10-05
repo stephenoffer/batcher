@@ -10,38 +10,43 @@ from __future__ import annotations
 
 import pytest
 
-from batcher.dist.executors.aligned.memory_fit import UNIT_FOOTPRINT, fit_units
+from batcher.dist.executors.aligned.memory_fit import UNIT_FOOTPRINT, USABLE_FRACTION, fit_units
 
 pytestmark = pytest.mark.unit
 
 _GB = 1 << 30
 
 
+def _usable(gb: int) -> int:
+    """A node's memory as the fit plans on it: the `USABLE_FRACTION` Ray's figure leaves."""
+    return int(gb * _GB * USABLE_FRACTION)
+
+
 def test_small_units_keep_the_core_sizing():
     fit = fit_units([(16, 42 * _GB)] * 4, unit_cpus=8, slots=8, largest_unit=256 << 20)
     assert (fit.unit_cpus, fit.slots, fit.per_node) == (8, 8, 2)
-    assert fit.memory_bytes == 21 * _GB  # each task's share of the node is its engine budget
+    assert fit.memory_bytes == _usable(42) // 2  # each task's share of the node is its budget
 
 
 def test_a_large_unit_runs_one_task_per_node_on_every_core():
-    # The q9 shape: 6 GB units need ~27 GB each, so a 42 GB node holds one, not two.
-    fit = fit_units([(16, 42 * _GB)] * 4, unit_cpus=8, slots=8, largest_unit=6 * _GB)
+    # The q9 shape: 5 GB units need 30 GB each, so a 42 GB node holds one, not two.
+    fit = fit_units([(16, 42 * _GB)] * 4, unit_cpus=8, slots=8, largest_unit=5 * _GB)
     assert (fit.unit_cpus, fit.slots, fit.per_node) == (16, 4, 1)
-    assert fit.memory_bytes == 42 * _GB
-    assert fit.memory_bytes >= 6 * _GB * UNIT_FOOTPRINT
+    assert fit.memory_bytes == _usable(42)
+    assert fit.memory_bytes >= 5 * _GB * UNIT_FOOTPRINT
 
 
 def test_a_unit_too_large_for_any_node_still_runs_one_per_node():
     # Fewer than one cannot run at all; the engine budget makes the overrun spill instead.
     fit = fit_units([(16, 20 * _GB)] * 2, unit_cpus=8, slots=4, largest_unit=10 * _GB)
     assert (fit.unit_cpus, fit.slots, fit.per_node) == (16, 2, 1)
-    assert fit.memory_bytes == 20 * _GB
+    assert fit.memory_bytes == _usable(20)
 
 
 def test_the_tightest_node_decides():
     nodes = [(16, 100 * _GB), (16, 30 * _GB)]
     fit = fit_units(nodes, unit_cpus=8, slots=4, largest_unit=4 * _GB)  # needs 18 GB a task
-    assert fit.per_node == 1 and fit.memory_bytes == 30 * _GB
+    assert fit.per_node == 1 and fit.memory_bytes == _usable(30)
 
 
 def test_an_unmeasured_cluster_keeps_the_core_sizing_and_sets_no_budget():
@@ -55,7 +60,7 @@ def test_nodes_too_small_for_a_task_are_not_counted():
     # The 0-CPU head node holds no unit task, so its memory must not tighten the fit.
     nodes = [(0, 4 * _GB), (16, 42 * _GB), (16, 42 * _GB)]
     fit = fit_units(nodes, unit_cpus=8, slots=4, largest_unit=256 << 20)
-    assert (fit.slots, fit.per_node, fit.memory_bytes) == (4, 2, 21 * _GB)
+    assert (fit.slots, fit.per_node, fit.memory_bytes) == (4, 2, _usable(42) // 2)
 
 
 def test_a_node_with_more_cores_but_no_more_memory_runs_what_its_memory_holds():
@@ -64,7 +69,7 @@ def test_a_node_with_more_cores_but_no_more_memory_runs_what_its_memory_holds():
     # A 4 GB unit, so two tasks' footprint (`UNIT_FOOTPRINT`) fits the 64 GB node.
     nodes = [(64, 64 * _GB), (16, 64 * _GB)]
     fit = fit_units(nodes, unit_cpus=8, slots=10, largest_unit=4 * _GB)
-    assert fit.per_node == 2 and fit.memory_bytes == 32 * _GB
+    assert fit.per_node == 2 and fit.memory_bytes == _usable(64) // 2
     assert fit.slots == 4
 
 
@@ -72,7 +77,7 @@ def test_a_node_with_more_memory_keeps_its_cores_busy():
     # Memory is not the constraint on the large node, so it keeps a task per 8 cores.
     nodes = [(64, 512 * _GB), (16, 64 * _GB)]
     fit = fit_units(nodes, unit_cpus=8, slots=10, largest_unit=256 << 20)
-    assert fit.memory_bytes == 32 * _GB
+    assert fit.memory_bytes == _usable(64) // 2
     assert fit.slots == 8 + 2
 
 

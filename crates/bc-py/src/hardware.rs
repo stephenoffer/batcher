@@ -173,6 +173,16 @@ pub(crate) fn allocator_collect(py: Python<'_>, force: bool) -> u64 {
     before.saturating_sub(allocator_rss())
 }
 
+/// Hand every thread's retained free pages back to the OS: the headroom guard's reclaimer.
+///
+/// [`allocator_collect`] with `force`, without the GIL or the measurement, for the guard's
+/// sampler thread, which runs no Python.
+pub(crate) fn collect_retained() {
+    // SAFETY: as in `allocator_collect` -- `mi_collect` takes only a bool and is safe from any
+    // thread once the allocator is initialized, which it is: the engine allocated through it.
+    unsafe { libmimalloc_sys::mi_collect(true) }
+}
+
 /// How long mimalloc holds a freed region before handing its pages back to the OS.
 ///
 /// mimalloc's own default is 10 ms, which is tuned for a process whose allocation sizes sit in

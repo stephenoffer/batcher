@@ -991,11 +991,11 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `analysis.py` | 487 | Which part of a plan can run whole on each worker, over one key range of its inputs. |
 | `hoist.py` | 163 | Evaluate the parts of an aligned cut that read no aligned source, once, before its units. |
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
-| `memory_fit.py` | 89 | How many aligned units a node may run at once, from its memory as well as its cores. |
+| `memory_fit.py` | 95 | How many aligned units a node may run at once, from its memory as well as its cores. |
 | `reduce.py` | 216 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
 | `rewrite.py` | 232 | Push each join against a broadcast input down to the broadcast input it keys on. |
 | `route.py` | 458 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
-| `run.py` | 504 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
+| `run.py` | 508 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
 | `transfer.py` | 306 | Moving an aligned run's inputs and results between the driver and the fleet. |
 | `units.py` | 295 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
 
@@ -3047,11 +3047,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `chunked/mod.rs` | 611 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
+| `hardware.rs` | 329 | What the engine's own process knows about its hardware and its allocator. |
 | `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 787 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 176 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
-| `process.rs` | 111 | Process-wide singletons the FFI layer shares across calls. |
+| `process.rs` | 112 | Process-wide singletons the FFI layer shares across calls. |
 | `route.rs` | 175 | Which executor a plan runs on, and the two different affordability tests behind that. |
 | `shuffle/gather.rs` | 419 | The reducer's gather: how a worker pulls its bucket from every mapper. |
 | `shuffle/mod.rs` | 554 | Shuffle FFI: partitioners and the concurrent reducer gather. |
@@ -3398,7 +3398,7 @@ Process-wide memory accounting for reserve-before-allocate.
 | file | lines | what it is |
 |---|---|---|
 | `cancel.rs` | 201 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
-| `headroom.rs` | 251 | How much memory the machine has left, read rather than estimated. |
+| `headroom.rs` | 287 | How much memory the machine has left, read rather than estimated. |
 | `lib.rs` | 606 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`
