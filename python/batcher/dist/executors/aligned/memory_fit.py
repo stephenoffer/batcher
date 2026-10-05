@@ -22,8 +22,11 @@ __all__ = ["UnitFit", "fit_units", "fit_units_to_cluster"]
 
 #: A unit task's peak memory, as a multiple of its largest unit's projected input bytes: the
 #: unit it computes on, the one it prefetches, and the engine state over the first. Read off
-#: TPC-H q9 at SF1000: 28 GB per task over units of ~6 GB.
-UNIT_FOOTPRINT = 4.5
+#: TPC-H q9 at SF1000: 28 GB per task over units of ~6 GB at 4.5; re-measured 2026-10-05 at
+#: 30-35 GB of resident memory per task over the same units, so 6. An under-count here is an
+#: OOM kill (two tasks per 64 GB node at 30+ GB each); an over-count is a node running one
+#: task where it could have run two, which the engine's headroom guard now makes safe to risk.
+UNIT_FOOTPRINT = 6.0
 
 
 @dataclass(frozen=True)

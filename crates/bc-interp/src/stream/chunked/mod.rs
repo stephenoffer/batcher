@@ -516,6 +516,7 @@ impl Run<'_> {
         let mut state_bytes = 0usize;
         loop {
             self.opts.check_cancelled()?;
+            self.opts.check_memory()?;
             let views = self.shard_views(srcs);
             let folded = self.pool.install(|| {
                 views
@@ -579,6 +580,7 @@ impl Run<'_> {
         let mut held = 0usize;
         loop {
             self.opts.check_cancelled()?;
+            self.opts.check_memory()?;
             let views = self.shard_views(srcs);
             let pieces = self.pool.install(|| {
                 views
@@ -708,6 +710,7 @@ impl Run<'_> {
             )
         })?;
         self.opts.check_cancelled()?;
+        self.opts.check_memory()?;
         let lazies = self.lazies(src, ranges);
         let jit = std::sync::OnceLock::new();
         let rows_in = std::sync::atomic::AtomicU64::new(0);
@@ -756,6 +759,7 @@ impl Run<'_> {
             )
         })?;
         self.opts.check_cancelled()?;
+        self.opts.check_memory()?;
         let held = std::sync::atomic::AtomicUsize::new(0);
         let lazies = self.lazies(src, ranges);
         let pieces = self.pool.install(|| {

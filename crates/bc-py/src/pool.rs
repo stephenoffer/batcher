@@ -163,3 +163,14 @@ impl MemoryPool {
         self.inner.over_released() as u64
     }
 }
+
+/// `(available, floor)` bytes from the engine's memory headroom guard, or `None` where the
+/// kernel's figures cannot be read.
+///
+/// The same reading the executors trip on (`bc_resource::headroom`), so a control-plane
+/// decision about an allocation it makes itself -- a distributed unit task prefetching its next
+/// unit -- uses the engine's figure and floor instead of restating either.
+#[pyfunction]
+pub(crate) fn memory_headroom() -> Option<(u64, u64)> {
+    bc_resource::headroom::reading().map(|h| (h.available, h.floor))
+}

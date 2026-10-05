@@ -17,6 +17,7 @@
 //! pool itself is policy-free — it only accounts and admits.
 
 pub mod cancel;
+pub mod headroom;
 
 pub use cancel::CancelToken;
 
@@ -344,6 +345,16 @@ impl MemoryPool {
     /// growth would exceed the limit. This is the low-level admission primitive;
     /// prefer [`MemoryPool::try_reserve`] for an RAII guard that releases on drop.
     pub fn try_reserve_bytes(&self, bytes: usize) -> ResourceResult<()> {
+        // Accounted bytes are only what callers reserved; the machine running short is the
+        // fact that matters, so a reservation is refused then too and the caller spills.
+        if bytes > 0 && headroom::low().is_some() {
+            self.denied.fetch_add(1, Ordering::Relaxed);
+            return Err(ResourceError::Exhausted {
+                requested: bytes,
+                available: 0,
+                limit: self.limit(),
+            });
+        }
         let mut cur = self.used.load(Ordering::Acquire);
         loop {
             let limit = self.limit();

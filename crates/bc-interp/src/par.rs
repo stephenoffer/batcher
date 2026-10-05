@@ -153,6 +153,21 @@ impl ExecOptions {
         }
     }
 
+    /// `Err(MemoryBudgetExceeded)` when this query runs under a memory budget and the
+    /// machine's available memory has fallen below the guard's floor
+    /// (`bc_resource::headroom`). For executors whose caller re-routes that signal to one that
+    /// spills; the materializing executor itself spills instead (see [`admit`]).
+    #[inline]
+    pub fn check_memory(&self) -> Result<(), InterpError> {
+        if self.agg_spill.is_none() {
+            return Ok(());
+        }
+        match bc_resource::headroom::low() {
+            Some(h) => Err(crate::error::low_memory(h)),
+            None => Ok(()),
+        }
+    }
+
     pub fn with_engine_config(mut self, cfg: &EngineConfig) -> Self {
         self.morsel_rows = if cfg.morsel_rows == 0 {
             DEFAULT_TARGET_MORSEL
@@ -256,6 +271,12 @@ enum Admit {
 /// estimate cannot enforce on its own. With no envelope (the default) `op_budget`
 /// is `None`, so it always admits with no accounting and the fast path is unchanged.
 fn admit(opts: &ExecOptions, op_id: u32, estimate_bytes: usize) -> Admit {
+    // The machine itself is short of memory, whatever the estimates say: spill whenever there
+    // is a path to spill to (`bc_resource::headroom`). The pool's own refusal would get here
+    // too, but only for operators whose bytes it was asked to admit.
+    if opts.agg_spill.is_some() && bc_resource::headroom::low().is_some() {
+        return Admit::Spill;
+    }
     match opts.pool.as_ref() {
         // The pool accounts *actual* bytes, so it is the spill authority: reserve the
         // footprint cooperatively and spill only when the pool cannot admit it. Deciding

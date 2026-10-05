@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1558 Python modules across 220 packages and 328 Rust files across 14 crates.
+Covering 1558 Python modules across 220 packages and 329 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -991,11 +991,11 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `analysis.py` | 487 | Which part of a plan can run whole on each worker, over one key range of its inputs. |
 | `hoist.py` | 163 | Evaluate the parts of an aligned cut that read no aligned source, once, before its units. |
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
-| `memory_fit.py` | 86 | How many aligned units a node may run at once, from its memory as well as its cores. |
+| `memory_fit.py` | 89 | How many aligned units a node may run at once, from its memory as well as its cores. |
 | `reduce.py` | 216 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
 | `rewrite.py` | 232 | Push each join against a broadcast input down to the broadcast input it keys on. |
 | `route.py` | 458 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
-| `run.py` | 479 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
+| `run.py` | 504 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
 | `transfer.py` | 306 | Moving an aligned run's inputs and results between the driver and the fleet. |
 | `units.py` | 295 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
 
@@ -3048,10 +3048,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 799 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 787 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
-| `pool.rs` | 165 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
-| `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
+| `pool.rs` | 176 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
+| `process.rs` | 111 | Process-wide singletons the FFI layer shares across calls. |
 | `route.rs` | 175 | Which executor a plan runs on, and the two different affordability tests behind that. |
 | `shuffle/gather.rs` | 419 | The reducer's gather: how a worker pulls its bucket from every mapper. |
 | `shuffle/mod.rs` | 554 | Shuffle FFI: partitioners and the concurrent reducer gather. |
@@ -3070,7 +3070,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `coalesce.rs` | 172 | Merge a result's small batches before it leaves the engine. |
 | `dist.rs` | 596 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
-| `error.rs` | 146 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
+| `error.rs` | 157 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par/asof_stream.rs` | 454 | A keyless ASOF join that does not fit: a merge over two out-of-core sorted streams. |
 | `join_par/mod.rs` | 731 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `join_par/orient.rs` | 163 | Which side of a join to build on, once both sides' true sizes are known. |
@@ -3098,12 +3098,12 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 772 | Single-node parallel full sort by **sample-sort**. |
 | `ops/window_stream.rs` | 687 | Bounded-memory window execution for a partition that does not fit the envelope. |
-| `par.rs` | 3661 | The multi-core executor. |
+| `par.rs` | 3682 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
-| `stream/breaker.rs` | 631 | The breakers: operators that must see all of their input before they can emit any output. |
-| `stream/builds.rs` | 770 | Preparing a hash join's build side once, for every worker that will probe it. |
-| `stream/chunked/mod.rs` | 789 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
+| `stream/breaker.rs` | 634 | The breakers: operators that must see all of their input before they can emit any output. |
+| `stream/builds.rs` | 775 | Preparing a hash join's build side once, for every worker that will probe it. |
+| `stream/chunked/mod.rs` | 793 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
@@ -3113,7 +3113,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/meter.rs` | 429 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 786 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
-| `stream/parallel.rs` | 1683 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/parallel.rs` | 1696 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 284 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 733 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
@@ -3398,7 +3398,8 @@ Process-wide memory accounting for reserve-before-allocate.
 | file | lines | what it is |
 |---|---|---|
 | `cancel.rs` | 201 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
-| `lib.rs` | 595 | Process-wide memory accounting for reserve-before-allocate. |
+| `headroom.rs` | 215 | How much memory the machine has left, read rather than estimated. |
+| `lib.rs` | 606 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`
 

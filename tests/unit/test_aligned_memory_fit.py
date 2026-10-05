@@ -61,8 +61,9 @@ def test_nodes_too_small_for_a_task_are_not_counted():
 def test_a_node_with_more_cores_but_no_more_memory_runs_what_its_memory_holds():
     # 64 cores beside 16 on the same 64 GB: cores alone would put 8 tasks on the large node,
     # each handed the 32 GB budget, four times what the node has.
+    # A 4 GB unit, so two tasks' footprint (`UNIT_FOOTPRINT`) fits the 64 GB node.
     nodes = [(64, 64 * _GB), (16, 64 * _GB)]
-    fit = fit_units(nodes, unit_cpus=8, slots=10, largest_unit=6 * _GB)
+    fit = fit_units(nodes, unit_cpus=8, slots=10, largest_unit=4 * _GB)
     assert fit.per_node == 2 and fit.memory_bytes == 32 * _GB
     assert fit.slots == 4
 
@@ -73,3 +74,26 @@ def test_a_node_with_more_memory_keeps_its_cores_busy():
     fit = fit_units(nodes, unit_cpus=8, slots=10, largest_unit=256 << 20)
     assert fit.memory_bytes == 32 * _GB
     assert fit.slots == 8 + 2
+
+
+def test_a_unit_task_prefetches_only_while_the_node_keeps_its_floor(monkeypatch):
+    """The next unit is read early only if holding it leaves the engine's headroom floor intact.
+
+    Read through the engine's own guard (`memory_headroom`), so the figure and the floor are
+    the ones the executors trip on. Unreadable (no reading) keeps the old behaviour: prefetch.
+    """
+    from batcher.dist.executors.aligned import run
+
+    class _Engine:
+        reading: tuple[int, int] | None = (40 * _GB, 4 * _GB)
+
+        def memory_headroom(self):
+            return self.reading
+
+    fake = _Engine()
+    monkeypatch.setattr(run, "engine", lambda: fake)
+    assert run._room_to_prefetch(6 * _GB)  # 40 - 2x6 = 28 GB left, well above 4
+    fake.reading = (14 * _GB, 4 * _GB)
+    assert not run._room_to_prefetch(6 * _GB)  # 14 - 12 = 2 GB: under the floor
+    fake.reading = None
+    assert run._room_to_prefetch(6 * _GB)

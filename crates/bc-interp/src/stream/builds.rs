@@ -122,6 +122,11 @@ impl BuildCache {
     /// caller re-runs on the materializing executor, which spills, and the two are checked
     /// against one sequential oracle — so this changes peak memory and speed, never the answer.
     fn check_total(&self, budget: usize) -> Result<(), InterpError> {
+        if budget > 0 {
+            if let Some(h) = bc_resource::headroom::low() {
+                return Err(crate::error::low_memory(h));
+            }
+        }
         if budget > 0 && self.bytes as usize > budget {
             return Err(InterpError::MemoryBudgetExceeded {
                 needed: self.bytes as usize,
