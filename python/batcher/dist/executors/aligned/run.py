@@ -44,11 +44,11 @@ from batcher.dist.executors.aligned.reduce import (
 )
 from batcher.dist.executors.aligned.rewrite import group_broadcast_joins
 from batcher.dist.executors.aligned.transfer import (
-    RESULT_BYTES,
     gather_units,
     pack_held,
     pull_units,
     read_unit,
+    result_budget,
     trace_units,
     unpack_held,
 )
@@ -381,8 +381,8 @@ def run_cut(
     results = _run_units(calls, held, empties, unit_cpus, slots, depth)
     if results is None:
         get_logger("dist").info(
-            "aligned: unit results outgrew the driver budget (%d GiB); declined a %s cut over %s",
-            RESULT_BYTES >> 30,
+            "aligned: unit results outgrew the driver budget (%.1f GiB); declined a %s cut over %s",
+            result_budget() / (1 << 30),
             "partial-aggregate" if cut.aggregate is not None else "row-returning",
             type(cut.body).__name__,
         )

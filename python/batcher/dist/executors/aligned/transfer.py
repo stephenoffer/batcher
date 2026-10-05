@@ -27,12 +27,33 @@ __all__ = [
     "pack_held",
     "pull_units",
     "read_unit",
+    "result_budget",
     "trace_units",
     "unpack_held",
 ]
 
 #: Bytes the units of one cut may return to the driver: groups, or rows a residual joins.
+#: A ceiling: `result_budget` lowers it to what the driver's machine can actually hold.
 RESULT_BYTES = env_int("BATCHER_ALIGNED_RESULT_BYTES", 12 << 30, floor=1 << 20)
+
+
+def result_budget() -> int:
+    """Bytes of unit results the driver may gather now: `RESULT_BYTES`, or less if it is short.
+
+    `RESULT_BYTES` is a constant, and the driver is often the cluster's smallest machine: TPC-H
+    q22 at SF1000 ran its driver on a 32 GB head node whose cgroup allows ~22 GB, beside an 8 GB
+    object store, and the kernel killed it holding 18 GB. Half of what is available above twice
+    the engine's headroom floor (`memory_headroom`) leaves room for the residual that runs over
+    the gathered rows. A driver whose headroom cannot be read keeps the constant.
+    """
+    from batcher._internal.native import engine
+
+    reading = engine().memory_headroom()
+    if reading is None:
+        return RESULT_BYTES
+    available, floor = reading
+    return min(RESULT_BYTES, max(1 << 20, (available - 2 * floor) // 2))
+
 
 #: Broadcast bytes past which the held inputs travel compressed.
 PACK_BYTES = 32 << 20
@@ -234,6 +255,7 @@ def _drain(
 
     out: list[tuple] = [()] * len(calls)
     landed = 0
+    budget = result_budget()
     while pending:
         timeout = _IDLE_CHECK_S if idle is not None else None
         done, _ = ray.wait(list(pending), num_returns=1, timeout=timeout)
@@ -245,7 +267,7 @@ def _drain(
                 out[i] = result
                 landed += sum(b.nbytes for b in result[0])
             refill(worker, ref)
-        if landed > RESULT_BYTES:
+        if landed > budget:
             # Not `force=True`: these are actor calls, which Ray refuses to force-cancel
             # (`ValueError`), so the decline that was meant to fall back to another executor
             # failed TPC-H q9 and q10 at SF1000 instead.
