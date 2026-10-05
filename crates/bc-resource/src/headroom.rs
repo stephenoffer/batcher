@@ -162,7 +162,7 @@ fn sample() -> Option<Headroom> {
     let mut available = meminfo_kib(&meminfo, "MemAvailable:")?.saturating_mul(1024);
     let mut total = meminfo_kib(&meminfo, "MemTotal:")?.saturating_mul(1024);
     for dir in cgroup_dirs() {
-        if let Some((limit, unreclaimable)) = cgroup_usage(&dir) {
+        if let Some((limit, unreclaimable)) = cgroup_usage(dir) {
             available = available.min(limit.saturating_sub(unreclaimable));
             total = total.min(limit);
         }
@@ -181,18 +181,47 @@ fn meminfo_kib(text: &str, key: &str) -> Option<u64> {
         .ok()
 }
 
-/// The cgroup v2 directories whose memory limit binds this process: the mount root and the
-/// process's own leaf (`/proc/self/cgroup`'s `0::<path>`), when they differ.
-fn cgroup_dirs() -> Vec<String> {
-    const ROOT: &str = "/sys/fs/cgroup";
-    let mut dirs = vec![ROOT.to_string()];
-    if let Ok(own) = std::fs::read_to_string("/proc/self/cgroup") {
-        if let Some(path) = own.lines().find_map(|l| l.strip_prefix("0::")) {
-            let path = path.trim().trim_end_matches('/');
-            if !path.is_empty() {
-                dirs.push(format!("{ROOT}{path}"));
-            }
+/// The cgroup v2 directories whose memory limit binds this process: the mount root, the
+/// process's own cgroup, and every level between them. Resolved once: a process does not
+/// change cgroup while it runs.
+fn cgroup_dirs() -> &'static [String] {
+    static DIRS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+        resolve_cgroup_dirs(std::path::Path::new("/sys/fs/cgroup"), &own)
+    })
+}
+
+/// [`cgroup_dirs`] for a mount at `root` and a `/proc/self/cgroup` text.
+///
+/// The `0::` path is relative to the cgroup root the *kernel* sees, which inside a container is
+/// not the mount: an Anyscale node reports `/anyscale/ctr_<id>/workers` while the container's
+/// own cgroup is mounted at `/sys/fs/cgroup`, so the leaf is `/sys/fs/cgroup/workers`. Joining
+/// the path onto the mount named a directory that does not exist, the leaf was skipped, and the
+/// guard never saw the `workers` cgroup's 75% limit -- the one that killed a TPC-H q9 unit task
+/// at SF1000 while the node still had 7 GB available. So leading components are dropped until
+/// the path exists under the mount, and every level from there up to the mount is read, since a
+/// limit set on any of them binds the process.
+fn resolve_cgroup_dirs(root: &std::path::Path, proc_cgroup: &str) -> Vec<String> {
+    let mut dirs = vec![root.to_string_lossy().into_owned()];
+    let Some(path) = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::")) else {
+        return dirs;
+    };
+    let parts: Vec<&str> = path.trim().split('/').filter(|p| !p.is_empty()).collect();
+    let leaf = (0..parts.len())
+        .map(|skip| {
+            parts[skip..]
+                .iter()
+                .fold(root.to_path_buf(), |d, p| d.join(p))
+        })
+        .find(|d| d.is_dir());
+    let mut level = leaf;
+    while let Some(dir) = level {
+        if dir == root {
+            break;
         }
+        dirs.push(dir.to_string_lossy().into_owned());
+        level = dir.parent().map(std::path::Path::to_path_buf);
     }
     dirs
 }
@@ -254,6 +283,25 @@ mod tests {
         assert_eq!(stat_field(stat, "file "), 900, "not `file_mapped`");
         assert_eq!(stat_field(stat, "shmem "), 300);
         assert_eq!(stat_field(stat, "absent "), 0);
+    }
+
+    #[test]
+    fn a_container_cgroup_path_resolves_under_its_mount_with_every_level() {
+        let root = std::env::temp_dir().join(format!("bc-headroom-{}", std::process::id()));
+        let workers = root.join("workers").join("w1");
+        std::fs::create_dir_all(&workers).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        // The kernel's path carries the host's prefix; the mount does not.
+        let dirs = resolve_cgroup_dirs(&root, "0::/anyscale/ctr_abc/workers/w1\n");
+        assert_eq!(dirs, vec![s(&root), s(&workers), s(&root.join("workers"))]);
+        // A path the mount does not hold at all falls back to the mount alone.
+        assert_eq!(
+            resolve_cgroup_dirs(&root, "0::/nowhere/else\n"),
+            vec![s(&root)]
+        );
+        // The root itself (a cgroup namespace) adds nothing past the mount.
+        assert_eq!(resolve_cgroup_dirs(&root, "0::/\n"), vec![s(&root)]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
