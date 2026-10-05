@@ -421,6 +421,49 @@ impl super::JoinTable {
             start = end;
         }
     }
+
+    /// [`super::JoinTable::mark_range`] over the dense map: mark every build row some probe
+    /// row of `range` matches, with no per-row call.
+    ///
+    /// The per-row loop reached each slot through `head_for`, which is not inlined into the
+    /// generic loop -- the cost [`Self::probe_range_dense`] removed from the probe, left in the
+    /// mark. `orders EXCEPT lineitem` at sf1 marks 1.5M build rows from 6M probe rows and spent
+    /// a quarter of the query in that call. A dense map is exact, so no pre-filter applies.
+    pub(super) fn mark_range_dense(
+        &self,
+        dense: &DenseHeads,
+        key: &[i64],
+        range: std::ops::Range<usize>,
+        left_null: Option<&[bool]>,
+        matched: &[std::sync::atomic::AtomicBool],
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if dense.span == 0 {
+            return;
+        }
+        for i in range {
+            let slot = dense.raw(key[i]);
+            if slot == EMPTY || left_null.is_some_and(|m| m[i]) {
+                continue;
+            }
+            let mut row = slot - 1;
+            loop {
+                // Load before store: a probe that repeats a key (`lineitem`'s rows per order)
+                // finds the flag already set and leaves the cache line clean.
+                if !matched[row as usize].load(Relaxed) {
+                    matched[row as usize].store(true, Relaxed);
+                }
+                if self.unique {
+                    break;
+                }
+                let nxt = self.next[row as usize];
+                if nxt == u32::MAX {
+                    break;
+                }
+                row = nxt;
+            }
+        }
+    }
 }
 
 /// One `(row, next)` chain-link list per map chunk, before they are concatenated.

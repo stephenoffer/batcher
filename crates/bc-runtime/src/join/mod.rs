@@ -1327,6 +1327,10 @@ impl JoinTable {
         matched: &[std::sync::atomic::AtomicBool],
     ) {
         use std::sync::atomic::Ordering::Relaxed;
+        if let (Some(d), Some((_, left))) = (self.dense.as_ref(), keys.dense_keys()) {
+            self.mark_range_dense(d, left, range, probe_null, matched);
+            return;
+        }
         let pre = self.prefilter();
         let (inline_bits, pre) = Self::hoist_bits(keys, pre);
         let mut rejected = 0u64;
