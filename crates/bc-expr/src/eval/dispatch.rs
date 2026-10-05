@@ -108,6 +108,17 @@ impl Expr {
                 dtype,
                 try_cast,
             } => {
+                // A cast of a constant is the same value on every row, so it is cast once and
+                // broadcast rather than cast `num_rows` times. TPC-DS q5's
+                // `CAST(0 AS DECIMAL(7,2))` on every row of every `UNION ALL` branch was a quarter
+                // of the query: materialize the literal, rescale it, validate its precision, per
+                // row. The cast is elementwise, so one row's result -- value, null or error -- is
+                // every row's.
+                if batch.num_rows() > 1 && is_constant_chain(input) {
+                    let one = input.eval(&batch.slice(0, 1))?;
+                    let cast = cast_expr(&one, &parse_dtype(dtype)?, *try_cast)?;
+                    return broadcast_row(&cast, batch.num_rows());
+                }
                 let arr = input.eval(batch)?;
                 cast_expr(&arr, &parse_dtype(dtype)?, *try_cast)
             }
@@ -523,6 +534,21 @@ impl Expr {
     }
 }
 
+/// Whether `expr` is a literal, or casts of one: a value that is the same on every row.
+fn is_constant_chain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Lit { .. } => true,
+        Expr::Cast { input, .. } => is_constant_chain(input),
+        _ => false,
+    }
+}
+
+/// `n` copies of `one`'s single row, of `one`'s exact type.
+fn broadcast_row(one: &ArrayRef, n: usize) -> Result<ArrayRef, ExprError> {
+    let zeros = arrow::array::UInt32Array::from(vec![0u32; n]);
+    Ok(arrow::compute::take(one.as_ref(), &zeros, None)?)
+}
+
 #[cfg(test)]
 mod dict_tests {
     use super::*;
@@ -584,5 +610,85 @@ mod dict_tests {
             let op = e.eval(&p).expect("eval over plain");
             assert_eq!(od.as_ref(), op.as_ref(), "mismatch for {e:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod constant_cast_tests {
+    use super::*;
+    use crate::Literal;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{Field, Schema};
+
+    fn rows(n: usize) -> RecordBatch {
+        let schema = Schema::new(vec![Field::new(
+            "x",
+            arrow::datatypes::DataType::Int64,
+            true,
+        )]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(Int64Array::from(vec![7i64; n]))],
+        )
+        .unwrap()
+    }
+
+    fn cast(input: Expr, dtype: &str, try_cast: bool) -> Expr {
+        Expr::Cast {
+            input: Box::new(input),
+            dtype: dtype.into(),
+            try_cast,
+        }
+    }
+
+    fn lit(value: Literal) -> Expr {
+        Expr::Lit { value }
+    }
+
+    /// The per-row oracle: the literal materialized `n` times and cast as a column.
+    fn per_row(value: &Literal, dtypes: &[(&str, bool)], n: usize) -> Result<ArrayRef, ExprError> {
+        let mut arr = value.to_array(n);
+        for (dtype, try_cast) in dtypes {
+            arr = cast_expr(&arr, &parse_dtype(dtype)?, *try_cast)?;
+        }
+        Ok(arr)
+    }
+
+    /// A cast of a constant, cast once and broadcast, is the per-row cast exactly: value,
+    /// type, nulls -- across decimals, a failing `TRY_CAST`, temporal parses and nested casts.
+    #[test]
+    fn a_constant_cast_is_the_per_row_cast() {
+        let n = 1_000;
+        let b = rows(n);
+        let cases: Vec<(Literal, Vec<(&str, bool)>)> = vec![
+            (Literal::Int(0), vec![("decimal(7, 2)", false)]),
+            (Literal::Float(12.345), vec![("decimal(7, 2)", false)]),
+            (
+                Literal::Int(0),
+                vec![("decimal(7, 2)", false), ("float64", false)],
+            ),
+            (Literal::Str("abc".into()), vec![("int64", true)]),
+            (Literal::Str("2000-08-23".into()), vec![("date", false)]),
+            (Literal::Int(42), vec![("string", false)]),
+            (Literal::Float(2.5), vec![("int64", false)]),
+        ];
+        for (value, dtypes) in cases {
+            let mut e = lit(value.clone());
+            for (dtype, t) in &dtypes {
+                e = cast(e, dtype, *t);
+            }
+            let got = e.eval(&b).unwrap();
+            let want = per_row(&value, &dtypes, n).unwrap();
+            assert_eq!(got.len(), n);
+            assert_eq!(got.as_ref(), want.as_ref(), "{value:?} {dtypes:?}");
+        }
+    }
+
+    /// A strict cast that fails on the constant fails here too, as it would on every row.
+    #[test]
+    fn a_failing_strict_constant_cast_still_errors() {
+        let e = cast(lit(Literal::Str("abc".into())), "int64", false);
+        assert!(e.eval(&rows(100)).is_err());
+        assert!(per_row(&Literal::Str("abc".into()), &[("int64", false)], 100).is_err());
     }
 }

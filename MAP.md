@@ -1388,7 +1388,7 @@ Extended Kyber rule families.
 | `projection_scan.py` | 364 | Projection, ordering, and scan/schema simplifications — local, always-correct. |
 | `pushdown_gaps.py` | 469 | Pushdown gaps — the operators a `Filter`/projection may legally descend past, but didn't. |
 | `sargable.py` | 296 | NORMALIZE-phase sargable-predicate normalization — strip arithmetic wrappers so a |
-| `setops.py` | 379 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
+| `setops.py` | 428 | Set-operation rewrites — UNION / DISTINCT structural simplifications. |
 | `setops_extra.py` | 296 | Set-operation rewrites that `setops.py` leaves on the table — bag vs set, precisely. |
 | `string_folds.py` | 159 | Constant folding of string functions over string literals. |
 | `strings.py` | 482 | String-expression rewrites — LIKE despecialization, idempotence collapse, literal folding. |
@@ -3243,7 +3243,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/cmp/prim.rs` | 522 | `<integer or temporal column> <cmp> <literal>`, and a two-sided range over one column, a word of mask bits at a time. |
 | `eval/cmp/string.rs` | 409 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
-| `eval/dispatch.rs` | 525 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 551 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 432 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/edge_tests.rs` | 276 | Row-local failure versus caller error, and the edge semantics fixed alongside it. |
