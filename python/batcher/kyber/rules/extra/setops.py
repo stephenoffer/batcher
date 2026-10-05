@@ -27,7 +27,7 @@ import json
 from batcher.kyber.pass_base import OptimizerContext
 from batcher.kyber.registry import rule
 from batcher.kyber.rule import Phase
-from batcher.plan.expr_ir import Binary, Col, Lit, Not
+from batcher.plan.expr_ir import Binary, Cast, Col, Lit, Not
 from batcher.plan.logical import (
     Aggregate,
     Distinct,
@@ -48,6 +48,7 @@ from batcher.plan.logical._setops import (
 )
 
 __all__ = [
+    "align_union_branch_types",
     "dedup_distinct_union_branches",
     "drop_distinct_in_distinct_union",
     "flatten_nested_union",
@@ -83,6 +84,54 @@ def _flatten_branches(branch: LogicalPlan, outer_distinct: bool) -> list[Logical
             merged.extend(_flatten_branches(child, outer_distinct))
         return merged
     return [branch]
+
+
+@rule(name="align_union_branch_types", phase=Phase.REWRITE, matches=(Union,))
+def align_union_branch_types(node: Union, _ctx: OptimizerContext) -> LogicalPlan | None:
+    """Cast each branch column to the union's declared type inside its own branch.
+
+    A branch whose column type differs from the union's (`double` beside a
+    `CAST(0 AS DECIMAL(7,2))`, `int64` beside `float64`) is reconciled by the engine at the
+    union, per row, after the branch has computed it (`bc_interp::union_coerce`). Cast in the
+    branch instead, the cast lands on whatever produced the column, and a constant there --
+    TPC-DS q5's six `CAST(0 AS DECIMAL(7,2))` columns -- is then cast once and broadcast
+    (`bc_expr` evaluates a cast of a literal once per batch). Measured on q5 over
+    `double`-typed money columns, the per-row decimal round trip was ~40% of the query.
+
+    The cast is `TRY_CAST`: the engine's union coercion is arrow's default *safe* cast, which
+    is what `TRY_CAST` lowers to, so no value can convert differently here than at the union.
+    The target is the union's own declared type (`Union.available_schema`), the type the
+    engine coerces to (`plan.types` mirrors `bc_expr::common_supertype`). Declined when any
+    schema is unknown or a type has no cast spelling, leaving the engine to coerce as before.
+    """
+    from batcher.plan.types.registry import dtype_name
+
+    out = node.available_schema()
+    if out is None:
+        return None
+    targets = [f.type for f in out.arrow]
+    branches: list[LogicalPlan] = []
+    changed = False
+    for branch in node.inputs:
+        branch_schema = branch.available_schema()
+        if branch_schema is None or len(branch_schema.arrow) != len(targets):
+            return None
+        schema = branch_schema.arrow
+        if all(f.type == t for f, t in zip(schema, targets, strict=True)):
+            branches.append(branch)
+            continue
+        items = []
+        for f, t in zip(schema, targets, strict=True):
+            if f.type == t:
+                items.append(Projection(f.name, Col(f.name)))
+                continue
+            name = dtype_name(t)
+            if name is None:
+                return None
+            items.append(Projection(f.name, Cast(Col(f.name), name, try_cast=True)))
+        branches.append(Project(branch, tuple(items)))
+        changed = True
+    return Union(tuple(branches), node.distinct) if changed else None
 
 
 @rule(name="flatten_nested_union", phase=Phase.REWRITE, matches=(Union,))
