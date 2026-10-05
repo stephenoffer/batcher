@@ -26,7 +26,10 @@
 //! * the kernel's `MemAvailable` (free memory plus the page cache it can reclaim), and
 //! * for each cgroup v2 level that limits this process (the mount root and the process's own
 //!   leaf, which differ for a Ray worker under a systemd slice): `memory.max` less what it
-//!   holds that cannot be reclaimed, `memory.current - inactive_file`.
+//!   holds that cannot be reclaimed, `memory.current - (file - shmem)`. Page cache, active or
+//!   not, is reclaimed before the cgroup's OOM killer runs, so a scan that re-reads a few
+//!   hundred GB of Parquet must not read as pressure; shared memory is not, and on a Ray node
+//!   it is the object store.
 //!
 //! The floor is a fraction of the tightest total ([`FLOOR_FRACTION`], at least
 //! [`FLOOR_MIN_BYTES`]). It sits above Ray's own memory monitor, which kills workers at 95% of
@@ -194,7 +197,7 @@ fn cgroup_dirs() -> Vec<String> {
     dirs
 }
 
-/// `(memory.max, memory.current - inactive_file)` for a cgroup v2 directory with a finite
+/// `(memory.max, memory.current - (file - shmem))` for a cgroup v2 directory with a finite
 /// limit; `None` for an unlimited one or one that cannot be read.
 fn cgroup_usage(dir: &str) -> Option<(u64, u64)> {
     let max = std::fs::read_to_string(format!("{dir}/memory.max")).ok()?;
@@ -205,12 +208,16 @@ fn cgroup_usage(dir: &str) -> Option<(u64, u64)> {
         .parse()
         .ok()?;
     let stat = std::fs::read_to_string(format!("{dir}/memory.stat")).unwrap_or_default();
-    let inactive_file: u64 = stat
-        .lines()
-        .find_map(|l| l.strip_prefix("inactive_file "))
+    let reclaimable = stat_field(&stat, "file ").saturating_sub(stat_field(&stat, "shmem "));
+    Some((limit, current.saturating_sub(reclaimable)))
+}
+
+/// A `memory.stat` field's value in bytes, `0` when absent.
+fn stat_field(stat: &str, key: &str) -> u64 {
+    stat.lines()
+        .find_map(|l| l.strip_prefix(key))
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-    Some((limit, current.saturating_sub(inactive_file)))
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -239,6 +246,14 @@ mod tests {
         );
         let tiny_floor = verdict(FLOOR_MIN_BYTES / 2, 1).expect("the minimum floor applies");
         assert_eq!(tiny_floor.floor, FLOOR_MIN_BYTES);
+    }
+
+    #[test]
+    fn page_cache_is_reclaimable_but_shared_memory_is_not() {
+        let stat = "anon 100\nfile 900\nfile_mapped 5\nshmem 300\n";
+        assert_eq!(stat_field(stat, "file "), 900, "not `file_mapped`");
+        assert_eq!(stat_field(stat, "shmem "), 300);
+        assert_eq!(stat_field(stat, "absent "), 0);
     }
 
     #[test]

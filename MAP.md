@@ -3398,7 +3398,7 @@ Process-wide memory accounting for reserve-before-allocate.
 | file | lines | what it is |
 |---|---|---|
 | `cancel.rs` | 201 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
-| `headroom.rs` | 215 | How much memory the machine has left, read rather than estimated. |
+| `headroom.rs` | 222 | How much memory the machine has left, read rather than estimated. |
 | `lib.rs` | 606 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`
