@@ -13,6 +13,9 @@ import pyarrow as pa
 
 from .base import Engine, Rename, SqlRunner, sql_projection
 
+#: DuckDB's own default `memory_limit`, as a fraction of the memory it detects.
+_DUCKDB_DEFAULT_FRACTION = 0.8
+
 
 def match_batcher_budget(con: object) -> None:
     """Give DuckDB the same CPU and memory budget Batcher gives itself.
@@ -34,13 +37,22 @@ def match_batcher_budget(con: object) -> None:
 
     Both budgets come from Batcher's config, so the comparator is matched *to* the system
     under test rather than the reverse. That is the direction that removes an advantage.
+
+    One exception, measured: DuckDB's `memory_limit` bounds its buffer manager, not its
+    process. At TPC-H SF1000 q9 on a node whose cgroup allows ~185 GB, DuckDB set to Batcher's
+    0.9 (166 GB) grew the process to 187 GB and the cgroup killed it -- with Batcher's results
+    for the case, which share the process. So DuckDB keeps its *own* default fraction,
+    `_DUCKDB_DEFAULT_FRACTION`, applied to the cgroup-aware memory Batcher senses (which DuckDB
+    does not: it reads the container's root cgroup, not the nested one the process is in).
+    That leaves Batcher ~12% more buffer budget; it is disclosed here rather than hidden, and a
+    competitor killed mid-query compares nothing at all.
     """
     from batcher._internal.hardware import available_cpu_count, machine_memory_bytes
     from batcher.config import active_config
 
     cfg = active_config()
     cap = cfg.memory.max_memory_bytes or machine_memory_bytes()
-    effective = int(cap * (cfg.memory.hard_limit or 1.0))
+    effective = int(cap * min(cfg.memory.hard_limit or 1.0, _DUCKDB_DEFAULT_FRACTION))
     threads = cfg.execution.parallelism or available_cpu_count()
     con.execute(f"SET memory_limit='{effective}B'")
     con.execute(f"SET threads={max(1, int(threads))}")
