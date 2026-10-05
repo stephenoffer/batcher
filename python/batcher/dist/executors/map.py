@@ -563,7 +563,10 @@ def _room_for_actors(plan0, key: tuple, registry: dict, grant: dict, want: int, 
     merely short of free capacity (a co-tenant, an autoscaler) queues a single actor.
 
     Raises:
-        ResourceError: When no node's nameplate can host one actor of `grant`.
+        PlanError: When no node's nameplate can host one actor of `grant`. The same refusal
+            `require_placeable_accelerators` makes before submission on a fixed cluster; on an
+            autoscaling one that check defers to the autoscaler, and this is where a request
+            no node class could ever meet surfaces, so it carries the same type and remedy.
     """
     fits = _free_actor_slots(grant, want, _EVICTION_SETTLE_S)
     if fits is None or fits >= want:
@@ -583,9 +586,12 @@ def _room_for_actors(plan0, key: tuple, registry: dict, grant: dict, want: int, 
     )
     why = describe_pending_demand(demand) or "the cluster's free capacity is held elsewhere"
     if have + fits == 0 and why.startswith("no node"):
-        from batcher._internal.errors import ResourceError
+        from batcher._internal.errors import PlanError
 
-        raise ResourceError(f"cannot place a map_batches actor pool: {why}")
+        raise PlanError(
+            f"cannot place a map_batches actor pool: {why}. Drop the device request to run "
+            "the fn on CPU, or collect with distributed=False to run it in this process."
+        )
     spawn = max(fits, 0 if have else 1)
     _log.warning(
         "warm actor pool placing %d of %d requested new actors (%d already live): %s",

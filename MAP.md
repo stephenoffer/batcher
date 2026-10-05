@@ -974,7 +974,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 874 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3321 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3327 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 590 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 643 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 531 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1174,7 +1174,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `common_subplan.py` | 440 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 688 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 727 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
 | `measured_selectivity.py` | 78 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
@@ -1255,8 +1255,8 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 508 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 239 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 637 | The `Optimizer` façade and the module-level entry points. |
-| `plan_deps.py` | 118 | Re-validate a memoized plan against the measurements its own planning read. |
+| `facade.py` | 645 | The `Optimizer` façade and the module-level entry points. |
+| `plan_deps.py` | 176 | Re-validate a memoized plan against the measurements its own planning read. |
 
 ### `batcher/kyber/plan_cache/` — 3 · subsystem
 
@@ -1265,7 +1265,7 @@ Memoize the optimizer — the same query, planned once.
 | module | lines | what it is |
 |---|---|---|
 | `keys.py` | 574 | The plan-cache key: an exact half that decides meaning and a learned half that decides quality. |
-| `memo.py` | 275 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
+| `memo.py` | 305 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
 | `writes.py` | 128 | Advance the learning generation only when a write could change a plan. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -1571,7 +1571,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 270 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 497 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 2422 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 2440 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `group_bound.py` | 87 | An upper bound on a group-by's output from where its keys come from, not what they hold. |
 | `join_columns.py` | 202 | Join column-statistics propagation. |
 | `predicate_bounds.py` | 178 | Tighten a filtered column's bounds to the values its own predicate admits. |
@@ -3159,10 +3159,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather/spans.rs` | 136 | Copying a sequence of source byte spans into one output buffer, as few copies as possible. |
 | `join/asof.rs` | 539 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 237 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
-| `join/dense.rs` | 444 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
+| `join/dense.rs` | 487 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
 | `join/key_filter.rs` | 419 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 2238 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 2242 | Hash join — produces match index-pairs, built to distribute. |
 | `join/probe_par.rs` | 113 | The flat hash join's probe, across cores, emitting exactly what the serial probe emits. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
