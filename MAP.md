@@ -946,7 +946,7 @@ Window-function translation for the SQL front-end.
 |---|---|---|
 | `executor.py` | 3297 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 894 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_broadcast.py` | 544 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
+| `flight_broadcast.py` | 560 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
