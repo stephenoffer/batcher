@@ -13,6 +13,7 @@ stays with the callers (`stats.columns`, `stats.estimator`); this module only co
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -408,8 +409,15 @@ def merge_quantile_grids(
     if not math.isfinite(lo) or not math.isfinite(hi) or hi < lo:
         return None
 
+    # Each grid read as floats once: the bisection below evaluates the mixture thousands of
+    # times per merge, and converting every grid on every evaluation was most of planning time
+    # on the TPC-DS ROLLUP queries (q5: ~40 ms of ~190).
+    parsed = [
+        ([float(v) for v in g["values"]], [float(p) for p in g["probs"]], w) for g, w in usable
+    ]
+
     def mixture_cdf(x: float) -> float:
-        return sum(w * _grid_cdf(g, x) for g, w in usable) / total
+        return sum(w * _grid_cdf(values, probs, x) for values, probs, w in parsed) / total
 
     probs = [i / (points - 1) for i in range(points)]
     values = [_invert_monotone(mixture_cdf, p, lo, hi) for p in probs]
@@ -435,21 +443,22 @@ def _usable(grid: Mapping[str, Any] | None) -> bool:
     return len(values) >= 2 and len(probs) == len(values)
 
 
-def _grid_cdf(grid: Mapping[str, Any], x: float) -> float:
-    """`P(v <= x)` from one quantile grid, linearly interpolated between boundaries."""
-    values = [float(v) for v in grid["values"]]
-    probs = [float(p) for p in grid["probs"]]
+def _grid_cdf(values: list[float], probs: list[float], x: float) -> float:
+    """`P(v <= x)` from one quantile grid, linearly interpolated between boundaries.
+
+    The segment is the first `i` with `values[i] <= x <= values[i + 1]`, found by bisection:
+    with `j` the first index whose value is `>= x`, every earlier segment ends below `x`, so
+    `j - 1` is that first segment even across repeated boundary values.
+    """
     if x <= values[0]:
         return 0.0 if x < values[0] else probs[0]
     if x >= values[-1]:
         return 1.0
-    for i in range(len(values) - 1):
-        lo, hi = values[i], values[i + 1]
-        if lo <= x <= hi:
-            if hi == lo:
-                return probs[i]
-            return probs[i] + (x - lo) / (hi - lo) * (probs[i + 1] - probs[i])
-    return 1.0
+    i = bisect.bisect_left(values, x) - 1
+    lo, hi = values[i], values[i + 1]
+    if hi == lo:
+        return probs[i]
+    return probs[i] + (x - lo) / (hi - lo) * (probs[i + 1] - probs[i])
 
 
 def _invert_monotone(cdf, target: float, lo: float, hi: float, iterations: int = 40) -> float:

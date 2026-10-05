@@ -1171,7 +1171,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `calibration.py` | 704 | Cost-model calibration — turn measured `op_stats` into cost coefficients. |
 | `cardinality.py` | 20 | Back-compat shim — cardinality estimation moved to `kyber.stats`. |
 | `column_tables.py` | 232 | The learned per-column statistics tables — their schema, their keys, and their bound. |
-| `common_subplan.py` | 418 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
+| `common_subplan.py` | 440 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
 | `learning.py` | 688 | Cross-execution learning — the metadata feedback loop. |
@@ -1570,7 +1570,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `comonotone.py` | 201 | Narrow the columns that ascend together with the one a filter constrains. |
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 270 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
-| `distribution.py` | 488 | Distributional primitives shared by the cardinality and selectivity estimators. |
+| `distribution.py` | 497 | Distributional primitives shared by the cardinality and selectivity estimators. |
 | `estimator.py` | 2422 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `group_bound.py` | 87 | An upper bound on a group-by's output from where its keys come from, not what they hold. |
 | `join_columns.py` | 202 | Join column-statistics propagation. |
