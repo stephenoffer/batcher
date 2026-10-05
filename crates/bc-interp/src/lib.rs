@@ -50,7 +50,8 @@ pub use coalesce::coalesce_small_batches;
 pub use error::InterpError;
 pub use metrics::{ExecMetrics, OpMetric, QueryMetrics, QueryStopwatch};
 pub use par::{
-    auto_width, execute_parallel, execute_parallel_with, execute_parallel_with_metrics, ExecOptions,
+    auto_width, execute_parallel, execute_parallel_with, execute_parallel_with_metrics,
+    install_on_pool, ExecOptions,
 };
 pub use stream::chunked::{
     chunkable, execute_chunked, execute_units, execute_units_metered, partial_aggregate_units,

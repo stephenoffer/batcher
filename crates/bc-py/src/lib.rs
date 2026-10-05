@@ -310,16 +310,16 @@ fn prepare_exec(
     } else {
         std::collections::HashMap::new()
     };
-    // Sequential across batches: a large column is widened in parallel inside (`par_widen`).
-    let sources: Vec<Vec<RecordBatch>> = sources
-        .into_iter()
-        .map(|relation| {
-            relation
-                .iter()
-                .map(normalize_batch)
-                .collect::<PyResult<Vec<_>>>()
-        })
-        .collect::<PyResult<Vec<_>>>()?;
+    // Across the batches on the query's own pool (`install_on_pool`), not rayon's global one.
+    let width = bc_interp::auto_width(&opts, &sources, &plan);
+    let sources: Vec<Vec<RecordBatch>> = bc_interp::install_on_pool(width, || {
+        use rayon::prelude::*;
+        sources
+            .into_iter()
+            .map(|relation| relation.par_iter().map(normalize_batch).collect())
+            .collect::<PyResult<Vec<Vec<RecordBatch>>>>()
+    })
+    .map_err(to_pyerr)??;
     Ok(ExecSetup {
         plan,
         sources,
