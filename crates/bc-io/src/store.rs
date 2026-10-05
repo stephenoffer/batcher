@@ -424,6 +424,28 @@ fn as_duration(value: &str) -> String {
     }
 }
 
+/// A cached Parquet footer: the object's size and [`object_version`], and its metadata.
+pub(crate) type CachedFooter = (
+    u64,
+    Arc<str>,
+    parquet::arrow::arrow_reader::ArrowReaderMetadata,
+);
+
+/// The version of an object as its store reports it: the `ETag` where there is one, else the
+/// last-modified time.
+///
+/// Size alone is not an identity. An object rewritten in place at the same size kept its
+/// cached footer -- and the reader then decoded the *new* bytes at the *old* row-group offsets
+/// -- and kept its cached blocks ([`crate::split_read::block_cache`]), which then served the old bytes.
+/// Every store `object_store` speaks reports a last-modified time, and S3, GCS and Azure an
+/// `ETag` that changes with the content, so `(uri, size, version)` names one object's bytes.
+pub(crate) fn object_version(meta: &object_store::ObjectMeta) -> Arc<str> {
+    match &meta.e_tag {
+        Some(tag) => Arc::from(tag.as_str()),
+        None => Arc::from(meta.last_modified.to_rfc3339()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

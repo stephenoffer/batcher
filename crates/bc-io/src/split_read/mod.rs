@@ -242,14 +242,15 @@ pub(crate) fn maybe_split(
     inner: ObjectReader,
     store: &Arc<dyn ObjectStore>,
     path: &Path,
-    remote: Option<(&str, u64)>,
+    remote: Option<(&str, u64, &str)>,
     local: Option<(&std::path::Path, u64)>,
 ) -> MaybeSplitReader {
     if let Some(file) = local.and_then(|(p, size)| crate::mapped::open(p, size)) {
         return MaybeSplitReader::Mapped { inner, file };
     }
-    if let Some((uri, size)) = remote {
-        let cached = block_cache::global().map(|_| (block_cache::object_id(uri, size), size));
+    if let Some((uri, size, version)) = remote {
+        let cached =
+            block_cache::global().map(|_| (block_cache::object_id(uri, size, version), size));
         MaybeSplitReader::Split {
             inner,
             store: Arc::clone(store),

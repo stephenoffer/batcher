@@ -16,10 +16,10 @@
 //! coalesced into runs and split into concurrent GETs as any other remote read is
 //! ([`crate::split_read`]).
 //!
-//! **Identity is `(uri, size)`,** the identity the footer cache already serves by: a warm
-//! footer is only returned after a `HEAD` confirms the size, and every block read of a file
-//! follows its footer read. An object rewritten in place at the same size is the case
-//! neither cache can see, which is why this is off unless it is asked for.
+//! **Identity is `(uri, size, version)`,** the identity the footer cache serves by: a warm
+//! footer is only returned after a `HEAD` confirms the size and the version (`ETag`, else
+//! last-modified; see `crate::object_version`), and every block read of a file follows its
+//! footer read. An object rewritten in place, at any size, is a new identity and misses.
 //!
 //! **Off by default.** `BATCHER_OBJECT_CACHE_BYTES` sets the budget in bytes *for this
 //! process*. The cache lives in the process that reads, so a node running several reading
@@ -118,8 +118,8 @@ pub fn stats() -> CacheStats {
 }
 
 /// The identity a file's blocks are cached under: its URI and its size.
-pub(crate) fn object_id(uri: &str, size: u64) -> Arc<str> {
-    Arc::from(format!("{uri}#{size}"))
+pub(crate) fn object_id(uri: &str, size: u64, version: &str) -> Arc<str> {
+    Arc::from(format!("{uri}#{size}#{version}"))
 }
 
 impl BlockCache {
@@ -364,7 +364,7 @@ mod tests {
         data: &Bytes,
         ranges: &[Range<u64>],
     ) -> (Vec<Bytes>, usize, Vec<Range<u64>>) {
-        let id = object_id("s3://b/k", data.len() as u64);
+        let id = object_id("s3://b/k", data.len() as u64, "v1");
         let calls = Arc::new(AtomicUsize::new(0));
         let fetched = Arc::new(Mutex::new(Vec::new()));
         let got = futures::executor::block_on(cache.read(
@@ -453,7 +453,7 @@ mod tests {
     fn a_short_answer_from_the_store_is_an_error_not_a_wrong_read() {
         let data = object(2 * BLOCK);
         let cache = BlockCache::new(1 << 40);
-        let id = object_id("s3://b/k", data.len() as u64);
+        let id = object_id("s3://b/k", data.len() as u64, "v1");
         let short = |runs: Vec<Range<u64>>| {
             futures::future::ready(Ok(runs
                 .into_iter()

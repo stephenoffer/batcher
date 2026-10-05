@@ -293,11 +293,10 @@ pub fn read_parquet_many(
 /// The failure this prevents is not a stale-looking answer — it is reading the new bytes
 /// with the **old row-group offsets**, which surfaces as a corrupt-file error
 /// (`Column cannot have more than one dictionary`) on a perfectly valid file.
-fn meta_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, ArrowReaderMetadata)>> {
-    static C: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (u64, ArrowReaderMetadata)>>,
-    > = OnceLock::new();
+fn meta_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, store::CachedFooter>>
+{
+    static C: OnceLock<std::sync::Mutex<std::collections::HashMap<String, store::CachedFooter>>> =
+        OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -324,7 +323,7 @@ pub(crate) fn load_metadata_many(
                 tokio::spawn(async move {
                     let _permit = sem.acquire_owned().await;
                     let resolved = store::resolve(&uri)?;
-                    load_metadata_cached(&uri, &resolved).await.map(|(_, m)| m)
+                    load_metadata_cached(&uri, &resolved).await.map(|f| f.2)
                 })
             })
             .collect();
@@ -423,15 +422,16 @@ impl parquet::arrow::async_reader::AsyncFileReader for PrefetchedFooter {
 pub(crate) async fn load_metadata_cached(
     uri: &str,
     resolved: &store::Resolved,
-) -> Result<(u64, ArrowReaderMetadata), IoError> {
-    // Warm: one HEAD confirms the file is the one the entry describes, and the expensive
-    // half — the ranged footer GET and the parse — is served from memory. Serving an
-    // unvalidated hit costs correctness instead: the failure is not a stale-looking answer
-    // but reading *new* bytes at the *old* row-group offsets.
+) -> Result<(u64, Arc<str>, ArrowReaderMetadata), IoError> {
+    // Warm: one HEAD confirms the file is the one the entry describes -- the same size *and*
+    // the same version -- and the expensive half, the ranged footer GET and the parse, is
+    // served from memory. Serving an unvalidated hit costs correctness instead: the failure is
+    // not a stale-looking answer but reading *new* bytes at the *old* row-group offsets.
     let cached = meta_cache().lock().unwrap().get(uri).cloned();
-    if let Some((size, amd)) = cached {
-        if resolved.store.head(&resolved.path).await?.size == size {
-            return Ok((size, amd));
+    if let Some((size, version, amd)) = cached {
+        let head = resolved.store.head(&resolved.path).await?;
+        if head.size == size && store::object_version(&head) == version {
+            return Ok((size, version, amd));
         }
     }
     // Cold (or changed): **one** request. A suffix `GET` returns the trailing bytes *and*
@@ -468,6 +468,7 @@ pub(crate) async fn load_metadata_cached(
         )
         .await?;
     let size = get.meta.size;
+    let version = store::object_version(&get.meta);
     let tail = get.bytes().await?;
     let mut probe = PrefetchedFooter {
         store: resolved.store.clone(),
@@ -482,8 +483,8 @@ pub(crate) async fn load_metadata_cached(
     meta_cache()
         .lock()
         .unwrap()
-        .insert(uri.to_string(), (size, amd.clone()));
-    Ok((size, amd))
+        .insert(uri.to_string(), (size, version.clone(), amd.clone()));
+    Ok((size, version, amd))
 }
 
 async fn read_parquet_async(
@@ -536,7 +537,7 @@ pub(crate) async fn read_parquet_inner(
         locate,
     } = *unit;
     let resolved = store::resolve(uri)?;
-    let (size, arrow_meta) = load_metadata_cached(uri, &resolved).await?;
+    let (size, version, arrow_meta) = load_metadata_cached(uri, &resolved).await?;
     let arrow_meta = if locate {
         row_groups::with_row_numbers(&arrow_meta)?
     } else {
@@ -631,7 +632,7 @@ pub(crate) async fn read_parquet_inner(
             base,
             &store,
             &loc,
-            remote.then_some((uri, size)),
+            remote.then_some((uri, size, &*version)),
             local.as_deref().map(|p| (p, size)),
         );
         let amd = arrow_meta.clone();
@@ -898,6 +899,79 @@ mod tests {
         let a = Int64Array::from((0..n).collect::<Vec<_>>());
         let b = Float64Array::from((0..n).map(|x| x as f64 * 0.5).collect::<Vec<_>>());
         RecordBatch::try_new(schema, vec![Arc::new(a), Arc::new(b)]).unwrap()
+    }
+
+    /// `values` in one file of `rows_per_group`-row groups, padded with a key-value entry of
+    /// `pad` bytes so two different layouts can be made exactly the same size.
+    fn write_padded(path: &std::path::Path, values: &[i64], rows_per_group: usize, pad: usize) {
+        let batch = i64_batch(values);
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(rows_per_group))
+            .set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+                "pad".to_string(),
+                "x".repeat(pad),
+            )]))
+            .build();
+        let file = std::fs::File::create(path).unwrap();
+        let mut w = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+    }
+
+    /// An object rewritten in place **at the same size** is a different object: the cached
+    /// footer must not be served for it. Keyed on size alone, the second read decoded the new
+    /// bytes with the old file's row-group layout.
+    #[test]
+    fn a_same_size_rewrite_is_not_served_the_old_footer() {
+        let dir = std::env::temp_dir().join(format!("bcio_rewrite_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.parquet"), dir.join("t.parquet"));
+        let first: Vec<i64> = (0..4_000).collect();
+        let second: Vec<i64> = (0..4_000).map(|v| 1_000_000 - 7 * v).collect();
+        // Different layouts (one row group against eight), padded to one size.
+        write_padded(&old, &first, 4_000, 0);
+        write_padded(&new, &second, 500, 0);
+        let (a, b) = (
+            std::fs::metadata(&old).unwrap().len(),
+            std::fs::metadata(&new).unwrap().len(),
+        );
+        let (small, big, small_vals, small_rg) = if a < b {
+            (&old, b, &first, 4_000)
+        } else {
+            (&new, a, &second, 500)
+        };
+        for pad in (big - std::fs::metadata(small).unwrap().len()) as usize..((big as usize) + 64) {
+            write_padded(small, small_vals, small_rg, pad);
+            if std::fs::metadata(small).unwrap().len() >= big {
+                break;
+            }
+        }
+        assert_eq!(
+            std::fs::metadata(&old).unwrap().len(),
+            std::fs::metadata(&new).unwrap().len(),
+            "the fixture needs two layouts of one size"
+        );
+        let target = dir.join("target.parquet");
+        std::fs::copy(&old, &target).unwrap();
+        let uri = target.to_str().unwrap();
+        let col = |out: &[RecordBatch]| -> Vec<i64> {
+            out.iter()
+                .flat_map(|b| {
+                    b.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect()
+        };
+        assert_eq!(col(&read_parquet(uri, &[], None, 1024).unwrap()), first);
+        // Rewrite in place: same path, same size, a new layout and new values.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::copy(&new, &target).unwrap();
+        assert_eq!(col(&read_parquet(uri, &[], None, 1024).unwrap()), second);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

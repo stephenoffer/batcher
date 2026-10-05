@@ -208,7 +208,7 @@ async fn read_rows_async(
         return Err(IoError::Store("row positions must ascend".into()));
     }
     let resolved = crate::store::resolve(uri)?;
-    let (size, amd) = crate::load_metadata_cached(uri, &resolved).await?;
+    let (size, _, amd) = crate::load_metadata_cached(uri, &resolved).await?;
     // Each row group holding a wanted row, with a selection of exactly those rows in it.
     let mut plans: Vec<(usize, RowSelection)> = Vec::new();
     let (mut first, mut next) = (0u64, 0usize);

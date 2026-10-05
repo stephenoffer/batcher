@@ -3412,7 +3412,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
 | `late.rs` | 388 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
-| `lib.rs` | 799 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `lib.rs` | 800 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `mapped.rs` | 130 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
@@ -3420,8 +3420,8 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `row_filter.rs` | 524 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `row_groups.rs` | 268 | Reading a Parquet relation one row group at a time, for a caller that schedules the row groups itself. |
 | `split_read/block_cache.rs` | 334 | A process-wide cache of remote object bytes, kept in fixed-size blocks: the warm path. |
-| `split_read/mod.rs` | 356 | Split an oversized object-store read into several concurrent range GETs. |
-| `store.rs` | 426 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
+| `split_read/mod.rs` | 357 | Split an oversized object-store read into several concurrent range GETs. |
+| `store.rs` | 448 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-geo`
 
