@@ -310,13 +310,12 @@ fn prepare_exec(
     } else {
         std::collections::HashMap::new()
     };
-    // Batches normalize independently, so across the pool rather than on the calling thread.
+    // Sequential across batches: a large column is widened in parallel inside (`par_widen`).
     let sources: Vec<Vec<RecordBatch>> = sources
         .into_iter()
         .map(|relation| {
-            use rayon::prelude::*;
             relation
-                .par_iter()
+                .iter()
                 .map(normalize_batch)
                 .collect::<PyResult<Vec<_>>>()
         })

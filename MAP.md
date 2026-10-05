@@ -3048,7 +3048,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 799 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 787 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 165 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
