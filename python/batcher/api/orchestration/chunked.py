@@ -47,6 +47,8 @@ __all__ = [
     "UNITS_MIN_INPUT_BYTES",
     "chunk_worthy",
     "execute_chunked",
+    "memory_refusal_error",
+    "refused_for_memory",
     "run_chunked",
     "units_worthy",
 ]
@@ -84,6 +86,36 @@ def chunk_worthy(input_bytes: int) -> bool:
     return input_bytes >= CHUNKED_MIN_INPUT_BYTES
 
 
+#: Set when the chunked route gave way because memory ran out -- an estimate over its budget,
+#: or the machine's headroom (`bc_resource::headroom`) -- for the run of `run_chunked` it last
+#: started. Read by `refused_for_memory`.
+_MEMORY_REFUSED: ContextVar[bool] = ContextVar("batcher_chunked_memory_refused", default=False)
+
+
+def refused_for_memory() -> bool:
+    """Whether the last `run_chunked` returned `None` because memory ran out.
+
+    The caller must not answer such a refusal the way it answers a shape the chunked route does
+    not take, by reading every source into memory: that is the one route certain to need more
+    than the streaming one that just ran short. It goes out of core instead.
+    """
+    return _MEMORY_REFUSED.get()
+
+
+def memory_refusal_error() -> Exception:
+    """The error for a memory refusal whose plan has no out-of-core path to take instead.
+
+    Raised rather than answered by running the plan resident, which needs every source in
+    memory at once (see `refused_for_memory`).
+    """
+    from batcher._internal.errors import MemoryBudgetExceededError
+
+    return MemoryBudgetExceededError(
+        "the query ran out of memory streaming its input and this plan's shape has no "
+        "out-of-core path; raise memory.max_memory_bytes or run it distributed"
+    )
+
+
 def run_chunked(
     plan, opt: PhysicalPlan, ctx, sources: list[Source], *, input_bytes: int, spill: bool
 ) -> pa.Table | None:
@@ -91,9 +123,12 @@ def run_chunked(
 
     Tried when the query is going out of core (`spill`) or its projected input is large enough
     that streaming it pays (`chunk_worthy`, `units_worthy`); `None` without trying otherwise.
+    After a `None`, `refused_for_memory` says whether memory was the reason.
     """
     from batcher.api._join_helpers import _empty_result_schema
     from batcher.api.orchestration import phases
+
+    _MEMORY_REFUSED.set(False)
 
     python_chunks = spill or chunk_worthy(input_bytes)
     if not (python_chunks or units_worthy(input_bytes)):
@@ -238,6 +273,7 @@ def execute_chunked(
     except Exception as exc:
         if type(exc).__name__ != "MemoryBudgetExceededError":
             raise
+        _MEMORY_REFUSED.set(True)
         # The build sides outgrew the envelope: try the plan in passes that each hold a slice
         # of its largest build (`chunked_sideways.run_partitioned_build`) before handing it to
         # the out-of-core route, which spills every join. Never from inside a pass.

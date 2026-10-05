@@ -346,13 +346,13 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 124 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `chunked.py` | 434 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
+| `chunked.py` | 470 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
 | `chunked_sideways.py` | 647 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
 | `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 273 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
-| `run.py` | 674 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 679 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 342 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 592 | The three ways the conductor can execute an admitted plan, plus the source read. |
 | `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
