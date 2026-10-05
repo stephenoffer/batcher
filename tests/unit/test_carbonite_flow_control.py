@@ -158,7 +158,13 @@ def test_reasonable_request_passes_through():
     assert ResourceManager().grant_credits(8) == 8
 
 
-def test_oversized_request_is_clamped_to_ceiling():
+def test_oversized_request_is_clamped_to_ceiling(monkeypatch):
+    # The count ceiling is the subject; this machine's RAM share caps the grant below it on a
+    # box whose cgroup allows less (48 credits under a 22.5 GiB cgroup), so pin it out of the
+    # way as `test_window_is_config_driven` does.
+    from batcher.carbonite.policies import flow_control
+
+    monkeypatch.setattr(flow_control, "total_memory_bytes", lambda: 1 << 40)
     fc = FlowControlConfig()
     ceiling = fc.default_credits * fc.credit_ceiling_factor
     assert ResourceManager().grant_credits(10_000) == ceiling

@@ -2825,7 +2825,7 @@ Effective hardware detection — what this process's machine really is and reall
 | module | lines | what it is |
 |---|---|---|
 | `cache.py` | 151 | The CPU cache hierarchy this process runs on — the sizes every blocking decision needs. |
-| `cgroup.py` | 379 | cgroup file-format mechanics — the container limits that override what the host reports. |
+| `cgroup.py` | 390 | cgroup file-format mechanics — the container limits that override what the host reports. |
 | `cpu.py` | 369 | The CPU budget this process really has, and how much of it something else is taking. |
 | `isa.py` | 215 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 212 | The memory ceiling and page geometry this process runs under. |
@@ -3341,7 +3341,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `dtype_name.rs` | 226 | The cast dtype-*name* grammar — the one place a wire name becomes an Arrow type. |
 | `float_ident.rs` | 216 | The engine's one definition of **float identity**. |
-| `hardware.rs` | 397 | Host CPU capability detection for adaptive execution. |
+| `hardware.rs` | 423 | Host CPU capability detection for adaptive execution. |
 | `hash.rs` | 308 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 231 | The host's instruction-set capabilities, in full. |
 | `lib.rs` | 233 | `bc-arrow` — Arrow building blocks shared across the engine. |

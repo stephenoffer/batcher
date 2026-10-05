@@ -67,15 +67,8 @@ fn cfs_quota_cores() -> Option<usize> {
         let period: usize = parts.next().unwrap_or("100000").parse().ok()?;
         (quota > 0 && period > 0).then(|| quota.div_ceil(period).max(1))
     }
-    let mut dirs = vec!["/sys/fs/cgroup".to_string()];
-    if let Ok(own) = std::fs::read_to_string("/proc/self/cgroup") {
-        if let Some(sub) = own.lines().find_map(|l| l.strip_prefix("0::")) {
-            let parts: Vec<&str> = sub.trim().split('/').filter(|p| !p.is_empty()).collect();
-            for i in 1..=parts.len() {
-                dirs.push(format!("/sys/fs/cgroup/{}", parts[..i].join("/")));
-            }
-        }
-    }
+    let own = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let dirs = cgroup_v2_dirs(std::path::Path::new("/sys/fs/cgroup"), &own);
     let v2 = dirs.iter().filter_map(|d| quota_at(d)).min();
     if v2.is_some() {
         return v2;
@@ -91,6 +84,39 @@ fn cfs_quota_cores() -> Option<usize> {
         .parse()
         .ok()?;
     (quota > 0 && period > 0).then(|| (quota as usize).div_ceil(period as usize).max(1))
+}
+
+/// The cgroup v2 directories that bind this process: the mount at `root`, the process's own
+/// cgroup, and every level between.
+///
+/// `/proc/self/cgroup` names the cgroup relative to the root the *kernel* sees, which inside a
+/// container is not the mount: an Anyscale node reports `/anyscale/ctr_<id>/activities` for a
+/// cgroup mounted at `/sys/fs/cgroup/activities`, whose quota is 75% of the container's. Joined
+/// onto the mount that path names nothing, so leading components are dropped until it exists.
+/// The same resolution as `bc_resource::headroom`'s, kept in step with it by hand: that crate
+/// sits below this one and takes no Arrow, so neither can borrow the other's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_v2_dirs(root: &std::path::Path, proc_cgroup: &str) -> Vec<String> {
+    let mut dirs = vec![root.to_string_lossy().into_owned()];
+    let Some(sub) = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::")) else {
+        return dirs;
+    };
+    let parts: Vec<&str> = sub.trim().split('/').filter(|p| !p.is_empty()).collect();
+    let skip = (0..parts.len())
+        .find(|&k| {
+            parts[k..]
+                .iter()
+                .fold(root.to_path_buf(), |d, p| d.join(p))
+                .is_dir()
+        })
+        .unwrap_or(0);
+    for i in skip + 1..=parts.len() {
+        let dir = parts[skip..i]
+            .iter()
+            .fold(root.to_path_buf(), |d, p| d.join(p));
+        dirs.push(dir.to_string_lossy().into_owned());
+    }
+    dirs
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -456,6 +482,24 @@ mod usable_cores_tests {
     /// `usable_cores` must never exceed what the affinity mask allows, never be 0, and must
     /// agree with the detected profile — the profile is what the JIT and scheduler read, so a
     /// divergence between the two would size pools differently from the reported hardware.
+    #[test]
+    fn a_container_cgroup_path_resolves_under_its_mount() {
+        let root = std::env::temp_dir().join(format!("bc-arrow-cg-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("activities").join("x")).unwrap();
+        let s = |p: &std::path::Path| p.to_string_lossy().into_owned();
+        let dirs = cgroup_v2_dirs(&root, "0::/anyscale/ctr_abc/activities/x\n");
+        assert_eq!(
+            dirs,
+            vec![
+                s(&root),
+                s(&root.join("activities")),
+                s(&root.join("activities/x"))
+            ]
+        );
+        assert_eq!(cgroup_v2_dirs(&root, "0::/\n"), vec![s(&root)]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn usable_cores_is_bounded_and_consistent() {
         let affinity = std::thread::available_parallelism().map_or(1, |n| n.get());

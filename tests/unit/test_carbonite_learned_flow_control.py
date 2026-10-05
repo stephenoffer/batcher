@@ -134,7 +134,7 @@ def test_the_drivers_grant_reaches_the_adaptive_controller():
     assert granted.window == bare.window + 16  # the grant is honored, not ignored
 
 
-def test_a_reused_fleet_is_re_granted_under_adaptive_credits():
+def test_a_reused_fleet_is_re_granted_under_adaptive_credits(monkeypatch):
     """`set_grant` -> `set_credits` was a silent no-op whenever a controller was set.
 
     A warm shuffle fleet outlives the query that spawned it, so `set_grant` re-grants each
@@ -143,9 +143,11 @@ def test_a_reused_fleet_is_re_granted_under_adaptive_credits():
     `_credits`, which `_window()` never reads, so the fleet kept the previous query's window
     and the documented regression was live again.
     """
-    from batcher.carbonite.policies import AIMDFlowControl
+    from batcher.carbonite.policies import AIMDFlowControl, flow_control
     from batcher.carbonite.transfer.session import ShuffleSession
 
+    # The window's RAM-share cap is not the subject (48 under a 22.5 GiB cgroup); pin it out.
+    monkeypatch.setattr(flow_control, "total_memory_bytes", lambda: 1 << 40)
     ctl = AIMDFlowControl(initial_window=64)
     session = ShuffleSession(64, flow_control=ctl)
     assert session._window() == 64

@@ -236,6 +236,30 @@ def test_cgroup_v2_dirs_orders_leaf_before_its_ancestors(monkeypatch):
     assert depths == sorted(depths, reverse=True)
 
 
+def test_cgroup_v2_dirs_finds_a_namespaced_leaf_under_the_mount(monkeypatch):
+    """A host-relative path resolves to the cgroup the mount shows, with its limit.
+
+    Anyscale reports `/anyscale/ctr_<id>/workers`; inside the container that cgroup is
+    `/sys/fs/cgroup/workers`, capped at 75% of the container. Missing it sized every memory
+    envelope to the container's limit instead.
+    """
+    from io import StringIO
+
+    def opener(path, *a, **k):
+        if path == "/proc/self/cgroup":
+            return StringIO("0::/anyscale/ctr_abc/workers\n")
+        raise OSError
+
+    monkeypatch.setattr("builtins.open", opener)
+    exists = {"/sys/fs/cgroup", "/sys/fs/cgroup/workers"}
+    monkeypatch.setattr(os.path, "isdir", lambda path: path in exists)
+    cgroup.cgroup_v2_dirs.cache_clear()
+    try:
+        assert cgroup.cgroup_v2_dirs() == ("/sys/fs/cgroup", "/sys/fs/cgroup/workers")
+    finally:
+        cgroup.cgroup_v2_dirs.cache_clear()
+
+
 # --------------------------------------------------------------------------------------
 # reset_hardware_probes must clear every memoized reading in the package
 # --------------------------------------------------------------------------------------
