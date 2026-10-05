@@ -126,3 +126,23 @@ def test_a_replan_that_changed_what_runs_is_still_reverted():
     _replan()
     _store_and_run(second, 9.0)
     assert plan_cache.lookup(_KEY, lambda deps, rounds: False) is first
+
+
+def test_a_replan_that_reproduced_its_plan_settles_the_key():
+    """A re-plan that rebuilt what it replaced tells `holds` the key is settled.
+
+    The positive control is the first re-plan: before it, the key is not settled.
+    """
+    seen: list[bool] = []
+
+    def holds(_deps, _rounds, settled=False):
+        seen.append(settled)
+        return False
+
+    holds.accepts_settled = True  # type: ignore[attr-defined]
+    plan = _physical(1_667.0)
+    plan_cache.store(_KEY, (plan, None, ()), None, 16)
+    assert plan_cache.lookup(_KEY, holds) is None
+    plan_cache.store(_KEY, (_physical(1_000.0), None, ()), None, 16)  # estimates moved only
+    assert plan_cache.lookup(_KEY, holds) is None
+    assert seen == [False, True]

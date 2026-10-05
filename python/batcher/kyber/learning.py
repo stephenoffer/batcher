@@ -49,6 +49,7 @@ __all__ = [
     "load_column_tables",
     "load_learned_stats",
     "measured_corrections",
+    "measured_rows",
     "q_error_window",
     "record_column_row_bytes",
     "record_column_row_bytes_batch",
@@ -83,6 +84,8 @@ class _QErrorState:
     #: Signatures whose window changed since the correction factors were last summarized,
     #: so only those are re-derived. Owned by `_cardinality_corrections`, which clears it.
     dirty: set[str] = field(default_factory=set)
+    #: The output rows each signature measured on its latest run (`measured_rows`).
+    last_actual: dict[str, float] = field(default_factory=dict)
 
 
 # Per-hub incremental q-error windows, keyed weakly so a dropped hub evicts its state.
@@ -407,10 +410,46 @@ def _absorb_q_error(state: _QErrorState, row: dict[str, Any]) -> None:
             # factor — a whole-map rebuild used to do that implicitly.
             evicted = next(iter(state.samples))
             del state.samples[evicted]
+            state.last_actual.pop(evicted, None)
             state.dirty.add(evicted)
         bucket = state.samples[sig] = deque(maxlen=state.window)
     bucket.append(math.log(actual / est))
+    state.last_actual[sig] = actual
     state.dirty.add(sig)
+
+
+def measured_rows(hub: MetadataHub) -> dict[str, float]:
+    """The output rows each correctable plan signature measured on its most recent run.
+
+    What a plan's row estimate for that shape is answerable to: a correction factor exists to
+    bring the estimate to this number, so a plan whose estimate is already near it has nothing
+    to gain from being re-planned, however the factor itself has drifted
+    (`optimizer.plan_deps`).
+
+    Examples:
+        .. doctest::
+
+            >>> from batcher.kyber.learning import measured_rows
+            >>> from batcher.metadata import MetadataHub
+            >>> measured_rows(MetadataHub())
+            {}
+
+    Args:
+        hub: The metadata hub holding the operator feedback.
+
+    Returns:
+        `{signature: rows}`; empty when the correction loop is disabled or nothing ran.
+    """
+    window = active_config().optimizer.cardinality_correction_window
+    if window <= 0:
+        return {}
+    try:
+        _q_error_samples(hub, window)
+        state = _QERROR_CACHE.get(hub)
+    except Exception as exc:  # learning must never break planning
+        note_suppressed("kyber", "read measured operator rows", exc)
+        return {}
+    return dict(state.last_actual) if state is not None else {}
 
 
 def record_execution(hub: MetadataHub | None, plan: LogicalPlan, output_rows: int) -> None:

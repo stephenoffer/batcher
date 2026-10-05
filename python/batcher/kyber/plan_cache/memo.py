@@ -71,6 +71,10 @@ _REGRESSION_MIN_MS = 2.0
 # Re-plans a key may take before it keeps the plan it has (`lookup`), and how many it took.
 _MAX_REPLANS = 3
 _REPLANS: dict[str, int] = {}
+# The result a re-plan is replacing, held from the lookup that dropped it to the store of its
+# replacement, and the keys whose re-plan reproduced it (see `store`).
+_PRIOR: dict[str, Any] = {}
+_SETTLED: set[str] = set()
 
 
 def misses() -> int:
@@ -101,13 +105,17 @@ def clear() -> None:
         _PINNED.clear()
         _SERVED.clear()
         _REPLANS.clear()
+        _PRIOR.clear()
+        _SETTLED.clear()
 
 
 def lookup(key: str | None, holds: Callable[[Any, int], bool] | None = None) -> Any | None:
     """The cached optimizer result for `key`, or `None`. Refreshes its LRU position.
 
     `holds` re-validates the entry's stored dependencies (see `optimizer.plan_deps`), given
-    them and how many times this key has already been re-planned: an entry whose dependencies
+    them and how many times this key has already been re-planned (and, when it sets an
+    `accepts_settled` attribute, `settled=True` for a key whose last re-plan reproduced its
+    plan; see `store`): an entry whose dependencies
     no longer hold is dropped and reported as a miss, so the caller re-plans against the
     measurements it would otherwise have ignored. A changed *learned* fingerprint (see
     `cache_key`) re-plans the same way, but only while the key is within its learning rounds;
@@ -139,8 +147,13 @@ def lookup(key: str | None, holds: Callable[[Any, int], bool] | None = None) -> 
         # The two causes are rationed separately. Counted together, a round spent re-planning
         # for another query's learning (a fingerprint change) left none for this plan's *own*
         # first measurements, which then arrived and were ignored for good.
-        relearn = stored_fp != learned_fp and fp_rounds < FINGERPRINT_ROUNDS
-        moved = holds is not None and not holds(deps, dep_rounds)
+        settled = exact in _SETTLED
+        relearn = stored_fp != learned_fp and fp_rounds < FINGERPRINT_ROUNDS and not settled
+        moved = holds is not None and not (
+            holds(deps, dep_rounds, settled=True)
+            if settled and getattr(holds, "accepts_settled", False)
+            else holds(deps, dep_rounds)
+        )
         if (relearn or moved) and exact not in _PINNED:
             replans = _REPLANS.get(exact, 0) + 1
             if replans > _MAX_REPLANS:
@@ -149,6 +162,7 @@ def lookup(key: str | None, holds: Callable[[Any, int], bool] | None = None) -> 
                 return entry[0]
             _REPLANS[exact] = replans
             del _CACHE[exact]
+            _PRIOR[exact] = entry[0]
             if exact in _BEST_MS:
                 # Kept so the replacement can be held to what this plan measured.
                 _DISPLACED[exact] = (entry, _BEST_MS.pop(exact))
@@ -175,6 +189,15 @@ def store(
     keepalive = tuple(s for s in (sources or ()) if not getattr(s, "derivation", None))
     exact, learned_fp = _split(key)
     with _LOCK:
+        prior = _PRIOR.pop(exact, None)
+        if prior is not None and _runs_identically(prior, _first(result)):
+            # The re-plan spent this key's newest measurements and rebuilt the plan it
+            # replaced, so the estimates it corrected are not ones this plan turns on. Those
+            # re-plan it again only by drifting (`plan_deps.dependencies_hold`'s `settled`):
+            # on TPC-DS at sf1, 315 of 389 re-plans reproduced their plan and 45 queries
+            # re-planned three times without a change, ~45 ms each against ~20 ms queries.
+            # A dependency first measured after this re-plan is still judged as usual.
+            _SETTLED.add(exact)
         _CACHE[exact] = (result, keepalive, deps, _ROUNDS.pop(exact, (0, 0)), learned_fp)
         _CACHE.move_to_end(exact)
         while len(_CACHE) > max_entries:
@@ -183,6 +206,8 @@ def store(
             _DISPLACED.pop(evicted, None)
             _PINNED.discard(evicted)
             _REPLANS.pop(evicted, None)
+            _PRIOR.pop(evicted, None)
+            _SETTLED.discard(evicted)
 
 
 def served(result: Any, key: str | None) -> None:
@@ -236,6 +261,11 @@ def record_outcome(result: Any, elapsed_ms: float) -> None:
             _CACHE.move_to_end(exact)
             _BEST_MS[exact] = prior_ms
             _PINNED.add(exact)
+
+
+def _first(result: Any) -> Any:
+    """The physical plan of an optimizer result tuple, or the result itself."""
+    return result[0] if isinstance(result, tuple) and result else result
 
 
 def _runs_identically(displaced: Any, replacement: Any) -> bool:

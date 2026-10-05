@@ -282,6 +282,10 @@ class StatsEstimator:
         # from operator feedback rather than written through `learning`'s generation, so a
         # memoized plan must be re-validated against exactly these (`kyber.plan_deps`).
         self.consulted: set[str] = set()
+        # Per consulted signature, the `[selectivity, rows, width]` the plan was built on,
+        # measured or estimated. A measurement that later lands near it confirms the plan
+        # rather than invalidating it (`kyber.plan_deps`).
+        self.used: dict[str, list[float | None]] = {}
         # The same estimator with no correction factors, built on first need (`_raw`).
         self._raw_estimator: StatsEstimator | None = None
         # `row_width` memo, same identity discipline and same lifetime as `_row_cache`.
@@ -351,6 +355,10 @@ class StatsEstimator:
         if factor is None or factor <= 0.0:
             return 1.0
         return float(factor)
+
+    def _use(self, sig: str, slot: int, value: float) -> None:
+        """Record `value` as what slot `slot` of `used[sig]` was planned with."""
+        self.used.setdefault(sig, [None, None, None])[slot] = value
 
     def reportable_estimate(self, node: LogicalPlan) -> float:
         """The row estimate to report as feedback, or `0.0` to report nothing.
@@ -433,6 +441,7 @@ class StatsEstimator:
             return stats
         factor = self.correction_for(node)
         if factor == 1.0:
+            self._note_rows(node, stats.rows)
             return stats
         # The factor is measured against the *uncorrected* estimate (`reportable_estimate`),
         # so it scales that estimate, not this one. This one was built from inputs that are
@@ -441,11 +450,14 @@ class StatsEstimator:
         # 25,000-row join was estimated at 1.17 billion rows, admitted as 72 GB and spilled
         # to disk: 10 ms became 8 s.
         raw = self._raw(node)
-        return replace(
-            stats,
-            rows=max(1.0, raw * factor),
-            provenance=weakest(stats.provenance, Provenance.LEARNED),
-        )
+        rows = max(1.0, raw * factor)
+        self._note_rows(node, rows)
+        return replace(stats, rows=rows, provenance=weakest(stats.provenance, Provenance.LEARNED))
+
+    def _note_rows(self, node: LogicalPlan, rows: float) -> None:
+        """Record the row estimate a correctable `node` was planned with (`used`)."""
+        if isinstance(node, _CORRECTABLE) and not self._learned_rows_win(node):
+            self._use(self._sig(node), 1, rows)
 
     def _raw(self, node: LogicalPlan) -> float:
         """`node`'s row estimate with no correction factor applied anywhere beneath it."""
@@ -1648,8 +1660,9 @@ class StatsEstimator:
         self.consulted.add(sig)
         learned = self._learned.get(sig, {}).get("selectivity")
         if learned is not None:
+            self._use(sig, 0, learned)
             return learned
-        return predicate_selectivity(
+        estimated = predicate_selectivity(
             node.predicate,
             _ndvs(child),
             self._cfg,
@@ -1658,6 +1671,8 @@ class StatsEstimator:
             _bounds(child),
             _null_fractions(child),
         )
+        self._use(sig, 0, estimated)
+        return estimated
 
     def _has_learned(self, node: LogicalPlan) -> bool:
         sig = self._sig(node)
@@ -1791,7 +1806,10 @@ class StatsEstimator:
         known = measured or list(typed.values())
         avg_known = sum(known) / len(known)
         derived = sum(widths.get(c) or typed.get(c, avg_known) for c in cols)
-        return max(derived, self._measured_scan_width(node), self._measured_row_bytes(node))
+        measured_row = self._measured_row_bytes(node)
+        width = max(derived, self._measured_scan_width(node), measured_row)
+        self._use(self._sig(node), 2, width)
+        return width
 
     def _measured_row_bytes(self, node: LogicalPlan) -> float:
         """Bytes per output row measured for this plan shape, or `0.0` when never measured.

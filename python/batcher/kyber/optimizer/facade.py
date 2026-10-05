@@ -261,6 +261,7 @@ class Optimizer:
         # What the plan's estimates were read from, for the plan cache to re-validate against
         # (`plan_deps`): the measured values it consulted are not covered by the cache key.
         self.consulted = ctx.estimator.consulted
+        self.used = ctx.estimator.used
         phys = PhysicalPlan(
             ir=ir if ir is not None else plan.to_ir(),
             output_schema=None,
@@ -583,7 +584,12 @@ def optimize_full(
     key = plan_cache.cache_key(
         logical.content_key(), sources, cfg, hub, source_stats=source_stats, hardware=hardware
     )
-    cached = plan_cache.lookup(key, lambda deps, rounds: dependencies_hold(hub, deps, rounds))
+
+    def holds(deps, rounds: int, settled: bool = False) -> bool:
+        return dependencies_hold(hub, deps, rounds, settled)
+
+    holds.accepts_settled = True  # type: ignore[attr-defined]
+    cached = plan_cache.lookup(key, holds)
     if cached is not None:
         phys, plan, decisions = cached
         plan_cache.served(phys, key)
@@ -591,7 +597,9 @@ def optimize_full(
 
     optimizer = Optimizer(cfg, sources, hub, source_stats=source_stats, hardware=hardware)
     result = optimizer.optimize_full(logical)
-    deps = dependency_snapshot(hub, getattr(optimizer, "consulted", set()))
+    deps = dependency_snapshot(
+        hub, getattr(optimizer, "consulted", set()), getattr(optimizer, "used", None)
+    )
     plan_cache.store(key, result, sources, max_entries, deps)
     phys, plan, decisions = result
     plan_cache.served(phys, key)
