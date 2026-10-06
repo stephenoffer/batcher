@@ -349,6 +349,8 @@ class DeltaSink:
         if already_committed(path, self._app_txn, self._storage_options):
             return
         mode, filters = self._overwrite_scope(path)
+        if self._replace_where is not None:
+            self._require_in_scope(manifest)
         replaced = None
         if mode == "replace_partitions":
             mode, filters, replaced = "overwrite", None, self._replaced_partitions
@@ -406,6 +408,32 @@ class DeltaSink:
                 "columns you backfill by, or overwrite the whole table explicitly."
             )
         return "overwrite", filters
+
+    def _require_in_scope(self, manifest: WriteManifest) -> None:
+        """Refuse a ``replace_where`` write carrying rows its predicate does not cover.
+
+        See `partitions_outside`: such a row is appended into a partition the commit does
+        not retire, silently duplicating what is already there.
+
+        Raises:
+            CommitError: Naming the first out-of-scope partitions.
+        """
+        from batcher.io.formats.lakehouse.delta._partition_replace import partitions_outside
+
+        try:
+            outside = partitions_outside(self._replace_where, manifest.files, manifest.schema)
+        except Exception as exc:
+            raise CommitError(
+                f"could not check the written partitions against replace_where: {exc}"
+            ) from exc
+        if outside:
+            raise CommitError(
+                f"write(replace_where=...) wrote rows in partition(s) {outside[:3]} that the "
+                "predicate does not cover. Committing them would add them beside that "
+                "partition's existing rows instead of replacing anything. Filter the data to "
+                "the predicate first, or widen the predicate to the partitions you mean to "
+                "replace."
+            )
 
     def _partition_columns(self, path: str) -> list[str]:
         """This write's partition columns, else the existing table's.
