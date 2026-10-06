@@ -24,7 +24,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `asTable` | n/a | gap | Not yet: table argument (TableArg with partitionBy/orderBy) for table-valued functions and UDTFs. Wave W11. |
 | `cache` | {py:obj}`Dataset.cache <batcher.Dataset.cache>` | canonical |  |
 | `checkpoint` | {py:obj}`Dataset.cache <batcher.Dataset.cache>` | param | Missing: eager=True materialization that also truncates the logical plan. Wave W8. |
-| `coalesce` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | canonical |  |
+| `coalesce` | {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | mismatch | Differs: Spark coalesce(n) merges execution partitions down to n without a shuffle. A Batcher plan carries no execution partition count: repartition(n) only sets how many files the next write produces, and execution is unchanged until then. Wave W0. |
 | `collect` | {py:obj}`Dataset.collect <batcher.Dataset.collect>` | mismatch | Differs: Spark returns list\[Row\] eagerly; Batcher returns a pyarrow.Table. Port as: .to\_pylist(). Wave W0. |
 | `colRegex` | {py:obj}`bt.matches <batcher.matches>` | canonical |  |
 | `columns` | {py:obj}`Dataset.columns <batcher.Dataset.columns>` | canonical |  |
@@ -46,7 +46,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `dropDuplicatesWithinWatermark` | {py:obj}`Dataset.drop_duplicates_within_watermark <batcher.Dataset.drop_duplicates_within_watermark>` | param | Missing: reuse the event time and delay declared by withWatermark instead of passing event\_time=/lateness= again. Wave W10. |
 | `dropna` | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | canonical |  |
 | `dtypes` | {py:obj}`Dataset.dtypes <batcher.Dataset.dtypes>` | mismatch | Differs: Spark returns \[(name, 'bigint'), ...\] pairs of DDL type strings; Batcher returns a list of pyarrow DataTypes without names. Wave W0. |
-| `exceptAll` | {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | canonical |  |
+| `exceptAll` | {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | mismatch | Differs: except\_ defaults to distinct=True (EXCEPT DISTINCT, Spark's subtract); exceptAll keeps multiplicity, which is except\_(other, distinct=False). The codemod passes distinct=False. Wave W0. |
 | `executionInfo` | n/a | gap | Not yet: post-execution metrics object on the Dataset (Dataset.stats re-executes instead). Wave W8. |
 | `exists` | {py:obj}`Dataset.join <batcher.Dataset.join>` | param | Missing: an outer reference in a correlated subquery; port as join(other, how=semi). Wave W8. |
 | `explain` | {py:obj}`Dataset.explain <batcher.Dataset.explain>` | mismatch | Differs: Spark prints the plan and returns None (mode= simple/extended/codegen/cost/formatted); Batcher returns the plan as a str. Wave W0. |
@@ -63,7 +63,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `hint` | n/a | out of scope | Declined: no optimizer hint IR; Kyber chooses join strategies from measured statistics (revisit). |
 | `inputFiles` | {py:obj}`Dataset.meta <batcher.Dataset.meta>` | param | Missing: port as \[f.path for f in ds.meta.storage.files\]. Wave W8. |
 | `intersect` | {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | canonical |  |
-| `intersectAll` | {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | canonical |  |
+| `intersectAll` | {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | mismatch | Differs: intersect defaults to distinct=True (INTERSECT DISTINCT, Spark's intersect); intersectAll keeps multiplicity, which is intersect(other, distinct=False). The codemod passes distinct=False. Wave W0. |
 | `isEmpty` | {py:obj}`Dataset.is_empty <batcher.Dataset.is_empty>` | canonical |  |
 | `isLocal` | n/a | out of scope | Declined: Spark driver-local execution flag; Batcher always runs in-process. |
 | `isStreaming` | {py:obj}`Dataset.is_streaming <batcher.Dataset.is_streaming>` | canonical |  |
@@ -121,7 +121,7 @@ The following table maps the 117 names on `DataFrame`, sorted alphabetically.
 | `transpose` | {py:obj}`Dataset.transpose <batcher.Dataset.transpose>` | param | Missing: Spark's index column argument; port as transpose(column\_names=idx, include\_header=True, header\_name=key). Wave W8. |
 | `union` | {py:obj}`Dataset.union <batcher.Dataset.union>` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
 | `unionAll` | {py:obj}`Dataset.union <batcher.Dataset.union>` | mismatch | Differs: Spark unions by column position; Batcher requires identical column names in the same order and raises otherwise. Needs a by\_name=False positional mode. Wave W2. |
-| `unionByName` | {py:obj}`Dataset.union <batcher.Dataset.union>` | param | Missing: match columns by name in any order, and allowMissingColumns= filling absent columns with null. Wave W2. |
+| `unionByName` | {py:obj}`Dataset.union <batcher.Dataset.union>` | param | Missing: match columns by name in any order (the codemod selects other's columns into self's order). For allowMissingColumns=True use bt.concat(\[df, other\], how='diagonal'), which aligns by name and fills an absent column with null. Wave W2. |
 | `unpersist` | {py:obj}`Dataset.uncache <batcher.Dataset.uncache>` | canonical |  |
 | `unpivot` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
 | `where` | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | canonical |  |
