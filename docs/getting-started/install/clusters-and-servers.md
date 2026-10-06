@@ -21,6 +21,23 @@ You don't install Batcher on the workers yourself. When the driver connects, Bat
 1. Every worker must run the same operating system, processor architecture, and C library as the driver. A driver on a macOS laptop, or on an x86_64 machine attached to Arm workers, uploads an engine the workers can't load.
 1. Every worker must already have Batcher's dependencies, such as PyArrow and NumPy, because the upload carries Batcher's package and not the packages it depends on. Ray itself also requires the driver and the workers to run the same Python minor version.
 
+### Compatibility preflight
+
+Batcher checks both requirements before any worker loads the engine. The first time a Ray session sends work to a node other than the driver's own, Batcher runs a small probe on that node. The probe uses only the Python standard library and never imports Batcher, so it can run on a node that can't load the engine. It reports the node's operating system, processor architecture, C library, Python version and implementation, and the installed versions of Batcher's dependencies, and Batcher compares the answer with the driver.
+
+When the driver's own build is being uploaded, Batcher refuses the query with a `BackendError` if any node differs on one of the following:
+
+- The operating system, the processor architecture, or the C library family, such as musl against glibc.
+- The glibc version, when the node's glibc is older than the newest glibc symbol version the compiled engine references. A driver on a newer Linux distribution than its workers passes as long as the engine's own requirement is met.
+- The Python minor version or implementation.
+- PyArrow or NumPy missing from the node.
+
+The error names each node and each field, with the node's value and the driver's. A dependency at a different version, or a missing optional dependency, is logged as a warning and doesn't stop the query.
+
+When you set `trust_cluster_image`, or pass your own `DistributedConfig(runtime_env=...)`, the workers run a build you provided rather than the driver's. Batcher then logs the same report as a warning and runs the query, because an image built for the workers' platform is expected to differ from the driver. On a trusted image the report also names a node whose installed Batcher version differs from the driver's.
+
+The probe runs once per node per Ray session, and nodes an autoscaler adds later are probed when they first appear. A node that doesn't answer within 60 seconds is logged as unverified and isn't refused.
+
 ### Use one image for the whole cluster
 
 The simplest arrangement runs the driver, the head, and every worker from the same `-ray` image ({doc}`containers`), and tells Batcher to trust it instead of uploading a copy:

@@ -465,7 +465,12 @@ def _ensure_ray(workers: int) -> None:
 
 
 def _ensure_ray_locked(ray, workers: int) -> None:
-    """The bring-up decision, serialized by `_RAY_INIT_LOCK` against other pipelines."""
+    """The bring-up decision, serialized by `_RAY_INIT_LOCK` against other pipelines.
+
+    Ends with the worker compatibility preflight (`preflight.ensure_workers_compatible`),
+    before any task is submitted: a node that cannot load the build the driver ships is
+    refused here by a stdlib-only probe, rather than failing inside its first engine import.
+    """
     global _ship_session
 
     if not ray.is_initialized():
@@ -488,22 +493,22 @@ def _ensure_ray_locked(ray, workers: int) -> None:
                     from .readiness import _connect_or_fall_back
 
                     _connect_or_fall_back(ray, workers)
-        # Batcher initialized Ray: a local cluster shares the driver's modules and a
-        # remote one carries the self-shipped runtime_env, so the job makes batcher
-        # importable — no per-remote shipping needed.
+        # Batcher initialized Ray: a local cluster shares the driver's modules and a remote
+        # one carries the self-shipped runtime_env — no per-remote shipping needed.
         set_job_ships_batcher(True)
         _ship_session = ray_session_key()
     elif _ship_session is None or _ship_session != ray_session_key():
-        # A foreign `ray.init` ran before batcher (e.g. the user attached to the
-        # cluster themselves): batcher couldn't set the job runtime_env, so it must
-        # ship its package on each remote instead. A no-op when trust_cluster_image.
-        # Re-evaluated per session, so a reconnect to a cluster batcher did not start
-        # is recognized rather than inheriting the previous session's answer.
+        # A foreign `ray.init` ran before batcher (e.g. the user attached to the cluster
+        # themselves): batcher couldn't set the job runtime_env, so it must ship its package
+        # on each remote instead. A no-op when trust_cluster_image. Re-evaluated per session,
+        # so a reconnect to a cluster batcher did not start is recognized.
         set_job_ships_batcher(False)
         _ship_session = ray_session_key()
     from .capacity import warn_once_if_allocation_is_wider_than_ray
+    from .preflight import ensure_workers_compatible
 
     _report_attachment(ray)
+    ensure_workers_compatible(ray)  # refuses a node that cannot load the build, pre-import
     warn_once_if_allocation_is_wider_than_ray()
     _wrap_tasks(ray, task_options(current_envelope()))
 
