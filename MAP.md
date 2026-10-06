@@ -1934,7 +1934,7 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `_staging.py` | 128 | Staged-file writes for the Iceberg sink. |
 | `_time.py` | 88 | Normalize a user's time-travel timestamp into the form a table-format client accepts. |
 | `delta_sharing.py` | 366 | Delta Sharing format — read a shared table directly into Arrow. |
-| `hudi.py` | 494 | Apache Hudi format — read-only via `hudi` (hudi-rs). |
+| `hudi.py` | 499 | Apache Hudi format — read-only via `hudi` (hudi-rs). |
 | `maintenance.py` | 157 | Table maintenance — compaction, clustering, and reclamation, as transactions. |
 
 ### `batcher/io/formats/lakehouse/delta/` — 2 · neutral IO

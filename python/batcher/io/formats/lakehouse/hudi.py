@@ -377,14 +377,19 @@ class HudiSource:
             ) from exc
 
     def row_count(self) -> int | None:
-        """Exact row count from the timeline's per-slice record counts — no scan.
+        """Exact row count from the base files' Parquet footers — no scan — or None.
 
-        Hudi records how many rows each file slice holds, so the count is metadata. It used
-        to return `None`, which made the estimator guess at a table whose size the timeline
-        states outright.
+        A copy-on-write slice is exactly its base file, so summing the footers is the count.
+        A merge-on-read slice is not: its log files hold inserts the base file lacks and
+        deletes and updates it still carries, so the footers are a stale count that
+        `statistics()` would then report as exact, and `count()` answers from it without
+        executing. Any slice with log files therefore declines, the same line `splits()`
+        draws, and the engine counts the merged rows instead.
         """
         try:
             slices = self._file_slices()
+            if any(_has_log_files(s) for s in slices):
+                return None
             counts = _footer_rows(self._table_uri, [s.base_file_relative_path() for s in slices])
         except Exception:
             return None

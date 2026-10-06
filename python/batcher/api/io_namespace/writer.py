@@ -370,7 +370,7 @@ class Writer:
         * ``"error"`` — raise `PlanError` if `path` already exists.
         * ``"ignore"`` — skip the write (return an empty manifest) if `path` exists.
         * ``"append"`` — add to an existing table; only the sinks that can add to one
-          (`delta`/`iceberg`/`hudi`/`snowflake`) support it. A file sink raises, because
+          (`delta`/`iceberg`/`snowflake`) support it. A file sink raises, because
           it has nothing to append to.
 
         Spark's own ``"errorIfExists"`` and Python's file modes (``"w"``, ``"a"``,
