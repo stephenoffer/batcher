@@ -84,6 +84,7 @@ def compose_merge(
     target: Dataset,
     keys: Sequence[str],
     clauses: Sequence[MergeClause],
+    source_keys: Sequence[str] | None = None,
 ) -> Dataset:
     """Compose the target's post-merge state as a single lazy relation.
 
@@ -94,15 +95,19 @@ def compose_merge(
     Args:
         source: The change set being merged in.
         target: The table being merged into (supplies the output schema).
-        keys: The columns matching a source row to a target row.
+        keys: The target's columns matching a source row to a target row.
         clauses: The ordered ``WHEN …`` clauses.
+        source_keys: The source's columns paired positionally with `keys`, for a merge
+            written ``ON t.id = s.customer_id``. Defaults to `keys`: the same names on
+            both sides.
 
     Returns:
         The merged relation, with exactly the target's columns.
     """
     columns = merge_output_columns(target)
     keys = list(keys)
-    _validate(source, keys, clauses, columns)
+    src_keys = keys if source_keys is None else list(source_keys)
+    _validate(source, keys, src_keys, clauses, columns)
 
     matched = [c for c in clauses if c.kind == MATCHED]
     inserts = [c for c in clauses if c.kind == NOT_MATCHED]
@@ -111,7 +116,7 @@ def compose_merge(
     # Every source column moves to a reserved name, so a source and a target column of the
     # same name coexist in the joined relation and neither is shadowed or suffixed.
     prefixed = source.select(**{source_name(c): Col(c) for c in source.columns})
-    source_keys = [source_name(k) for k in keys]
+    source_keys = [source_name(k) for k in src_keys]
 
     parts: list[Dataset] = []
     parts.extend(_matched_part(prefixed, target, keys, source_keys, matched, columns))
@@ -131,11 +136,17 @@ def compose_merge(
 def _validate(
     source: Dataset,
     keys: list[str],
+    source_keys: list[str],
     clauses: Sequence[MergeClause],
     columns: list[str],
 ) -> None:
     if not keys:
         raise PlanError("merge(): `on` requires at least one key column")
+    if len(source_keys) != len(keys):
+        raise PlanError(
+            f"merge(): {len(keys)} target key column(s) but {len(source_keys)} source key "
+            "column(s); each target key pairs with exactly one source key"
+        )
     if not clauses:
         raise PlanError(
             "merge(): no WHEN clauses — a merge with no clauses would rewrite the target "
@@ -149,7 +160,7 @@ def _validate(
     missing_target = [k for k in keys if k not in target_names]
     if missing_target:
         raise PlanError(f"merge(): key column(s) {missing_target} are not in the target")
-    missing_source = [k for k in keys if k not in source_names]
+    missing_source = [k for k in source_keys if k not in source_names]
     if missing_source:
         raise PlanError(f"merge(): key column(s) {missing_source} are not in the source")
 
@@ -161,8 +172,17 @@ def _validate(
     if _KEEP in source.columns or _KEEP in columns:
         raise PlanError(f"merge(): {_KEEP!r} is a reserved column name; rename it")
 
+    renamed = source_keys != keys
     for clause in clauses:
         validate_clause(clause, columns)
+        if clause.values is None and not clause.is_delete and renamed:
+            # `SET *` / `INSERT *` reads each target column from the same-named source
+            # column, so the key would come from a source column the ON did not name.
+            raise PlanError(
+                f"merge(): a {clause.kind} clause writes every column by name, but the keys "
+                f"pair differently named columns ({keys} = {source_keys}). List the columns "
+                "explicitly, e.g. INSERT (id, v) VALUES (s.customer_id, s.v)."
+            )
         if clause.values is None and not clause.is_delete:
             # `UPDATE SET *` / `INSERT *` reads every target column from the source.
             absent = [c for c in columns if c not in source.columns]
@@ -196,7 +216,7 @@ def _matched_part(
     joined = target.join(prefixed, left_on=keys, right_on=source_keys, how="inner")
     # The join emits each key once, under the target's name; re-materialize the source's
     # spelling so `source_col(key)` resolves in a clause. On an equijoin they are equal.
-    joined = joined.with_columns(**{source_name(k): Col(k) for k in keys})
+    joined = joined.with_columns(**{sk: Col(k) for k, sk in zip(keys, source_keys, strict=True)})
     return _apply(joined, clauses, columns, default=Col, default_keep=True)
 
 

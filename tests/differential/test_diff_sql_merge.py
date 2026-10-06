@@ -11,11 +11,11 @@ Every case here runs the **same statement text** through DuckDB and through Batc
 compares the resulting table state. That is the strongest form available: not "does it look
 right" but "does the engine that defines the semantics agree".
 
-The `ON` condition is restricted to equalities on the same column name on both sides,
-because the engine matches a source row to a target row by key column. Anything else is
-refused rather than approximated — quietly picking a key would merge on a condition the user
-did not write, which is the failure mode a differential test cannot see because both sides
-would be asked a different question.
+The `ON` condition is restricted to column equalities between the two sides (``t.id =
+s.id`` or ``t.id = s.customer_id``), because the engine matches a source row to a target
+row by key columns. Anything else is refused rather than approximated — quietly picking a
+key would merge on a condition the user did not write, which is the failure mode a
+differential test cannot see because both sides would be asked a different question.
 """
 
 from __future__ import annotations
@@ -98,6 +98,18 @@ def _both(statement: str):
             "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET val = t.val + s.val",
         ),
         (
+            "insert star",
+            "MERGE INTO t USING s ON t.k = s.k WHEN NOT MATCHED THEN INSERT *",
+        ),
+        (
+            "update star",
+            "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET *",
+        ),
+        (
+            "key equality written source-first",
+            "MERGE INTO t USING s ON s.k = t.k WHEN MATCHED THEN UPDATE SET val = s.val",
+        ),
+        (
             "delete and insert together",
             "MERGE INTO t USING s ON t.k = s.k "
             "WHEN MATCHED THEN DELETE "
@@ -149,13 +161,17 @@ class TestRefusals:
         with pytest.raises(Exception, match="equalities of the form"):
             _session().sql("MERGE INTO t USING s ON t.k > s.k WHEN MATCHED THEN DELETE")
 
-    def test_joining_columns_of_different_names_is_refused(self):
-        """There is no key here: the engine matches by column name, so accepting this
-        would mean choosing one of the two names and merging on something else."""
+    def test_insert_star_with_differently_named_keys_is_refused(self):
+        """`INSERT *` takes each column by name, so with ``t.k = o.j`` the key would come
+        from a source column the ON never named. Refused rather than guessed."""
         session = _session()
-        session.register("other", bt.from_pydict({"j": [2], "val": [1]}))
-        with pytest.raises(Exception, match="equalities of the form"):
-            session.sql("MERGE INTO t USING other ON t.k = other.j WHEN MATCHED THEN DELETE")
+        session.register("o", bt.from_pydict({"j": [9], "k": [1], "val": [1]}))
+        with pytest.raises(Exception, match="writes every column by name"):
+            session.sql("MERGE INTO t USING o ON t.k = o.j WHEN NOT MATCHED THEN INSERT *")
+
+    def test_returning_is_refused(self):
+        with pytest.raises(Exception, match="RETURNING is not supported"):
+            _session().sql("MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN DELETE RETURNING *")
 
     def test_a_merge_with_no_when_clause_is_refused(self):
         """Refused by the *parser*, before the translation runs, which is why the message
@@ -169,3 +185,78 @@ class TestRefusals:
     def test_an_unknown_target_names_the_registered_tables(self):
         with pytest.raises(Exception, match="no table"):
             _session().sql("MERGE INTO nope USING s ON nope.k = s.k WHEN MATCHED THEN DELETE")
+
+
+class TestDifferentKeyNames:
+    """``ON t.k = c.customer_k``: the key pairs columns of different names (AP-329)."""
+
+    @staticmethod
+    def _both(statement: str):
+        conn = _duck()
+        conn.sql(
+            "CREATE TABLE c AS SELECT * FROM (VALUES (2,99),(4,40),(NULL,7)) AS v(customer_k,val)"
+        )
+        conn.sql(statement)
+        expected = sorted(conn.sql("SELECT k, val FROM t").fetchall(), key=str)
+
+        session = _session()
+        session.sql(
+            "CREATE TABLE c AS SELECT * FROM (VALUES (2,99),(4,40),(NULL,7)) AS v(customer_k,val)"
+        )
+        session.sql(statement)
+        rows = session.sql("SELECT k, val FROM t").to_pydict()
+        return sorted(zip(rows["k"], rows["val"], strict=True), key=str), expected
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "MERGE INTO t USING c ON t.k = c.customer_k "
+            "WHEN MATCHED THEN UPDATE SET val = c.val "
+            "WHEN NOT MATCHED THEN INSERT (k, val) VALUES (c.customer_k, c.val)",
+            "MERGE INTO t USING c ON c.customer_k = t.k WHEN MATCHED THEN DELETE",
+            "MERGE INTO t USING c AS src ON t.k = src.customer_k "
+            "WHEN NOT MATCHED BY SOURCE THEN UPDATE SET val = 0",
+        ],
+    )
+    def test_matches_duckdb(self, statement):
+        got, expected = self._both(statement)
+        assert got == expected
+
+
+class TestCatalogTarget:
+    """MERGE into a *catalog* table: the same rewrite, collected and written back (AP-325)."""
+
+    STATEMENT = (
+        "MERGE INTO wh.t AS t USING s ON t.k = s.k "
+        "WHEN MATCHED THEN UPDATE SET val = s.val "
+        "WHEN NOT MATCHED THEN INSERT (k, val) VALUES (s.k, s.val)"
+    )
+
+    def _expected(self):
+        conn = _duck()
+        conn.sql(self.STATEMENT.replace("wh.t AS t", "t"))
+        return sorted(conn.sql("SELECT k, val FROM t").fetchall())
+
+    def _check(self, session):
+        session.sql("CREATE SCHEMA wh")
+        session.sql("CREATE TABLE wh.t AS SELECT * FROM (VALUES (1,10),(2,20),(3,30)) AS v(k,val)")
+        session.register("s", bt.from_pydict(dict(SOURCE)))
+        session.sql(self.STATEMENT)
+        rows = session.sql("SELECT k, val FROM wh.t").to_pydict()
+        assert sorted(zip(rows["k"], rows["val"], strict=True)) == self._expected()
+
+    def test_memory_catalog(self):
+        self._check(bt.Session())
+
+    def test_directory_catalog(self, tmp_path):
+        session = bt.Session()
+        session.catalog.attach(bt.Catalog.from_directory(str(tmp_path), name="dir"))
+        session.sql("USE dir")
+        self._check(session)
+        # The rows were written to storage: a fresh read of the table sees them.
+        assert sorted(session.catalog.get_table("dir.wh.t").read().to_pydict()["k"]) == [
+            1,
+            2,
+            3,
+            4,
+        ]

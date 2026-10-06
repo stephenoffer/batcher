@@ -23,6 +23,8 @@ import pyarrow as pa
 import pytest
 
 import batcher as bt
+from _harness import assert_same
+from batcher._internal.errors import PlanError
 
 pytestmark = pytest.mark.differential
 
@@ -143,16 +145,14 @@ class TestInformationSchema:
         ]
         assert got == expected
 
-    def test_table_type_is_always_base_table_because_there_is_no_distinction(self, two_tables):
-        """Batcher does not distinguish a table from a view: `CREATE TABLE … AS` and
-        `CREATE VIEW … AS` both bind a lazy `Dataset`, and `Session.register` binds the
-        same thing. So one value has to be chosen for every row, and `BASE TABLE` is the
-        one a reflection reads as "you may query this".
+    def test_a_registered_dataset_is_a_base_table(self, two_tables):
+        """`Session.register` binds a relation, which is a table to a reflection.
 
         Not compared against DuckDB here on purpose. DuckDB answers `VIEW` for an Arrow
         object registered with `register()` and `BASE TABLE` for one created with `CREATE
         TABLE`, so the comparison would be measuring how the *fixture* loaded the data
-        rather than anything about either engine.
+        rather than anything about either engine. `TestViewsAndSchemata` compares the
+        statement-created forms, which both engines create the same way.
         """
         session, _ = two_tables
         types = session.sql("SELECT table_type FROM information_schema.tables").to_pydict()[
@@ -211,9 +211,183 @@ class TestInformationSchema:
     def test_an_unserved_view_says_which_are_served(self, two_tables):
         session, _ = two_tables
         with pytest.raises(Exception, match="is not served"):
-            session.sql("SELECT * FROM information_schema.schemata")
+            session.sql("SELECT * FROM information_schema.routines")
 
     def test_an_empty_session_returns_no_rows_rather_than_failing(self):
         assert bt.sql("SELECT table_name FROM information_schema.tables").to_pydict() == {
             "table_name": []
         }
+
+
+_SETUP = (
+    "CREATE TABLE base AS SELECT * FROM (VALUES (1, 10), (2, 20)) AS v(k, x)",
+    "CREATE TABLE other AS SELECT 1 AS y",
+    "CREATE VIEW big AS SELECT k FROM base WHERE x > 10",
+)
+
+
+class TestViewsAndSchemata:
+    """A view is reported as a view, and `views`/`schemata` are served (AP-336, AP-350).
+
+    Both engines run the same statements, so the comparison is about the catalog rather than
+    how a fixture loaded it.
+    """
+
+    @pytest.fixture
+    def both(self, duck):
+        session = bt.Session()
+        for statement in _SETUP:
+            session.sql(statement)
+            duck.execute(statement)
+        return session, duck
+
+    def test_table_type_matches_duckdb(self, both):
+        session, duck = both
+        q = "SELECT table_name, table_type FROM information_schema.tables ORDER BY table_name"
+        got = session.sql(q).to_pydict()
+        expected = duck.sql(q).fetchall()
+        assert list(zip(got["table_name"], got["table_type"], strict=True)) == expected
+        assert ("big", "VIEW") in expected
+
+    def test_views_lists_the_views_by_name_as_duckdb_does(self, both):
+        session, duck = both
+        q = "SELECT table_name FROM information_schema.views"
+        # DuckDB also lists its own system views, in catalog `system`; the user's are in
+        # `memory`, Batcher's session views in `batcher`.
+        theirs = duck.sql(q + " WHERE table_catalog = 'memory'").fetchall()
+        assert session.sql(q).to_pydict()["table_name"] == [r[0] for r in theirs] == ["big"]
+
+    def test_views_columns_are_a_subset_of_duckdbs(self, both):
+        session, duck = both
+        ours = session.sql("SELECT * FROM information_schema.views").columns
+        theirs = list(duck.sql("SELECT * FROM information_schema.views").columns)
+        assert ours == ["table_catalog", "table_schema", "table_name", "view_definition"]
+        assert set(ours) <= set(theirs)
+
+    def test_the_view_definition_is_the_stored_query_and_runs(self, both):
+        """DuckDB stores the whole ``CREATE VIEW ...;`` text and re-renders the body;
+        Batcher reports the query the view stores, as Postgres does. The two texts differ,
+        so what is asserted is that the definition *is* the view: running it gives the
+        view's rows."""
+        session, _ = both
+        definition = session.sql(
+            "SELECT view_definition FROM information_schema.views WHERE table_name = 'big'"
+        ).to_pydict()["view_definition"][0]
+        assert session.sql(definition).to_pydict() == session.sql("SELECT * FROM big").to_pydict()
+
+    def test_a_view_shadowed_by_a_per_call_table_is_a_table(self, both):
+        session, _ = both
+        rows = session.sql(
+            "SELECT table_type FROM information_schema.tables WHERE table_name = 'big'",
+            big=bt.from_pydict({"k": [1]}),
+        ).to_pydict()
+        assert rows == {"table_type": ["BASE TABLE"]}
+
+    def test_schemata_lists_every_catalog_namespace(self, both):
+        """Compared with DuckDB on its user catalog. DuckDB also lists its ``system`` and
+        ``temp`` catalogs, which Batcher has no counterpart for, and Batcher lists the
+        session's own ``batcher.main``, where session tables and views are reported."""
+        session, duck = both
+        session.sql("CREATE SCHEMA stg")
+        duck.execute("CREATE SCHEMA stg")
+        q = "SELECT catalog_name, schema_name FROM information_schema.schemata"
+        got = session.sql(q).to_pydict()
+        ours = set(zip(got["catalog_name"], got["schema_name"], strict=True))
+        theirs = {r for r in duck.sql(q).fetchall() if r[0] == "memory"}
+        assert ours - {("batcher", "main")} == theirs == {("memory", "main"), ("memory", "stg")}
+
+    def test_schemata_names_the_schema_the_session_tables_are_reported_in(self, both):
+        """`tables` and `schemata` join: every table's schema is a listed schema."""
+        session, _ = both
+        orphans = session.sql(
+            "SELECT t.table_name FROM information_schema.tables AS t "
+            "LEFT JOIN information_schema.schemata AS s "
+            "ON t.table_catalog = s.catalog_name AND t.table_schema = s.schema_name "
+            "WHERE s.schema_name IS NULL"
+        ).to_pydict()
+        assert orphans == {"table_name": []}
+
+    def test_columns_still_lists_a_views_columns(self, both):
+        session, duck = both
+        q = (
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'big' ORDER BY ordinal_position"
+        )
+        assert session.sql(q).to_pydict()["column_name"] == [r[0] for r in duck.sql(q).fetchall()]
+
+
+class TestTemporaryTables:
+    """``CREATE TEMP TABLE`` is session-scoped whatever ``USE`` says (AP-322)."""
+
+    def test_temp_after_use_creates_a_session_table_not_a_catalog_table(self):
+        session = bt.Session()
+        session.sql("CREATE SCHEMA stg")
+        session.sql("USE stg")
+        session.sql("CREATE TEMP TABLE t3 AS SELECT 1 AS x")
+        assert session.catalog.list_tables() == []
+        assert session.sql("SELECT x FROM t3").to_pydict() == {"x": [1]}
+
+    def test_a_plain_create_after_use_still_writes_the_catalog(self):
+        """The control: without TEMP the same statement reaches the catalog."""
+        session = bt.Session()
+        session.sql("CREATE SCHEMA stg")
+        session.sql("USE stg")
+        session.sql("CREATE TABLE t3 AS SELECT 1 AS x")
+        assert session.catalog.list_tables() == ["stg.t3"]
+
+    def test_temporary_spelling_and_temp_view(self):
+        session = bt.Session()
+        session.sql("CREATE SCHEMA stg")
+        session.sql("USE stg")
+        session.sql("CREATE TEMPORARY TABLE t4 AS SELECT 2 AS x")
+        session.sql("CREATE TEMP VIEW v4 AS SELECT x + 1 AS y FROM t4")
+        assert session.catalog.list_tables() == []
+        assert session.sql("SELECT y FROM v4").to_pydict() == {"y": [3]}
+
+    def test_a_qualified_temp_name_is_refused(self):
+        session = bt.Session()
+        session.sql("CREATE SCHEMA stg")
+        with pytest.raises(PlanError, match="temporary table is a session table"):
+            session.sql("CREATE TEMP TABLE stg.t5 AS SELECT 1 AS x")
+        assert session.catalog.list_tables() == []
+
+    def test_a_temp_table_answers_queries_as_duckdbs_does(self, duck):
+        statement = "CREATE TEMP TABLE tt AS SELECT * FROM (VALUES (1, 'a'), (2, NULL)) v(k, s)"
+        session = bt.Session()
+        session.sql("CREATE SCHEMA stg")
+        session.sql("USE stg")
+        session.sql(statement)
+        duck.execute(statement)
+        q = "SELECT k, s FROM tt WHERE k >= 1"
+        assert_same(session.sql(q).to_arrow(), duck.sql(q))
+
+
+class TestExplain:
+    """``EXPLAIN`` reads the session's dialect and raises the session's parse error (AP-352)."""
+
+    def test_the_session_dialect_parses_the_explained_query(self):
+        session = bt.Session(dialect="spark")
+        session.register("t", bt.from_pydict({"a": [1]}))
+        plan = session.sql("EXPLAIN SELECT `a` FROM t").to_pydict()
+        assert plan["explain_key"] == ["plan"]
+        assert "scan" in plan["explain_value"][0]
+
+    def test_a_syntax_error_is_a_plan_error_without_terminal_escapes(self):
+        session = bt.Session()
+        with pytest.raises(PlanError) as raised:
+            session.sql("EXPLAIN SELEC 1")
+        assert "\x1b[" not in str(raised.value)
+
+    def test_it_explains_a_view_and_a_catalog_table(self):
+        session = bt.Session()
+        session.sql("CREATE SCHEMA stg")
+        session.sql("CREATE TABLE stg.t AS SELECT 1 AS a")
+        session.sql("CREATE VIEW v AS SELECT a FROM stg.t")
+        assert session.sql("EXPLAIN SELECT * FROM v").to_pydict()["explain_key"] == ["plan"]
+
+    def test_explaining_a_change_is_refused_and_changes_nothing(self):
+        session = bt.Session()
+        session.register("t", bt.from_pydict({"a": [1]}))
+        with pytest.raises(PlanError, match="EXPLAIN explains a query"):
+            session.sql("EXPLAIN DELETE FROM t")
+        assert session.sql("SELECT a FROM t").to_pydict() == {"a": [1]}

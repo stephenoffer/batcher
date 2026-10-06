@@ -150,8 +150,8 @@ def test_insert_cte_body(duck):
         "INSERT INTO t VALUES (1)",  # too few columns
         "INSERT INTO t (x) VALUES (1, 2)",  # arity mismatch
         "INSERT INTO t (nope) VALUES (1)",  # unknown column
-        "INSERT INTO t VALUES (1, 1) ON CONFLICT DO NOTHING",  # unsupported clause
-        "INSERT INTO t VALUES (1, 1) RETURNING x",  # unsupported clause
+        "INSERT INTO t VALUES (1, 1) ON CONFLICT DO NOTHING",  # no conflict target
+        "INSERT INTO t VALUES (1, 1) RETURNING nope",  # RETURNING an unknown column
         "UPDATE t SET z = 1",  # unknown column
         "INSERT INTO missing VALUES (1, 1)",  # unknown table
     ],

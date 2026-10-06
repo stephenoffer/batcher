@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1558 Python modules across 220 packages and 328 Rust files across 14 crates.
+Covering 1563 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -331,7 +331,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `builder.py` | 341 | `MergeBuilder` — the fluent ``MERGE INTO`` surface, and the legacy keyword shorthand. |
 | `cdc.py` | 146 | Applying a **change feed** (CDC) to a table — the harder sibling of a keyed upsert. |
 | `clauses.py` | 231 | The clause model of a SQL ``MERGE`` — and how a clause names a source vs a target column. |
-| `compose.py` | 318 | Compose a full SQL ``MERGE`` out of relational algebra — no new IR, so it distributes. |
+| `compose.py` | 338 | Compose a full SQL ``MERGE`` out of relational algebra — no new IR, so it distributes. |
 | `delta_native.py` | 207 | Native Delta ``MERGE INTO`` — the full clause set, executed as one transaction. |
 | `execute.py` | 292 | Executing a MERGE: rewrite only the files that can match, and swap them atomically. |
 | `format.py` | 96 | Which format is the table at this path? — the one question a merge can answer by looking. |
@@ -405,10 +405,10 @@ The SQL `Session`: a table catalog, a Python-function registry, and a read diale
 
 | module | lines | what it is |
 |---|---|---|
-| `catalog_sql.py` | 295 | SQL over a session's catalogs: ``USE``, ``SHOW``, schema DDL, and catalog table references. |
+| `catalog_sql.py` | 396 | SQL over a session's catalogs: ``USE``, ``SHOW``, schema DDL, and catalog table references. |
 | `registry.py` | 103 | What a Python function registered for SQL looks like to the translator. |
 | `session.py` | 798 | The SQL `Session` — a context binding named tables, Python functions, and a dialect. |
-| `statements.py` | 227 | SQL statements that change the catalog rather than only reading it. |
+| `statements.py` | 288 | SQL statements that change the catalog rather than only reading it. |
 | `views.py` | 145 | Session views bound at query time, and the one case rule every session name follows. |
 
 ### `batcher/api/streaming/` — 5 · conductor
@@ -844,8 +844,19 @@ SQL frontend — run standard SQL over Batcher datasets.
 
 | module | lines | what it is |
 |---|---|---|
-| `dml.py` | 373 | INSERT / DELETE / UPDATE as pure plan rewrites over a session catalog. |
 | `expression.py` | 157 | Translate one SQL *expression* (not a query) into an `Expr`. |
+
+### `batcher/_sql/dml/` — 6 · front-end
+
+INSERT / DELETE / UPDATE / MERGE as plan rewrites over a session catalog.
+
+| module | lines | what it is |
+|---|---|---|
+| `apply.py` | 69 | The DML entry point: dispatch a statement to its rewrite and gather its ``RETURNING``. |
+| `merge.py` | 231 | ``MERGE INTO`` translated into the clause objects `api.merge.compose_merge` takes. |
+| `rewrite.py` | 293 | INSERT / DELETE / UPDATE as pure plan rewrites over a session catalog. |
+| `upsert.py` | 148 | ``INSERT ... ON CONFLICT (k) DO NOTHING | DO UPDATE`` lowered onto the engine's merge. |
+| `using.py` | 182 | ``DELETE ... USING`` rewritten to the ``EXISTS`` it means. |
 
 ### `batcher/_sql/parser/` — 6 · front-end
 
@@ -860,7 +871,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `from_clause.py` | 635 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 538 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 321 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
-| `statements.py` | 212 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
+| `statements.py` | 328 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 331 | Built-in table functions in the FROM clause: the series generators and model scoring. |
 | `translator.py` | 647 | The `_Translator` skeleton plus the public `sql()` entry point. |
 | `udf.py` | 196 | Registered-Python-function support for the SQL translator. |

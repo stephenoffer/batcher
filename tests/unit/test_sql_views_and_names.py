@@ -212,15 +212,16 @@ def test_delete_and_update_rewrite_a_catalog_table():
     assert sorted(s.table("sales.orders").to_pydict()["id"]) == [3, 20]
 
 
-def test_merge_into_a_catalog_table_names_the_alternative():
+def test_merge_into_a_catalog_table_writes_the_merged_rows():
+    """MERGE takes the collect-then-overwrite path DELETE and UPDATE already take."""
     s = bt.Session()
     s.catalog.create_table("orders", bt.from_pydict({"id": [1]}))
     s.register("src", bt.from_pydict({"id": [2]}))
-    with pytest.raises(PlanError, match="MERGE into the catalog table"):
-        s.sql(
-            "MERGE INTO orders USING src ON orders.id = src.id "
-            "WHEN NOT MATCHED THEN INSERT VALUES (src.id)"
-        )
+    s.sql(
+        "MERGE INTO orders USING src ON orders.id = src.id "
+        "WHEN NOT MATCHED THEN INSERT (id) VALUES (src.id)"
+    )
+    assert sorted(s.catalog.get_table("orders").read().to_pydict()["id"]) == [1, 2]
 
 
 # --- nothing runs while the SQL is translated ---------------------------------------------------
