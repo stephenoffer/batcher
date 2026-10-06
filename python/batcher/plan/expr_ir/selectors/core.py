@@ -374,9 +374,13 @@ class Selector(Expr):
     def matched_columns(self, columns: list[str], schema: Any | None) -> list[str]:
         """The input columns this selector matches, in the input's column order.
 
+        The way to see what a selector would pick before using it:
+        ``sel.matched_columns(ds.columns, ds.schema)``.
+
         Args:
             columns: The input plan's column names, in order.
-            schema: The input plan's `SchemaRef`, or None when it cannot be resolved.
+            schema: A ``pyarrow.Schema`` (such as ``ds.schema``), the plan's `SchemaRef`,
+                or None when it cannot be resolved.
 
         Returns:
             The matched column names, in input order.
@@ -387,6 +391,10 @@ class Selector(Expr):
                 >>> import batcher as bt
                 >>> bt.matches("^x").matched_columns(["xa", "b", "xc"], None)
                 ['xa', 'xc']
+
+                >>> ds = bt.from_pydict({"a": [1], "s": ["x"]})
+                >>> bt.string().matched_columns(ds.columns, ds.schema)
+                ['s']
         """
         if self._names is not None:
             missing = [n for n in self._names if n not in columns]
@@ -402,7 +410,7 @@ class Selector(Expr):
                 f"the dtype-based selector {self._desc} needs the input schema, which is "
                 "not known for this plan; select the columns by name instead"
             )
-        arrow = schema.arrow if schema is not None else None
+        arrow = schema if schema is None or isinstance(schema, pa.Schema) else schema.arrow
         out = []
         for c in columns:
             has_field = arrow is not None and arrow.get_field_index(c) >= 0

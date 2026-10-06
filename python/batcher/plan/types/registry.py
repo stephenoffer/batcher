@@ -34,6 +34,7 @@ __all__ = [
     "dtype_name",
     "normalize_dtype_spec",
     "resolve_dtype",
+    "resolve_dtype_spec",
 ]
 
 # Cast dtype name → Arrow type, for the names that take no parameters. Mirrors
@@ -403,3 +404,40 @@ def normalize_dtype_spec(dtype: Any, *, caller: str = "cast") -> str:
         f"{caller}(): cannot interpret {dtype!r} as a dtype; pass a dtype name such as "
         "'int64', a Python type (int/float/str/bool), or a pyarrow DataType"
     )
+
+
+def resolve_dtype_spec(dtype: Any, *, caller: str = "cast") -> pa.DataType | None:
+    """The Arrow type any user dtype spelling names, or ``None`` when nothing parses it.
+
+    The one parser behind every surface that takes a dtype from a user: a schema mapping
+    (``bt.from_pydict(..., schema={"x": "int32"})``), ``match_to_schema`` and the
+    ``by_dtype`` selector. A pyarrow `DataType` passes through untouched, so a nested
+    type the cast grammar cannot spell (``pa.list_(pa.int64())``) is still accepted where
+    no cast is built from it. Anything else goes through `normalize_dtype_spec`,
+    `canonical_dtype_name` and `resolve_dtype`, exactly as ``col("x").cast(...)`` does,
+    so the two surfaces cannot drift apart on what ``"DECIMAL(10,2)"`` means.
+
+    Args:
+        dtype: A pyarrow type, a dtype name, or a Python builtin type.
+        caller: The public method name to quote if `dtype` is not a dtype at all.
+
+    Returns:
+        The Arrow type, or ``None`` when `dtype` is a name the vocabulary does not know.
+
+    Raises:
+        PlanError: If `dtype` is not a name, a Python type, or a self-naming object.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.plan.types.registry import resolve_dtype_spec
+            >>> resolve_dtype_spec("DECIMAL(10,2)")
+            Decimal128Type(decimal128(10, 2))
+
+            >>> resolve_dtype_spec(pa.list_(pa.int64()))
+            ListType(list<item: int64>)
+    """
+    if isinstance(dtype, pa.DataType):
+        return dtype
+    return resolve_dtype(canonical_dtype_name(normalize_dtype_spec(dtype, caller=caller)))

@@ -32,7 +32,15 @@ print(original.address == returned.address)
 # True
 ```
 
-`from_arrow` accepts a `Table`, a single `RecordBatch`, or a sequence of batches. {py:obj}`bt.from_batches <batcher.from_batches>` takes a factory instead, for a source that produces batches lazily rather than a list that is already in memory.
+`from_arrow` accepts a `Table`, a single `RecordBatch`, or a sequence of batches. It also accepts any object exporting `__arrow_c_stream__`, and drains it into a table when called. {py:obj}`bt.from_batches <batcher.from_batches>` takes a factory instead, for a source that produces batches lazily rather than a list that is already in memory. Handed a stream producer such as a `RecordBatchReader`, it reads the stream batch by batch at execution:
+
+```python
+reader = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+print(bt.from_batches(reader).count())
+# 3
+```
+
+A reader is single-shot, so a second execution over that `Dataset` raises rather than reading an exhausted stream as empty. Pass a factory that opens a fresh reader to read it again.
 
 ## NumPy in, NumPy out
 

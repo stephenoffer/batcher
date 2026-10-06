@@ -41,12 +41,18 @@ __all__ = [
 ]
 
 
-def from_pandas(df: Any) -> Dataset:
+def from_pandas(df: Any, *, preserve_index: bool = False) -> Dataset:
     """Create a `Dataset` from a pandas `DataFrame` via its Arrow bridge.
 
     Needs pandas (``pip install 'batcher-engine[pandas]'``); raises `BackendError`
     if it is absent. Goes through ``pyarrow.Table.from_pandas`` — no per-row Python.
-    A pandas `Series` is accepted and becomes a one-column dataset.
+    A pandas `Series` is accepted and becomes a one-column dataset. The frame is
+    converted to Arrow and held at construction.
+
+    The index is **dropped** by default, as DuckDB, Polars and Ray Data do. Pass
+    ``preserve_index=True`` to keep it the way ``df.reset_index()`` would: each level
+    becomes a leading column named after it, or ``index`` (``level_<n>`` for an unnamed
+    `MultiIndex` level) when it has none.
 
     Examples:
         .. doctest::
@@ -56,18 +62,26 @@ def from_pandas(df: Any) -> Dataset:
             >>> bt.from_pandas(pd.DataFrame({"a": [1, 2], "b": [3, 4]})).to_pydict()
             {'a': [1, 2], 'b': [3, 4]}
 
+            >>> df = pd.DataFrame({"v": [10, 20]}, index=pd.Index(["x", "y"], name="key"))
+            >>> bt.from_pandas(df, preserve_index=True).to_pydict()
+            {'key': ['x', 'y'], 'v': [10, 20]}
+
     Args:
         df: The pandas `DataFrame` (or `Series`) to ingest.
+        preserve_index: Keep the index levels as leading columns instead of dropping
+            them.
 
     Returns:
         A lazy `Dataset` over the frame.
 
     Raises:
         BackendError: If pandas is not installed.
+        PlanError: If `preserve_index` is set and an index level's name is already a
+            data column.
     """
     if type(df).__name__ == "Series" and hasattr(df, "to_frame"):
         df = df.to_frame()
-    return _scan(interop.from_pandas(df))
+    return _scan(interop.from_pandas(df, preserve_index=preserve_index))
 
 
 def from_polars(df: Any) -> Dataset:

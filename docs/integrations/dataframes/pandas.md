@@ -37,12 +37,14 @@ If a pipeline crosses this boundary in a loop, the fix is usually to move the bo
 
 ## The index does not exist here
 
-A Batcher `Dataset` has columns and nothing else. There is no index, so `from_pandas` keeps the index only if you have made it a column first:
+A Batcher `Dataset` has columns and nothing else. There is no index, so `from_pandas` drops it by default. Pass `preserve_index=True` to keep it as columns, named the way `df.reset_index()` names them: each level becomes a leading column called after the level, or `index` (`level_<n>` for an unnamed level of a `MultiIndex`) when it has no name.
 
 ```python
 # docs: skip
-ds = bt.from_pandas(frame.reset_index())
+ds = bt.from_pandas(frame, preserve_index=True)
 ```
+
+A level whose name is already a data column raises a `PlanError` instead of being renamed behind your back. Rename the index with `df.rename_axis(...)` first.
 
 This is the same decision Polars made, and for the same reason: an index is a second addressing scheme that every operator has to agree about, and joins and group-bys already say what they key on. To get row positions back, {py:obj}`ds.with_row_index() <batcher.Dataset.with_row_index>` adds an explicit column.
 

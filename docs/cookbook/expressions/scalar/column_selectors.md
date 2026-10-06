@@ -30,11 +30,15 @@ import batcher as bt
 
 ds = bt.from_pydict({"a": [1], "b": [2.0], "label": ["x"]})
 print(bt.starts_with("a").matched_columns(ds.columns, None))
+# ['a']
+print(bt.numeric().matched_columns(ds.columns, ds.schema))
+# ['a', 'b']
 ```
 
 A name-based selector needs only the column names, so `None` is an acceptable schema. A
-type-based selector such as {py:func}`bt.numeric() <batcher.numeric>` needs the types too, and resolving one without
-them matches nothing rather than raising.
+type-based selector such as {py:func}`bt.numeric() <batcher.numeric>` needs the types too:
+pass {py:obj}`ds.schema <batcher.Dataset.schema>`, and resolving one with `None` raises a
+`PlanError` rather than guessing.
 
 ## See also
 

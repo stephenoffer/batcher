@@ -13,7 +13,8 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Col, Expr, coalesce, lit, null
-from batcher.plan.types import dtype_name, normalize_dtype_spec, resolve_dtype, widen
+from batcher.plan.types import dtype_name, widen
+from batcher.plan.types.registry import resolve_dtype_spec
 
 if TYPE_CHECKING:
     from batcher.api.dataset.frame import Dataset
@@ -25,9 +26,14 @@ _EXTRA = ("raise", "ignore")
 
 
 def _target_type(column: str, spec: Any) -> pa.DataType:
-    """The Arrow type a schema entry names, widened the way the engine boundary widens it."""
-    name = normalize_dtype_spec(spec, caller="match_to_schema")
-    resolved = resolve_dtype(name)
+    """The Arrow type a schema entry names, widened the way the engine boundary widens it.
+
+    A pyarrow type is taken as it stands rather than spelled through the cast grammar,
+    which has no nested types: ``ds.match_to_schema(ds.schema)`` has to accept its own
+    schema when a column is a list or a struct. A name is only needed to *build* a missing
+    column, and `_named` refuses an unspellable type there with its own message.
+    """
+    resolved = resolve_dtype_spec(spec, caller="match_to_schema")
     if resolved is None:
         raise PlanError(f"match_to_schema(): column {column!r} names unknown dtype {spec!r}")
     return widen(resolved)

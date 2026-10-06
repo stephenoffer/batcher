@@ -80,7 +80,7 @@ print(ds.select(bt.exclude("qty")).columns)
 # ['name', 'price']
 ```
 
-The dtype selectors pick columns by kind. {py:func}`bt.numeric() <batcher.numeric>` covers integer, float, and decimal, and {py:func}`bt.integer() <batcher.integer>`, {py:func}`bt.floating() <batcher.floating>`, {py:func}`bt.string() <batcher.string>`, and {py:func}`bt.boolean() <batcher.boolean>` narrow that to one kind each. {py:func}`bt.temporal() <batcher.temporal>` covers date, time, timestamp, and duration, and {py:func}`bt.by_dtype(pa.float64(), ...) <batcher.by_dtype>` matches Arrow types as the engine stores them, taking a `pyarrow` type or its name.
+The dtype selectors pick columns by kind. {py:func}`bt.numeric() <batcher.numeric>` covers integer, float, and decimal, and {py:func}`bt.integer() <batcher.integer>`, {py:func}`bt.floating() <batcher.floating>`, {py:func}`bt.string() <batcher.string>`, and {py:func}`bt.boolean() <batcher.boolean>` narrow that to one kind each. {py:func}`bt.temporal() <batcher.temporal>` covers date, time, timestamp, and duration, and {py:func}`bt.by_dtype(pa.float64(), ...) <batcher.by_dtype>` matches Arrow types as the engine stores them, taking a `pyarrow` type or any dtype name `cast` accepts, such as `"decimal(10,2)"`.
 
 The name selectors match column *names*. {py:func}`bt.matches(regex) <batcher.matches>` matches by regular expression, and {py:func}`bt.starts_with(...) <batcher.starts_with>`, {py:func}`bt.ends_with(...) <batcher.ends_with>`, and {py:func}`bt.contains(...) <batcher.contains>` match by literal prefix, suffix, and substring. Each of those three accepts several arguments. {py:func}`bt.all() <batcher.all>` matches every column.
 
@@ -192,7 +192,7 @@ print(ds.drop(bt.temporal()).columns)  # nothing matched, nothing dropped
 # ['name', 'price', 'qty']
 ```
 
-A selector is refused with a `PlanError` in a filter predicate, as a join key, and in the other verbs that take column names. A join key is refused because the two sides would each expand it on their own. Some Polars selector constructors are not provided. There is no positional selector such as `by_index`, `first`, or `last`, and {py:obj}`bt.first <batcher.first>` and {py:obj}`bt.last <batcher.last>` are aggregates rather than selectors. There is also no finer dtype selector such as `date`, `datetime`, `duration`, `decimal`, `categorical`, `binary`, or `signed_integer`. Use {py:obj}`bt.by_dtype(...) <batcher.by_dtype>` with the Arrow type instead.
+A selector is refused with a `PlanError` in a filter predicate, as a join key, and in the other verbs that take column names. A join key is refused because the two sides would each expand it on their own. Some Polars selector constructors are not provided. There is no positional selector such as `by_index`, `first`, or `last`, and {py:obj}`bt.first <batcher.first>` and {py:obj}`bt.last <batcher.last>` are aggregates rather than selectors. There is also no finer dtype selector such as `date`, `datetime`, `duration`, `decimal`, `categorical`, `binary`, or `signed_integer`. Use {py:obj}`bt.by_dtype(...) <batcher.by_dtype>` with the Arrow type instead, or {py:meth}`ds.select_dtypes(...) <batcher.Dataset.select_dtypes>`, which also names the `decimal`, `binary`, `list`, `struct`, `map`, `nested`, and `tensor` families.
 
 ## Casting inside a projection
 
