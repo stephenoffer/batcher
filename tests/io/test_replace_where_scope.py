@@ -9,6 +9,8 @@ outside the predicate was appended beside the rows already in its partition.
 
 from __future__ import annotations
 
+import datetime as dt
+
 import pyarrow as pa
 import pytest
 
@@ -78,3 +80,26 @@ def test_an_in_scope_typed_backfill_still_commits(tmp_path) -> None:
     )
     got = bt.read.delta(path).collect().to_pydict()
     assert sorted(zip(got["k"], got["v"], strict=True)) == [(1, 100), (2, 2)]
+
+
+def test_a_date_partition_backfill_commits(tmp_path) -> None:
+    """A date literal reaches delta-rs as ``2024-01-05``, not as its day count ``19727``."""
+    pytest.importorskip("deltalake")
+    path = str(tmp_path / "t")
+    day, other, third = dt.date(2024, 1, 5), dt.date(2024, 1, 6), dt.date(2024, 1, 7)
+    bt.from_arrow(pa.table({"d": [day, other, third], "v": [1, 2, 3]})).write.delta(
+        path, partition_by=["d"]
+    )
+    bt.from_arrow(pa.table({"d": [day], "v": [100]})).write.delta(
+        path, mode="overwrite", replace_where=bt.col("d") == day
+    )
+    # An OR of dates takes the explicit-removal path, which matches the same text form.
+    bt.from_arrow(pa.table({"d": [other, third], "v": [200, 300]})).write.delta(
+        path, mode="overwrite", replace_where=(bt.col("d") == other) | (bt.col("d") == third)
+    )
+    got = bt.read.delta(path).collect().to_pydict()
+    assert sorted(zip(got["d"], got["v"], strict=True)) == [
+        (day, 100),
+        (other, 200),
+        (third, 300),
+    ]

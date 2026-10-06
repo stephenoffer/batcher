@@ -321,7 +321,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 1872 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2282 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `writer.py` | 2286 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -1944,11 +1944,11 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | module | lines | what it is |
 |---|---|---|
 | `_commit.py` | 504 | The metadata-only Delta commit: register worker-written files, move no data. |
-| `_partition_replace.py` | 107 | Replacing several Delta partitions in one commit. |
-| `_predicate.py` | 175 | Rendering an expression for delta-rs: as partition filters, or as SQL. |
+| `_partition_replace.py` | 160 | Replacing several Delta partitions in one commit. |
+| `_predicate.py` | 188 | Rendering an expression for delta-rs: as partition filters, or as SQL. |
 | `_snapshot.py` | 644 | One cached read of a Delta table's `_delta_log`, shared by every metadata question. |
 | `maintenance.py` | 172 | Delta table maintenance: OPTIMIZE, ZORDER, VACUUM, and log checkpointing. |
-| `sink.py` | 486 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
+| `sink.py` | 514 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
 | `source.py` | 522 | Reading a Delta Lake table: log-driven file skipping, time travel, and CDF. |
 | `stream.py` | 395 | Reading a Delta table's Change Data Feed, unbounded or over a fixed version window. |
 
