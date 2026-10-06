@@ -58,12 +58,16 @@ __all__ = ["KeyedStateFold"]
 #: ever sees a state mapping.
 _TOUCHED = "__bt_state_touched_us"
 
-#: The column the group key rides in when the state is snapshotted. One JSON-encoded
-#: column rather than one column per key: the keys may be any mix of types, and a snapshot
-#: whose *shape* depends on the key types cannot be restored by a run that has not yet
-#: seen a row. JSON is the same encoding the checkpoint's offset log already uses for an
-#: opaque source position.
+#: The legacy key column: the whole key tuple JSON-encoded. Still read on restore so a
+#: checkpoint written before typed keys existed restarts, but no longer written, because JSON
+#: cannot encode a timestamp, date, decimal or bytes key and the first checkpointed commit of
+#: such a query raised `TypeError`.
 _KEY = "__bt_state_key"
+
+#: Prefix of the typed key columns, one per group-key component (`__bt_state_key_0`, ...).
+#: Each keeps the key's Arrow type, so any key the group-by accepted round-trips exactly.
+#: Restore needs no type in advance: the snapshot carries the columns it was written with.
+_KEY_PREFIX = "__bt_state_key_"
 
 #: What one retained slot costs before its payload: a boxed scalar, its dict slot, and its
 #: share of the containers around it, rounded up. Charged per state field, per key component
@@ -84,6 +88,7 @@ class KeyedStateFold:
         "_clock",
         "_dropped",
         "_fn",
+        "_had_state",
         "_held",
         "_input_ir",
         "_keys",
@@ -115,6 +120,11 @@ class KeyedStateFold:
         #: *payload* -- a key holding a 10 MiB string is charged its 10 MiB, which a per-field
         #: constant charged as 192 bytes.
         self._held = 0
+        #: Whether this fold has ever held a key. Once it has, an emptied key space must
+        #: still be checkpointed (as a zero-row snapshot): writing nothing leaves the older
+        #: snapshot as the newest, and a restart would restore every key that had since
+        #: expired or been forgotten.
+        self._had_state = False
         #: The last stamp handed out, held non-decreasing. `time.time()` can step backwards
         #: (an NTP correction), and a key stamped into the future would sit at the head of
         #: the order and stop expiry for every key behind it.
@@ -142,8 +152,14 @@ class KeyedStateFold:
         rows = self._nat.execute_plan(self._input_ir, [[batch]], self._cfg)
         out: list[pa.RecordBatch] = []
         now = self._tick()
+        stale_before = now - self._ttl if self._ttl > 0 else None
         for key, group in _group_by(rows, self._keys):
             previous = self._state.get(key)
+            if previous is not None and stale_before is not None and previous[1] < stale_before:
+                # Past its TTL but not yet swept: expiry runs at the end of the batch, so
+                # without this a key with new rows got its expired state back. A state
+                # lives until its TTL expires, and not one call longer.
+                previous = None
             produced, new_state = self._fn(key, group, previous[0] if previous else None)
             # Removed either way: a forgotten key is gone, and a retained one has to be
             # *reinserted* to move to the end of the last-touched order `_expire` reads.
@@ -197,6 +213,7 @@ class KeyedStateFold:
 
     def _store(self, key: tuple, fields: dict[str, Any], touched: int) -> None:
         """Retain `fields` for `key` at the end of the touch order, charging its footprint."""
+        self._had_state = True
         charge = _entry_bytes(key, fields)
         self._state[key] = (fields, touched, charge)
         self._held += charge
@@ -252,23 +269,36 @@ class KeyedStateFold:
         )
 
     def state(self) -> pa.RecordBatch | None:
-        """The whole key space as one checkpointable batch, or None when empty.
+        """The whole key space as one checkpointable batch, or None if no key was ever held.
 
-        The key rides as JSON in one column rather than as one column per key, because a
-        snapshot whose *shape* depends on the key types cannot be restored by a run that
-        has not yet seen a row — and restore happens before the first row by construction.
+        Each key component rides in its own typed column (`_KEY_PREFIX`), so a timestamp,
+        decimal or binary key round-trips exactly; the snapshot carries its own columns, so
+        a restore before the first row needs no type in advance.
+
+        An emptied key space is a zero-row batch, not None. None writes no snapshot, which
+        leaves an older one as the newest, and a restart restored keys that had expired.
         """
         if not self._state:
-            return None
-        keys = [json.dumps(list(key)) for key in self._state]
-        touched = [stamp for _, stamp, _charge in self._state.values()]
-        fields = sorted({name for value, _, _charge in self._state.values() for name in value})
-        columns: dict[str, Any] = {_KEY: pa.array(keys, type=pa.string())}
+            if not self._had_state:
+                return None
+            return pa.record_batch({_TOUCHED: pa.array([], type=pa.int64())})
+        entries = list(self._state.items())
+        columns: dict[str, Any] = {}
+        for i in range(len(self._keys)):
+            columns[f"{_KEY_PREFIX}{i}"] = pa.array([key[i] for key, _ in entries])
+        fields = sorted({name for _, (value, _, _c) in entries for name in value})
         for name in fields:
-            columns[name] = pa.array(
-                [value.get(name) for value, _, _charge in self._state.values()]
-            )
-        columns[_TOUCHED] = pa.array(touched, type=pa.int64())
+            try:
+                columns[name] = pa.array([value.get(name) for _, (value, _, _c) in entries])
+            except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+                from batcher._internal.errors import PlanError
+
+                raise PlanError(
+                    f"transform_with_state: state field {name!r} holds values of different "
+                    f"types across keys, so the key space cannot be checkpointed ({exc}). "
+                    "Give the field one type for every key."
+                ) from exc
+        columns[_TOUCHED] = pa.array([stamp for _, (_v, stamp, _c) in entries], type=pa.int64())
         return pa.record_batch(columns)
 
     def restore(self, state: pa.RecordBatch) -> None:
@@ -282,16 +312,28 @@ class KeyedStateFold:
         """
         self._state = {}
         self._held = 0
-        if state is None or state.num_rows == 0:
+        if state is None:
             return
-        names = [n for n in state.schema.names if n not in (_KEY, _TOUCHED)]
-        keys = state.column(_KEY).to_pylist()
+        # A snapshot exists, so this fold had state: an empty restore must keep checkpointing.
+        self._had_state = True
+        if state.num_rows == 0:
+            return
+        names = state.schema.names
+        key_columns = sorted(
+            (n for n in names if n.startswith(_KEY_PREFIX)),
+            key=lambda n: int(n[len(_KEY_PREFIX) :]),
+        )
+        fields = [n for n in names if n not in (_KEY, _TOUCHED) and n not in key_columns]
+        if key_columns:
+            parts = [state.column(n).to_pylist() for n in key_columns]
+            keys = [tuple(p[i] for p in parts) for i in range(state.num_rows)]
+        else:  # a checkpoint from before typed keys
+            keys = [tuple(json.loads(k)) for k in state.column(_KEY).to_pylist()]
         touched = state.column(_TOUCHED).to_pylist()
-        values = {name: state.column(name).to_pylist() for name in names}
+        values = {name: state.column(name).to_pylist() for name in fields}
         ordered = sorted(range(len(keys)), key=lambda i: int(touched[i]))
         for i in ordered:
-            key = tuple(json.loads(keys[i]))
-            self._store(key, {n: values[n][i] for n in names}, int(touched[i]))
+            self._store(keys[i], {n: values[n][i] for n in fields}, int(touched[i]))
         self._clock = max(self._clock, int(touched[ordered[-1]]))
 
 

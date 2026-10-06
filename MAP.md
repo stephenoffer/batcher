@@ -1788,7 +1788,7 @@ Streaming (incremental) aggregation and the bounded-memory operator drivers.
 | module | lines | what it is |
 |---|---|---|
 | `drivers.py` | 634 | Bounded-memory drivers for a top-level operator over a streaming source. |
-| `keyed_state.py` | 409 | Arbitrary keyed state over a stream — the fold behind `transform_with_state`. |
+| `keyed_state.py` | 451 | Arbitrary keyed state over a stream — the fold behind `transform_with_state`. |
 | `spill.py` | 227 | Cold windows of a streaming aggregate's state, held on disk instead of in memory. |
 
 ### `batcher/core/streaming/folds/` — 3 · subsystem

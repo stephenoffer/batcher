@@ -280,3 +280,116 @@ def test_null_keys_group_together_rather_than_one_group_per_row():
     events = bt.from_pydict({"user": [None, None, "a"], "v": [1, 2, 3]})
     events.transform_with_state(record, group_by="user", output_columns=["user"]).collect()
     assert dict(seen) == {(None,): 2, ("a",): 1}, "the two null-keyed rows split into groups"
+
+
+@pytest.mark.integration
+def test_a_forgotten_key_space_does_not_come_back_after_a_restart(tmp_path):
+    """BT-222: an emptied key space must be checkpointed too.
+
+    An empty fold used to snapshot nothing, which left the previous snapshot as the newest,
+    so a restart restored every key the query had since forgotten or expired.
+    """
+    mode = {"forget": False}
+
+    def counter(key, rows, state):
+        if mode["forget"]:
+            return {"bucket": [key[0]], "n": [0]}, None  # forget every key it sees
+        n = (state or {"n": 0})["n"] + rows.num_rows
+        return {"bucket": [key[0]], "n": [n]}, {"n": n}
+
+    checkpoint = str(tmp_path / "ckpt")
+
+    def run(name: str, num_rows: int):
+        stateful = (
+            bt.read.rate(5, num_rows=num_rows, pace=False)
+            .with_columns(bucket=bt.col("value") % 2)
+            .transform_with_state(
+                counter, group_by="bucket", output_columns=["bucket", "n"], state_ttl="1 hour"
+            )
+        )
+        query = stateful.write.memory(
+            name, trigger=bt.Trigger.available_now(), checkpoint=checkpoint, query_name="tws-fg"
+        )
+        assert query.await_termination(timeout=60) is True
+        assert query.exception() is None
+        return bt.read_memory(name).to_pydict()
+
+    assert max(run("tws_fg1", 10)["n"]) == 5
+    mode["forget"] = True
+    run("tws_fg2", 20)  # rows 10..19: every key is forgotten, the key space ends empty
+    mode["forget"] = False
+    third = run("tws_fg3", 30)  # rows 20..29: five per bucket, counted from nothing
+    assert max(third["n"]) == 5, f"forgotten state came back after the restart: {third}"
+
+
+@pytest.mark.integration
+def test_keys_json_cannot_encode_round_trip_through_a_snapshot():
+    """BT-224: timestamp, date, decimal and binary keys must checkpoint and restore exactly."""
+    import datetime as dt
+    from decimal import Decimal
+
+    from batcher.core.streaming import KeyedStateFold
+
+    schema = pa.schema(
+        [
+            ("ts", pa.timestamp("us")),
+            ("d", pa.date32()),
+            ("dec", pa.decimal128(10, 2)),
+            ("blob", pa.binary()),
+            ("v", pa.int64()),
+        ]
+    )
+    rows = pa.record_batch(
+        {
+            "ts": [dt.datetime(2026, 1, 1, 12), dt.datetime(2026, 1, 2)],
+            "d": [dt.date(2026, 1, 1), dt.date(2026, 1, 2)],
+            "dec": [Decimal("1.25"), Decimal("2.50")],
+            "blob": [b"\x00\x01", b"\xff"],
+            "v": [1, 2],
+        },
+        schema=schema,
+    )
+
+    def total(key, group, state):
+        t = (state or {"t": 0})["t"] + sum(group.column("v").to_pylist())
+        return None, {"t": t}
+
+    def fold():
+        stream = bt.from_batches(lambda: iter(()), schema, bounded=False)
+        node = stream.transform_with_state(
+            total, group_by=["ts", "d", "dec", "blob"], output_columns=["v"], state_ttl="1 hour"
+        )._plan
+        return KeyedStateFold(node)
+
+    original = fold()
+    original.push(rows)
+    snapshot = original.state()  # raised TypeError: datetime is not JSON serializable
+    restored = fold()
+    restored.restore(snapshot)
+    assert restored._state.keys() == original._state.keys()
+    restored.push(rows)  # the same keys must find their restored state
+    assert sorted(v[0]["t"] for v in restored._state.values()) == [2, 4]
+
+
+@pytest.mark.integration
+def test_an_expired_key_does_not_get_its_old_state_back():
+    """BT-232: a key past its TTL must start empty even if expiry has not swept it yet."""
+    from batcher.core.streaming import KeyedStateFold
+
+    seen = []
+
+    def remember(key, rows, state):
+        seen.append(state)
+        return None, {"n": 1}
+
+    fold = KeyedStateFold(
+        _stream((["a"], [1]))
+        .transform_with_state(
+            remember, group_by="user", output_columns=["user"], state_ttl="1 hour"
+        )
+        ._plan
+    )
+    fold.push(pa.record_batch({"user": ["a"], "v": [1]}, schema=_SCHEMA))
+    fold._ttl = 1  # one microsecond: the key is already past its TTL
+    fold.push(pa.record_batch({"user": ["a"], "v": [2]}, schema=_SCHEMA))
+    assert seen == [None, None], f"an expired key was handed its old state: {seen}"
