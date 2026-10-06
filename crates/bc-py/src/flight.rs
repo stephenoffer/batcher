@@ -516,10 +516,16 @@ pub(crate) fn flight_fetch(
 /// batches return through an Arrow IPC round trip), so it trades a re-read for a memory
 /// bound. `0` (the default) is unbounded, which is the historical behaviour.
 ///
-/// Called once per worker process when its Flight server starts. The cap is captured by
-/// each store at construction, so it must be set before the server is created.
+/// `shuffle_spill_root` is the local scratch directory those spilled buckets go under --
+/// the configured `memory.spill_dir` or the node's measured local volume, as every other
+/// spill path uses. `None` (or empty) keeps the OS temp dir.
+///
+/// Called once per worker process when its Flight server starts. The cap and spill root
+/// are captured by each store at construction, so they must be set before the server is
+/// created.
 #[pyfunction]
-#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None, shuffle_store_cap_bytes=0, gather_streams=0, gather_inflight_bytes=0))]
+#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None, shuffle_store_cap_bytes=0, gather_streams=0, gather_inflight_bytes=0, shuffle_spill_root=None))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn set_flight_transport_config(
     idle_timeout_ms: u64,
     keepalive_ms: u64,
@@ -528,7 +534,13 @@ pub(crate) fn set_flight_transport_config(
     shuffle_store_cap_bytes: u64,
     gather_streams: u64,
     gather_inflight_bytes: u64,
+    shuffle_spill_root: Option<String>,
 ) {
+    bc_transport::set_shuffle_spill_root(
+        shuffle_spill_root
+            .filter(|root| !root.is_empty())
+            .map(std::path::PathBuf::from),
+    );
     bc_transport::set_transport_timeouts(idle_timeout_ms, keepalive_ms);
     bc_transport::set_connections_per_peer(connections_per_peer);
     if let Some(code) = compression {

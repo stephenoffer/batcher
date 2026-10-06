@@ -234,6 +234,9 @@ pub(crate) struct PartitionStore {
     /// worker by the control plane — and a captured value also makes the bound testable
     /// without a global that concurrent tests would fight over.
     cap: usize,
+    /// The scratch root spilled buckets go under (`crate::shuffle_spill_root`), captured at
+    /// construction for the same reason as `cap`.
+    spill_root: PathBuf,
     /// Scratch directory for spilled buckets, created on first spill.
     spill_dir: std::sync::OnceLock<Option<PathBuf>>,
     /// Makes every spill file name unique, so an abandoned write (its partition was replaced
@@ -273,10 +276,16 @@ impl Default for PartitionStore {
 impl PartitionStore {
     /// A store bounded at `cap` bytes of resident buckets (`0` = unbounded).
     pub(crate) fn with_cap(cap: usize) -> Self {
+        Self::with_cap_in(cap, crate::shuffle_spill_root())
+    }
+
+    /// A store bounded at `cap` that spills under `spill_root`.
+    pub(crate) fn with_cap_in(cap: usize, spill_root: PathBuf) -> Self {
         Self {
             partitions: RwLock::new(HashMap::new()),
             retained: AtomicUsize::new(0),
             cap,
+            spill_root,
             spill_dir: std::sync::OnceLock::new(),
             spill_seq: std::sync::atomic::AtomicU64::new(0),
         }
@@ -518,7 +527,7 @@ impl PartitionStore {
     fn spill_dir(&self) -> Option<&PathBuf> {
         self.spill_dir
             .get_or_init(|| {
-                let root = std::env::temp_dir().join("batcher_shuffle_spill");
+                let root = self.spill_root.join("batcher_shuffle_spill");
                 sweep_orphaned_spill_dirs(&root);
                 let dir = root.join(format!("{}_{:p}", std::process::id(), self));
                 crate::shared::create_private_dir(&dir).ok().map(|()| dir)
@@ -1078,6 +1087,64 @@ mod tests {
         assert_eq!(batches.len(), 1);
         gauge.on_send();
         assert_eq!(gauge.max(), 1);
+    }
+
+    /// A configured spill root is where buckets spill, and where the orphan sweep runs.
+    ///
+    /// The store used to spill under `temp_dir()` whatever the operator configured, so on a
+    /// container whose `/tmp` is a small tmpfs the spill took the RAM it was meant to free.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn buckets_spill_under_the_configured_root() {
+        let scratch =
+            std::env::temp_dir().join(format!("bc_spill_root_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let orphan = scratch
+            .join("batcher_shuffle_spill")
+            .join("4294967294_0xdead");
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        let store = PartitionStore::with_cap_in(1, scratch.clone());
+        store
+            .register("56/0/0/0/0".into(), vec![wide_batch(1, 512)])
+            .await
+            .unwrap();
+        store
+            .register("56/1/0/0/0".into(), vec![wide_batch(2, 512)])
+            .await
+            .unwrap();
+
+        let dir = store.spill_dir().expect("a spill dir").clone();
+        let spilled = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
+        let read_back = store.get("56/0/0/0/0").await.unwrap().expect("bucket");
+        let orphan_swept = !orphan.exists();
+        store.clear().await;
+        let _ = std::fs::remove_dir_all(&scratch);
+
+        assert!(
+            dir.starts_with(&scratch),
+            "spilled to {dir:?}, not under the configured root"
+        );
+        assert!(spilled >= 1, "nothing spilled under the configured root");
+        assert_eq!(read_back.len(), 1);
+        assert!(
+            orphan_swept,
+            "the orphan sweep did not run under the configured root"
+        );
+    }
+
+    /// The process tunable is what a default store captures, and clearing it restores the
+    /// temp-dir default. The root is a writable path rather than a bogus one because the
+    /// tunable is process-wide: a store another test builds in the window captures it too,
+    /// and must still be able to spill there.
+    #[test]
+    fn a_default_store_captures_the_process_spill_root() {
+        let root = std::env::temp_dir().join("bc_spill_root_capture");
+        crate::set_shuffle_spill_root(Some(root.clone()));
+        let captured = PartitionStore::with_cap(0).spill_root;
+        crate::set_shuffle_spill_root(None);
+        assert_eq!(captured, root);
+        assert_eq!(crate::shuffle_spill_root(), std::env::temp_dir());
     }
 
     /// A spilled bucket's file must go when the bucket does, on every eviction path —

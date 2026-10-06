@@ -352,6 +352,34 @@ mod tunables {
         SHUFFLE_STORE_CAP.load(Ordering::Relaxed) as usize
     }
 
+    /// The local scratch root the store spills buckets under, `None` = the OS temp dir.
+    ///
+    /// Every other spill path honours `memory.spill_dir` and the node's measured local
+    /// volume; this one wrote to `temp_dir()` unconditionally, which on a container whose
+    /// `/tmp` is a small tmpfs makes the "spill" consume the very RAM it exists to free,
+    /// and on a small root disk fills it beside an unused NVMe. Set per worker from the
+    /// control plane, which knows the configured and measured scratch, before the server
+    /// is created: each store captures it at construction, like the cap.
+    static SHUFFLE_SPILL_ROOT: std::sync::RwLock<Option<std::path::PathBuf>> =
+        std::sync::RwLock::new(None);
+
+    /// Set (or clear, with `None`) the shuffle store's spill root.
+    pub fn set_shuffle_spill_root(root: Option<std::path::PathBuf>) {
+        *SHUFFLE_SPILL_ROOT
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = root;
+    }
+
+    /// The directory the shuffle store's spill directories are created under: the
+    /// configured root, else the OS temp dir.
+    pub fn shuffle_spill_root() -> std::path::PathBuf {
+        SHUFFLE_SPILL_ROOT
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
     /// Set the shuffle wire-compression codec (0 none / 1 lz4 / 2 zstd). Values outside
     /// that range are ignored (keep current). Settable per worker from Carbonite.
     pub fn set_compression(code: u64) {
@@ -403,8 +431,8 @@ mod tunables {
 pub use tunables::{
     client_tls, compression, connections_per_peer, fetch_idle_timeout, gather_streams, keepalive,
     set_client_tls, set_compression, set_connections_per_peer, set_gather_inflight_bytes,
-    set_gather_streams, set_shuffle_store_cap, set_transport_timeouts, shuffle_store_cap,
-    stream_bytes_for,
+    set_gather_streams, set_shuffle_spill_root, set_shuffle_store_cap, set_transport_timeouts,
+    shuffle_spill_root, shuffle_store_cap, stream_bytes_for,
 };
 
 impl From<tonic::Status> for TransportError {
