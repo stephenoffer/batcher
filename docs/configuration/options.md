@@ -36,6 +36,7 @@ How work is sized and parallelized.
 | `max_concurrent_queries` | `0` | Queries admitted at once; further arrivals queue. `0` is unbounded and is a true bypass, not a large limit. Above `0`, each admitted query also requests a narrower worker pool (`cores // running`), so N concurrent queries don't each ask for the whole machine. See {doc}`/user-guide/trust/hardening`. |
 | `admission_queue_depth` | `1000` | Queries allowed to wait for a slot. A further arrival raises `AdmissionTimeout` rather than joining an unbounded queue, because a queue nobody drains is an outage that presents as slowness. |
 | `admission_timeout_s` | `0.0` | Seconds a query waits for a slot before raising `AdmissionTimeout`. `0` waits indefinitely. |
+| `query_timeout_s` | `None` | Wall-clock seconds one terminal operation, such as `collect`, a write, or `iter_batches`, may run before it is cancelled through the same path as {py:func}`bt.cancel_query <batcher.cancel_query>`. `None` is no limit. The query raises `QueryCancelledError` naming the limit and the phase it was in. `iter_batches` counts only the time spent producing batches, never the time your loop holds one. |
 | `shrink_output_dtypes` | `False` | Re-narrow a pass-through output column back to its source numeric width, such as `Int32` ids widened on input, halving its footprint. It's lossless but data-dependent, so it's off by default. With it off, output types match {py:obj}`Dataset.schema <batcher.Dataset.schema>` exactly. |
 | `streaming` | `True` | Run plans on the streaming executor, which pulls morsels through linear runs and materializes only at breakers, so peak memory is the breakers' state plus one morsel per worker. A breaker whose state exceeds `memory.max_memory_bytes` hands the query to the materializing executor, which spills. `False` forces that executor for every query, as a bisecting escape hatch. |
 | `auto_offload_blobs` | `False` | Move a `large_binary` column out of line around a sort, so the payload crosses the breaker as a small content-addressed handle and is read back after it. The automatic form of {py:meth}`Dataset.offload_blobs <batcher.Dataset.offload_blobs>`. It pays only for genuinely large payloads, so it's off by default. |
@@ -407,6 +408,7 @@ What the engine tells you about what it did: the `batcher.*` logger hierarchy an
 | `openlineage_api_key` | `""` | Bearer token. Empty reads `OPENLINEAGE_API_KEY`. Accepts an `env:`, `file:`, or `cmd:` secret reference. |
 | `openlineage_namespace` | `"batcher"` | Namespace jobs and datasets are recorded under, conventionally one per environment. |
 | `openlineage_timeout_s` | `5.0` | Per-request timeout for the lineage POST. It bounds the drain thread, never a query. |
+| `query_label` | `""` | A name for the queries run under this config, such as `"nightly-orders-etl"`. Every query in scope carries it on its `QUERY_START` event, in the `query_label` column of {py:func}`bt.query_history() <batcher.query_history>`, on a write's `WriteManifest.query_label`, and as a note on the exception when it fails. Empty is no label. |
 
 These fields are the
 {py:class}`ObservabilityConfig <batcher.config.config.ObservabilityConfig>` dataclass. Construct
@@ -469,6 +471,8 @@ print(cfg.optimizer.cardinality.eq_selectivity)
 Batcher validates a config where you install it, not where it's used. Invalid values raise {py:exc}`ConfigError <batcher.ConfigError>` at the config entry point, meaning `set_config`, `config_context`, `from_env`, or `from_file`, rather than failing confusingly at runtime. That covers a negative retry count, a `soft_limit` above `hard_limit`, and a non-positive timeout. A half-configured TLS block fails the same way.
 
 `Config` and every section are frozen. Derive a new one with {py:meth}`Config.replace <batcher.Config.replace>` or `dataclasses.replace` rather than assigning to a field.
+
+`execution.query_timeout_s` is cooperative. The engine stops at its next morsel or operator boundary, a `map_batches` stage stops before its next batch, and `iter_batches` checks as each batch arrives, so a query overruns the limit by up to one such step. A distributed query's Ray tasks are not interrupted by it.
 
 The worker fan-out is a terminal-call parameter, {py:meth}`ds.collect(num_workers=...) <batcher.Dataset.collect>`, not a `Config` field. The `distributed` section tunes how the fan-out behaves once chosen, not how wide it is.
 

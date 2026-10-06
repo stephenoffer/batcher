@@ -9,6 +9,7 @@ failure guidance instead, since standing up three vendor SDKs in CI would test t
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -166,3 +167,28 @@ def test_literals_and_none_still_pass_straight_through():
     """Adding schemes must not change what a plain password or a None does."""
     assert resolve_secret("hunter2") == "hunter2"
     assert resolve_secret(None) is None
+
+
+@pytest.mark.parametrize(
+    ("reference", "module", "extra"),
+    [
+        ("aws-sm:prod/warehouse", "boto3", "aws-secrets"),
+        ("aws-ssm:/prod/warehouse/password", "boto3", "aws-secrets"),
+        ("gcp-sm:projects/p/secrets/s", "google.cloud.secretmanager", "gcp-secrets"),
+        ("azure-kv:https://v.vault.azure.net/secrets/db", "azure.identity", "azure-secrets"),
+    ],
+)
+def test_a_missing_sdk_raises_the_typed_install_hint(monkeypatch, reference, module, extra):
+    """A missing vendor SDK is the same `MissingDependencyError` every optional extra raises.
+
+    It used to be a plain `BackendError` naming the extra only in prose, so a caller could
+    not read the install command off it. It is still a `BackendError`, so a handler written
+    against that keeps working.
+    """
+    from batcher._internal.errors import MissingDependencyError
+
+    monkeypatch.setitem(sys.modules, module, None)  # makes `import module` raise ImportError
+    with pytest.raises(MissingDependencyError) as info:
+        resolve_secret(reference)
+    assert isinstance(info.value, BackendError)
+    assert info.value.install == f"pip install 'batcher-engine[{extra}]'"

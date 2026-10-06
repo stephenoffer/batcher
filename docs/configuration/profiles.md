@@ -185,7 +185,7 @@ To pin the fan-out instead and skip the wait entirely, pass `num_workers=` to th
 
 ## Reusing a recipe
 
-A recipe is an ordinary `Config`. Define it once, then activate it process-wide with
+A recipe is an ordinary `Config`. Define it once, then activate it for the current thread with
 `set_config` or per block with `config_context`. `Config` is immutable, so the same object
 is safe to reuse and to combine by chaining `replace` calls. See {doc}`options` for every
 field you can change.

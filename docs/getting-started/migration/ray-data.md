@@ -102,7 +102,7 @@ print(ds.select("city", "amount").limit(2).to_pylist())
 
 ## Block and object-ref APIs
 
-Bulk Arrow never becomes a Ray object, so `get_internal_block_refs`, `to_arrow_refs`, and `num_blocks` have no equivalent: stream with `ds.iter_batches()` and read execution details from `ds.stats()`. Configuration is process-wide through {py:obj}`bt.set_config(...) <batcher.set_config>`. Typing a Ray Data name tells you what to use instead:
+Bulk Arrow never becomes a Ray object, so `get_internal_block_refs`, `to_arrow_refs`, and `num_blocks` have no equivalent: stream with `ds.iter_batches()` and read execution details from `ds.stats()`. Configuration is set for the current thread through {py:obj}`bt.set_config(...) <batcher.set_config>`, or for every process through `BATCHER_*` environment variables. Typing a Ray Data name tells you what to use instead:
 
 ```python
 try:

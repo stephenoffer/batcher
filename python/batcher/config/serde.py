@@ -24,17 +24,70 @@ from batcher._internal.optional import require
 if TYPE_CHECKING:
     from batcher.config.config import Config
 
-__all__ = ["config_to_dict", "env_var_names"]
+__all__ = ["REDACTED", "SECRET_OPTIONS", "config_to_dict", "env_var_names"]
+
+#: The option paths holding credential material. Every printable view of a config — its
+#: `repr`, `to_dict()`, `non_defaults()`, `diff()`, and `describe_options()` — shows
+#: `REDACTED` in their place, because those views end up in logs, tracebacks and job
+#: manifests. The two key-*path* fields of `ShuffleTlsConfig` are not here: they name a file
+#: the platform mounts, not the key itself.
+SECRET_OPTIONS: frozenset[str] = frozenset(
+    {"distributed.shuffle_token", "observability.openlineage_api_key"}
+)
+
+#: What a redacted secret reads as. `Config` validation refuses it as a value, so a dict
+#: produced by a redacting `to_dict()` cannot be reloaded as though it carried the real
+#: secret: the load fails naming the field instead of authenticating with ``"<redacted>"``.
+REDACTED = "<redacted>"
 
 
-def config_to_dict(config: Config, *, only_non_default: bool = False) -> dict[str, Any]:
+def redact(path: str, value: object) -> object:
+    """`value`, or `REDACTED` when `path` is a secret option holding a non-empty value.
+
+    An unset secret (None or ``""``) is shown as-is, since "no token configured" is the
+    useful thing to see and gives nothing away.
+    """
+    return REDACTED if path in SECRET_OPTIONS and value not in (None, "") else value
+
+
+def check_no_redacted_secrets(config: Config) -> None:
+    """Raise `ConfigError` if a secret option holds the redaction placeholder.
+
+    Args:
+        config: The config to check.
+
+    Raises:
+        ConfigError: If a secret field's value is `REDACTED`, which means the config was
+            rebuilt from a redacted `to_dict()` and the real secret is missing.
+    """
+    for path in sorted(SECRET_OPTIONS):
+        section, name = path.split(".")
+        if getattr(getattr(config, section), name) == REDACTED:
+            msg = (
+                f"{path} holds the redaction placeholder {REDACTED!r}: this config was "
+                "rebuilt from a redacted to_dict(), so the real secret is missing. Reload "
+                "from to_dict(redact_secrets=False), or supply the secret as an env:/file: "
+                "reference or through its environment variable."
+            )
+            raise ConfigError(msg)
+
+
+def config_to_dict(
+    config: Config, *, only_non_default: bool = False, redact_secrets: bool = True
+) -> dict[str, Any]:
     """Convert a `Config` to a nested plain-dict, ready for JSON/TOML/YAML.
 
     The inverse of `Config.from_dict`. Values are JSON-native — scalars and lists — so the
     dict is safe to `json.dumps`, log, or ship as part of a job manifest.
 
-    Feeding the result back reproduces the same config, with one documented exception: the
-    fields `Config.from_dict` auto-resolves come back resolved. A config carrying the
+    Secrets are redacted by default, because a config dict is far more often printed,
+    logged or attached to a manifest than reloaded. A redacted dict still loads for every
+    config that sets no secret; one that does fails loudly in `Config.from_dict` rather than
+    authenticating with the placeholder. Pass ``redact_secrets=False`` to serialize the
+    secrets too, for a round trip you control.
+
+    Feeding an unredacted result back reproduces the same config, with one documented
+    exception: the fields `Config.from_dict` auto-resolves come back resolved. A config carrying the
     ``autoscale_wait_s = -1`` sentinel for "decide from the environment" reloads as the
     wait the current environment implies, which is the point of the sentinel rather than a
     lossy round trip.
@@ -53,31 +106,46 @@ def config_to_dict(config: Config, *, only_non_default: bool = False) -> dict[st
             >>> config_to_dict(cfg, only_non_default=True)
             {'execution': {'morsel_rows': 4096}}
 
+        .. doctest::
+
+            >>> from batcher.config import Config, DistributedConfig, config_to_dict
+            >>> cfg = Config().replace(distributed=DistributedConfig(shuffle_token="s3cret"))
+            >>> config_to_dict(cfg, only_non_default=True)
+            {'distributed': {'shuffle_token': '<redacted>'}}
+            >>> config_to_dict(cfg, only_non_default=True, redact_secrets=False)
+            {'distributed': {'shuffle_token': 's3cret'}}
+
     Args:
         config: The config to convert.
         only_non_default: Emit only the values that differ from the built-in defaults,
             producing the minimal document that reproduces this config.
+        redact_secrets: Replace each non-empty secret option (`SECRET_OPTIONS`) with
+            `REDACTED`. False emits the real values, for a round trip through
+            `Config.from_dict`.
 
     Returns:
         A nested dict mirroring the config's section structure.
     """
     from batcher.config.config import Config as _Config
 
-    return _to_dict(config, _Config() if only_non_default else None)
+    return _to_dict(config, _Config() if only_non_default else None, "", redact_secrets)
 
 
-def _to_dict(obj: object, default: object | None) -> dict[str, Any]:
+def _to_dict(
+    obj: object, default: object | None, prefix: str, redact_secrets: bool
+) -> dict[str, Any]:
     """Recursively convert a frozen config object, pruning against `default` when given."""
     out: dict[str, Any] = {}
     for field in dataclasses.fields(obj):  # type: ignore[arg-type]
         value = getattr(obj, field.name)
         base = None if default is None else getattr(default, field.name)
+        path = f"{prefix}{field.name}"
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
-            nested = _to_dict(value, base)
+            nested = _to_dict(value, base, f"{path}.", redact_secrets)
             if nested or default is None:
                 out[field.name] = nested
         elif default is None or value != base:
-            out[field.name] = _jsonable(value)
+            out[field.name] = redact(path, _jsonable(value)) if redact_secrets else _jsonable(value)
     return out
 
 
@@ -92,6 +160,45 @@ def _jsonable(value: object) -> object:
     the declared type on the way back in.
     """
     return list(value) if isinstance(value, tuple) else value
+
+
+def non_default_origins(config: Config) -> dict[str, dict[str, object]]:
+    """Each non-default option of `config`, with the layer that set it.
+
+    The active config is built in layers, and this walks them in order, attributing each
+    value to the last layer that changed it: ``"auto-detected"`` (the resolution step that
+    reacts to a spot node or an autoscaling cluster), ``"file"`` (``BATCHER_CONFIG_FILE``),
+    ``"environment"`` (``BATCHER_*`` variables), ``"explicit"`` (`set_config` /
+    `set_option`), then ``"context"`` (an enclosing `config_context`, `option_context` or
+    `tenant` block). A value that no layer of the active config holds was set on `config`
+    itself, by `Config.replace` or a constructor, and is reported as ``"explicit"`` too.
+
+    Args:
+        config: The config to explain.
+
+    Returns:
+        A dict mapping dotted option path to ``{"value": ..., "origin": ...}``, for the
+        options that differ from the built-in defaults. Secrets are redacted.
+    """
+    from batcher.config.config import Config as _Config
+    from batcher.config.config import origin_layers
+    from batcher.config.options import _leaves
+
+    defaults = dict(_leaves(_Config()))
+    layers = [(name, dict(_leaves(layer))) for name, layer in origin_layers()]
+    active = layers[-1][1]
+    out: dict[str, dict[str, object]] = {}
+    for path, value in _leaves(config):
+        if value == defaults[path]:
+            continue
+        origin = "explicit"
+        if active[path] == value:
+            previous = defaults[path]
+            for name, values in layers:
+                if values[path] != previous:
+                    origin, previous = name, values[path]
+        out[path] = {"value": redact(path, value), "origin": origin}
+    return out
 
 
 def env_var_names(config: Config | None = None) -> dict[str, str]:

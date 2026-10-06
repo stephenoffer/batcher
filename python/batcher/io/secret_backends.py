@@ -33,7 +33,8 @@ so a node without a role fails closed rather than inheriting the driver's.
 
 Vault needs nothing: its KV API is a GET with a token header, so it is answered with
 `urllib`. The three cloud stores use their vendor SDK, imported only when that scheme is
-actually used, and a missing one raises `BackendError` naming the extra to install.
+actually used, and a missing one raises `MissingDependencyError` (a `BackendError`) naming
+the extra to install.
 
 # No caching, deliberately
 
@@ -50,6 +51,7 @@ import os
 from typing import Any
 
 from batcher._internal.errors import BackendError
+from batcher._internal.optional import require
 from batcher.config.env import env_float
 
 __all__ = ["BACKEND_SCHEMES", "resolve_backend_ref"]
@@ -182,7 +184,7 @@ def _from_aws_secrets_manager(target: str, *, what: str, reference: str) -> str:
     Credentials come from the standard chain, which on a Ray worker means the instance
     profile or the IRSA role that pod holds. Nothing is passed from the driver.
     """
-    boto3 = _require("boto3", scheme="aws-sm", extra="aws-secrets", what=what)
+    boto3 = _require("boto3", scheme="aws-sm", provides="boto3", extra="aws-secrets", what=what)
     name, _, key = target.partition("#")
     client = boto3.client("secretsmanager", region_name=os.environ.get("AWS_REGION") or None)
     response = client.get_secret_value(SecretId=name)
@@ -206,7 +208,7 @@ def _from_aws_parameter_store(target: str, *, what: str, reference: str) -> str:
             f"{what}: {reference!r} names an SSM parameter without a leading slash; "
             "SSM parameter names are absolute, e.g. 'aws-ssm:/prod/warehouse/password'"
         )
-    boto3 = _require("boto3", scheme="aws-ssm", extra="aws-secrets", what=what)
+    boto3 = _require("boto3", scheme="aws-ssm", provides="boto3", extra="aws-secrets", what=what)
     client = boto3.client("ssm", region_name=os.environ.get("AWS_REGION") or None)
     response = client.get_parameter(Name=target, WithDecryption=True)
     return str(response["Parameter"]["Value"])
@@ -225,7 +227,13 @@ def _from_gcp_secret_manager(target: str, *, what: str, reference: str) -> str:
             f"{what}: {reference!r} must name a Secret Manager resource, e.g. "
             "'gcp-sm:projects/my-project/secrets/db-password'"
         )
-    module = _require("google.cloud.secretmanager", scheme="gcp-sm", extra="gcp-secrets", what=what)
+    module = _require(
+        "google.cloud.secretmanager",
+        scheme="gcp-sm",
+        provides="google-cloud-secret-manager",
+        extra="gcp-secrets",
+        what=what,
+    )
     name = target if "/versions/" in target else f"{target.rstrip('/')}/versions/latest"
     client = module.SecretManagerServiceClient()
     response = client.access_secret_version(request={"name": name})
@@ -250,9 +258,19 @@ def _from_azure_key_vault(target: str, *, what: str, reference: str) -> str:
             "azure-kv:https://myvault.vault.azure.net/secrets/db-password"
         )
     vault_url, _, name = url.partition(marker)
-    identity = _require("azure.identity", scheme="azure-kv", extra="azure-secrets", what=what)
+    identity = _require(
+        "azure.identity",
+        scheme="azure-kv",
+        provides="azure-identity",
+        extra="azure-secrets",
+        what=what,
+    )
     secrets = _require(
-        "azure.keyvault.secrets", scheme="azure-kv", extra="azure-secrets", what=what
+        "azure.keyvault.secrets",
+        scheme="azure-kv",
+        provides="azure-keyvault-secrets",
+        extra="azure-secrets",
+        what=what,
     )
     client = secrets.SecretClient(vault_url=vault_url, credential=identity.DefaultAzureCredential())
     return str(client.get_secret(name.split("/")[0]).value)
@@ -282,17 +300,16 @@ def _maybe_json_key(secret: str, key: str, *, what: str, reference: str) -> str:
     return str(document[key])
 
 
-def _require(module: str, *, scheme: str, extra: str, what: str) -> Any:
-    """Import `module` or raise a `BackendError` naming the extra that provides it."""
-    from importlib import import_module
+def _require(module: str, *, scheme: str, provides: str, extra: str, what: str) -> Any:
+    """Import `module`, or raise `MissingDependencyError` naming the extra that provides it.
 
-    try:
-        return import_module(module)
-    except ImportError as exc:
-        raise BackendError(
-            f"{what}: the '{scheme}:' scheme needs {module!r}; install it with "
-            f"`pip install 'batcher-engine[{extra}]'`"
-        ) from exc
+    `MissingDependencyError` is a `BackendError`, so a caller catching that still does, and
+    it carries the exact install command in its `install` field like every other optional
+    dependency in the engine.
+    """
+    return require(
+        module, feature=f"{what}: the '{scheme}:' scheme", provides=provides, extra=extra
+    )
 
 
 def _timeout() -> float:

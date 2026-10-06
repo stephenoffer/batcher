@@ -6342,6 +6342,7 @@ class Dataset:
         from batcher.api.dataset._export import shape_batches
         from batcher.api.terminal.core import _resolve_distributed, cached_batches
         from batcher.api.terminal.event_log import pipeline_signature, report_stream
+        from batcher.core.runtime import bounded_iteration
 
         shape = shape_batches(
             batch_size=batch_size,
@@ -6369,7 +6370,7 @@ class Dataset:
         # which recurses on the `batch_size` path and would double-count every row.
         yield from shape(
             report_stream(
-                batches,
+                bounded_iteration(batches),
                 label=type(self._plan).__name__.lower(),
                 signature=pipeline_signature(self._plan),
             )
