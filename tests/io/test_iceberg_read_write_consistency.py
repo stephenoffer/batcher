@@ -14,6 +14,7 @@ Four defects, each a wrong answer rather than an error:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -23,7 +24,9 @@ import batcher as bt
 
 pytest.importorskip("pyiceberg", reason="pyiceberg not installed")
 
+from batcher.io.formats.lakehouse.iceberg.sink import IcebergSink
 from batcher.io.formats.lakehouse.iceberg.source import IcebergSource
+from batcher.io.manifest import WriteManifest
 
 pytestmark = pytest.mark.integration
 
@@ -139,3 +142,73 @@ def test_a_time_travel_split_keeps_its_snapshot(spec):
     assert [s._snapshot_id for s in splits] == [pinned]
     rows = [r for s in splits for b in s.read() for r in b.to_pydict()["id"]]
     assert rows == [1]
+
+
+# --- BT-248: the stream marker survives snapshot expiry --------------------------------------
+
+
+def _stream_sink(spec: dict, version: int) -> IcebergSink:
+    return IcebergSink("db.t", catalog=spec, app_id="app-1", txn_version=version)
+
+
+def _commit_batch(spec: dict, sink: IcebergSink, ids: list[int]) -> None:
+    staged = sink.write(pa.table({"id": ids, "v": ids}, schema=_SCHEMA), "")
+    sink.commit(WriteManifest(files=(staged,)), "")
+
+
+def test_a_committed_batch_stays_committed_after_its_snapshot_expires(spec):
+    _commit_batch(spec, _stream_sink(spec, 7), [1, 2])
+    marked = _table(spec).current_snapshot().snapshot_id
+
+    _append(spec, [3])  # a later commit with no marker: compaction, another writer
+    _table(spec).maintenance.expire_snapshots().by_id(marked).commit()
+    assert all(s.snapshot_id != marked for s in _table(spec).snapshots())
+
+    replay = _stream_sink(spec, 7)
+    assert replay.is_committed("")
+    assert _stream_sink(spec, 6).is_committed("")
+    assert not _stream_sink(spec, 8).is_committed("")
+    assert not IcebergSink("db.t", catalog=spec, app_id="app-2", txn_version=7).is_committed("")
+
+
+def test_the_marker_never_moves_backwards(spec):
+    _commit_batch(spec, _stream_sink(spec, 7), [1])
+    _commit_batch(spec, _stream_sink(spec, 3), [2])  # a stale writer, committing an old batch
+    _append(spec, [3])
+    tomorrow = datetime.now(UTC) + timedelta(days=1)
+    _table(spec).maintenance.expire_snapshots().older_than(tomorrow).commit()
+    assert len(_table(spec).snapshots()) == 1  # only the marker-less current one survives
+    assert _stream_sink(spec, 7).is_committed("")
+
+
+# --- BT-242 (empty overwrite): a scoped write of nothing still deletes -----------------------
+
+
+def test_an_empty_overwrite_empties_the_table(spec):
+    _append(spec, [1, 2, 3])
+    IcebergSink("db.t", catalog=spec, mode="overwrite").commit(WriteManifest(), "")
+    assert _ids(spec) == []
+
+
+def test_an_empty_replace_where_deletes_only_its_scope(spec):
+    _append(spec, [1, 2, 3])
+    scope = (bt.col("id") > 1).to_ir()
+    IcebergSink("db.t", catalog=spec, mode="overwrite", replace_where=scope).commit(
+        WriteManifest(), ""
+    )
+    assert _ids(spec) == [1]
+
+
+def test_an_empty_append_commits_nothing(spec):
+    _append(spec, [1, 2, 3])
+    before = _table(spec).current_snapshot().snapshot_id
+    IcebergSink("db.t", catalog=spec).commit(WriteManifest(), "")
+    assert _table(spec).current_snapshot().snapshot_id == before
+    assert _ids(spec) == [1, 2, 3]
+
+
+def test_an_empty_overwrite_of_a_missing_table_creates_nothing(spec):
+    from batcher.io.catalog import resolve_catalog
+
+    IcebergSink("db.absent", catalog=spec, mode="overwrite").commit(WriteManifest(), "")
+    assert not resolve_catalog(dict(spec)).table_exists("db.absent")
