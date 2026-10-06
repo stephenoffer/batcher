@@ -116,14 +116,14 @@ rather than returning a wrong answer.
 | `QUALIFY` on a window not in `SELECT` | partial | project the window with an alias, then `QUALIFY alias = 1` — or `.with_columns(rn=…over(…)).filter(bt.col("rn") == 1)` |
 | `LATERAL`, `UNNEST` in `FROM` | **parsed** — `FROM t, UNNEST(arr)` and `LATERAL (SELECT …)` both lower; `UNNEST` adds the element column (named `unnest`, or by `AS u(x)`) beside the list, as DuckDB does | `ds.explode("col")` / `ds.unnest("struct_col")` for the DataFrame form |
 | `WITH RECURSIVE` | body translated once — **wrong answer risk** | rewrite as an explicit loop of `Dataset` unions in Python |
-| `MERGE INTO` | unsupported DML | `ds.write.delta(uri, merge_on=["id"])` — one transactional call |
+| `MERGE INTO` | **supported** on session and catalog tables; `ON` must be column equalities (names may differ); a catalog target is collected and overwritten; `RETURNING` rejected | `ds.write.delta(uri, merge_on=["id"])` for a transactional, incremental lakehouse write |
 | `array_agg(DISTINCT x)`, `string_agg(DISTINCT x)` | rejected — the list aggregates have no dedup form | pre-aggregate the distinct values in a subquery |
 | `SUM(DISTINCT x)` beside `AVG`/`STDDEV`/`VAR`/a quantile/a second `COUNT(DISTINCT y)` | rejected — those have no single-column mergeable partial to survive the dedup | compute them in a separate subquery and join (`SUM/AVG/MIN/MAX(DISTINCT x)` alone, or beside `COUNT`/`SUM`/`MIN`/`MAX`/`BOOL_*`/`BIT_*`/`PRODUCT`/`ANY_VALUE`, is fine) |
 | Frame `EXCLUDE CURRENT ROW/GROUP/TIES` | **supported** for `sum`/`count`/`avg`/`min`/`max`/`bool_and`/`bool_or` over a `ROWS` (CURRENT ROW) or `GROUPS` frame; rejected under a bounded `ROWS` frame for GROUP/TIES and under a value-offset `RANGE` | use a `GROUPS` frame; never subtract the current row (wrong on NULL, empty remainder, inf) |
 | `x > ANY (subquery)`, `x >= ALL (subquery)` | **supported** — lowered to the exact three-valued answer (empty set, NULLs included), correlated or not | nothing; a row-valued `(a, b) > ALL (...)` is rejected — compare one column at a time |
 | `IN (subquery)` under `OR` | rejected — a semi-join drops the rows the `OR` keeps | write it as `EXISTS (SELECT 1 FROM s WHERE s.c = t.x)`, qualifying the outer column |
 | Non-column `PARTITION BY`/window `ORDER BY` | **supported** — a computed key is hoisted into a hidden column | nothing; `PARTITION BY date_trunc('month', ts)` works |
-| `INSERT … ON CONFLICT` / `RETURNING` | unsupported | `write.delta(..., merge_on=...)` |
+| `INSERT … ON CONFLICT` / `RETURNING` / `DELETE … USING` | **supported** on session tables; `ON CONFLICT` needs an explicit `(key)` and rejects duplicate inserted keys; `RETURNING` rejected on `MERGE`, `ON CONFLICT` and catalog tables | name the conflict key; dedupe the inserted rows first |
 | Scalar UDF in `GROUP BY` / agg arg / `ORDER BY` | rejected | compute it as a projected alias in a subquery first |
 | Non-constant `LIKE`/`regexp_*`/`substr` arguments | constants only | restructure, or use the `.str` expression namespace |
 

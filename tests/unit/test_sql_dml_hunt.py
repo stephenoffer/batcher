@@ -50,9 +50,12 @@ def test_dml_rebinds_catalog_lazily(dml):
         ("INSERT INTO t (nope) VALUES (1)", PlanError),
         ("UPDATE t SET z = 1", PlanError),
         ("INSERT INTO missing VALUES (1, 1)", PlanError),
-        ("INSERT INTO t VALUES (1, 1) ON CONFLICT DO NOTHING", NotImplementedError),
-        ("INSERT INTO t VALUES (1, 1) RETURNING x", NotImplementedError),
-        ("DELETE FROM t WHERE x = 1 RETURNING x", NotImplementedError),
+        # Batcher tables declare no key, so ON CONFLICT must name one.
+        ("INSERT INTO t VALUES (1, 1) ON CONFLICT DO NOTHING", PlanError),
+        ("INSERT INTO t VALUES (1, 1) ON CONFLICT (nope) DO NOTHING", PlanError),
+        ("INSERT INTO t VALUES (1, 1) ON CONFLICT (x) DO NOTHING RETURNING x", PlanError),
+        ("MERGE INTO t USING t AS s ON t.x = s.x WHEN MATCHED THEN DELETE RETURNING x", PlanError),
+        ("UPDATE t SET y = 1 FROM t AS u", PlanError),
     ],
 )
 def test_bad_dml_raises_clean(dml, exc):

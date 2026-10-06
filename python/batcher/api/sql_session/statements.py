@@ -8,9 +8,14 @@ can take in whole.
 
 Every form on a *session* name is a plan rewrite. Nothing there materializes a row: `CREATE
 TABLE AS` registers a lazy `Dataset`, `CREATE VIEW` stores its query text, and
-`INSERT`/`DELETE`/`UPDATE` produce a union, a filter, or a projected `CASE` that runs only
-on a later terminal op. `DELETE`/`UPDATE` on a *catalog* table is the exception: a catalog
-table is storage, so the new contents are written back immediately.
+`INSERT`/`DELETE`/`UPDATE`/`MERGE` produce a union, a filter, a projected `CASE` or a
+composed merge that runs only on a later terminal op. `DELETE`/`UPDATE`/`MERGE` on a
+*catalog* table is the exception: a catalog table is storage, so the new contents are
+collected and written back immediately.
+
+`EXPLAIN` sits here too: it is served at the session, so the query it explains is parsed in
+the session's dialect and resolves the session's views and catalog tables exactly as the
+same query without `EXPLAIN` would.
 """
 
 from __future__ import annotations
@@ -21,12 +26,25 @@ import pyarrow as pa
 from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
+from batcher._internal.sql_errors import parse_sql
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
     from batcher.api.sql_session.session import Session
 
-__all__ = ["create", "dml", "drop"]
+__all__ = ["create", "dml", "drop", "explain"]
+
+# Statements a session performs as it translates them, so `EXPLAIN` must not run them.
+_CHANGES = (
+    exp.Insert,
+    exp.Delete,
+    exp.Update,
+    exp.Merge,
+    exp.Create,
+    exp.Drop,
+    exp.Use,
+    exp.Command,
+)
 
 
 def create(session: Session, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset:
@@ -92,10 +110,10 @@ def dml(session: Session, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Da
     """Handle ``INSERT`` / ``DELETE`` / ``UPDATE`` / ``MERGE`` — rebind the target table.
 
     Per-call `tables` bindings are visible to the rewrite, but the rebind lands on the
-    session catalog, matching ``CREATE``. A ``DELETE`` or ``UPDATE`` on a *catalog* table
-    computes the table's new contents and writes them back with ``mode="overwrite"``; it is
-    the one DML form that runs immediately, and it reads the whole table through this
-    process to do so.
+    session catalog, matching ``CREATE``. A ``DELETE``, ``UPDATE`` or ``MERGE`` on a
+    *catalog* table computes the table's new contents and writes them back with
+    ``mode="overwrite"``; it is the one DML form that runs immediately, and it reads the
+    whole table through this process to do so.
 
     Args:
         session: The session whose catalog is rebound.
@@ -103,10 +121,12 @@ def dml(session: Session, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Da
         tables: Per-call table bindings visible to the rewrite.
 
     Returns:
-        The target table's new lazy state.
+        The ``RETURNING`` rows when the statement has the clause, else the target table's
+        new lazy state.
 
     Raises:
-        PlanError: The target is a view, or a ``MERGE`` targets a catalog table.
+        PlanError: The target is a view, or a statement on a catalog table carries
+            ``RETURNING`` or ``ON CONFLICT``.
     """
     from batcher._sql.dml import apply_dml
     from batcher.api.sql_session.catalog_sql import qualified_name
@@ -129,21 +149,25 @@ def dml(session: Session, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Da
         (ast.this.this if isinstance(ast.this, exp.Schema) else ast.this).set(
             "this", exp.to_identifier(key)
         )
-    name, new_state = apply_dml(ast, registry, session._functions)
-    session._rebind(name, new_state)
-    return new_state
+    result = apply_dml(ast, registry, session._functions)
+    session._rebind(result.name, result.state)
+    return result.state if result.returning is None else result.returning
 
 
 def _catalog_dml(session: Session, ast: Any, target: Any, name: str, registry: dict) -> Dataset:
-    """``DELETE``/``UPDATE`` on a catalog table: compute the new rows, then overwrite it."""
+    """``DELETE``/``UPDATE``/``MERGE`` on a catalog table: compute the new rows, then overwrite.
+
+    The same rewrite a session table gets, so the statement means the same thing on both;
+    only the last step differs. The new contents are collected through this process and
+    written with ``mode="overwrite"``, which a catalog that cannot overwrite refuses.
+    """
     from batcher._sql.dml import apply_dml
     from batcher.api.session import from_arrow
 
-    if not isinstance(ast, (exp.Delete, exp.Update)):
+    if ast.args.get("returning"):
         raise PlanError(
-            f"MERGE into the catalog table {name!r} is not supported",
-            hint="Upsert with ds.write.table(name, mode='overwrite') over the merged rows, or "
-            "keep the table in Delta and use ds.write.delta(uri, merge_on=[...]).",
+            f"RETURNING on the catalog table {name!r} is not supported",
+            hint="Query the table after the statement.",
         )
     key = "__bc_dml_target"
     ast = ast.copy()
@@ -153,10 +177,10 @@ def _catalog_dml(session: Session, ast: Any, target: Any, name: str, registry: d
         node.set(part, None)
     node.set("this", exp.to_identifier(key))
     node.set("alias", alias)
-    _, new_state = apply_dml(ast, {**registry, key: session.table(name)}, session._functions)
+    result = apply_dml(ast, {**registry, key: session.table(name)}, session._functions)
     # Collected before the write: the new rows are computed *from* the table the overwrite
     # replaces, so reading lazily while writing could observe a half-replaced table.
-    from_arrow(new_state.collect()).write.table(name, mode="overwrite", session=session)
+    from_arrow(result.state.collect()).write.table(name, mode="overwrite", session=session)
     return session.table(name)
 
 
@@ -225,3 +249,40 @@ def _drop_target(session: Session, name: str, kind: str) -> str | None:
             hint=f"Use DROP {actual} {name}.",
         )
     return key
+
+
+def explain(session: Session, ast: Any, tables: dict[str, Dataset | pa.Table]) -> Dataset | None:
+    """Serve ``EXPLAIN [ANALYZE] <query>``, or return None when `ast` is not one.
+
+    sqlglot does not model ``EXPLAIN``; it parses as a `Command` carrying the rest of the
+    statement as text. That text is run back through the session, so it is parsed in the
+    session's dialect, a syntax error in it is the same `PlanError` the bare query raises,
+    and a view or catalog table in it resolves exactly as it would without ``EXPLAIN``.
+
+    Args:
+        session: The session the explained query runs against.
+        ast: The parsed statement.
+        tables: Per-call table bindings visible to the explained query.
+
+    Returns:
+        A one-row relation of ``explain_key``/``explain_value``, DuckDB's shape, or None.
+    """
+    if not (isinstance(ast, exp.Command) and str(ast.this).upper() == "EXPLAIN"):
+        return None
+    text = ast.expression.this if ast.expression is not None else ""
+    analyze = False
+    stripped = text.lstrip()
+    if stripped[:8].upper() == "ANALYZE ":
+        analyze, text = True, stripped[8:]
+    if not text.strip():
+        raise PlanError("EXPLAIN needs a query to explain", hint="Write EXPLAIN SELECT ...")
+    inner = parse_sql(text, dialect=session._dialect)
+    if isinstance(inner, _CHANGES):
+        # Running the text would perform the change: the session executes DDL and DML as
+        # it translates them. Refused rather than explained by doing it.
+        raise PlanError(
+            f"EXPLAIN of a {type(inner).__name__.upper()} statement is not supported; "
+            "EXPLAIN explains a query",
+        )
+    plan = session._run(text, tables).explain(analyze=analyze)
+    return session._as_dataset(pa.table({"explain_key": ["plan"], "explain_value": [plan]}))

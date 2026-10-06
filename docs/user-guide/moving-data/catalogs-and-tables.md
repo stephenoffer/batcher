@@ -164,7 +164,15 @@ print(session.sql("SHOW TABLES").to_pydict())
 # {'name': ['events']}
 ```
 
-An unqualified `CREATE TABLE t AS <select>` creates a catalog table once `USE` has moved the session off its starting `memory.main`: after `USE staging` above, it creates `staging.t`, which is what DuckDB does. Before any `USE` it registers a session table, as it did before catalogs existed. `DELETE` and `UPDATE` on a catalog table compute the new rows and overwrite the table immediately, reading the whole table through the driver to do so.
+An unqualified `CREATE TABLE t AS <select>` creates a catalog table once `USE` has moved the session off its starting `memory.main`: after `USE staging` above, it creates `staging.t`, which is what DuckDB does. Before any `USE` it registers a session table, as it did before catalogs existed. `CREATE TEMP TABLE` always registers a session table, whatever `USE` says, because a temporary table lasts as long as the session. A qualified `TEMP` name such as `staging.t` is refused. To persist a table, create it without `TEMP`, by a qualified name or after a `USE`:
+
+```python
+session.sql("CREATE TEMP TABLE scratch AS SELECT 1 AS id")
+print(session.catalog.list_tables())
+# ['staging.events']
+```
+
+`DELETE`, `UPDATE` and `MERGE INTO` on a catalog table compute the new rows and overwrite the table immediately, reading the whole table through the driver to do so. They are the same rewrites a session table gets, so the statement means the same thing on both, and a catalog that can't overwrite a table refuses them.
 
 ## Keep tables between sessions
 
@@ -239,8 +247,8 @@ The table below maps each engine's spelling onto Batcher's, alphabetically by th
 - A Delta table scopes `replace_where` to its partition columns, so an overwrite with a predicate needs a partitioned table there. The in-memory backend takes any predicate.
 - `mode="overwrite_partitions"` replaces every partition the rows cover in one commit, so a concurrent reader sees the old partitions or the new ones, never a mix. On Delta this needs each covered partition to be named by partition values that aren't null, because the removals are resolved from the log by equality.
 - An Iceberg catalog refuses `partition_by` on create, because Iceberg partitioning is a partition spec declared on the table. Create the table with pyiceberg, then write to it. Dropping an Iceberg table removes its catalog entry and leaves the data files.
-- `MERGE` acts on session tables only. For a catalog table, use `replace_where` or {py:meth}`ds.write.merge_into <batcher.api.io_namespace.writer.Writer.merge_into>` on the underlying format. `DELETE` and `UPDATE` on a catalog table rewrite the whole table.
-- `information_schema.tables` and `information_schema.columns` list session tables and views only. `SHOW TABLES` lists those and the current namespace's catalog tables, and `DESCRIBE` answers for either.
+- `DELETE`, `UPDATE` and `MERGE` on a catalog table rewrite the whole table, collecting it through the driver. For a large table, prefer `replace_where`, or {py:meth}`ds.write.merge_into <batcher.api.io_namespace.writer.Writer.merge_into>` on the underlying format, which writes only what changes. `RETURNING` and `INSERT ... ON CONFLICT` act on session tables only.
+- `information_schema.tables`, `information_schema.columns` and `information_schema.views` list session tables and views only. `information_schema.schemata` lists every attached catalog's namespaces. `SHOW TABLES` lists session names and the current namespace's catalog tables, and `DESCRIBE` answers for either.
 - `DROP VIEW` drops only a view and `DROP TABLE` only a table. DuckDB treats a `register`ed relation as a view, while Batcher treats it as a session table, so drop it with `DROP TABLE` or {py:meth}`Session.drop <batcher.Session.drop>`.
 
 ## See also

@@ -50,8 +50,8 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 | Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates, including the `DISTINCT` forms. See [DISTINCT aggregates](#distinct-aggregates) for what they may be mixed with. |
 | Scalar expressions | Arithmetic, comparison, boolean, and function calls (incl. registered Python functions). |
 | DDL | `CREATE [OR REPLACE] {TABLE,VIEW} ... AS ...` and `DROP TABLE` register/unregister a lazy table in the session. |
-| DML | `INSERT`, `UPDATE`, `DELETE`, and `MERGE INTO ... USING ... ON ... WHEN ...` rebind the target to its new state. |
-| Catalog | `SHOW TABLES` lists the session's tables; `DESCRIBE <table>` returns its columns; `information_schema.tables` and `information_schema.columns` answer both in ANSI form. All come back as ordinary relations. |
+| DML | `INSERT`, `UPDATE`, `DELETE`, and `MERGE INTO ... USING ... ON ... WHEN ...` rebind the target to its new state. `INSERT ... ON CONFLICT (k)`, `DELETE ... USING` and `RETURNING` are supported on session tables. |
+| Catalog | `SHOW TABLES` lists the session's tables; `DESCRIBE <table>` returns its columns; `information_schema.tables`, `.columns`, `.views` and `.schemata` answer in ANSI form. All come back as ordinary relations. |
 
 ### WHERE and GROUP BY
 
@@ -417,8 +417,8 @@ Settings there go in the trailing `STRUCT`, as `ML.PREDICT(MODEL m, TABLE t, STR
 
 ## Statements that change or describe the catalog
 
-`CREATE`, `DROP`, `MERGE INTO`, `SHOW TABLES`, `DESCRIBE` and `information_schema` are on
-their own page: see {doc}`SQL statements </api/relational/sql-statements>`.
+`CREATE`, `DROP`, `MERGE INTO`, `INSERT ... ON CONFLICT`, `RETURNING`, `DELETE ... USING`,
+`SHOW TABLES`, `DESCRIBE`, `information_schema` and `EXPLAIN` are on their own page: see {doc}`SQL statements </api/relational/sql-statements>`.
 
 ## Binding the current dataset
 
