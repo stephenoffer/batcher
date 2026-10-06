@@ -41,6 +41,7 @@ from typing import Any
 
 from sqlglot import expressions as exp
 
+from batcher._sql.parser.expressions.lowering.named import keyword_arguments, split_keywords
 from batcher._sql.parser.expressions.lowering.signatures import build_arguments, parameter_kinds
 from batcher.plan.expr_ir import Expr
 from batcher.plan.expr_ir.walk import contains_aggregate
@@ -127,6 +128,15 @@ def positional_arity(fn) -> tuple[int, int | None]:
     required = sum(1 for p in params if p.default is p.empty)
     variadic = any(p.kind is p.VAR_POSITIONAL for p in signature.parameters.values())
     return required, None if variadic else len(params)
+
+
+def _positional_names(fn) -> set[str]:
+    """The names of `fn`'s parameters that can be filled by position."""
+    return {
+        p.name
+        for p in inspect.signature(fn).parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    }
 
 
 #: Parameter annotations that stand for a *group* of columns rather than one.
@@ -228,18 +238,21 @@ def family_function(tr, node) -> Expr | None:
             f"({node.name or key}_x, _y, _z, _w), or the DataFrame API"
         )
     required, total = positional_arity(fn)
+    args, keywords = split_keywords(args)
     built = build_arguments(tr, fn, args, node.name or key)
-    if len(built) == required - 1 and key in _STANDARD_DEFAULTS:
+    named = keyword_arguments(tr, fn, keywords, node.name or key, filled=len(built))
+    # A required positional parameter may be given by name, `ST_Buffer(g, radius => 2)`.
+    given = len(built) + sum(1 for name in named if name in _positional_names(fn))
+    if given == required - 1 and key in _STANDARD_DEFAULTS:
         built.append(_STANDARD_DEFAULTS[key])
-    if len(built) < required or (total is not None and len(built) > total):
+        given += 1
+    if given < required or (total is not None and given > total):
         if total is None:
             expected = f"at least {required}"
         else:
             expected = str(required) if required == total else f"{required} to {total}"
-        raise NotImplementedError(
-            f"{node.name or key}() takes {expected} argument(s), got {len(built)}"
-        )
-    result = fn(*built)
+        raise NotImplementedError(f"{node.name or key}() takes {expected} argument(s), got {given}")
+    result = fn(*built, **named)
     if contains_aggregate(result):
         # An aggregate needs the *aggregate* dispatch — the translator has to know a
         # projection reduces, so it can build the GROUP BY around it. Reached through the

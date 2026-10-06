@@ -38,6 +38,7 @@ from batcher.plan.expr_ir import Expr
 __all__ = [
     "LITERAL_READERS",
     "STRINGS",
+    "annotation_kind",
     "arity",
     "build_arguments",
     "hints",
@@ -213,19 +214,34 @@ def parameter_kinds(fn: Any, *, skip_first: bool = False) -> list[Any] | None:
         ):
             return None  # a keyword-only parameter with no default
         annotation = annotations.get(parameter.name)
-        if annotation is None:
-            return None
-        members = union_members(annotation)
-        if any(isinstance(m, type) and issubclass(m, Expr) for m in members):
-            kinds.append(Expr)
-        elif members and all(m in LITERAL_READERS for m in members):
-            # `int | float` reads as the widest member that accepts the narrower one.
-            kinds.append(float if float in members else members[0])
-        elif _is_string_iterable(annotation) and parameter is last:
+        kind = annotation_kind(annotation)
+        if kind is not None:
+            kinds.append(kind)
+        elif annotation is not None and _is_string_iterable(annotation) and parameter is last:
             kinds.append(STRINGS)
         else:
             return None
     return kinds
+
+
+def annotation_kind(annotation: Any) -> Any:
+    """`Expr` for a column parameter, a literal type for a constant one, else None.
+
+    Args:
+        annotation: A parameter's resolved annotation, or None when it has none.
+
+    Returns:
+        `Expr`, a key of `LITERAL_READERS`, or None when SQL cannot spell the parameter.
+    """
+    if annotation is None:
+        return None
+    members = union_members(annotation)
+    if any(isinstance(m, type) and issubclass(m, Expr) for m in members):
+        return Expr
+    if members and all(m in LITERAL_READERS for m in members):
+        # `int | float` reads as the widest member that accepts the narrower one.
+        return float if float in members else members[0]
+    return None
 
 
 def _is_string_iterable(annotation: Any) -> bool:

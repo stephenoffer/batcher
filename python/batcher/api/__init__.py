@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     from batcher._internal.errors import PlanError as PlanError
     from batcher._internal.errors import ResourceError as ResourceError
     from batcher._internal.errors import SchemaError as SchemaError
+    from batcher._internal.errors import SQLSyntaxError as SQLSyntaxError
+    from batcher._internal.errors import SQLUnsupportedError as SQLUnsupportedError
     from batcher._internal.errors import TransportError as TransportError
     from batcher.api.catalog import Catalog as Catalog
     from batcher.api.catalog import Table as Table
