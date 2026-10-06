@@ -3375,7 +3375,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `offset.rs` | 268 | Typed `key ± offset` arithmetic — the one place a temporal distance is applied. |
 | `page_cache.rs` | 69 | Telling the kernel how a spill file is about to be used. |
 | `placement.rs` | 143 | Which CPU a worker thread should run on. |
-| `private_fs.rs` | 154 | Creating the engine's on-disk artifacts owner-only, in one place. |
+| `private_fs.rs` | 252 | Creating the engine's on-disk artifacts owner-only, in one place. |
 | `row_sort.rs` | 202 | A stable multi-column sort permutation over the Arrow row format. |
 | `topology.rs` | 498 | The machine's memory and core topology, as the data plane needs to see it. |
 
@@ -3410,7 +3410,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `handler.rs` | 457 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 120 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 409 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
-| `shared.rs` | 427 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
+| `shared.rs` | 442 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
 | `store.rs` | 610 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 93 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 207 | TLS configuration for the inter-node Flight shuffle. |
