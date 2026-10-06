@@ -300,6 +300,41 @@ def _regrant_fleet(fleet: ShuffleFleet, credits: int, cfg_json: str) -> None:
     fleet.cfg_json = cfg_json
 
 
+def _regrant_or_replace(
+    fleet: ShuffleFleet, workers: int, credits: int, cfg_json: str
+) -> ShuffleFleet:
+    """Re-grant `fleet` for this query; on failure, never reuse it as if the grant had landed.
+
+    A failed re-grant used to be swallowed without a word. `set_grant` is one RPC per actor,
+    so an actor that is restarting, or a transient RPC error, fails the `ray.get` *after*
+    some workers took the new grant: the fleet then ran this query on a mixed grant, and
+    every later one too, because its recorded grant was never updated to say so. That is
+    the 0.6 s -> 3.2 s regression `_regrant_fleet` exists to prevent, arrived at silently.
+
+    So the failure is logged, and the fleet is respawned when nobody else is using it.
+    When somebody is, it is kept for this query (tearing it down would kill their shuffle)
+    and its recorded grant is cleared, so the next acquire sees it as stale and re-grants.
+    """
+    try:
+        _regrant_fleet(fleet, credits, cfg_json)
+        return fleet
+    except Exception as exc:
+        failure = exc
+    resizable = _session_fleet_resizable()
+    get_logger("dist").warning(
+        "could not re-grant the warm shuffle fleet (%s: %s); %s",
+        type(failure).__name__,
+        failure,
+        "respawning it" if resizable else "keeping it for this query, re-granting on the next",
+    )
+    if not resizable:
+        fleet.cfg_json = ""  # matches no real grant, so the next acquire re-grants
+        return fleet
+    with contextlib.suppress(Exception):
+        fleet.cleanup()
+    return ShuffleFleet.spawn(workers, credits, cfg_json)
+
+
 def _session_fleet_resizable() -> bool:
     """Whether the cached session fleet may be torn down and respawned right now.
 
@@ -389,8 +424,7 @@ def _acquire_session_fleet(workers: int, credits: int, cfg_json: str) -> Shuffle
         ):
             # Wide enough, but granted for someone else's query. Re-grant, don't respawn —
             # and only when no concurrent pipeline is shuffling over these same workers.
-            with contextlib.suppress(Exception):
-                _regrant_fleet(_SESSION, credits, cfg_json)
+            _SESSION = _regrant_or_replace(_SESSION, workers, credits, cfg_json)
         _SESSION_LEASES += 1
         # The query lease takes its hold here, on the first acquire, rather than on entry —
         # see `session_fleet_lease` for why holding it from entry deadlocks a query whose
