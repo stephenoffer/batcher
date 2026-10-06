@@ -51,7 +51,7 @@ pub use error::InterpError;
 pub use metrics::{ExecMetrics, OpMetric, QueryMetrics, QueryStopwatch};
 pub use par::{
     auto_width, execute_parallel, execute_parallel_with, execute_parallel_with_metrics,
-    install_on_pool, ExecOptions,
+    install_on_pool, spawn_on_every_pool_thread, ExecOptions,
 };
 pub use stream::chunked::{
     chunkable, execute_chunked, execute_chunked_metered, execute_units, execute_units_metered,

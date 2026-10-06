@@ -170,6 +170,13 @@ pub(crate) fn allocator_collect(py: Python<'_>, force: bool) -> u64 {
         // point after the allocator is initialized, which it is — it served this frame.
         unsafe { libmimalloc_sys::mi_collect(force) }
     });
+    if force {
+        // `mi_collect(true)` frees what the other heaps hand back, but an idle pool thread's
+        // own freed pages stay with it until that thread collects; see
+        // `bc_interp::spawn_on_every_pool_thread`. Queued, not awaited, so the figure returned
+        // is this thread's share and the pool threads' arrive as each one runs.
+        bc_interp::spawn_on_every_pool_thread(collect_here);
+    }
     before.saturating_sub(allocator_rss())
 }
 
@@ -178,6 +185,12 @@ pub(crate) fn allocator_collect(py: Python<'_>, force: bool) -> u64 {
 /// [`allocator_collect`] with `force`, without the GIL or the measurement, for the guard's
 /// sampler thread, which runs no Python.
 pub(crate) fn collect_retained() {
+    collect_here();
+    bc_interp::spawn_on_every_pool_thread(collect_here);
+}
+
+/// A forced collect of the calling thread's heap, and of whatever other heaps have abandoned.
+fn collect_here() {
     // SAFETY: as in `allocator_collect` -- `mi_collect` takes only a bool and is safe from any
     // thread once the allocator is initialized, which it is: the engine allocated through it.
     unsafe { libmimalloc_sys::mi_collect(true) }

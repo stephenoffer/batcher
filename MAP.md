@@ -3047,7 +3047,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `chunked/mod.rs` | 653 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `hardware.rs` | 329 | What the engine's own process knows about its hardware and its allocator. |
+| `hardware.rs` | 342 | What the engine's own process knows about its hardware and its allocator. |
 | `lib.rs` | 800 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 787 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 176 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
@@ -3098,7 +3098,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 772 | Single-node parallel full sort by **sample-sort**. |
 | `ops/window_stream.rs` | 687 | Bounded-memory window execution for a partition that does not fit the envelope. |
-| `par.rs` | 3682 | The multi-core executor. |
+| `par.rs` | 3712 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 634 | The breakers: operators that must see all of their input before they can emit any output. |

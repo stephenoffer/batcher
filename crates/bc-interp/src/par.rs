@@ -638,10 +638,40 @@ pub fn install_on_pool<R: Send>(
     Ok(pool_for(width.max(1))?.install(f))
 }
 
-pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
+/// Queue `f` once on every worker thread of every cached engine pool, without waiting for it.
+///
+/// For the allocator's release valve. mimalloc keeps a heap per thread and a thread purges
+/// its own freed pages only while it is running allocator code, so a pool thread left idle
+/// after a large query holds what it freed for as long as it stays idle -- a forced collect
+/// from any *other* thread does not reach it. Measured on TPC-H q9 at SF10, run alone: ~1.5 GB
+/// of anonymous memory stayed resident after the query with nothing alive to own it, and a
+/// forced collect from the control plane's thread returned 0.04-0.25 GB of it. At SF1000 the
+/// same retention ratcheted across back-to-back runs in one process until the cgroup killed it.
+///
+/// Non-blocking (`spawn_broadcast`): a thread busy with another query runs `f` when it next
+/// comes free, so a caller on the headroom guard's sampler or at the end of a query never waits
+/// on someone else's work. Pools only: rayon's global pool is not touched, since asking it
+/// for anything would start it.
+pub fn spawn_on_every_pool_thread(f: fn()) {
+    let pools: Vec<Arc<rayon::ThreadPool>> = pool_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .pools
+        .values()
+        .map(|cached| Arc::clone(&cached.pool))
+        .collect();
+    for pool in pools {
+        pool.spawn_broadcast(move |_| f());
+    }
+}
+
+fn pool_cache() -> &'static Mutex<PoolCache> {
     static POOLS: OnceLock<Mutex<PoolCache>> = OnceLock::new();
-    let pools = POOLS.get_or_init(|| Mutex::new(PoolCache::default()));
-    pools
+    POOLS.get_or_init(|| Mutex::new(PoolCache::default()))
+}
+
+pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
+    pool_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get_or_build(width, max_cached_pool_threads())
@@ -4629,6 +4659,44 @@ mod tests {
         let c = pool_for(2).unwrap();
         assert!(!Arc::ptr_eq(&a, &c), "a different width gets its own pool");
         assert_eq!(c.current_num_threads(), 2);
+    }
+
+    /// The allocator's release valve reaches every thread of a cached pool, each one once.
+    #[test]
+    fn spawn_on_every_pool_thread_reaches_each_worker() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEEN: Mutex<Option<HashSet<std::thread::ThreadId>>> = Mutex::new(None);
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        fn note() {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            SEEN.lock()
+                .unwrap()
+                .get_or_insert_with(HashSet::new)
+                .insert(std::thread::current().id());
+        }
+        // A width no other test asks for, so this pool's threads are known and countable.
+        let pool = pool_for(7).unwrap();
+        let ids: HashSet<_> = pool
+            .broadcast(|_| std::thread::current().id())
+            .into_iter()
+            .collect();
+        spawn_on_every_pool_thread(note);
+        // Queued, not awaited: wait (bounded) until every one of the pool's threads has run it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !SEEN
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| ids.is_subset(s))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a pool thread never ran it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(RUNS.load(Ordering::SeqCst) >= ids.len());
     }
 
     /// The pool cache never grows past its thread budget, however many distinct widths a
