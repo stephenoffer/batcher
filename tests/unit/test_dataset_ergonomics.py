@@ -107,8 +107,9 @@ def test_select_dtypes_exclude_is_the_complement(ds: bt.Dataset) -> None:
     assert ds.select_dtypes(exclude="string").columns == ["x", "y"]
 
 
-def test_select_dtypes_needs_exactly_one_of_include_exclude(ds: bt.Dataset) -> None:
-    with pytest.raises(PlanError, match="exactly one"):
+def test_select_dtypes_needs_include_or_exclude(ds: bt.Dataset) -> None:
+    # Both together are allowed since AP-063 (include minus exclude); neither is refused.
+    with pytest.raises(PlanError, match="`include`, `exclude`, or both"):
         ds.select_dtypes()
 
 
