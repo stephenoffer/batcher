@@ -290,78 +290,94 @@ def gather_map_results(
                         continue
                 warn_barrier_stalled(waited, n, _stall_diagnosis(task_cpus, len(inflight)))
             continue
-        finished += 1
-        ref = done[0]
-        idx = inflight.pop(ref)
-        try:
-            value = ray.get(ref)
-            # Consumed on arrival, or retained — never both, so the driver's peak is the
-            # sink's running state rather than every partition's result at once.
-            if sink is not None:
-                sink(idx, value)
-            else:
-                results[idx] = value
-            del value
-            if on_done is not None:
-                on_done(idx)
-            completed += 1
-            # After the result is safely handled, so a partition is only ever counted when
-            # it really landed -- `finished` above counts *wakeups*, including the ones that
-            # turn out to be a transient failure and get resubmitted.
-            events.publish(
-                events.PARTITION, name=stage or "stage", total=n, slot=idx, done=completed
-            )
-        except RayTaskError as exc:
-            # A deterministic UDF error fails the same way everywhere, so resubmitting cannot
-            # help — surface it immediately. But a CUDA OOM, a throttled model endpoint, or a
-            # network timeout also arrives as a `RayTaskError`, and those DO clear on a retry.
-            # Failing the whole job on one would discard hours of completed inference.
-            #
-            # `is_recoverable_task_failure` covers worker loss that arrives as a task error: a
-            # map task can **read a Flight intermediate**, so a stage scanning what a previous
-            # stage published fetches from a peer inside the task, and a lost peer arrives here
-            # as a `RetryableShuffleError` wrapped in a `RayTaskError` — the transport's own
-            # word for "retry me". Re-raising it was observed as a windowed rank over a hot
-            # key dying with `transport error` while the identical query on a uniform key
-            # passed, because only the skewed one moved a bucket big enough for the fetch to
-            # break.
-            if not (_is_transient_udf_error(exc) or is_recoverable_task_failure(exc)):
-                raise
-            # Almost every failure loses work, which is what a retry is for. A device that
-            # took an uncontained ECC fault did something else: it kept running and returned
-            # a wrong number, so the partitions that already *succeeded* on it are suspect
-            # too. Retrying past that produces a job that completes and writes out
-            # corruption, which is worse than the crash it avoided.
-            check_results_trusted(exc)
-            attempts[idx] += 1
-            if attempts[idx] > policy.max_attempts or not budget.try_consume():
-                raise
-            pending.appendleft(idx)
-        except RayError as exc:
-            # Worker / actor / node loss (preemption). Requeue at the front so the
-            # survivor-resubmit keeps priority for the next free slot. A `RayError` that
-            # is *not* a death (broken runtime_env, OOM, cancellation) is re-raised: it
-            # would otherwise be retried onto healthy workers and, via `on_lost`, blame
-            # each of them in turn until the fleet looked entirely dead.
-            if _is_fatal_ray_error(exc):
-                raise
-            # A failure that taught us a worker is dead is *progress*, not a wasted try:
-            # in a correlated preemption wave a retry can land on a host that is already
-            # gone but not yet observed, and charging that to the partition's budget can
-            # exhaust it while survivors still exist. Progress is bounded (each worker is
-            # discovered dead at most once), and `submit` raises once none are left.
-            progressed = bool(on_lost(idx, exc)) if on_lost is not None else False
-            if not progressed:
+        for ref in _ready_batch(ray, done[0], inflight):
+            finished += 1
+            idx = inflight.pop(ref)
+            try:
+                value = ray.get(ref)
+                # Consumed on arrival, or retained — never both, so the driver's peak is the
+                # sink's running state rather than every partition's result at once.
+                if sink is not None:
+                    sink(idx, value)
+                else:
+                    results[idx] = value
+                del value
+                if on_done is not None:
+                    on_done(idx)
+                completed += 1
+                # After the result is safely handled, so a partition is only ever counted when
+                # it really landed -- `finished` above counts *wakeups*, including the ones that
+                # turn out to be a transient failure and get resubmitted.
+                events.publish(
+                    events.PARTITION, name=stage or "stage", total=n, slot=idx, done=completed
+                )
+            except RayTaskError as exc:
+                # A deterministic UDF error fails the same way everywhere, so resubmitting cannot
+                # help — surface it immediately. But a CUDA OOM, a throttled model endpoint, or a
+                # network timeout also arrives as a `RayTaskError`, and those DO clear on a retry.
+                # Failing the whole job on one would discard hours of completed inference.
+                #
+                # `is_recoverable_task_failure` covers worker loss that arrives as a task error: a
+                # map task can **read a Flight intermediate**, so a stage scanning what a previous
+                # stage published fetches from a peer inside the task, and a lost peer arrives here
+                # as a `RetryableShuffleError` wrapped in a `RayTaskError` — the transport's own
+                # word for "retry me". Re-raising it was observed as a windowed rank over a hot
+                # key dying with `transport error` while the identical query on a uniform key
+                # passed, because only the skewed one moved a bucket big enough for the fetch to
+                # break.
+                if not (_is_transient_udf_error(exc) or is_recoverable_task_failure(exc)):
+                    raise
+                # Almost every failure loses work, which is what a retry is for. A device that
+                # took an uncontained ECC fault did something else: it kept running and returned
+                # a wrong number, so the partitions that already *succeeded* on it are suspect
+                # too. Retrying past that produces a job that completes and writes out
+                # corruption, which is worse than the crash it avoided.
+                check_results_trusted(exc)
                 attempts[idx] += 1
-                # Charged to the job-wide budget for the same reason it is charged to the
-                # partition's: a retry that taught us nothing is a retry, and a cluster
-                # losing workers faster than the stage can finish must fail on the loss
-                # rather than resubmit into it indefinitely.
                 if attempts[idx] > policy.max_attempts or not budget.try_consume():
                     raise
-            pending.appendleft(idx)
+                pending.appendleft(idx)
+            except RayError as exc:
+                # Worker / actor / node loss (preemption). Requeue at the front so the
+                # survivor-resubmit keeps priority for the next free slot. A `RayError` that
+                # is *not* a death (broken runtime_env, OOM, cancellation) is re-raised: it
+                # would otherwise be retried onto healthy workers and, via `on_lost`, blame
+                # each of them in turn until the fleet looked entirely dead.
+                if _is_fatal_ray_error(exc):
+                    raise
+                # A failure that taught us a worker is dead is *progress*, not a wasted try:
+                # in a correlated preemption wave a retry can land on a host that is already
+                # gone but not yet observed, and charging that to the partition's budget can
+                # exhaust it while survivors still exist. Progress is bounded (each worker is
+                # discovered dead at most once), and `submit` raises once none are left.
+                progressed = bool(on_lost(idx, exc)) if on_lost is not None else False
+                if not progressed:
+                    attempts[idx] += 1
+                    # Charged to the job-wide budget for the same reason it is charged to the
+                    # partition's: a retry that taught us nothing is a retry, and a cluster
+                    # losing workers faster than the stage can finish must fail on the loss
+                    # rather than resubmit into it indefinitely.
+                    if attempts[idx] > policy.max_attempts or not budget.try_consume():
+                        raise
+                pending.appendleft(idx)
         _fill()
     return results
+
+
+def _ready_batch(ray, first, inflight: dict) -> list:
+    """`first` plus every other in-flight ref that is already done, without blocking.
+
+    The blocking wait returns one ref, and handing back one per wakeup made the barrier pass
+    the whole in-flight list to `ray.wait` once per *completion*: O(n x window) driver work,
+    which is O(n^2) on the fast path where the window is all `n` partitions — a 20k-partition
+    stage marshalled ~2e8 refs, serialized on the driver. Draining what is ready with a
+    zero-timeout wait makes it one list pass per *wakeup*, and a wakeup usually finds many.
+    """
+    rest = [r for r in inflight if r != first]
+    if not rest:
+        return [first]
+    more, _ = ray.wait(rest, num_returns=len(rest), timeout=0)
+    return [first, *more]
 
 
 def _idle_pool(workers: int, slots: int) -> deque[int]:
