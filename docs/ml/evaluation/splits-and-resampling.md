@@ -115,6 +115,17 @@ print([(train.count(), validate.count()) for train, validate in ds.ml.time_serie
 
 `expanding=True`, the default, grows the training window with each split, matching a model retrained on all history. `expanding=False` slides a fixed-width window, matching one that deliberately forgets.
 
+Adjacent windows still leak when a feature looks back or a label looks forward. A 7-day rolling mean computed on the first validation day reads six days of training rows, and a 30-day churn label on the last training day is decided inside the validation window. `gap=` leaves a buffer between the two: training stops at `cut - gap` while validation still starts at the cut, and a rolling window keeps its width as it moves back. The gap is in the time column's own units for a numeric column and a `datetime.timedelta` for a timestamp or date column:
+
+```python
+import datetime as dt
+
+daily = bt.from_pydict({"day": [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(100)]})
+gapped = daily.ml.time_series_split("day", 4, gap=dt.timedelta(days=7))
+print([(train.count(), validate.count()) for train, validate in gapped])
+# [(13, 20), (33, 20), (53, 20), (73, 19)]
+```
+
 `batcher.ml.model_selection` runs the fit-and-score loop over these folds. `cross_val_predict` gives every row its out-of-fold prediction, which is the unbiased input a stacking ensemble needs. {doc}`model-selection` covers `cross_val_score`, the searches, and `learning_curve`.
 
 {py:func}`batcher.ml.splitting.fold_column <batcher.ml.splitting.fold_column>` is the primitive underneath. Reach for it when the split should outlive the pipeline that created it: it writes one column that every downstream job can filter on without re-deriving the assignment.

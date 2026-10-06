@@ -406,6 +406,36 @@ doesn't duplicate it.
 you narrow a float64 column. It accepts only dtypes NumPy represents numerically, so `bfloat16`
 raises `PlanError` rather than producing an opaque column. Cast to bf16 inside the model.
 
+### What a column becomes
+
+Every loader turns Arrow columns into framework arrays, and a few column shapes change on the way. The following table lists each loader against the column shapes that change, as measured on an `int64` column with and without a null, a `string` column, a ragged list column, and a list column whose rows all have the same width. A `float64` null becomes NaN in every loader except the Arrow format, and a `bool` column follows the `int64` row:
+
+| Loader | `int64`, no null | `int64` with a null | `string` | Ragged list | Fixed-width list |
+|---|---|---|---|---|---|
+| `iter_batches(batch_format="pyarrow")` | `int64` | `int64`, null kept | `string` | `list` | `list` |
+| `iter_batches(batch_format="numpy")`, `to_numpy_batches` | `int64` | `float64`, null as NaN | `object` array, `None` kept | `object` array of arrays | 2-D `float64` |
+| `iter_batches(batch_format="pandas")` | `int64` | `float64`, null as NaN; a `bool` goes to `object` | `object` | `object` | `object` |
+| `iter_torch_batches` | `torch.int64` | `torch.float64`, null as NaN | dropped | dropped | 2-D tensor |
+| `to_tf` | `int64` | `float64`, null as NaN | dropped | dropped | 2-D tensor |
+| `stream_loader` | `torch.int64` | `torch.float64`, null as NaN | dropped | dropped | 2-D tensor |
+
+The NaN promotion and every drop raise a `UserWarning` naming the column, with one exception: `stream_loader`'s warning names a dropped string column but not a dropped ragged list. The integer promotion is the one to watch, because a label column with one null turns into floats and a loss that wants integer class ids fails far from the cause:
+
+```python
+import warnings
+
+from batcher.ml import to_numpy_batches
+
+labels = bt.from_pydict({"label": [1, 0, None]})
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    arrays = next(iter(to_numpy_batches(labels.iter_batches())))
+print(arrays["label"].dtype, arrays["label"].tolist())
+# float64 [1.0, 0.0, nan]
+```
+
+Fill or drop the nulls first, with `fill_null` or a `filter`, to keep the integer type. Pad a ragged list to a fixed width, or pass it through `iter_batches` in the Arrow format, when the tensor loaders would drop it.
+
 ## Do the work upstream
 
 Anything you can express as an operator should be one. Filters, projections, feature arithmetic,

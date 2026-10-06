@@ -91,10 +91,36 @@ print(enc.transform(ds).collect().column("city").to_pylist())
 # [1.0, 1.0, 0.0, 0.0]  (paris churns, rome does not)
 ```
 
-`OrdinalEncoder` and `LabelEncoder` map values unseen at fit, and nulls, to
-`unknown_value`, which defaults to `-1`. `OneHotEncoder` produces all-zero indicators for
-them. A category present only in validation therefore encodes deterministically instead of
-shifting every code, which is why you fit once, on train.
+Every encoder maps a category it never saw at fit, and a null, to a fixed output, so a category present only in validation encodes deterministically instead of shifting every code. That is why you fit once, on train. No encoder raises on an unseen value, and most can't tell an unseen value from a null. The following table lists, alphabetically, what each one produces, as measured after fitting on `["a", "b", "a", "a"]` and transforming `["z", None]`:
+
+| Encoder | Unseen category | Null | Knob |
+|---|---|---|---|
+| `BinaryEncoder` | all-zero bit columns | all-zero bit columns | none |
+| `FrequencyEncoder` | `0.0` | `0.0` | `unknown_value` |
+| `HashingEncoder` | its hash bucket, like any value | null | `n_buckets` |
+| `JamesSteinEncoder` | the training target mean | the training target mean | none |
+| `LabelEncoder` | `-1` | `-1` | `unknown_value` |
+| `LeaveOneOutEncoder` | the training target mean | the training target mean | none |
+| `MultiHotEncoder` | the element is ignored | a null list gives null indicators | `categories` |
+| `OneHotEncoder` | all-zero indicators | all-zero indicators | `drop_first` folds the first category into the same all-zero row |
+| `OrdinalEncoder` | `-1` | `-1` | `unknown_value` |
+| `RareCategoryEncoder` | `"__rare__"` | `"__rare__"` | `other_value` |
+| `TargetEncoder` | the prior, the training target mean | the prior | `smoothing` sets how far seen categories shrink toward it |
+| `WOEEncoder` | `0.0`, no evidence either way | `0.0` | none |
+
+To refuse unseen labels at inference instead of encoding them, check the column against the fitted categories before transforming. `accepted_values` doesn't count a null as a violation, so pair it with `not_null` when a null should fail too:
+
+```python
+from batcher.ml.preprocessors import OrdinalEncoder
+
+enc = OrdinalEncoder("c").fit(bt.from_pydict({"c": ["a", "b"]}))
+serving = bt.from_pydict({"c": ["a", "z"]})
+report = serving.dq.accepted_values("c", enc.categories_["c"]).validate()
+print(report.ok)
+# False
+```
+
+`.fail()` in place of `.validate()` raises `DataQualityError` instead, and `.quarantine()` routes the unseen rows aside.
 
 ## Encoding a high-cardinality category
 
