@@ -64,6 +64,32 @@ def _engine_profile() -> str:
     return str(getattr(engine(), "__engine_profile__", "unknown"))
 
 
+# The I/O backends a remote path or a database URI routes through. Kept apart from
+# `_OPTIONAL` because a missing one fails only when a path is opened, which is too late to
+# learn the `[cloud]` or `[sql]` extra was never installed.
+_IO_OPTIONAL = ("fsspec", "s3fs", "gcsfs", "adlfs", "adbc_driver_manager", "connectorx")
+
+# pyarrow's native object-store filesystems, which exist only when pyarrow was built with
+# them. Reported per store, since a build with S3 and no Azure is common.
+_PYARROW_FILESYSTEMS = {
+    "pyarrow_s3": "S3FileSystem",
+    "pyarrow_gcs": "GcsFileSystem",
+    "pyarrow_azure": "AzureFileSystem",
+}
+
+
+def _pyarrow_filesystems() -> dict[str, str]:
+    """Whether this pyarrow build carries each native object-store filesystem."""
+    try:
+        import pyarrow.fs as pafs
+    except ImportError:
+        return dict.fromkeys(_PYARROW_FILESYSTEMS, "not installed")
+    return {
+        key: "available" if hasattr(pafs, cls) else "not built"
+        for key, cls in _PYARROW_FILESYSTEMS.items()
+    }
+
+
 def versions() -> dict[str, str]:
     """Return the Batcher, engine, Python, platform, and optional-backend versions.
 
@@ -75,6 +101,12 @@ def versions() -> dict[str, str]:
     ``engine_profile`` is ``release`` or ``debug``. A ``debug`` engine — what ``just
     build`` installs — is unoptimized, and nothing else about a running query says so, so
     it is the first thing to check when a pipeline is unexpectedly slow.
+
+    The I/O rows answer "will this remote path open" before a transfer starts: the
+    fsspec drivers (``fsspec``, ``s3fs``, ``gcsfs``, ``adlfs``), the database routing
+    drivers (``adbc_driver_manager``, ``connectorx``), and whether pyarrow was built with
+    its native S3, GCS and Azure filesystems (``pyarrow_s3``/``pyarrow_gcs``/
+    ``pyarrow_azure``: ``"available"`` or ``"not built"``).
 
     Returns:
         A mapping of component name to version string.
@@ -96,11 +128,12 @@ def versions() -> dict[str, str]:
         "python": sys.version.split()[0],
         "platform": platform.platform(),
     }
-    for name in _OPTIONAL:
+    for name in (*_OPTIONAL, *_IO_OPTIONAL):
         try:
             out[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             out[name] = "not installed"
+    out.update(_pyarrow_filesystems())
     return out
 
 

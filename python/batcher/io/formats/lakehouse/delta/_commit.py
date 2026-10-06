@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from typing import Any
 
 import pyarrow as pa
@@ -51,6 +52,10 @@ __all__ = [
 # Arrow types whose min/max are meaningful and JSON-encodable for a Delta stat. Nested,
 # binary, and extension columns are skipped: an absent stat is always sound (the reader
 # keeps a file it cannot decide on), a *wrong* one silently loses rows.
+#: The commitInfo key a write tags its commit with, so `_version_tagged` can find the
+#: version that commit landed at.
+_WRITE_ID = "batcher.writeId"
+
 _STATTABLE = (
     pa.types.is_integer,
     pa.types.is_floating,
@@ -328,7 +333,7 @@ def commit_add_actions(
     app_txn: tuple[str, int] | None = None,
     table_properties: dict[str, str] | None = None,
     replace_partitions: list[list[tuple[str, str, str]]] | None = None,
-) -> None:
+) -> int | None:
     """Commit the manifest's already-written data files as one Delta transaction.
 
     Registers the files; moves none of them. The driver's cost is one log write,
@@ -355,6 +360,9 @@ def commit_add_actions(
             the ``metaData`` action when this commit creates the table, or as an
             ``ALTER TABLE SET TBLPROPERTIES`` when it already exists.
 
+    Returns:
+        The table version this commit created, or None when there was nothing to commit.
+
     Raises:
         CommitError: If the commit conflicts with a concurrent writer, or fails.
     """
@@ -366,7 +374,7 @@ def commit_add_actions(
     actions = [_add_action(f, path) for f in files]
     exists = deltalake.DeltaTable.is_deltatable(path, storage_options=storage_options)
     if not actions and mode == "append" and exists:
-        return  # nothing written, and the table already says what it is
+        return None  # nothing written, and the table already says what it is
     # An append of no rows to a table that does not exist yet is NOT nothing to say: what
     # it has to say is the schema. Returning here left a directory holding the writer's
     # own zero-row part file and no `_delta_log` at all -- not a Delta table, and one
@@ -383,11 +391,17 @@ def commit_add_actions(
         # laid down anyway: its footer carries the schema the empty table needs.
         schema = _schema_from_written(files) or _schema_from_written(list(manifest.files))
 
-    properties = None
-    if app_txn is not None:
-        properties = CommitProperties(
-            app_transactions=[Transaction(app_id=app_txn[0], version=app_txn[1])]
-        )
+    # Tagging the commit is what lets the version it created be found afterwards: the
+    # handle does not advance on `create_write_transaction`, and a commit that lost a race
+    # is retried at a later version, so "the version before, plus one" can name another
+    # writer's commit.
+    write_id = uuid.uuid4().hex
+    properties = CommitProperties(
+        custom_metadata={_WRITE_ID: write_id},
+        app_transactions=(
+            None if app_txn is None else [Transaction(app_id=app_txn[0], version=app_txn[1])]
+        ),
+    )
 
     try:
         if not exists:
@@ -405,7 +419,7 @@ def commit_add_actions(
                 storage_options=storage_options,
                 commit_properties=properties,
             )
-            return
+            return 0  # creating the table is its first version
         table = deltalake.DeltaTable(path, storage_options=storage_options)
         # On an existing table the properties are a separate commit, exactly as
         # `ALTER TABLE ... SET TBLPROPERTIES` is. Applied before the data commit so a
@@ -427,6 +441,7 @@ def commit_add_actions(
             partition_filters=partition_filters,
             commit_properties=properties,
         )
+        return _version_tagged(table, write_id)
     except CommitError:
         raise
     except Exception as exc:
@@ -435,6 +450,30 @@ def commit_add_actions(
                 f"Delta commit to {path!r} conflicted with a concurrent writer: {exc}"
             ) from exc
         raise CommitError(f"Delta commit to {path!r} failed: {exc}") from exc
+
+
+def _version_tagged(table: Any, write_id: str) -> int | None:
+    """The version whose commit carries `write_id`, read from the log's own history.
+
+    Matched by the tag rather than by position, so a concurrent writer committing just
+    before or after this write is never reported as this write's version.
+
+    Args:
+        table: The handle the commit was made through, at its pre-commit version.
+        write_id: The tag the commit was written with.
+
+    Returns:
+        The tagged commit's version, or None if the history no longer shows it.
+    """
+    before = table.version()
+    try:
+        table.update_incremental()
+        for entry in table.history(limit=max(1, table.version() - before + 1)):
+            if entry.get(_WRITE_ID) == write_id:
+                return int(entry["version"])
+    except Exception as exc:  # the commit is durable; a missing version must not fail it
+        note_suppressed("io", "read back the Delta version a write committed", exc)
+    return None
 
 
 def _is_conflict(exc: Exception) -> bool:

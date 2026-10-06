@@ -189,7 +189,7 @@ class IcebergSink:
             for f in files
         ]
 
-    def commit(self, manifest: WriteManifest, path: str) -> None:  # noqa: ARG002
+    def commit(self, manifest: WriteManifest, path: str) -> int | None:  # noqa: ARG002
         """Register all staged files with the table in ONE snapshot.
 
         Two properties, both of which were missing.
@@ -208,11 +208,14 @@ class IcebergSink:
 
         `add_files` references the staged Parquet directly — the driver never re-reads or
         re-writes the data.
+
+        Returns the snapshot id the commit created, which the writer reports as
+        `WriteManifest.version`, or None when there was nothing to commit.
         """
         _require_pyiceberg()
         files = [f for f in manifest.files if f.rows]
         if not files:
-            return
+            return None
         cat = resolve_catalog(self._catalog if self._catalog is not None else "default")
         try:
             schema = _staged_schema(files[0].path)
@@ -229,6 +232,10 @@ class IcebergSink:
             raise
         except Exception as exc:
             raise BackendError(f"Iceberg commit to {self._identifier!r} failed: {exc}") from exc
+        # The committing handle's metadata, refreshed by its own transaction -- not a
+        # catalog re-read, which could return a concurrent writer's later snapshot.
+        snapshot = table.current_snapshot()
+        return None if snapshot is None else snapshot.snapshot_id
 
     def is_committed(self, path: str) -> bool:  # noqa: ARG002 - the identifier is the path
         """Whether this write's ``(app_id, batch_id)`` is already recorded in the table.
