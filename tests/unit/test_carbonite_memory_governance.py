@@ -225,6 +225,28 @@ def test_reset_memory_sampling_clears_the_cgroup_cap(monkeypatch) -> None:
     probe.reset_memory_sampling()
 
 
+def test_cgroup_cap_follows_an_in_place_resize(monkeypatch) -> None:
+    """A pod resized in place lowers `memory.max` under a running process (BT-037).
+
+    The cap was memoized for the process, so admission kept granting against the old,
+    larger limit until the kernel OOM-killed the worker. With no reset in between, the
+    new limit must be seen once the cache window has passed.
+    """
+    probe.reset_memory_sampling()
+    clock = [1_000.0]
+    monkeypatch.setattr(probe.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(probe, "cgroup_v2_dirs", lambda: ["/sys/fs/cgroup"])
+    monkeypatch.setattr(probe, "read_cgroup_bytes", lambda _p: 32 * 1024**3)
+    assert probe.cgroup_limit_bytes() == 32 * 1024**3
+
+    monkeypatch.setattr(probe, "read_cgroup_bytes", lambda _p: 16 * 1024**3)
+    clock[0] += 0.01  # within one admission round the read is shared
+    assert probe.cgroup_limit_bytes() == 32 * 1024**3
+    clock[0] += 5.0
+    assert probe.cgroup_limit_bytes() == 16 * 1024**3
+    probe.reset_memory_sampling()
+
+
 # --- the learned fit ---------------------------------------------------------
 
 
