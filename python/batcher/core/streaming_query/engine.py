@@ -137,6 +137,7 @@ class StreamingQueryEngine:
         # Changelog deltas written since the last whole snapshot. Bounds how long a chain
         # recovery has to replay — see `_write_state`.
         self._deltas_written = 0
+        self._pending_finalize = False  # a logged, uncommitted final flush (see `_recover`)
         self._error: BaseException | None = None
         self._active = False
         # Lifetime totals for this run. `_progress` is a bounded window, so a sum over it
@@ -185,6 +186,7 @@ class StreamingQueryEngine:
 
         plan = recover(self._checkpoint)
         self._batches = plan.start_batch
+        self._pending_finalize = plan.pending_finalize
         if plan.seek and 0 in plan.seek:
             self._runner.seek(plan.seek[0])
         if plan.state is None:
@@ -306,6 +308,10 @@ class StreamingQueryEngine:
     # --- the loop ---------------------------------------------------------
     def _run(self) -> None:
         try:
+            if self._pending_finalize:
+                # The previous run died inside its flush: finish it before its id is reused.
+                self._pending_finalize = False
+                self._emit_finalize(replay=True)
             self._run_resilient()
             self._emit_finalize()
         except BaseException as exc:
@@ -391,7 +397,7 @@ class StreamingQueryEngine:
             errs = (*errs, ray.exceptions.RayActorError, ray.exceptions.RayTaskError)
         return errs
 
-    def _emit_finalize(self) -> None:
+    def _emit_finalize(self, *, replay: bool = False) -> None:
         """Flush any windows still open when the loop ends, and *claim* the batch id it used.
 
         The flush writes to the sink under `self._batches`, the id the next micro-batch would
@@ -404,17 +410,28 @@ class StreamingQueryEngine:
 
         Recording and committing the flushed batch closes it: recovery resumes *after* it,
         and the positions written are the ones the loop had already consumed.
+
+        The record is a **write-ahead**, made before the sink sees a row, and it carries a
+        finalize marker. Recorded after the emit, a crash between the two left the flush in
+        the sink with nothing in the log to say so — the same collision as above, through a
+        narrower window. With the marker, recovery knows the uncommitted id was a flush and
+        re-runs it from the restored state under that id (`replay`), where the sink absorbs a
+        repeat of rows it already holds, then commits and moves on.
+
+        Args:
+            replay: Re-run a flush recovery found logged and uncommitted. Its marker is
+                already durable, and the id is committed even when nothing is left to flush,
+                so the marker can never be inherited by the next micro-batch's data.
         """
         finalize = getattr(self._runner, "finalize", None)
-        if finalize is None:
+        flushed = [] if finalize is None else [rows for rows in finalize() if rows.num_rows]
+        if not flushed and not replay:
             return
-        flushed = [rows for rows in finalize() if rows.num_rows]
-        if not flushed:
-            return
+        if self._checkpoint is not None and not replay:
+            self._checkpoint.record_offsets(self._batches, self._runner.positions(), finalize=True)
         for rows in flushed:
             self._runner.emit_final(self._batches, rows)
         if self._checkpoint is not None:
-            self._checkpoint.record_offsets(self._batches, self._runner.positions())
             # Same reason as the drain marker: the snapshot must accompany the commit, or
             # recovery restores nothing for the batch it resumes after.
             self._commit_microbatch()

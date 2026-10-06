@@ -1807,7 +1807,7 @@ The streaming-query engine — the micro-batch loop behind a unified `ds.write`.
 
 | module | lines | what it is |
 |---|---|---|
-| `engine.py` | 659 | The micro-batch loop — trigger cadence, checkpointing, recovery, and progress. |
+| `engine.py` | 676 | The micro-batch loop — trigger cadence, checkpointing, recovery, and progress. |
 | `processors.py` | 577 | What a micro-batch *becomes* — the per-batch processors and the routing that picks one. |
 | `state_policy.py` | 99 | How much of a streaming query's state to persist on any one micro-batch. |
 
@@ -2119,9 +2119,9 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `identity.py` | 221 | Who a checkpoint belongs to: its stream id, the plan that wrote it, and its one owner. |
 | `location.py` | 113 | Where a checkpoint lives — local disk, or the object store the durability advice names. |
 | `logs.py` | 202 | Durable offset + commit logs for streaming-query checkpointing. |
-| `recovery.py` | 60 | The recovery decision at streaming-query start. |
+| `recovery.py` | 82 | The recovery decision at streaming-query start. |
 | `state_store.py` | 364 | Durable snapshots of a streaming query's running aggregation state. |
-| `store.py` | 149 | `CheckpointStore` — the offset log, commit log, and state store under one dir. |
+| `store.py` | 163 | `CheckpointStore` — the offset log, commit log, and state store under one dir. |
 
 ### `batcher/io/formats/streaming/codecs/` — 2 · neutral IO
 

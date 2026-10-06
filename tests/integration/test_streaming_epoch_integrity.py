@@ -246,3 +246,82 @@ def test_the_checkpoint_logs_run_in_write_ahead_mode(tmp_path, log):
     store = CheckpointStore(str(tmp_path / "ckpt"))
     conn = getattr(store, log)._conn
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+
+# --------------------------------------------------------------------------
+# A crash inside the final flush must not hand its batch id to new data.
+# --------------------------------------------------------------------------
+class _EchoAndFlush:
+    """Emits each epoch's rows and, at end of stream, one summary row of what it holds —
+    the shape of a windowed aggregate that publishes closed windows as it goes and flushes
+    the still-open ones when the query stops. The flush empties the state, as it does there."""
+
+    def __init__(self) -> None:
+        self.seen: list[int] = []
+
+    def process(self, batch: pa.RecordBatch) -> list[pa.RecordBatch]:
+        self.seen.extend(batch.column("a").to_pylist())
+        return [batch]
+
+    def finalize(self) -> list[pa.RecordBatch]:
+        if not self.seen:
+            return []
+        out, self.seen = [pa.record_batch({"a": [100 + sum(self.seen)]})], []
+        return out
+
+    def snapshot_state(self) -> pa.RecordBatch | None:
+        return pa.record_batch({"a": pa.array(self.seen, type=pa.int64())})
+
+    def restore_state(self, state: pa.RecordBatch) -> None:
+        self.seen = list(state.column("a").to_pylist())
+
+
+class _Crash(Exception):
+    pass
+
+
+class _CrashOnCommit(CheckpointStore):
+    """A store whose commit of one batch id never happens — the process died first."""
+
+    __slots__ = ("_crash_at",)
+
+    def __init__(self, location: str, crash_at: int) -> None:
+        super().__init__(location)
+        self._crash_at = crash_at
+
+    def commit(self, batch_id: int, sink_token: str | None = None) -> None:
+        if batch_id == self._crash_at:
+            raise _Crash(batch_id)
+        super().commit(batch_id, sink_token)
+
+
+def test_a_crash_between_the_final_flush_and_its_commit_loses_nothing(tmp_path):
+    """The flush reached the sink before anything was logged for its id, so a crash before
+    the commit left recovery resuming *at* that id with no idea it was taken. The restarted
+    query's first epoch of new data was staged under it and the idempotent sink skipped it
+    as a duplicate — those rows were never written. The flush is now write-ahead logged as
+    one, and recovery finishes it under its own id before staging anything new."""
+    sink = _IdempotentSink()
+    location = str(tmp_path / "ckpt")
+    # Batch 0 carries the rows, batch 1 is the drain marker, batch 2 is the flush.
+    engine = StreamingQueryEngine(
+        name="flush-crash",
+        source=_Checkpointable([pa.record_batch({"a": [1, 2]})]),
+        sink=sink,
+        processor=_EchoAndFlush(),
+        trigger=Trigger.available_now(),
+        output_mode="append",
+        checkpoint=_CrashOnCommit(location, crash_at=2),
+    )
+    engine.start()
+    with pytest.raises(_Crash):
+        engine.await_termination(30)
+    assert sink.rows() == [1, 2, 103]  # the flush reached the sink; its commit did not
+
+    replayed = _Checkpointable([pa.record_batch({"a": [1, 2]}), pa.record_batch({"a": [3, 4]})])
+    _run(sink, replayed, _EchoAndFlush(), CheckpointStore(location))
+
+    # The epoch after the restart landed, the replayed flush was the only repeat the sink
+    # absorbed, and the open windows were flushed once — not again inside a later flush.
+    assert sink.rows() == [1, 2, 3, 4, 103, 107]
+    assert sink.dropped == [2]

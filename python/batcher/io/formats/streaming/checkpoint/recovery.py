@@ -17,7 +17,12 @@ if TYPE_CHECKING:
 
     from batcher.io.formats.streaming.checkpoint.store import CheckpointStore
 
-__all__ = ["ResumePlan", "recover"]
+__all__ = ["FINALIZE_SOURCE_ID", "ResumePlan", "recover"]
+
+#: The offset-log source id a *finalize* batch records alongside the real positions. A real
+#: source id is a plan input's index, so it is never negative; the marker therefore cannot be
+#: mistaken for one, and a reader that seeks only the sources it knows simply ignores it.
+FINALIZE_SOURCE_ID = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +40,11 @@ class ResumePlan:
     seek: dict[int, dict] = field(default_factory=dict)
     state: pa.RecordBatch | None = None
     state_deltas: tuple[pa.RecordBatch, ...] = ()
+    #: Whether `start_batch` is an end-of-stream flush that was write-ahead logged and never
+    #: committed. Its output may or may not have reached the sink, so the driver re-runs the
+    #: flush from the restored state under the same id (the sink absorbs a repeat) and
+    #: commits it, rather than handing the id to fresh data the sink would then skip.
+    pending_finalize: bool = False
 
 
 def recover(store: CheckpointStore) -> ResumePlan:
@@ -49,12 +59,24 @@ def recover(store: CheckpointStore) -> ResumePlan:
         return ResumePlan()  # fresh query
     last_commit = store.commits.last_committed()
     if last_commit is None:
-        return ResumePlan()  # nothing committed yet → reprocess from the start
+        # Nothing committed yet → reprocess from the start, finishing a flush first if that
+        # is what the first run died inside.
+        return ResumePlan(pending_finalize=_is_finalize(store, 0))
     resume_batch = last_commit + 1
     seek = store.offsets.position_at(last_commit)
+    pending = _is_finalize(store, resume_batch)
     chain = store.state.restore_chain(last_commit)
     if not chain:
-        return ResumePlan(start_batch=resume_batch, seek=seek)
+        return ResumePlan(start_batch=resume_batch, seek=seek, pending_finalize=pending)
     return ResumePlan(
-        start_batch=resume_batch, seek=seek, state=chain[0], state_deltas=tuple(chain[1:])
+        start_batch=resume_batch,
+        seek=seek,
+        state=chain[0],
+        state_deltas=tuple(chain[1:]),
+        pending_finalize=pending,
     )
+
+
+def _is_finalize(store: CheckpointStore, batch_id: int) -> bool:
+    """Whether `batch_id` was write-ahead logged as an end-of-stream flush."""
+    return FINALIZE_SOURCE_ID in store.offsets.position_at(batch_id)
