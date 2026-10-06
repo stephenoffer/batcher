@@ -239,6 +239,32 @@ def test_oversized_build_side_refuses_rather_than_replicating(split_source, band
         ds.collect(distributed=True, num_workers=WORKERS)
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("above", [False, True], ids=["bare", "aggregate_above"])
+def test_an_empty_build_side_is_an_answer_not_a_refusal(split_source, cluster_scratch, above):
+    """BT-161: a range join whose right side filters to nothing has a defined answer.
+
+    The broadcast helper declined an empty build side, a decline the equi-join turns into a
+    shuffle; the range join has no shuffle, so it raised "empty or over the broadcast budget"
+    under `distributed=True` (and `distributed="auto"` hid it by re-running single-node).
+    """
+    left = bt.read.parquet(split_source)
+    d = cluster_scratch("no_bands")
+    pq.write_table(
+        pa.table({"lo": pa.array([], pa.int64()), "tier": pa.array([], pa.string())}),
+        d / "empty.parquet",
+    )
+    right = bt.read.parquet(str(d))
+    ds = left.join(right, how="cross").filter(bt.col("x") < bt.col("lo"))
+    if above:
+        ds = ds.group_by("tier").agg(n=bt.count())
+    single = ds.collect(distributed=False)
+    dist = ds.collect(distributed=True, num_workers=WORKERS)
+    assert single.num_rows == 0
+    assert dist.num_rows == 0
+    assert dist.schema.names == single.schema.names
+
+
 # --- distributed UNION streams branch by branch --------------------------------
 
 
