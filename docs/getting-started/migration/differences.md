@@ -61,6 +61,38 @@ print(big.select(y=bt.col("x") + 1).to_pydict())
 
 An integer `sum` that overflows raises an `ExecutionError` asking you to cast to a wider type first. Unsigned 64-bit integers are stored as signed 64-bit, so a `UInt64` above `2**63 - 1` overflows on the way in.
 
+## Nulls, NaN, and row order
+
+Batcher follows SQL semantics for missing values, so a pandas port changes answers without raising. The following table compares the cases a port most often gets wrong, row by row against pandas, Polars, and SQL as DuckDB implements it. `tests/differential/test_diff_semantic_compat.py` runs every cell against the installed libraries. Spark isn't a column because that suite has no JVM to run it on. Its name-level differences, such as ascending sorts putting nulls first, are in {doc}`spark/dataframe`.
+
+| Question | Batcher | pandas | Polars | SQL (DuckDB) |
+|---|---|---|---|---|
+| Is NaN null? | No: `is_null` is false for NaN | Yes: `isna` is true for NaN | No | No |
+| Does `fill_null` replace NaN? | No | Yes, `fillna` does | No | n/a |
+| What does `count(col)` skip? | Nulls only, NaN is counted | Nulls and NaN | Nulls only | Nulls only |
+| `mean` or `sum` over a NaN | NaN | NaN skipped | NaN | NaN |
+| `sum` of an all-null or empty column | null | 0 | 0 | null |
+| Integer column holding a null | stays `int64` | becomes `float64` | stays `Int64` | stays integer |
+| `1 / 0` and `0 / 0` | `inf` and NaN | `inf` and NaN | `inf` and NaN | `inf` and NaN |
+| Integer `//` by zero | null | `inf` or NaN | null | null |
+| Where nulls sort, both directions | last | last | first | last |
+| A null group key | one group | dropped | one group | one group |
+| Does a distinct count include null? | No: `count_distinct` skips it | No: `nunique` skips it | Yes: `n_unique` counts it | No |
+
+Use `is_nan` and `fill_nan` for NaN, and `is_null` and `fill_null` for null. Batcher keeps the two apart:
+
+```python
+vals = bt.from_pydict({"x": [1.0, None, float("nan")]})
+print(vals.select(null=bt.col("x").is_null(), nan=bt.col("x").is_nan()).to_pydict())
+# {'null': [False, True, False], 'nan': [False, None, True]}
+print(vals.agg(n=bt.col("x").count(), rows=bt.count()).to_pydict())
+# {'n': [2], 'rows': [3]}
+```
+
+`is_nan` of a null is itself null, as in SQL, so filter on `is_nan` or `is_null` and not on its negation alone.
+
+Only `sort` promises an order. The rows of a `group_by`, a join, or a `distinct` come back in whatever order execution produces, unlike pandas, whose `groupby` sorts its keys by default. Sort before reading results positionally, and compare ports with `equals`, which ignores row order unless you pass `ordered=True`.
+
 ## APIs with a relational replacement
 
 Some familiar APIs are absent by design, because a relation has no row index or row order. Each one raises an `AttributeError` naming the replacement.
@@ -72,7 +104,7 @@ Some familiar APIs are absent by design, because a relation has no row index or 
 | Absent | Why | Instead |
 |---|---|---|
 | `df.set_index`, `df.reset_index`, `df.loc`, `df.iloc` | A relation is an unordered multiset with no row index, as in SQL. | {py:meth}`ds.filter(...) <batcher.Dataset.filter>`, {py:meth}`ds.select(...) <batcher.Dataset.select>`, {py:meth}`ds.sort(...) <batcher.Dataset.sort>`, {py:meth}`ds.with_row_index() <batcher.Dataset.with_row_index>` |
-| `df.iterrows`, `df.itertuples`, `df.applymap` | Per-row Python never runs on the hot path. | {py:meth}`ds.iter_rows(named=True) <batcher.Dataset.iter_rows>` at the end of a pipeline; expressions or {py:meth}`ds.map_batches() <batcher.Dataset.map_batches>` inside one |
+| `df.iterrows`, `df.itertuples`, `df.applymap` | Iterating rows in Python is the slowest way to touch data, so Batcher keeps it out of the engine. | {py:meth}`ds.iter_rows(named=True) <batcher.Dataset.iter_rows>` at the end of a pipeline; expressions or {py:meth}`ds.map_batches() <batcher.Dataset.map_batches>` inside one |
 | `df.apply` | Its per-row and per-column meanings don't survive a columnar engine. | {py:meth}`ds.with_columns(y=expr) <batcher.Dataset.with_columns>` or {py:meth}`ds.map_batches(fn) <batcher.Dataset.map_batches>` |
 | `df.T`, `df.transpose` | Transposing needs a materialized, single-typed frame. | `ds.to_pandas().T`, or {py:meth}`ds.unpivot() <batcher.Dataset.unpivot>` / {py:meth}`ds.pivot() <batcher.Dataset.pivot>` |
 | `df.shift`, `df.diff`, `df.cumsum`, `df.rolling` | Each needs a row order the relation doesn't carry. | {py:meth}`ds.window(order_by=[...], functions={...}) <batcher.Dataset.window>` |

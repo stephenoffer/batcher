@@ -11,6 +11,15 @@ from __future__ import annotations
 __all__ = ["DATASET_EXPORTERS", "DATASET_ML_MOVED", "DATASET_NAMING", "DATASET_RAY_DATA"]
 
 
+#: Spark's temp views map onto the session's name registry. Every `Session` has one, and
+#: `bt.sql` reads the process-default session's.
+_VIEW_REGISTRY = (
+    "Register it by name with bt.current_session().register('t', ds); bt.sql('SELECT * FROM "
+    "t') then sees it, and bt.sql('CREATE VIEW v AS SELECT ...') defines a view. For one "
+    "query, pass it in: bt.sql('SELECT * FROM t', t=ds)."
+)
+_NO_GLOBAL_SCOPE = " There is no global_temp scope shared across sessions."
+
 DATASET_NAMING: dict[str, str] = {
     # Batcher's own removed second spellings.
     "query": (
@@ -41,14 +50,27 @@ DATASET_NAMING: dict[str, str] = {
     "unionAll": (
         "Spelled ds.union(other) here; union keeps duplicates (pass distinct=True to drop them)."
     ),
-    "unionByName": "Spelled ds.union(other) here; ensure both sides expose the same columns.",
-    "exceptAll": "Spelled ds.except_(other) here.",
-    "intersectAll": "Spelled ds.intersect(other) here.",
+    "unionByName": (
+        "ds.union(other) matches columns by position, so align by name with "
+        "bt.concat([ds, other], how='diagonal'), which also fills a column one side lacks "
+        "with nulls (Spark's allowMissingColumns=True)."
+    ),
+    "exceptAll": (
+        "Spelled ds.except_(other, distinct=False) here; the default distinct=True is "
+        "EXCEPT DISTINCT (Spark's subtract), and distinct=False keeps multiplicity."
+    ),
+    "intersectAll": (
+        "Spelled ds.intersect(other, distinct=False) here; the default distinct=True is "
+        "INTERSECT DISTINCT (Spark's intersect), and distinct=False keeps multiplicity."
+    ),
     "subtract": "Spelled ds.except_(other) here (set difference).",
     "crossJoin": "Spelled ds.cross_join(other) here.",
     "dropDuplicates": "Spelled ds.distinct() here; ds.distinct(subset) for dropDuplicates(cols).",
     "where": "Spelled ds.filter(bt.col('x') > 0) here (Spark's `where` alias).",
-    "approxQuantile": "Spelled ds.approx_quantile(column, [0.5]) here.",
+    "approxQuantile": (
+        "Spelled ds.approx_quantile('x', 0.5) here: one column and one quantile per call, "
+        "returning a float."
+    ),
     "sampleBy": (
         "Per-key sampling: ds.sample_per_group(by, n) for n rows per group, or "
         "ds.stratified_split(by=...)."
@@ -62,16 +84,10 @@ DATASET_NAMING: dict[str, str] = {
     "observe": (
         "Measured per-operator metrics are ds.stats(); ds.explain(analyze=True) reports what ran."
     ),
-    "createTempView": (
-        "Batcher has no view registry. Pass the dataset into bt.sql('... FROM t', t=ds)."
-    ),
-    "createGlobalTempView": (
-        "Batcher has no view registry. Pass the dataset into bt.sql('... FROM t', t=ds)."
-    ),
-    "createOrReplaceGlobalTempView": (
-        "Batcher has no view registry. Pass into bt.sql('... FROM t', t=ds)."
-    ),
-    "registerTempTable": "Batcher has no view registry. Pass into bt.sql('... FROM t', t=ds).",
+    "createTempView": _VIEW_REGISTRY,
+    "createGlobalTempView": _VIEW_REGISTRY + _NO_GLOBAL_SCOPE,
+    "createOrReplaceGlobalTempView": _VIEW_REGISTRY + _NO_GLOBAL_SCOPE,
+    "registerTempTable": _VIEW_REGISTRY,
     "alias": "Self-joins disambiguate columns automatically (a suffix); no alias is needed.",
     "rdd": "Batcher has no RDD layer. Use ds.iter_batches() for Arrow batches.",
     "metrics": "Spelled ds.stats() here, which returns measured per-operator RunStats.",
@@ -79,8 +95,7 @@ DATASET_NAMING: dict[str, str] = {
     "writeTo": "Write to a catalog table with ds.write.iceberg(table).",
     "writeStream": "Streaming writes use ds.write.* with a Trigger; see the streaming guide.",
     "createOrReplaceTempView": (
-        "Batcher has no global view registry. Pass the dataset straight into "
-        "bt.sql('SELECT * FROM t', t=ds), or use ds.sql('SELECT * FROM self')."
+        _VIEW_REGISTRY + " Against the dataset alone, ds.sql('SELECT * FROM self') needs no name."
     ),
     "n_partitions": (
         "Partitioning is decided at execution, not carried on the plan, so a lazy "
@@ -117,8 +132,8 @@ DATASET_EXPORTERS: dict[str, str] = {
     "to_html": "A display concern; collect first: ds.to_pandas().to_html().",
     "to_string": "A display concern; use ds.show() for a preview, or ds.to_pandas().to_string().",
     "to_clipboard": "A display concern; collect first: ds.to_pandas().to_clipboard().",
-    "to_xml": "No XML sink; collect first: ds.to_pandas().to_xml(...).",
-    "to_sql": "Write to a database with ds.write.sql(uri, table=...).",
+    "to_xml": "Write XML through the writer facade: ds.write.xml(path).",
+    "to_sql": "Write to a database with ds.write.sql(table, uri=uri).",
     "na": "Null handling is ds.fill_null(...), ds.drop_nulls(), and bt.col('x').is_null().",
     "stat": (
         "Statistics are ds.corr(...), ds.cov(...), ds.approx_quantile(...), and ds.crosstab(...)."
@@ -171,7 +186,10 @@ DATASET_RAY_DATA: dict[str, str] = {
         "it instead of recomputing; ds.cache('disk_only') keeps it off the memory budget "
         "entirely."
     ),
-    "iterator": "Spelled ds.iter_batches() here; ds.iter_rows() yields dicts.",
+    "iterator": (
+        "Spelled ds.iter_batches() here; ds.iter_rows(named=True) yields dicts, and "
+        "ds.iter_rows() yields tuples."
+    ),
     "iter_torch_batches": "Spelled ds.ml.iter_torch_batches(...) here.",
     "iter_tf_batches": "Spelled ds.ml.to_tf(...) here.",
     "iter_jax_batches": (
@@ -184,24 +202,21 @@ DATASET_RAY_DATA: dict[str, str] = {
     "write_json": "Spelled ds.write.json(path) here.",
     "write_iceberg": "Spelled ds.write.iceberg(table) here.",
     "write_lance": "Spelled ds.write.lance(path) here.",
-    "write_mongo": "Spelled ds.write.mongo(uri, ...) here.",
+    "write_mongo": "Spelled ds.write.mongo(collection, uri=uri) here.",
     "write_snowflake": "Spelled ds.write.snowflake(...) here.",
-    "write_sql": "Spelled ds.write.sql(uri, table=...) here.",
+    "write_sql": "Spelled ds.write.sql(table, uri=uri) here.",
     "write_kafka": "Spelled ds.write.kafka(...) here.",
     "write_datasink": "Custom sinks are ds.write.for_each_batch(fn); every sink is on ds.write.",
-    "write_numpy": "No NumPy sink. Write a column with ds.write.parquet(path), or ds.to_numpy().",
+    "write_numpy": "Spelled ds.write.numpy(path) here; ds.to_numpy() collects in memory instead.",
     "write_images": (
         "No image sink. Encode to bytes with the .image accessor, then ds.write.parquet(path)."
     ),
-    "write_tfrecords": (
-        "No TFRecord sink. Write ds.write.parquet(path), which the loaders read directly."
-    ),
+    "write_tfrecords": "Spelled ds.write.tfrecord(path) here (singular, like bt.read.tfrecord).",
     "write_webdataset": (
-        "No WebDataset sink. Write ds.write.parquet(path); Batcher reads WebDataset shards on "
-        "the way in with bt.read.webdataset(...)."
+        "Spelled ds.write.webdataset(path) here; bt.read.webdataset(path) reads the shards back."
     ),
     "write_bigquery": "No BigQuery sink. Land Parquet with ds.write.parquet(path) and load it.",
-    "write_clickhouse": "No ClickHouse sink. Use ds.write.sql(uri, table=...).",
+    "write_clickhouse": "Spelled ds.write.clickhouse(table, host=host) here.",
     "write_turbopuffer": (
         "No Turbopuffer sink. Write vectors with ds.write.parquet(path), or push them with "
         "ds.write.for_each_batch(fn)."

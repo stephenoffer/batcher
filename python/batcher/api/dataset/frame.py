@@ -5,8 +5,11 @@ operation returns a new `Dataset` (nothing mutates); no work happens until a
 terminal operation (`collect`, `to_pydict`, ...). At that point `api` orchestrates
 the layers: Kyber optimizes, Carbonite checks feasibility, Core executes.
 
-One obvious way to do each thing: expressions everywhere (no lambdas), `select`
-for choosing/deriving the full output, `with_columns` for adding/replacing.
+One obvious way to do each thing: `select` for choosing/deriving the full output,
+`with_columns` for adding/replacing. Column work is an expression by default, which
+runs in Rust and which the optimizer can see through. Python callables are an explicit
+opt-in for what an expression cannot say: `map_batches` and a callable `filter` work
+batch by batch, and `map`/`flat_map` call a function per row.
 """
 
 from __future__ import annotations
@@ -366,8 +369,9 @@ class Dataset:
     `Dataset`; nothing mutates and no work runs until a **terminal** operation
     (`collect`, `to_pydict`, `to_pylist`, `iter_batches`, `write`, `count`, …)
     executes the optimized plan. Expressions (`batcher.col("x") * 2`) describe
-    column work that runs in the Rust data plane; per-row Python never enters the
-    hot path.
+    column work that runs in the Rust data plane, and are the default. Python runs
+    only inside a callable you pass in: batch-level for `map_batches` and a callable
+    `filter`, per row for `map` and `flat_map`.
 
     Examples:
         .. doctest::

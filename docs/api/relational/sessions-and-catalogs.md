@@ -53,9 +53,39 @@ it has attached through `session.catalog`, a {py:class}`SessionCatalog
    api.catalog.SessionCatalog
 ```
 
+## Two meanings of "table"
+
+Two families of APIs carry the word "table", and they look a name up in different places.
+
+A *catalog table* is a name in a session or catalog: a dataset you registered, a view, or a table that `CREATE TABLE` or `ds.write.table` made. {py:meth}`Session.table <batcher.Session.table>`, {py:func}`bt.sql <batcher.sql>`, and {py:meth}`ds.write.table <batcher.api.io_namespace.writer.Writer.table>` all resolve it, first against the session's registered names and then against its attached catalogs.
+
+`bt.read.table(format, ...)` is *format dispatch*. Its first argument names a source format such as `"delta"`, and it forwards the rest to that reader, so `bt.read.table("delta", uri)` is `bt.read.delta(uri)`. It never consults a session or catalog. Passing it a catalog name fails with an unknown-source error.
+
+```python
+import batcher as bt
+
+session = bt.Session()
+session.register("orders", bt.from_pydict({"id": [1, 2], "amount": [10, 20]}))
+print(session.table("orders").to_pydict())
+# {'id': [1, 2], 'amount': [10, 20]}
+print(session.sql("SELECT sum(amount) AS total FROM orders").to_pydict())
+# {'total': [30]}
+```
+
+## Threads and concurrency
+
+The objects on this page differ in what they let threads share. The following list says which can be shared and which can't, and `tests/integration/test_thread_safety_contract.py` checks each statement:
+
+- A {py:class}`Dataset <batcher.Dataset>` is immutable. No method changes it, so threads can share one, build on it, and collect it at the same time.
+- A {py:class}`Session <batcher.Session>` and its catalogs are plain mutable registries with no locking. Don't register, drop, or `CREATE` in one session from several threads at once. Give each concurrent workload its own `bt.Session()` and call its `sql` and `table` directly.
+- The default session behind {py:func}`bt.sql <batcher.sql>` is process-global. {py:func}`bt.set_session <batcher.set_session>` in one thread changes it for every thread, so a multi-threaded program should pass sessions around rather than swap the default.
+- {py:func}`config_context <batcher.config_context>` is scoped to the calling thread's context, so a block in one thread doesn't affect a query running in another.
+- {py:func}`set_config <batcher.set_config>` also sets the calling context only. A thread started afterwards begins from the defaults, so call `set_config` or open a `config_context` inside each worker thread that needs the setting.
+- `iter_batches` and `iter_rows` return Python generators. Each belongs to one consumer, so don't advance one from two threads. Call `iter_batches` once per consumer instead, which runs the query once for each.
+
 ## See also
 
 - {doc}`sql`: the SQL a session runs, and the constructs it supports.
 - {doc}`/user-guide/moving-data/catalogs-and-tables`: catalogs, namespaces, and table writes, worked through.
 - {doc}`/api/operations/governance`: attaching policy to the tables a catalog holds.
-- {doc}`/api/symbols/readers-and-writers`: `bt.read.table` and `ds.write.table`, which resolve through a catalog.
+- {doc}`/api/symbols/readers-and-writers`: `ds.write.table`, which resolves through a catalog, and `bt.read.table`, which dispatches on a format name.

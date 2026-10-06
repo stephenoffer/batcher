@@ -456,8 +456,9 @@ class Union(LogicalPlan):
         for other in self.inputs[1:]:
             if other.available_columns() != cols:
                 raise PlanError(
-                    "union inputs must have identical columns: "
-                    f"{cols} vs {other.available_columns()}"
+                    f"union inputs must have identical columns: {cols} vs "
+                    f"{other.available_columns()}. To match columns by name in any order and "
+                    "null-fill a missing one, use bt.concat([a, b], how='diagonal')"
                 )
         validate_branch_types([i.available_schema() for i in self.inputs], cols)
 
