@@ -28,6 +28,7 @@ __all__ = [
     "HIVE_NULL",
     "date_typed_partitioning",
     "partition_bounds",
+    "partition_type_overrides",
     "partitioning_arg",
     "typed_partition_value",
 ]
@@ -67,7 +68,57 @@ def _all_dates(values: Any) -> bool:
     return True
 
 
-def date_typed_partitioning(dataset: Any) -> bytes | None:
+def partition_type_overrides(partitioning: Any) -> bytes | None:
+    """The caller's declared partition-column types, serialized, or None for a discovery name.
+
+    Discovery types a Hive key from its *values*, which is lossy for a key that only looks
+    numeric: ``k=01``/``k=02`` read back as int64 ``1``/``2``, leading zeros and type both
+    gone. Declaring the key's type is the fix every engine offers (DuckDB ``hive_types``,
+    Spark's partition schema), so ``partitioning=`` accepts a `pyarrow.Schema` or a
+    ``{column: type}`` mapping as well as a discovery name. A type is a `pyarrow.DataType`
+    or a pyarrow type alias such as ``"string"``.
+
+    Serialized for the reason `date_typed_partitioning` is: it rides a split to a worker and
+    is part of a cache key, so it has to be picklable and hashable.
+
+    Args:
+        partitioning: A discovery name such as ``"hive"``, a `pyarrow.Schema`, or a mapping
+            of partition column to type.
+
+    Returns:
+        The serialized override schema, or None when `partitioning` is a discovery name.
+
+    Raises:
+        FormatError: When a declared type is neither a `pyarrow.DataType` nor an alias.
+    """
+    from collections.abc import Mapping
+
+    from batcher._internal.errors import FormatError
+
+    if isinstance(partitioning, pa.Schema):
+        return partitioning.serialize().to_pybytes()
+    if not isinstance(partitioning, Mapping):
+        return None
+    fields = []
+    for name, dtype in partitioning.items():
+        if isinstance(dtype, str):
+            try:
+                dtype = pa.type_for_alias(dtype)
+            except ValueError as exc:
+                raise FormatError(
+                    f"partitioning={{{name!r}: {dtype!r}}}: {dtype!r} is not a pyarrow type "
+                    "alias; pass a pyarrow type such as pa.string() or pa.int32()"
+                ) from exc
+        if not isinstance(dtype, pa.DataType):
+            raise FormatError(
+                f"partitioning={{{name!r}: ...}}: expected a pyarrow type or type alias, "
+                f"got {type(dtype).__name__}"
+            )
+        fields.append(pa.field(str(name), dtype))
+    return pa.schema(fields).serialize().to_pybytes()
+
+
+def date_typed_partitioning(dataset: Any, overrides: bytes | None = None) -> bytes | None:
     """A partitioning schema that reads date-valued keys as dates, or None to keep discovery.
 
     ``partition_by=["day"]`` on a date column is the most common Hive layout there is, and
@@ -88,23 +139,48 @@ def date_typed_partitioning(dataset: Any) -> bytes | None:
     is date-like in one branch and not in another stays a string rather than failing to parse
     later. `HIVE_NULL` is excluded from the vote, not counted against it.
 
+    A key named in `overrides` takes the declared type instead and is never promoted: the
+    caller's declaration outranks anything inferred from the values. Every other key is
+    discovered as usual, so declaring one key does not drop the rest.
+
     Args:
         dataset: A `pyarrow.dataset.Dataset` built with Hive discovery.
+        overrides: The serialized declared types from `partition_type_overrides`, if any.
 
     Returns:
         The serialized partitioning schema to rebuild with, or None to keep what discovery
         produced. Serialized rather than live because it travels on a split to a worker and
         is part of a cache key, so it has to be both picklable and hashable.
+
+    Raises:
+        FormatError: When `overrides` names a column that is not a partition key.
     """
+    declared = {} if overrides is None else {f.name: f.type for f in _read_schema(overrides)}
     part = getattr(dataset, "partitioning", None)
     schema = getattr(part, "schema", None)
+    discovered = [] if schema is None else list(schema.names)
+    unknown = sorted(set(declared) - set(discovered))
+    if unknown:
+        from batcher._internal.errors import FormatError
+
+        raise FormatError(
+            f"partitioning= declares a type for {unknown}, which "
+            + (
+                f"is not a partition key; the tree's keys are {discovered}"
+                if discovered
+                else "is not a partition key: no col=value directories were found"
+            )
+        )
     if schema is None or not len(schema):
         return None
     dictionaries = list(getattr(part, "dictionaries", None) or [])
     fields, promoted = [], False
     for index, field in enumerate(schema):
         values = dictionaries[index] if index < len(dictionaries) else None
-        if field.type == pa.string() and _all_dates(values):
+        if field.name in declared:
+            fields.append(pa.field(field.name, declared[field.name]))
+            promoted = True
+        elif field.type == pa.string() and _all_dates(values):
             fields.append(pa.field(field.name, pa.date32()))
             promoted = True
         else:
@@ -126,7 +202,12 @@ def partitioning_arg(partitioning: Any) -> Any:
         return partitioning
     import pyarrow.dataset as pads
 
-    return pads.HivePartitioning(pa.ipc.read_schema(pa.BufferReader(partitioning)))
+    return pads.HivePartitioning(_read_schema(partitioning))
+
+
+def _read_schema(serialized: bytes) -> pa.Schema:
+    """A schema back from its IPC serialization."""
+    return pa.ipc.read_schema(pa.BufferReader(serialized))
 
 
 def typed_partition_value(raw: str, target: pa.DataType) -> Any:

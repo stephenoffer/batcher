@@ -8,7 +8,7 @@ O(whole dataset) on the driver.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +21,7 @@ from batcher.io.formats.base import SOURCES
 from batcher.io.formats.structured.parquet.partitions import (
     date_typed_partitioning,
     partition_bounds,
+    partition_type_overrides,
     partitioning_arg,
     typed_partition_value,
 )
@@ -51,6 +52,21 @@ def _footer_row_counter(fs: Any) -> Any:
             return None
 
     return rows
+
+
+def _types_suffix(partitioning: str | bytes | None) -> str:
+    """An identity suffix for a typed partitioning, empty for a discovery name.
+
+    The partition types decide what the same files read *as* (``k=01`` is ``"01"`` or
+    ``1``), so two reads that differ only in them must not share a scan-cache entry or
+    learned statistics. A discovery name adds nothing, which keeps every untyped identity
+    exactly what it was.
+    """
+    if not isinstance(partitioning, bytes):
+        return ""
+    import hashlib
+
+    return f":types={hashlib.sha256(partitioning).hexdigest()[:16]}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +142,7 @@ class ParquetFragmentSplit:
         yield from self._table(projection, predicate).to_batches()
 
     def identity(self) -> str:
-        return f"parquet_dataset:{self.root}:{self.file_path}"
+        return f"parquet_dataset:{self.root}:{self.file_path}{_types_suffix(self.partitioning)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +270,7 @@ class PartitionDirSplit:
             return None
 
     def identity(self) -> str:
-        return f"parquet_dataset:{self.subdir}"
+        return f"parquet_dataset:{self.subdir}{_types_suffix(self.partitioning)}"
 
 
 #: What counts as a partition directory, shared with `FileSource` so the reader that
@@ -282,6 +298,7 @@ class ParquetDatasetSource:
     __slots__ = (
         "_built",
         "_dirs",
+        "_partition_types",
         "_partitioning",
         "_path",
         "_resolved",
@@ -290,10 +307,18 @@ class ParquetDatasetSource:
     )
 
     def __init__(
-        self, path: str, *, partitioning: str = "hive", schema_mode: str = "strict"
+        self,
+        path: str,
+        *,
+        partitioning: str | pa.Schema | Mapping[str, Any] = "hive",
+        schema_mode: str = "strict",
     ) -> None:
         self._path = path
-        self._partitioning = partitioning
+        #: Declared partition-column types (`partition_type_overrides`), or None. A schema
+        #: or mapping still discovers the tree Hive-style; it only fixes the named keys'
+        #: types, which discovery would otherwise infer from the values (``01`` -> 1).
+        self._partition_types = partition_type_overrides(partitioning)
+        self._partitioning = "hive" if self._partition_types is not None else partitioning
         self._schema_mode = schema_mode
         self._resolved = False
         self._schema_cache: pa.Schema | None = None
@@ -379,7 +404,7 @@ class ParquetDatasetSource:
         )
         if not self._resolved:
             self._resolved = True
-            promoted = date_typed_partitioning(built)
+            promoted = date_typed_partitioning(built, self._partition_types)
             if promoted is not None:
                 self._partitioning = promoted
                 built = ds.dataset(
@@ -557,7 +582,7 @@ class ParquetDatasetSource:
             return ()
 
     def identity(self) -> str:
-        return f"parquet_dataset:{self._path}"
+        return f"parquet_dataset:{self._path}{_types_suffix(self._partition_types)}"
 
     def clustering_columns(self) -> tuple[str, ...]:
         """The columns this dataset's splits will hold constant, without enumerating them.
