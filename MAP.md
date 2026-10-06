@@ -1963,7 +1963,7 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `maintenance.py` | 125 | Iceberg table maintenance: snapshot expiry, and an honest refusal to compact. |
 | `puffin.py` | 199 | The distinct-value counts a table's Puffin statistics publish, read for planning. |
 | `sink.py` | 288 | Writing an Iceberg table: workers stage data files, the driver commits one snapshot. |
-| `source.py` | 643 | Reading an Iceberg table: manifest-level file skipping, time travel, incremental scans. |
+| `source.py` | 725 | Reading an Iceberg table: manifest-level file skipping, time travel, incremental scans. |
 
 ### `batcher/io/formats/ml/` — 2 · neutral IO
 

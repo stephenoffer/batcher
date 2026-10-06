@@ -27,6 +27,27 @@ __all__ = ["IcebergSource", "IcebergTableSplit"]
 _UNSET: Any = object()
 
 
+#: Snapshot-summary totals that are nonzero when a merge-on-read delete file is live.
+_DELETE_TOTALS = ("total-position-deletes", "total-equality-deletes", "total-delete-files")
+
+
+def _has_delete_files(summary: Any) -> bool:
+    """Whether a snapshot summary records any live delete file, positional or equality.
+
+    Every key is consulted because writers fill them differently: one that records only
+    ``total-delete-files`` still says a row of ``total-records`` may be gone. An
+    unparseable value counts as a delete, since a declined count costs a scan while a
+    wrong one is an answer.
+    """
+    for key in _DELETE_TOTALS:
+        try:
+            if int(summary.get(key, 0) or 0):
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
+
+
 @SOURCES.register("iceberg")
 class IcebergSource:
     """An Apache Iceberg table read as Arrow.
@@ -175,13 +196,17 @@ class IcebergSource:
         the table does not have: a filtered read of a 10-row table reported 10 and then
         produced 4. So the summary is used only when it is the true count, and otherwise the
         engine counts the rows it actually reads.
+
+        Both kinds of delete file disqualify it, not only positional ones. A Flink-CDC table
+        carries *equality* deletes, and checking only ``total-position-deletes`` let such a
+        table answer `count()` with every row it ever inserted, 100 where 70 remain.
         """
         if self._row_filter is not None:
             return None  # the summary counts rows this source will never return
         snapshot = self._snapshot()
         if snapshot is None or snapshot.summary is None:
             return None
-        if int(snapshot.summary.get("total-position-deletes", 0) or 0):
+        if _has_delete_files(snapshot.summary):
             return None  # merge-on-read deletes are not subtracted from `total-records`
         total = snapshot.summary.get("total-records")
         return int(total) if total is not None else None
@@ -351,6 +376,7 @@ class IcebergSource:
         clustering, positions = self._common_clustering(
             {getattr(task.file, "spec_id", None) for task in tasks}
         )
+        snapshot_id, schema_id = self._planned_versions()
         out = []
         for task in tasks:
             # A file written under an OLDER partition spec carries a partition record with
@@ -364,7 +390,8 @@ class IcebergSource:
                 IcebergTableSplit(
                     identifier=self._identifier,
                     catalog=self._catalog,
-                    snapshot_id=self._snapshot_id,
+                    snapshot_id=snapshot_id,
+                    schema_id=schema_id,
                     task=task,
                     rows=getattr(task.file, "record_count", None),
                     row_filter=self._row_filter,
@@ -373,6 +400,34 @@ class IcebergSource:
                 )
             )
         return out
+
+    def _planned_versions(self) -> tuple[int | None, int | None]:
+        """The snapshot and schema the driver planned against, for every split to carry.
+
+        A worker rebuilds its source from the split and reloads the table, so whatever the
+        split leaves open is resolved again at *execution* time. For a latest read that used
+        to be everything: the split carried ``snapshot_id=None``, and the worker projected
+        the task against whichever schema was current when it ran. A column renamed between
+        planning and the read then left the worker unable to find the column the plan asked
+        for, and splits read on either side of the change disagreed on their schema.
+
+        The schema is pinned alongside the snapshot because pinning the snapshot alone does
+        not reproduce the driver's read: pyiceberg projects a pinned snapshot against *that
+        snapshot's* schema, while a latest read projects against the table's current one,
+        and the two differ after any schema change that has not yet been followed by a
+        commit. A time-travel read keeps the snapshot's own schema, as it does whole.
+
+        Returns:
+            ``(snapshot_id, schema_id)``; the schema id is None for a time-travel read, and
+            both are None for a table with no snapshot.
+        """
+        if self._snapshot_id is not None:
+            return self._snapshot_id, None
+        table = self._table()
+        snapshot = table.current_snapshot()
+        if snapshot is None:
+            return None, None
+        return snapshot.snapshot_id, table.metadata.current_schema_id
 
     def _common_clustering(self, spec_ids: set) -> tuple[tuple[str, ...], dict]:
         """The partition fields every live file's spec shares, and where each spec keeps them.
@@ -494,6 +549,7 @@ class IcebergTableSplit:
         "_positions",
         "_row_filter",
         "_rows",
+        "_schema_id",
         "_snapshot_id",
         "_task",
     )
@@ -505,6 +561,7 @@ class IcebergTableSplit:
         catalog: CatalogSpec | str | None,
         snapshot_id: int | None,
         task: Any,
+        schema_id: int | None = None,
         rows: int | None = None,
         row_filter: Any = None,
         clustering: tuple[str, ...] = (),
@@ -517,6 +574,8 @@ class IcebergTableSplit:
         self._identifier = identifier
         self._catalog = catalog
         self._snapshot_id = snapshot_id
+        #: The schema the driver planned against, for a latest read (`_planned_versions`).
+        self._schema_id = schema_id
         self._task = task
         self._rows = rows
         # The source's constructor `row_filter` MUST travel with the split. A worker sees
@@ -576,7 +635,13 @@ class IcebergTableSplit:
         source = self._source()
         table = source._table()
         scan = source._scan(projection, predicate)
-        return ArrowScan(table.metadata, table.io, scan.projection(), scan.row_filter, True)
+        if self._schema_id is None:
+            return ArrowScan(table.metadata, table.io, scan.projection(), scan.row_filter, True)
+        metadata = _with_schema(table.metadata, self._schema_id)
+        schema = metadata.schema()
+        if "*" not in scan.selected_fields:
+            schema = schema.select(*scan.selected_fields, case_sensitive=scan.case_sensitive)
+        return ArrowScan(metadata, table.io, schema, scan.row_filter, True)
 
     def _read_table(self, projection: list[str] | None, predicate: dict | None = None) -> pa.Table:
         try:
@@ -587,7 +652,10 @@ class IcebergTableSplit:
         return normalize_engine_types(arrow)
 
     def schema(self) -> pa.Schema:
-        return self._source().schema()
+        if self._schema_id is None:
+            return self._source().schema()
+        metadata = _with_schema(self._source()._table().metadata, self._schema_id)
+        return engine_schema(metadata.schema().as_arrow())
 
     def read(
         self, projection: list[str] | None = None, predicate: dict | None = None
@@ -641,3 +709,17 @@ class IcebergTableSplit:
 
     def identity(self) -> str:
         return f"iceberg:{self._identifier}:{self._data_file_path()}"
+
+
+def _with_schema(metadata: Any, schema_id: int) -> Any:
+    """`metadata` with `schema_id` as its current schema, so a read resolves names under it.
+
+    Pinning the current schema rather than only the projection matters because pyiceberg's
+    `ArrowScan` binds the row filter against `metadata.schema()`: a projection pinned to the
+    planned schema with a filter bound to a newer one still fails on a renamed column. A
+    schema the reloaded metadata no longer holds leaves the metadata as it is, which is the
+    read this split made before it carried the id.
+    """
+    if not any(s.schema_id == schema_id for s in metadata.schemas):
+        return metadata
+    return metadata.model_copy(update={"current_schema_id": schema_id})
