@@ -22,7 +22,9 @@ use crate::eval::list::{
 };
 use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform, eval_list_zip};
 use crate::eval::map::{eval_map, eval_struct_field};
-use crate::eval::math::{eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2};
+use crate::eval::math::{
+    eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2, round_decimal_lit,
+};
 use crate::eval::media::image::ImageArgs;
 use crate::eval::media::{eval_audio, eval_image, eval_image_crop, eval_video, Bounds};
 use crate::eval::spatial::eval_spatial;
@@ -387,8 +389,11 @@ impl Expr {
             Expr::Least { inputs } => eval_extreme(inputs, batch, false),
             Expr::Math2 { func, left, right } => {
                 let l = left.eval(batch)?;
-                let r = right.eval(batch)?;
-                eval_math2(*func, &l, &r)
+                // A decimal rounded to a literal place count stays an exact decimal.
+                match round_decimal_lit(*func, &l, right) {
+                    Some(out) => out,
+                    None => eval_math2(*func, &l, &right.eval(batch)?),
+                }
             }
             Expr::ListGet { input, index } => {
                 let arr = input.eval(batch)?;

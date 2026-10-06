@@ -126,8 +126,28 @@ def mathfunc_type(expr: MathExpr, schema: SchemaRef, infer: InferFn) -> pa.DataT
         return pa.int64()
     if fn in _MATH_TYPE_PRESERVING:
         operand = infer(expr.input, schema)
+        if fn == "round" and operand is not None and pa.types.is_decimal128(operand):
+            return _rounded_decimal(operand, 0)
         return None if operand is None else _widened_numeric(_alone_as_double(operand))
     return pa.float64()
+
+
+def _rounded_decimal(dtype: pa.Decimal128Type, digits: int) -> pa.DataType:
+    """`round(dtype, digits)`'s type: DuckDB's ``DECIMAL(p, min(s, max(digits, 0)))``.
+
+    Mirrors `bc_expr::eval::math::round_decimal`, which rounds the exact mantissa and keeps
+    the decimal rather than promoting it to double.
+    """
+    return pa.decimal128(dtype.precision, min(dtype.scale, max(digits, 0)))
+
+
+def _literal_int(expr: Expr) -> int | None:
+    """`expr`'s value when it is an integer literal, else ``None``."""
+    from batcher.plan.expr_ir.core import Lit
+
+    if isinstance(expr, Lit) and type(expr.value) is int:
+        return expr.value
+    return None
 
 
 def math2func_type(expr: Math2Expr, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
@@ -136,13 +156,19 @@ def math2func_type(expr: Math2Expr, schema: SchemaRef, infer: InferFn) -> pa.Dat
     `pow`/`atan2`/`hypot`/`next_after` are Float64. `gcd`/`lcm` are Int64. `round` follows
     its *left* operand, because `bc_expr` routes `round(Int64, n)` to `round_int` and keeps
     it Int64 -- DuckDB returns BIGINT for `round(bigint, n)`, and the f64 round-trip
-    corrupted values above 2^53.
+    corrupted values above 2^53. A `Decimal128` rounded to a literal place count stays a
+    decimal, at the scale `_rounded_decimal` derives.
     """
     fn = expr.fn
     if fn in _MATH2_INT_RESULT:
         return pa.int64()
     if fn in ("round", "round_even"):
         left = infer(expr.left, schema)
+        if left is not None and pa.types.is_decimal128(left):
+            # Only a literal place count keeps the decimal (a scale is part of the type);
+            # a per-row `digits` column takes the engine's Float64 path.
+            digits = _literal_int(expr.right)
+            return pa.float64() if digits is None else _rounded_decimal(left, digits)
         return None if left is None else _widened_numeric(_alone_as_double(left))
     return pa.float64()
 
