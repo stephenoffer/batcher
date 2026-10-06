@@ -100,10 +100,18 @@ class Reader:
         return _read(path, format=format, **opts)
 
     def table(self, format: str, *args: Any, **opts: Any) -> Dataset:
-        """Read any registered non-file source by name (escape hatch).
+        """Read from a registered source *format* named by string; this is not a catalog lookup.
 
-        ``bt.read.table("delta", "s3://bucket/table", version=3)``. The typed
-        methods below wrap this for the common backends.
+        ``bt.read.table("delta", "s3://bucket/table", version=3)`` dispatches on the
+        format name ``"delta"`` and passes the rest to that source, exactly as
+        ``bt.read.delta("s3://bucket/table", version=3)`` would. It is the escape hatch
+        for a source with no typed method below. "Table" here means the source's own
+        notion, such as a Delta path; it is not a name in a session or catalog.
+
+        To read a table *by name* from a session or catalog, use
+        ``bt.current_session().table("ns.t")`` (or `Session.table` on your own session),
+        or query it with ``bt.sql("SELECT * FROM ns.t")``. Writing by name is
+        ``ds.write.table("ns.t")``, which resolves through the catalogs the same way.
 
         Args:
             format: Registered source name to dispatch to (e.g. ``"delta"``).
