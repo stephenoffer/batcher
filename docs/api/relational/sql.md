@@ -317,6 +317,17 @@ print(out.to_pydict())
 # {'p': [1, 0, 1, 0, 1]}
 ```
 
+A dialect changes how the SQL is *parsed*, meaning its grammar and its function names. It doesn't change what the query computes. Every dialect runs on Batcher's semantics, which follow DuckDB's, so integer division and NULL ordering are DuckDB's under `dialect="postgres"` too, where PostgreSQL would answer differently:
+
+```python
+print(bt.sql("SELECT 7 / 2 AS q", dialect="postgres").to_pydict())
+# {'q': [3.5]}
+```
+
+An unknown dialect name raises {py:exc}`PlanError <batcher.PlanError>` listing the dialects there are, when the session is built or when the call names it. A session also takes `read_only=True`, which refuses every statement that writes, and `max_recursion=`, the iteration cap for a `WITH RECURSIVE` CTE. Both are described on {doc}`sessions-and-catalogs`.
+
+Values bind into a query with `params=`, and a query that can't run raises {py:exc}`SQLSyntaxError <batcher.SQLSyntaxError>` or {py:exc}`SQLUnsupportedError <batcher.SQLUnsupportedError>` carrying the line and column. Both are covered, with scripts and checking a query before it runs, in {doc}`/user-guide/analyze/sql-parameters`.
+
 ## Calling Python functions from SQL
 
 Register a Python function with
@@ -431,9 +442,12 @@ print(out.to_pydict())
 # {'id': [3, 4, 5], 'amount': [30.0, 40.0, 50.0]}
 ```
 
+It takes the same bindings as {py:func}`bt.sql <batcher.sql>`: further tables by keyword or as a mapping, and values with `params=`.
+
 ## See also
 
 - {doc}`SQL user guide </user-guide/analyze/sql>`: a guided tour with runnable queries.
+- {doc}`SQL parameters, scripts, and errors </user-guide/analyze/sql-parameters>`: `params=`, `execute_script`, and the SQL error types.
 - {doc}`Model and AI functions in SQL </user-guide/analyze/sql-model-functions>`: the guide to `ML_PREDICT`, `AI_GENERATE`, and `AI_EXTRACT`.
 - {doc}`Dataset </api/relational/dataset>`: the DataFrame surface SQL lowers to.
 - {doc}`Expressions </api/relational/expressions>`: the scalar functions available in projections.

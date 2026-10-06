@@ -30,6 +30,36 @@ session holds is control-plane metadata, so registering a table executes nothing
    set_session
 ```
 
+### Scope a session to a block
+
+{py:meth}`Session.activate <batcher.Session.activate>` makes a session the one {py:func}`bt.sql <batcher.sql>`, {py:func}`bt.register_function <batcher.register_function>` and `ds.write.table` use, for the code inside a `with` block. The scope is held in a `contextvars.ContextVar`, so a nested block wins until it exits, and two asyncio tasks that each activate their own session don't see each other's tables. When the block exits, the previous session is current again. {py:func}`bt.set_session <batcher.set_session>` still sets the process default, which applies wherever no block is active.
+
+```python
+import batcher as bt
+
+scratch = bt.Session()
+with scratch.activate():
+    bt.sql("CREATE TABLE staging AS SELECT 1 AS x")
+    print(bt.sql("SELECT x FROM staging").to_pydict())
+# {'x': [1]}
+print(scratch.list(), "staging" in bt.current_session())
+# ['staging'] False
+```
+
+### Read-only sessions
+
+`bt.Session(read_only=True)` refuses every SQL statement that creates, drops or changes a table, view or schema, raising {py:exc}`PlanError <batcher.PlanError>` before anything runs. Queries, `SHOW`, `DESCRIBE` and an `EXPLAIN` of a query still run. It's a guard on SQL statements, not a sandbox: Python methods such as `session.register` still work, and a registered Python function runs whatever code it holds.
+
+```python
+reader = bt.Session(read_only=True)
+reader.register("t", bt.from_pydict({"x": [1, 2]}))
+try:
+    reader.sql("DROP TABLE t")
+except bt.PlanError as err:
+    print(err.message)
+# this session is read-only and refuses the DROP statement
+```
+
 ## Catalogs and tables
 
 

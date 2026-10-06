@@ -12,7 +12,7 @@ for choosing/deriving the full output, `with_columns` for adding/replacing.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import timedelta
 from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Any, TypeVar, overload
@@ -1925,22 +1925,39 @@ class Dataset:
             **{name: given[name] for name in ROW_OPTIONS},
         )
 
-    def sql(self, query: str, *, table_name: str = "self", dialect: str | None = None) -> Dataset:
+    def sql(
+        self,
+        query: str,
+        tables: Mapping[str, Any] | None = None,
+        *,
+        table_name: str = "self",
+        dialect: str | None = None,
+        params: Sequence[Any] | Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Dataset:
         """Run a SQL query with this dataset bound to `table_name` (default ``self``).
 
         The Polars-style ``ds.sql("SELECT ... FROM self")``: a lazy `Dataset` that
         composes with the rest of the API. Tables and functions registered on the
-        default catalog (via `bt.register_function` or ``CREATE TABLE``) resolve too,
-        so the query can join ``self`` against them. For multi-table SQL with several
-        ad-hoc inputs, use `bt.sql(query, a=ds1, b=ds2)`.
+        current session (via `bt.register_function` or ``CREATE TABLE``) resolve too,
+        so the query can join ``self`` against them. Further tables bind exactly as they
+        do for `bt.sql`, by keyword or as a ``{name: table}`` mapping, and `params` fills
+        the query's ``?`` or ``$name`` placeholders with values.
 
         Args:
             query: A SQL statement referring to this dataset as `table_name`.
+            tables: More tables for this query, as a ``{name: table}`` mapping.
             table_name: The name this dataset is bound to in the query.
             dialect: Override the sqlglot read dialect (default ``duckdb``).
+            params: Values for the query's ``?``/``$1`` (a sequence) or ``$name`` (a
+                mapping) placeholders.
+            **kwargs: More tables for this query, by name.
 
         Returns:
             A lazy `Dataset` of the query result.
+
+        Raises:
+            PlanError: If another binding uses `table_name`.
 
         Examples:
             .. doctest::
@@ -1949,12 +1966,19 @@ class Dataset:
                 >>> ds = bt.from_pydict({"a": [1, 2, 3]})
                 >>> ds.sql("SELECT a, a * 2 AS d FROM self WHERE a > 1").to_pydict()
                 {'a': [2, 3], 'd': [4, 6]}
+
+                >>> ds.sql("SELECT a FROM self WHERE a = ?", params=[2]).to_pydict()
+                {'a': [2]}
         """
         from batcher.api.session.sql import current_session
 
-        default = current_session()
-        session = default if dialect is None else default._with_dialect(dialect)
-        return session._run(query, {table_name: self})
+        if table_name in kwargs or (tables is not None and table_name in tables):
+            raise PlanError(
+                f"sql(): {table_name!r} is already this dataset's name in the query",
+                hint="Pass table_name= to bind this dataset under another name.",
+            )
+        bound = {**(tables or {}), **kwargs, table_name: self}
+        return current_session().sql(query, bound, dialect=dialect, params=params)
 
     def drop(
         self,

@@ -23,6 +23,19 @@ print(s.sql("SELECT * FROM big_events ORDER BY id").to_pydict())
 # {'id': [1, 2], 'amount': [30.0, 40.0]}
 ```
 
+## Running several statements
+
+{py:meth}`Session.sql <batcher.Session.sql>` runs one statement. {py:meth}`Session.execute_script <batcher.Session.execute_script>` runs a `;`-separated script in order and returns one result per statement. It isn't atomic: when a statement fails, the ones before it stay applied, and the error carries a note saying how many completed.
+
+```python
+scratch = bt.Session()
+results = scratch.execute_script(
+    "CREATE TABLE t AS SELECT 1 AS x; INSERT INTO t VALUES (2); SELECT sum(x) AS total FROM t"
+)
+print(results[-1].to_pydict())
+# {'total': [3]}
+```
+
 ## MERGE INTO
 
 `MERGE INTO` is the lakehouse DML statement, and it runs through the same engine as

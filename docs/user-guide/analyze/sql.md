@@ -28,7 +28,7 @@ print(out.to_pydict())
 # {'category': ['a', 'b', 'c'], 'n': [3, 2, 1]}
 ```
 
-The keyword name (`t` above) is the table identifier used in the `FROM` clause.
+The keyword name (`t` above) is the table identifier used in the `FROM` clause. To put a value into a query, pass it with `params=` and write a `?` or `$name` placeholder where it goes, rather than formatting it into the string. {doc}`sql-parameters` covers binding, checking a query before it runs, and the SQL error types.
 
 ## Supported subset
 

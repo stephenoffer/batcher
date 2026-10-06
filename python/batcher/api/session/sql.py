@@ -3,7 +3,8 @@
 A process-global `Session` backs all three, so ``CREATE TABLE AS`` in one call is
 visible to the next, and `ds.write.table` resolves table names against it when no session
 is passed. `bt.current_session` returns it and `bt.set_session` replaces it; `bt.Session`
-builds an isolated one.
+builds an isolated one, and ``with session.activate():`` makes one current for the code
+inside the block only.
 
 `bt.sql_expr` and `bt.call_function` sit beside them: they reach the same SQL function
 table for a single expression, read in the default session's dialect unless told otherwise.
@@ -11,7 +12,7 @@ table for a single expression, read in the default session's dialect unless told
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
@@ -32,19 +33,21 @@ __all__ = [
 ]
 
 # The process-global default session, backing the module-level `sql` / `register_function`
-# below. A one-slot list so `set_session` can replace it without a `global` statement.
+# below wherever no `Session.activate()` scope is active. A one-slot list so `set_session`
+# can replace it without a `global` statement.
 _default: list[Session] = [Session()]
 
 
 def current_session() -> Session:
-    """The process-default `Session` that `bt.sql` and `ds.write.table` use.
+    """The `Session` that `bt.sql` and `ds.write.table` use here and now.
 
-    Spark's ``SparkSession.active()`` and Daft's ``current_session()``. Tables created with
-    ``bt.sql("CREATE TABLE ...")`` and catalogs attached to it are visible to every later
-    `bt.sql` call in the process.
+    Spark's ``SparkSession.active()`` and Daft's ``current_session()``. Inside a
+    ``with session.activate():`` block it is that session; everywhere else it is the
+    process default, so tables created with ``bt.sql("CREATE TABLE ...")`` and catalogs
+    attached to it are visible to every later `bt.sql` call in the process.
 
     Returns:
-        The default session.
+        The active session, or the process default.
 
     Examples:
         .. doctest::
@@ -53,11 +56,15 @@ def current_session() -> Session:
             >>> bt.current_session().catalog.current_catalog()
             'memory'
     """
-    return _default[0]
+    active = Session._active()
+    return _default[0] if active is None else active
 
 
 def set_session(session: Session) -> None:
     """Make `session` the process default that `bt.sql` and `ds.write.table` use.
+
+    A ``with other.activate():`` block still uses `other` inside it; the default applies
+    wherever no such block is active.
 
     Args:
         session: The session to install.
@@ -81,32 +88,12 @@ def set_session(session: Session) -> None:
     _default[0] = session
 
 
-def _bind(tables: Mapping[str, Any]) -> dict[str, Any]:
-    """Coerce each bound table to something the SQL session can scan.
-
-    A `Dataset` and a pyarrow table pass through; anything else a `bt.from_*`
-    constructor understands (pandas, Polars, a dict of columns, a list of row dicts,
-    a DuckDB relation) is converted here, so binding a table never needs a separate
-    conversion step at the call site.
-    """
-    import pyarrow as pa
-
-    from batcher.api.session.frameworks import from_any
-
-    out: dict[str, Any] = {}
-    for name, value in tables.items():
-        if isinstance(value, (Dataset, pa.Table, pa.RecordBatch)):
-            out[name] = value
-        else:
-            out[name] = from_any(value)
-    return out
-
-
 def sql(
     query: str,
     tables: Mapping[str, Any] | None = None,
     *,
     dialect: str | None = None,
+    params: Sequence[Any] | Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> Dataset:
     """Run a SQL query over named tables, returning a lazy `Dataset`.
@@ -115,27 +102,38 @@ def sql(
     table, or any object a ``bt.from_*`` constructor accepts — a pandas or Polars
     frame, a dict of columns, a list of row dicts, a DuckDB relation. Pass a
     ``{name: table}`` mapping positionally when the names are not valid Python
-    identifiers or are computed. The query is parsed and optimized through the same
-    engine as the DataFrame API, so the two interoperate freely: the result is
-    itself a lazy `Dataset` you can keep building on (``.filter``,
+    identifiers, are computed, or are ``dialect`` or ``params``. The query is parsed and
+    optimized through the same engine as the DataFrame API, so the two interoperate freely:
+    the result is itself a lazy `Dataset` you can keep building on (``.filter``,
     ``.with_columns``, another ``sql``) before a terminal operation runs the plan.
 
-    Names not passed here resolve from the default catalog, which ``CREATE
+    `params` binds values to the query's placeholders: ``?`` or ``$1`` take a sequence,
+    ``$name`` takes a mapping. A value is substituted into the parsed query as a typed
+    literal, never spliced into its text, so it cannot change what the query means.
+
+    Names not passed here resolve from the current session's catalog, which ``CREATE
     TABLE/VIEW AS`` populates and ``DROP TABLE`` clears, so a later ``bt.sql("...
     FROM t")`` can omit the binding. Functions registered with `bt.register_function`
-    are callable from the query. For an isolated catalog use `bt.Session`.
+    are callable from the query. For an isolated catalog use `bt.Session`. This is
+    `Session.sql` on `bt.current_session`.
 
     Args:
         query: A SQL statement. Table names refer to the bound names.
         tables: A ``{name: table}`` mapping, merged with the keyword bindings.
-        dialect: Override the sqlglot read dialect for this call (default ``duckdb``).
+        dialect: Override the sqlglot read dialect for this call (default ``duckdb``). It
+            changes the grammar only; the semantics are Batcher's in every dialect.
+        params: Values for the query's ``?``/``$1`` (a sequence) or ``$name`` (a mapping)
+            placeholders.
         **kwargs: Named inputs, each a `Dataset`, pyarrow table, or convertible object.
 
     Returns:
         A lazy `Dataset` of the query result.
 
     Raises:
-        PlanError: If `query` is not a string, or `tables` is not a mapping.
+        SQLSyntaxError: If `query` does not parse.
+        SQLUnsupportedError: If `query` uses a construct Batcher does not translate.
+        PlanError: If `query` is not a string, `tables` is not a mapping, or `params`
+            does not match the placeholders.
 
     Examples:
         .. doctest::
@@ -152,23 +150,15 @@ def sql(
 
             >>> bt.sql("SELECT * FROM t", {"t": {"x": [1, 2]}}).to_pydict()
             {'x': [1, 2]}
+
+            >>> bt.sql(
+            ...     "SELECT region FROM sales WHERE amount > $min ORDER BY region",
+            ...     sales=sales,
+            ...     params={"min": 15},
+            ... ).to_pydict()
+            {'region': ['e', 'w']}
     """
-    if not isinstance(query, str):
-        raise PlanError(
-            f"sql() expects a SQL string as its first argument, got {type(query).__name__}"
-        )
-    bound: dict[str, Any] = {}
-    if tables is not None:
-        if not isinstance(tables, Mapping):
-            raise PlanError(
-                "sql(): the second positional argument must be a {name: table} mapping, "
-                f"got {type(tables).__name__}"
-            )
-        bound.update(tables)
-    bound.update(kwargs)
-    default = current_session()
-    session = default if dialect is None else default._with_dialect(dialect)
-    return session._run(query, _bind(bound))
+    return current_session().sql(query, tables, dialect=dialect, params=params, **kwargs)
 
 
 def sql_expr(text: str, *, dialect: str | None = None) -> Expr:
@@ -208,7 +198,7 @@ def sql_expr(text: str, *, dialect: str | None = None) -> Expr:
     """
     from batcher._sql.expression import parse_sql_expression
 
-    return parse_sql_expression(text, dialect=dialect or _default[0]._dialect)
+    return parse_sql_expression(text, dialect=dialect or current_session()._dialect)
 
 
 def call_function(name: str, *args: Any, dialect: str | None = None) -> Expr:
@@ -245,7 +235,7 @@ def call_function(name: str, *args: Any, dialect: str | None = None) -> Expr:
     """
     from batcher._sql.expression import call_sql_function
 
-    return call_sql_function(name, args, dialect=dialect or _default[0]._dialect)
+    return call_sql_function(name, args, dialect=dialect or current_session()._dialect)
 
 
 def register_function(name: str, fn: Callable, **options: Any) -> None:
