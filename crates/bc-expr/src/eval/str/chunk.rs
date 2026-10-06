@@ -15,7 +15,11 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, ListBuilder, StringArray, StringBuilder};
+use arrow::array::{
+    Array, ArrayRef, Int64Array, ListArray, ListBuilder, StringArray, StringBuilder, StructArray,
+};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, Field, Fields};
 
 use crate::{ExprError, StrFunc};
 
@@ -79,20 +83,30 @@ impl Boundary {
 /// Evaluate `chunk`: `length` is the chunk size and `start` the overlap, both in
 /// characters; `pattern` names the boundary mode. Null input → null list; empty string →
 /// empty list.
+///
+/// With `offsets`, each element is a `{text, start}` struct carrying the chunk's 0-based
+/// character offset into the source (`StrFunc::ChunkOffsets`). The chunks themselves are
+/// the same either way: both shapes run the one [`chunk_row`].
 pub(crate) fn eval_chunk(
     s: &StringArray,
     start: Option<i64>,
     length: Option<i64>,
     pattern: Option<&str>,
+    offsets: bool,
 ) -> Result<ArrayRef, ExprError> {
+    let func = if offsets {
+        StrFunc::ChunkOffsets
+    } else {
+        StrFunc::Chunk
+    };
     let size = length.ok_or_else(|| ExprError::MissingArgument {
-        func: format!("{:?}", StrFunc::Chunk),
+        func: format!("{func:?}"),
         arg: "length",
     })?;
     let overlap = start.unwrap_or(0);
     if size < 1 || overlap < 0 || overlap >= size {
         return Err(ExprError::InvalidArgument {
-            func: format!("{:?}", StrFunc::Chunk),
+            func: format!("{func:?}"),
             reason: format!(
                 "chunk size must be >= 1 and overlap in [0, size), got size={size} \
                  overlap={overlap}"
@@ -101,23 +115,68 @@ pub(crate) fn eval_chunk(
     }
     let boundary = Boundary::parse(pattern)?;
     let (size, overlap) = (size as usize, overlap as usize);
-    let mut builder = ListBuilder::new(StringBuilder::new());
     // Reused across rows: the byte offset of every character boundary.
-    let mut offsets: Vec<usize> = Vec::new();
-    for o in s {
-        match o {
-            Some(v) => {
-                chunk_row(v, size, overlap, boundary, &mut offsets, builder.values());
-                builder.append(true);
+    let mut table: Vec<usize> = Vec::new();
+    if !offsets {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for o in s {
+            match o {
+                Some(v) => {
+                    let out = builder.values();
+                    chunk_row(v, size, overlap, boundary, &mut table, &mut |t, _| {
+                        out.append_value(t)
+                    });
+                    builder.append(true);
+                }
+                None => builder.append(false),
             }
-            None => builder.append(false),
         }
+        return Ok(Arc::new(builder.finish()));
     }
-    Ok(Arc::new(builder.finish()))
+    let mut texts = StringBuilder::new();
+    let mut starts: Vec<i64> = Vec::new();
+    let mut list_offsets: Vec<i32> = vec![0];
+    for o in s {
+        if let Some(v) = o {
+            chunk_row(v, size, overlap, boundary, &mut table, &mut |t, at| {
+                texts.append_value(t);
+                starts.push(at as i64);
+            });
+        }
+        let end = i32::try_from(starts.len()).map_err(|_| ExprError::InvalidArgument {
+            func: format!("{func:?}"),
+            reason: "more chunks than a list column can index".into(),
+        })?;
+        list_offsets.push(end);
+    }
+    let fields = offset_fields();
+    let values = StructArray::try_new(
+        fields.clone(),
+        vec![
+            Arc::new(texts.finish()) as ArrayRef,
+            Arc::new(Int64Array::from(starts)) as ArrayRef,
+        ],
+        None,
+    )?;
+    let item = Arc::new(Field::new("item", DataType::Struct(fields), true));
+    Ok(Arc::new(ListArray::try_new(
+        item,
+        OffsetBuffer::new(list_offsets.into()),
+        Arc::new(values),
+        s.nulls().cloned(),
+    )?))
 }
 
-/// Append one row's chunks to `out`, each a borrowed `&str` slice of `text` (so no
-/// per-chunk `String` is built).
+/// The element fields of `chunk_offsets`: the chunk's text and its character offset.
+fn offset_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("text", DataType::Utf8, true),
+        Field::new("start", DataType::Int64, true),
+    ])
+}
+
+/// Hand one row's chunks to `out` with each chunk's 0-based character offset, each chunk a
+/// borrowed `&str` slice of `text` (so no per-chunk `String` is built).
 ///
 /// ASCII — the bulk of the text a RAG pipeline ingests — needs no boundary table at
 /// all, since a character is a byte; otherwise `offsets` is reused across rows to hold
@@ -133,7 +192,7 @@ fn chunk_row(
     overlap: usize,
     boundary: Boundary,
     offsets: &mut Vec<usize>,
-    out: &mut StringBuilder,
+    out: &mut dyn FnMut(&str, usize),
 ) {
     let mut emit = |chars: usize, byte_at: &dyn Fn(usize) -> usize| {
         // The character at char-index `k`, read through the same offset mapping.
@@ -160,7 +219,7 @@ fn chunk_row(
                     })
                     .unwrap_or(hard_end)
             };
-            out.append_value(&text[byte_at(i)..byte_at(end)]);
+            out(&text[byte_at(i)..byte_at(end)], i);
             if end == chars {
                 break;
             }
@@ -179,4 +238,67 @@ fn chunk_row(
     offsets.push(text.len());
     let table = &offsets[..];
     emit(table.len() - 1, &|i| table[i]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::AsArray;
+
+    /// `chunk_offsets` gives the same chunks as `chunk`, and each `start` locates its chunk:
+    /// the `len(text)` characters at character offset `start` of the source are the chunk.
+    #[test]
+    fn every_offset_locates_its_chunk_in_every_boundary_mode() {
+        let docs = [
+            "alpha beta gamma. delta! epsilon\nzeta eta",
+            "h\u{e9}llo\u{2192}w\u{f6}rld and more \u{1F468}\u{200D}\u{1F469} text",
+            "ab",
+            "",
+        ];
+        let s = StringArray::from(docs.iter().map(|d| Some(*d)).collect::<Vec<_>>());
+        for boundary in ["char", "word", "sentence", "line"] {
+            for (size, overlap) in [(1, 0), (4, 0), (5, 2), (9, 3)] {
+                let plain =
+                    eval_chunk(&s, Some(overlap), Some(size), Some(boundary), false).unwrap();
+                let located =
+                    eval_chunk(&s, Some(overlap), Some(size), Some(boundary), true).unwrap();
+                let (plain, located) = (plain.as_list::<i32>(), located.as_list::<i32>());
+                for (row, doc) in docs.iter().enumerate() {
+                    let chars: Vec<char> = doc.chars().collect();
+                    let texts = plain.value(row);
+                    let texts = texts.as_string::<i32>();
+                    let pieces = located.value(row);
+                    let pieces = pieces.as_struct();
+                    let ptext = pieces.column(0).as_string::<i32>();
+                    let pstart = pieces
+                        .column(1)
+                        .as_primitive::<arrow::datatypes::Int64Type>();
+                    assert_eq!(
+                        texts.len(),
+                        pieces.len(),
+                        "{boundary} {size}/{overlap} {doc:?}"
+                    );
+                    for k in 0..pieces.len() {
+                        let text = ptext.value(k);
+                        assert_eq!(text, texts.value(k));
+                        let at = pstart.value(k) as usize;
+                        let n = text.chars().count();
+                        let window: String = chars[at..at + n].iter().collect();
+                        assert_eq!(
+                            window, text,
+                            "{boundary} {size}/{overlap} {doc:?} chunk {k}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_null_row_is_a_null_list_with_offsets() {
+        let s = StringArray::from(vec![Some("abc"), None]);
+        let out = eval_chunk(&s, None, Some(2), None, true).unwrap();
+        assert!(!out.is_null(0));
+        assert!(out.is_null(1));
+    }
 }

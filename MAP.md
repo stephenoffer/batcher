@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1558 Python modules across 220 packages and 328 Rust files across 14 crates.
+Covering 1559 Python modules across 220 packages and 330 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -892,7 +892,7 @@ The scalar lowerings big enough to own a module, kept out of the `scalar` dispat
 | `accessors.py` | 225 | SQL → the typed accessor namespaces, by name. |
 | `buckets.py` | 121 | `time_bucket` — snapping a timestamp to the start of the period that contains it. |
 | `derived.py` | 44 | The dispatches *derived* from the public expression surface, in the order they run. |
-| `dynamic.py` | 139 | String functions whose parameters are columns rather than constants. |
+| `dynamic.py` | 127 | String functions whose parameters are columns rather than constants. |
 | `families.py` | 319 | SQL → the public function library, by name. |
 | `intervals.py` | 170 | SQL ``INTERVAL`` literals → the ``(months, days, microseconds)`` triple. |
 | `matching.py` | 78 | ``LIKE`` / ``ILIKE`` lowering, including the shapes that skip the pattern matcher. |
@@ -2430,7 +2430,7 @@ The scalar expression algebra.
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 512 | Module-level expression constructors (the user-facing entry points). |
 | `core.py` | 6874 | The scalar expression base class and its core IR nodes. |
-| `fn_names.py` | 371 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
+| `fn_names.py` | 375 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 410 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
@@ -2455,13 +2455,14 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | module | lines | what it is |
 |---|---|---|
 | `_bind.py` | 91 | Shared accessor-generation helper for the namespace families. |
-| `_descriptions.py` | 409 | The curated per-accessor docstrings, keyed by accessor name. |
-| `_dialect.py` | 54 | Plan-time constants for the `.str` parameters that select another engine's semantics. |
+| `_descriptions.py` | 417 | The curated per-accessor docstrings, keyed by accessor name. |
+| `_dialect.py` | 175 | Plan-time constants for the `.str` parameters that select another engine's semantics. |
 | `_temporal_units.py` | 137 | The truncation-unit vocabulary shared by `.dt.truncate`/`floor`/`ceil`/`round`. |
 | `collections.py` | 1910 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `dynamic.py` | 77 | Build a string function whose parameters may be columns rather than constants. |
 | `meta.py` | 276 | The `.meta` accessor: questions about an expression's *shape*, answered without data. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
-| `strings.py` | 4441 | The `.str` accessor namespace. |
+| `strings.py` | 4811 | The `.str` accessor namespace. |
 | `temporal.py` | 1427 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
@@ -2711,7 +2712,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 | `collections.py` | 224 | Output types for the container accessors: `list`, `struct` and `map`. |
 | `dispatch.py` | 386 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `geospatial.py` | 107 | Output types for the `st_*` geometry and `quat_*`/`se3_*` rigid-body functions. |
-| `scalars.py` | 248 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
+| `scalars.py` | 274 | Output types for the `str` and `dt` accessor functions, keyed by function name alone. |
 
 ### `batcher/metadata/` — 1 · contract
 
@@ -3303,30 +3304,32 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/spatial/mod.rs` | 162 | Evaluation of the `Expr::Spatial` variant — the array-level half of rigid-body support. |
 | `eval/str/ascii/mod.rs` | 112 | Whole-column string kernels for the case where every byte a column holds is ASCII. |
 | `eval/str/case.rs` | 272 | Case conversion for `StrFunc::ToCase`, and the SQuAD normalization every text metric runs first. |
-| `eval/str/chunk.rs` | 182 | `StrFunc::Chunk` — overlapping text windows (the RAG document splitter). |
-| `eval/str/compress.rs` | 144 | Byte-stream compression for `StrFunc::Compress`/`Decompress` — six codecs, one shape. |
+| `eval/str/chunk.rs` | 242 | `StrFunc::Chunk` — overlapping text windows (the RAG document splitter). |
+| `eval/str/compress.rs` | 177 | Byte-stream compression for `StrFunc::Compress`/`Decompress` — six codecs, one shape. |
 | `eval/str/dialect/mod.rs` | 146 | The other engines' reading of a string function Batcher already has. |
 | `eval/str/dynamic/mod.rs` | 138 | `StrFunc` evaluation with **per-row** parameters. |
+| `eval/str/groups/mod.rs` | 76 | `StrFunc::RegexpExtractGroups` — every capture group of one match, as a struct. |
 | `eval/str/html.rs` | 171 | `strip_html`: recover the readable text of an HTML document. |
 | `eval/str/jaro.rs` | 82 | Jaro and Jaro-Winkler string similarity (the `.str.jaro`/`.str.jaro_winkler` funcs). |
 | `eval/str/json.rs` | 795 | JSON path extraction for the `.json` accessor (`json_extract_{string,int,float,bool}`). |
 | `eval/str/like.rs` | 277 | Fast SQL `LIKE` / substring matching. |
 | `eval/str/minhash.rs` | 137 | `StrFunc::MinHash` — a MinHash signature of a document → `List<Int64>`. |
-| `eval/str/mod.rs` | 1894 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
+| `eval/str/mod.rs` | 1921 | String-function evaluation for `Expr::Str` (split out of `lib.rs`). |
 | `eval/str/numfmt.rs` | 178 | String functions whose input is a **number**, not a string. |
 | `eval/str/quality/builders.rs` | 27 | Shared column builders for the text-quality measures. |
 | `eval/str/quality/entropy.rs` | 49 | Character-distribution entropy — deliberately *not* one of Gopher's rules. |
 | `eval/str/quality/gopher.rs` | 277 | Gopher, C4, and RefinedWeb's published document-quality rules. |
 | `eval/str/quality/mod.rs` | 33 | Per-document text-quality measures — the LLM pretraining-corpus filters. |
 | `eval/str/regex_cache.rs` | 106 | A process-wide memo for compiled regexes. |
-| `eval/str/uri_path.rs` | 222 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
+| `eval/str/unicode/mod.rs` | 117 | Unicode-aware string kernels: normalization, case folding, and grapheme clusters. |
+| `eval/str/uri_path.rs` | 261 | URL escaping, filesystem-path decomposition, binary text, and the two string distances DuckDB spells `hamming`/`mismatches` and `jaccard`. |
 | `eval/temporal/civil.rs` | 232 | Calendar field extraction as integer arithmetic, for the date parts a query groups by. |
 | `eval/temporal/date.rs` | 689 | Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`). |
 | `eval/temporal/make.rs` | 161 | Temporal construction for `Expr::MakeTemporal` — calendar parts and epoch counts in. |
 | `eval/temporal/mod.rs` | 18 | Date/time evaluation: field extraction, timezone conversion, and construction. |
 | `eval/temporal/text.rs` | 232 | Text ↔ instant: `strftime` renders one, `strptime` reads one back. |
 | `eval/temporal/timezone.rs` | 62 | Timezone conversion for `Expr::ConvertTimezone` (`convert_timezone`). |
-| `lib.rs` | 2676 | `bc-expr` — scalar expression IR and its evaluation. |
+| `lib.rs` | 2711 | `bc-expr` — scalar expression IR and its evaluation. |
 | `select.rs` | 430 | Short-circuiting evaluation of a conjunctive filter predicate into a keep mask. |
 | `subset.rs` | 186 | Evaluating an expression over a *subset* of a batch's rows, and putting the answer back where it came from. |
 | `supertype.rs` | 207 | The common-supertype lattice over Arrow types — one answer for every tier. |

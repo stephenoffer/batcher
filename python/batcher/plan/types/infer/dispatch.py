@@ -203,7 +203,7 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
     if isinstance(expr, ListSimhash):
         return pa.list_(pa.int64())  # one Int64 bit per hyperplane
     if isinstance(expr, StrFunc):
-        return strfunc_type(expr.fn)
+        return strfunc_type(expr.fn, expr.pattern)
     if isinstance(expr, StrFuncDyn):
         # The dynamic spelling (a per-row `pattern`/`start`/`length`, which the SQL parser
         # builds for `repeat(s, n)` and friends) computes the same function as `StrFunc`,

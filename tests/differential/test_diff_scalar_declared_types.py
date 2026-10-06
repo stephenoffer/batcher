@@ -174,6 +174,7 @@ _STR_SHAPES: tuple[tuple[str, dict], ...] = (
     ("s", {"pattern": _AES_KEY}),  # aes_encrypt / aes_decrypt -- a key
     ("s", {"pattern": "Xxn\x00"}),  # mask_by_class -- one replacement per character class
     ("s", {"start": 1, "length": 2}),
+    ("s", {"pattern": "(?P<k>a)(b)?"}),  # the group extracts -- one field per capture group
 )
 
 

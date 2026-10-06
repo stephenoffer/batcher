@@ -70,15 +70,34 @@ pub(crate) fn compress(data: &[u8], codec: &str) -> Option<Result<Vec<u8>, ExprE
 }
 
 /// Decompress `data` with `codec`. `None` for an unknown codec; `Some(None)` for input
-/// that is not a valid frame for this codec (the lenient case).
-pub(crate) fn decompress(data: &[u8], codec: &str) -> Option<Option<Vec<u8>>> {
+/// that is not a valid frame for this codec (the lenient case), or whose payload would
+/// exceed `limit` bytes.
+///
+/// `limit` is the decompression-bomb bound: a few hundred bytes of gzip can expand to
+/// gigabytes, and a single such cell would otherwise allocate all of it. The streaming
+/// decoders read at most `limit + 1` bytes, so an oversized payload is detected without
+/// being materialized; `lz4`'s frame *states* its size up front, so that is checked before
+/// anything is allocated. `None` keeps the unbounded read.
+pub(crate) fn decompress(
+    data: &[u8],
+    codec: &str,
+    limit: Option<usize>,
+) -> Option<Option<Vec<u8>>> {
     Some(match codec {
-        "gzip" => read_all(flate2::read::GzDecoder::new(data)),
-        "zlib" => read_all(flate2::read::ZlibDecoder::new(data)),
-        "deflate" => read_all(flate2::read::DeflateDecoder::new(data)),
-        "zstd" => zstd::stream::decode_all(data).ok(),
-        "brotli" => read_all(brotli::Decompressor::new(data, 4096)),
-        "lz4" => lz4_flex::block::decompress_size_prepended(data).ok(),
+        "gzip" => read_all(flate2::read::GzDecoder::new(data), limit),
+        "zlib" => read_all(flate2::read::ZlibDecoder::new(data), limit),
+        "deflate" => read_all(flate2::read::DeflateDecoder::new(data), limit),
+        "zstd" => match limit {
+            None => zstd::stream::decode_all(data).ok(),
+            Some(_) => zstd::stream::read::Decoder::new(data)
+                .ok()
+                .and_then(|d| read_all(d, limit)),
+        },
+        "brotli" => read_all(brotli::Decompressor::new(data, 4096), limit),
+        "lz4" => match lz4_flex::block::uncompressed_size(data) {
+            Ok((size, _)) if limit.is_some_and(|cap| size > cap) => None,
+            _ => lz4_flex::block::decompress_size_prepended(data).ok(),
+        },
         _ => return None,
     })
 }
@@ -113,14 +132,28 @@ impl_finish!(
     flate2::write::DeflateEncoder<Vec<u8>>
 );
 
-/// Read a decoder to the end, or `None` if the stream is malformed or truncated.
+/// Read a decoder to the end, or `None` if the stream is malformed or truncated, or holds
+/// more than `limit` bytes.
 ///
 /// A truncated frame surfaces as a read error partway through, so this cannot be
 /// shortened to "decode and hope" — the whole read has to succeed for the output to be
-/// the real payload rather than a prefix of it.
-fn read_all(mut r: impl Read) -> Option<Vec<u8>> {
+/// the real payload rather than a prefix of it. For the same reason a payload over the
+/// limit is `None`, never its first `limit` bytes.
+fn read_all(r: impl Read, limit: Option<usize>) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    r.read_to_end(&mut out).ok()?;
+    match limit {
+        None => {
+            let mut r = r;
+            r.read_to_end(&mut out).ok()?;
+        }
+        Some(cap) => {
+            // One byte past the cap is enough to know the payload does not fit.
+            r.take(cap as u64 + 1).read_to_end(&mut out).ok()?;
+            if out.len() > cap {
+                return None;
+            }
+        }
+    }
     Some(out)
 }
 
@@ -181,7 +214,7 @@ mod tests {
     fn every_codec_round_trips() {
         for codec in CODECS {
             let packed = compress(PAYLOAD, codec).unwrap().unwrap();
-            let back = decompress(&packed, codec).unwrap().unwrap();
+            let back = decompress(&packed, codec, None).unwrap().unwrap();
             assert_eq!(back, PAYLOAD, "{codec} did not round-trip");
         }
     }
@@ -190,7 +223,7 @@ mod tests {
     fn every_codec_round_trips_the_empty_input() {
         for codec in CODECS {
             let packed = compress(b"", codec).unwrap().unwrap();
-            let back = decompress(&packed, codec).unwrap().unwrap();
+            let back = decompress(&packed, codec, None).unwrap().unwrap();
             assert!(back.is_empty(), "{codec} did not round-trip an empty input");
         }
     }
@@ -219,7 +252,7 @@ mod tests {
         // visible.
         for codec in ["gzip", "zlib", "zstd", "brotli", "lz4"] {
             assert!(
-                decompress(b"\x00not a valid frame at all\xff", codec)
+                decompress(b"\x00not a valid frame at all\xff", codec, None)
                     .unwrap()
                     .is_none(),
                 "{codec} accepted garbage"
@@ -233,7 +266,7 @@ mod tests {
         // deflate has no magic bytes and no checksum, so some byte strings decode to
         // something. Callers who need detection should use `zlib` (adler32) or `gzip`
         // (crc32), which wrap the same algorithm in a frame that can be validated.
-        let got = decompress(b"\x00not a valid frame at all\xff", "deflate").unwrap();
+        let got = decompress(b"\x00not a valid frame at all\xff", "deflate", None).unwrap();
         assert_ne!(got.as_deref(), Some(PAYLOAD));
     }
 
@@ -245,7 +278,7 @@ mod tests {
         for codec in CODECS {
             let packed = compress(&PAYLOAD.repeat(50), codec).unwrap().unwrap();
             let truncated = &packed[..packed.len() / 2];
-            let got = decompress(truncated, codec).unwrap();
+            let got = decompress(truncated, codec, None).unwrap();
             assert!(
                 got.as_ref().is_none_or(|v| v != &PAYLOAD.repeat(50)),
                 "{codec} returned data from a truncated frame"
@@ -258,7 +291,7 @@ mod tests {
         let packed = compress(PAYLOAD, "gzip").unwrap().unwrap();
         for codec in ["zstd", "brotli", "lz4"] {
             assert_ne!(
-                decompress(&packed, codec).unwrap().as_deref(),
+                decompress(&packed, codec, None).unwrap().as_deref(),
                 Some(PAYLOAD),
                 "{codec} decoded a gzip frame"
             );
@@ -268,7 +301,7 @@ mod tests {
     #[test]
     fn an_unknown_codec_is_none_in_both_directions() {
         assert!(compress(PAYLOAD, "snappy").is_none());
-        assert!(decompress(PAYLOAD, "snappy").is_none());
+        assert!(decompress(PAYLOAD, "snappy", None).is_none());
     }
 
     #[test]
@@ -279,8 +312,32 @@ mod tests {
                 "{codec} listed but not compressed"
             );
             assert!(
-                decompress(b"x", codec).is_some(),
+                decompress(b"x", codec, None).is_some(),
                 "{codec} listed but not decompressed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_payload_over_the_limit_is_none_for_every_codec() {
+        // A megabyte of zeros: the decompression-bomb shape, a tiny frame with a huge
+        // payload. Under a 1 KiB cap every codec refuses it rather than allocating it.
+        let bomb = vec![0u8; 1 << 20];
+        for codec in CODECS {
+            let packed = compress(&bomb, codec).unwrap().unwrap();
+            assert!(packed.len() < 1 << 14, "{codec}: the fixture is not a bomb");
+            assert_eq!(
+                decompress(&packed, codec, Some(1024)),
+                Some(None),
+                "{codec} decoded past its limit"
+            );
+            // At exactly the payload size the limit admits it, so the bound is not off by one.
+            assert_eq!(
+                decompress(&packed, codec, Some(bomb.len()))
+                    .unwrap()
+                    .as_deref(),
+                Some(bomb.as_slice()),
+                "{codec} refused a payload that fits"
             );
         }
     }
