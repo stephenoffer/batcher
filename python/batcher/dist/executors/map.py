@@ -2372,8 +2372,15 @@ def _drive_actor_pool(
     import ray
     from ray.exceptions import RayError, RayTaskError
 
+    from batcher.dist.executors.ray_runtime.policies import retry_budget
+
     parts = list(partitions)
     depth = max(1, min(_actor_inflight_depth(), len(parts) or 1))
+    # The query's job-wide budget, shared with every barrier: the per-partition cap alone lets
+    # a pool whose actors keep dying retry `max_attempts` times per partition, unbounded in
+    # total, while the stateless barriers of the same query are already held to the budget.
+    budget = retry_budget()
+    budget.record_attempt(len(parts))
     hi = max(1, min(max_size, len(parts)))
     lo = max(1, min(min_size, hi))
 
@@ -2489,7 +2496,7 @@ def _drive_actor_pool(
                 # job successfully and write the corruption out.
                 check_results_trusted(exc)
                 attempts[idx] += 1
-                if attempts[idx] > policy.max_attempts:
+                if attempts[idx] > policy.max_attempts or not budget.try_consume():
                     raise
                 slots[actor] += 1
                 pending.appendleft(idx)
@@ -2507,7 +2514,7 @@ def _drive_actor_pool(
                 _release_bundle(actor)
                 for i in orphaned:
                     attempts[i] += 1
-                    if attempts[i] > policy.max_attempts:
+                    if attempts[i] > policy.max_attempts or not budget.try_consume():
                         raise
                     pending.appendleft(i)
                 while len(actors) < lo:

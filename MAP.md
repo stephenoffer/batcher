@@ -990,7 +990,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 874 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3321 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3328 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 590 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 643 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 531 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1069,7 +1069,7 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 |---|---|---|
 | `_barrier.py` | 675 | The map-stage barrier: gather partition results under worker-loss recovery. |
 | `_drain.py` | 166 | Which workers are on a node that is going away. |
-| `_faults.py` | 475 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
+| `_faults.py` | 507 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `_topn.py` | 112 | Worker-loss recovery for the distributed top-N fold. |
 
 ### `batcher/dist/fleet/` — 4 · backend
