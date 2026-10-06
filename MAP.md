@@ -219,7 +219,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 6687 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 6754 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2760 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -230,7 +230,7 @@ Plan-construction helpers behind the thinner `Dataset` methods.
 | module | lines | what it is |
 |---|---|---|
 | `combine.py` | 296 | Bodies of the `Dataset` verbs that combine two or more relations over existing operators. |
-| `conform.py` | 153 | Bodies of the `Dataset` verbs that hold a relation to a shape: `match_to_schema`, `drop_nans`. |
+| `conform.py` | 159 | Bodies of the `Dataset` verbs that hold a relation to a shape: `match_to_schema`, `drop_nans`. |
 | `core.py` | 563 | Plan-construction helpers behind the thinner `Dataset` methods. |
 | `reshape.py` | 226 | Bodies of the `Dataset` verbs that cut or turn a relation: `transpose`, `partition_by`, `split`. |
 | `sessions.py` | 136 | Session windows: grouping a partition's events into runs separated by an idle gap. |
@@ -378,8 +378,8 @@ Session entry points that create `Dataset`s.
 | `admin.py` | 454 | Session-level administration: table maintenance, streaming control, cluster release. |
 | `cache.py` | 109 | Session-level control of the process result cache: what it holds, and dropping it. |
 | `combine.py` | 163 | Frame combination: the polymorphic `concat`. |
-| `frames.py` | 515 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
-| `frameworks.py` | 478 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
+| `frames.py` | 760 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
+| `frameworks.py` | 492 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
 | `onboarding.py` | 149 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
 | `read.py` | 133 | The generic read dispatch behind the `bt.read` namespace. |
@@ -1853,7 +1853,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `credentials.py` | 353 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
 | `detect.py` | 467 | Format and layout detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 720 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
-| `interop.py` | 681 | Framework-interop ingestion — build a `Source` from a foreign object. |
+| `interop.py` | 710 | Framework-interop ingestion — build a `Source` from a foreign object. |
 | `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
 | `secret_backends.py` | 300 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
@@ -2470,8 +2470,8 @@ Column selectors — expressions that stand for *many* columns at plan time.
 
 | module | lines | what it is |
 |---|---|---|
-| `build.py` | 316 | The public selector constructors — ``bt.all()``, ``bt.numeric()``, ``bt.matches(...)``. |
-| `core.py` | 443 | The `Selector` expression leaf and its `.name` rename accessor. |
+| `build.py` | 365 | The public selector constructors — ``bt.all()``, ``bt.numeric()``, ``bt.matches(...)``. |
+| `core.py` | 451 | The `Selector` expression leaf and its `.name` rename accessor. |
 | `expand.py` | 353 | Resolving a selector-bearing expression against a schema. |
 
 ### `batcher/plan/expr_rewrite/` — 1 · contract
@@ -2696,7 +2696,7 @@ The neutral type vocabulary and inference for the plan layer.
 | `lattice.py` | 330 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `layout.py` | 216 | Respell the Arrow *layouts* the FFI boundary cannot import (neutral layer). |
 | `media.py` | 260 | Output types for the multimodal expressions, where the shape is in the arguments. |
-| `registry.py` | 405 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name grammar. |
+| `registry.py` | 443 | The dtype-name ↔ Arrow-type vocabulary — the canonical cast-name grammar. |
 | `sequence.py` | 81 | Output types for the `.seq` genomics expressions. |
 | `text_quality.py` | 47 | Output types for the per-document text-quality string functions. |
 | `widths.py` | 303 | Static per-column byte widths derived from a column's Arrow type. |
@@ -2999,7 +2999,7 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 | module | lines | what it is |
 |---|---|---|
 | `arrays.py` | 310 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
-| `diagnostics.py` | 149 | Why a Python value cannot become an Arrow column, and what to do about it. |
+| `diagnostics.py` | 266 | Why a Python value cannot become an Arrow column, and what to do about it. |
 | `formats.py` | 394 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
 
 ### `batcher/migrate/` — ?

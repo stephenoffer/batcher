@@ -77,7 +77,7 @@ def _source_from_table(table: pa.Table) -> Source:
     return InMemorySource(batches)
 
 
-def _table_from_rows(rows: list[dict[str, Any]]) -> pa.Table:
+def _table_from_rows(rows: list[dict[str, Any]], schema: pa.Schema | None = None) -> pa.Table:
     """Build a table from row dicts using the ORDERED UNION of keys as the schema.
 
     ``pa.Table.from_pylist`` infers the schema from the first row alone, so a key
@@ -85,7 +85,12 @@ def _table_from_rows(rows: list[dict[str, Any]]) -> pa.Table:
     takes every key across every row (first-seen order) and fills missing cells with
     null — the documented row-ingestion contract. It is column-oriented, so each
     column's type is inferred independently.
+
+    With a declared `schema`, its columns are the table's instead: a key it does not
+    name is left out, and a missing one is null.
     """
+    if schema is not None:
+        return pa.table({f.name: [row.get(f.name) for row in rows] for f in schema}, schema=schema)
     keys: dict[str, None] = {}
     for row in rows:
         for k in row:
@@ -118,26 +123,30 @@ def from_pydict(data: dict[str, Any]) -> Source:
     return _source_from_table(pa.table(data))
 
 
-def from_pylist(rows: list[dict[str, Any]]) -> Source:
+def from_pylist(rows: list[dict[str, Any]], *, schema: pa.Schema | None = None) -> Source:
     """Build a `Source` from a row-oriented list of ``{column: value}`` dicts.
 
     The row-major counterpart to `from_pydict` — the natural shape for JSON records or
-    API responses. Missing keys become nulls; the union of keys is the schema.
+    API responses. Missing keys become nulls; the union of keys is the schema, unless a
+    declared `schema` names the columns.
     """
-    return _source_from_table(_table_from_rows(rows))
+    return _source_from_table(_table_from_rows(rows, schema))
 
 
-def from_items(items: list[Any], *, column: str = "item") -> Source:
+def from_items(
+    items: list[Any], *, column: str = "item", schema: pa.Schema | None = None
+) -> Source:
     """Build a `Source` from a list of items, one row per item (the Ray Data shape).
 
     Dict items expand to columns (like `from_pylist`); scalar/other items become a
     single `column`. ``from_items([1, 2, 3])`` → one ``item`` column;
-    ``from_items([{"a": 1}, {"a": 2}])`` → an ``a`` column.
+    ``from_items([{"a": 1}, {"a": 2}])`` → an ``a`` column. A declared `schema` types
+    the columns; an empty list with one is the schema's empty table.
     """
     rows = list(items)
-    if rows and all(isinstance(r, dict) for r in rows):
-        return _source_from_table(_table_from_rows(rows))
-    return _source_from_table(pa.table({column: rows}))
+    if (rows and all(isinstance(r, dict) for r in rows)) or (not rows and schema is not None):
+        return _source_from_table(_table_from_rows(rows, schema))
+    return _source_from_table(pa.table({column: rows}, schema=schema))
 
 
 def from_numpy(ndarray: Any, *, column: str = "data") -> Source:
@@ -160,16 +169,36 @@ def from_numpy(ndarray: Any, *, column: str = "data") -> Source:
 
 
 # ---- optional-framework adapters -----------------------------------------
-def from_pandas(df: Any) -> Source:
+def from_pandas(df: Any, *, preserve_index: bool = False) -> Source:
     """Build a `Source` from a pandas `DataFrame` via ``pa.Table.from_pandas``.
 
-    The pandas index is dropped (``preserve_index=False``) — matching DuckDB, Polars,
-    and Ray Data. Keeping it would leak pyarrow's internal ``__index_level_0__``
-    column (or the index name) into the public schema as a phantom extra column; call
-    ``df.reset_index()`` first to ingest the index as a real column.
+    The pandas index is dropped by default — matching DuckDB, Polars, and Ray Data.
+    Letting pyarrow keep it would leak its internal ``__index_level_0__`` column into
+    the public schema, so ``preserve_index=True`` follows ``df.reset_index()`` instead:
+    each index level becomes a leading column named after the level, or ``index``
+    (``level_<n>`` for an unnamed level of a `MultiIndex`) when it has no name. A name
+    that collides with a data column raises rather than being renamed silently.
     """
     require("pandas", feature="pandas interop", provides="pandas", extra="pandas")
+    if preserve_index:
+        df = _reset_index(df)
     return _source_from_table(pa.Table.from_pandas(df, preserve_index=False))
+
+
+def _reset_index(df: Any) -> Any:
+    """`df` with its index levels as leading columns, refusing a name a column already has."""
+    levels = list(df.index.names)
+    names = [
+        str(n) if n is not None else ("index" if len(levels) == 1 else f"level_{i}")
+        for i, n in enumerate(levels)
+    ]
+    taken = sorted(set(names) & {str(c) for c in df.columns})
+    if taken:
+        raise PlanError(
+            f"from_pandas(preserve_index=True): index level name(s) {taken} are already "
+            "data columns; rename the index (df.rename_axis(...)) or the columns first"
+        )
+    return df.reset_index(names=names)
 
 
 def from_polars(df: Any) -> Source:

@@ -188,6 +188,10 @@ _DTYPE_FAMILY_ALIASES: dict[Any, str] = {
     "datetime": "temporal",
     "timestamp": "temporal",
     "datetime64[ns]": "temporal",
+    bytes: "binary",
+    "bytes": "binary",
+    "large_binary": "binary",
+    "decimal128": "decimal",
 }
 
 
@@ -196,9 +200,28 @@ def _as_family_list(wanted: Any) -> list[Any]:
     return list(wanted) if isinstance(wanted, (list, tuple, set)) else [wanted]
 
 
+def _tensor_family() -> Any:
+    """`select_dtypes`'s ``"tensor"`` family: fixed- and variable-shape tensor columns.
+
+    Built here rather than beside the other family selectors because the tensor type tests
+    live in `io`, which the plan layer cannot import.
+    """
+    from batcher.io.formats.ml.ragged import is_ragged_tensor_column
+    from batcher.io.formats.ml.tensor import is_tensor_column
+    from batcher.plan.expr_ir.selectors.build import _dtype_selector
+
+    return _dtype_selector(lambda d: is_tensor_column(d) or is_ragged_tensor_column(d), "tensor()")
+
+
+def _dtype_family_columns(ds: Dataset, families: set[Callable[[], Any]]) -> set[str]:
+    """The columns of `ds` that any of the resolved `families` match."""
+    return {c for family in families for c in selector_columns(ds, family())}
+
+
 def _resolve_dtype_family(family: Any) -> Callable[[], Any]:
     """Resolve one `select_dtypes` family specification to a column-selector factory."""
     from batcher.plan.expr_ir import selectors
+    from batcher.plan.expr_ir.selectors import build
 
     known = {
         "numeric": selectors.numeric,
@@ -207,6 +230,13 @@ def _resolve_dtype_family(family: Any) -> Callable[[], Any]:
         "string": selectors.string,
         "boolean": selectors.boolean,
         "temporal": selectors.temporal,
+        "list": build._list_family,
+        "struct": build._struct_family,
+        "map": build._map_family,
+        "binary": build._binary_family,
+        "decimal": build._decimal_family,
+        "nested": build._nested_family,
+        "tensor": _tensor_family,
     }
     # A family name wins as itself; anything else resolves through the alias table.
     name = family if family in known else _DTYPE_FAMILY_ALIASES.get(family)
@@ -215,7 +245,7 @@ def _resolve_dtype_family(family: Any) -> Callable[[], Any]:
         raise PlanError(
             f"select_dtypes(): cannot resolve {family!r} to a dtype family; expected "
             f"one of {sorted(known)}, a Python type (int/float/str/bool), or a dtype "
-            "name such as 'int64'"
+            "name such as 'int64' (which selects its whole family)"
         )
     return factory
 
@@ -4160,48 +4190,75 @@ class Dataset:
         """Keep only the columns of a dtype family (pandas ``select_dtypes``).
 
         A family is named the Batcher way (``"numeric"``, ``"integer"``,
-        ``"floating"``, ``"string"``, ``"boolean"``, ``"temporal"``), or with any
-        spelling pandas accepts for the same idea: a Python type (``int``,
-        ``float``, ``str``, ``bool``), a concrete dtype name (``"int64"``,
-        ``"float32"``, ``"utf8"``), or a list mixing them. Passing `exclude`
-        instead keeps everything the families do *not* match.
+        ``"floating"``, ``"string"``, ``"boolean"``, ``"temporal"``, ``"decimal"``,
+        ``"binary"``, ``"list"``, ``"struct"``, ``"map"``, ``"nested"`` for any of the
+        last three, ``"tensor"`` for fixed- and variable-shape tensor columns), or with
+        any spelling pandas accepts for the same idea: a Python type (``int``,
+        ``float``, ``str``, ``bool``), a dtype name, or a list mixing them.
+
+        A concrete dtype name selects its **whole family**, not that exact width:
+        ``"float32"`` means "the floating-point columns" and matches a ``float64``
+        column too, because the engine widens narrow types when data enters it and a
+        relation's column is whatever width it resolved to. Use
+        ``ds.select(bt.by_dtype(...))`` to match one exact execution type. A
+        variable-shape tensor column is stored as a struct, so ``"struct"`` and
+        ``"nested"`` match it as well as ``"tensor"``.
+
+        Given both, the result is `include` minus `exclude`, in column order, as in
+        pandas. A family named in both is refused rather than silently resolved.
 
         Args:
             include: A family, Python type, dtype name, or list of them to keep.
-            exclude: The same, but for columns to drop. Mutually exclusive with
-                `include`.
+            exclude: The same, but for columns to drop.
 
         Returns:
             A new `Dataset` with only the matching columns.
 
         Raises:
-            PlanError: If neither or both of `include`/`exclude` is given, or if a
-                family cannot be resolved.
+            PlanError: If neither `include` nor `exclude` is given, if a family is in
+                both, if a family cannot be resolved, or if no column matches.
 
         Examples:
             .. doctest::
 
                 >>> import batcher as bt
-                >>> ds = bt.from_pydict({"a": [1], "s": ["x"]})
+                >>> ds = bt.from_pydict({"a": [1], "f": [0.5], "s": ["x"]})
                 >>> ds.select_dtypes("numeric").columns
-                ['a']
+                ['a', 'f']
 
                 >>> ds.select_dtypes(int).columns
                 ['a']
 
                 >>> ds.select_dtypes(exclude="string").columns
-                ['a']
+                ['a', 'f']
+
+                >>> ds.select_dtypes(include="number", exclude="integer").columns
+                ['f']
         """
-        if (include is None) == (exclude is None):
-            raise PlanError("select_dtypes() takes exactly one of `include` or `exclude`")
-        wanted = include if include is not None else exclude
-        families = {_resolve_dtype_family(f) for f in _as_family_list(wanted)}
-        matched = {c for family in families for c in selector_columns(self, family())}
-        keep = [c for c in self.columns if (c in matched) is (include is not None)]
+        if include is None and exclude is None:
+            raise PlanError("select_dtypes() takes `include`, `exclude`, or both")
+        inc = (
+            {_resolve_dtype_family(f) for f in _as_family_list(include)}
+            if include is not None
+            else None
+        )
+        exc = (
+            {_resolve_dtype_family(f) for f in _as_family_list(exclude)}
+            if exclude is not None
+            else set()
+        )
+        if inc is not None and inc & exc:
+            raise PlanError(
+                f"select_dtypes(): include={include!r} and exclude={exclude!r} name the same "
+                "dtype family; a family can be kept or dropped, not both"
+            )
+        kept = _dtype_family_columns(self, inc) if inc is not None else set(self.columns)
+        dropped = _dtype_family_columns(self, exc)
+        keep = [c for c in self.columns if c in kept and c not in dropped]
         if not keep:
             raise PlanError(
-                f"select_dtypes(): no column matches {wanted!r}; the dataset's types "
-                f"are {[str(t) for t in self.dtypes]}"
+                f"select_dtypes(): no column matches include={include!r}, exclude={exclude!r}; "
+                f"the dataset's types are {[str(t) for t in self.dtypes]}"
             )
         return self.select(*keep)
 
@@ -5442,8 +5499,13 @@ class Dataset:
     def schema(self) -> pa.Schema:
         """The output Arrow schema (column names and types), without scanning rows.
 
-        A scan returns its source schema directly; other plans resolve derived
-        column types via a zero-row execution. Use `columns` for just the names
+        The types are the engine's *execution* types, not the source's: narrow types
+        are widened once, when data enters the engine, so an ``int8``, ``int32`` or
+        unsigned source column reports ``int64``, ``float16``/``float32`` report
+        ``float64``, and a dictionary-encoded column reports its value type (see the
+        type-system guide). By default the collected result has exactly these types;
+        ``ExecutionConfig(shrink_output_dtypes=True)`` narrows a pass-through column
+        back to its source width in the result. Use `columns` for just the names
         (always free).
 
         Returns:
@@ -5455,6 +5517,11 @@ class Dataset:
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [1, 2, 3]}).schema.names
                 ['x']
+
+                >>> import pyarrow as pa
+                >>> narrow = bt.from_arrow(pa.table({"x": pa.array([1], pa.int8())}))
+                >>> str(narrow.schema.field("x").type)
+                'int64'
         """
         return _schema(self._plan, self._sources, self.columns)
 

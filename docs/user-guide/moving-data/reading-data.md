@@ -79,6 +79,29 @@ print(bt.date_range("2024-01-01", "2024-01-03").count())
 # 3
 ```
 
+### From rows, with declared types
+
+{py:func}`from_records <batcher.from_records>` takes tuple rows with `columns=`, namedtuples, which name themselves by their `_fields`, dict rows, and dataclass instances. A dataclass is read field by field with `dataclasses.asdict`, so a nested dataclass becomes a struct column. Every in-memory constructor takes the same `schema=`: a `pyarrow.Schema`, or a `{column: dtype}` dict whose dtypes are spelled the way `cast` spells them. An empty input with a schema is a typed empty `Dataset`.
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass
+class Reading:
+    sensor: str
+    value: float | None
+
+
+print(bt.from_records([Reading("a", 1.5), Reading("b", None)]).to_pydict())
+# {'sensor': ['a', 'b'], 'value': [1.5, None]}
+empty = bt.from_pydict({}, schema={"id": "int64", "tags": pa.list_(pa.string())})
+print(empty.count(), [str(t) for t in empty.dtypes])
+# 0 ['int64', 'list<item: string>']
+```
+
+These constructors convert their input when they are called and hold it in memory, so a generator handed to `from_iter` is drained there and then. Only `from_batches` reads at execution. A schema decides the columns, so a key it doesn't name is dropped. For a strict check, build without one and call {py:meth}`match_to_schema(schema, extra_columns="raise") <batcher.Dataset.match_to_schema>`.
+
 ### Python values Arrow cannot type
 
 Every column crossing into the engine has to be an Arrow type. Numbers, strings, bytes,
