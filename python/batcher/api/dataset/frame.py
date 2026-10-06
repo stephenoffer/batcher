@@ -56,6 +56,7 @@ from batcher.api.dataset._build.combine import (
     build_zip,
 )
 from batcher.api.dataset._build.conform import build_drop_nans, build_match_to_schema
+from batcher.api.dataset._build.join import build_join
 from batcher.api.dataset._build.reshape import build_partition_by, build_split, build_transpose
 from batcher.api.dataset._nulls import (
     build_drop_nulls,
@@ -103,7 +104,6 @@ from batcher.plan.expr_rewrite.naming import output_name
 from batcher.plan.logical import (
     AsofJoin,
     Distinct,
-    Join,
     Limit,
     LogicalPlan,
     Project,
@@ -112,7 +112,6 @@ from batcher.plan.logical import (
     Sort,
     SortKeySpec,
     Union,
-    align_join_key_types,
     asof_tolerance,
     remap_sources,
 )
@@ -2372,6 +2371,11 @@ class Dataset:
         runs as a hash join. Other predicates are checked on the pairs that survive. A null
         makes a predicate false, as in SQL.
 
+        References are by name only. ``ds["k"]`` is ``bt.col("k")``, not bound to `ds`, so
+        ``L["k"] == R["k"]`` compares the left ``k`` with itself. That comparison is refused
+        with a `PlanError` rather than run as a cross product; write the right side's
+        column as ``bt.col("k_right")``.
+
         Args:
             other: The right-hand dataset.
             *predicates: Boolean expressions over both sides' columns, all of which must hold.
@@ -2382,7 +2386,8 @@ class Dataset:
             A new `Dataset` of the matching pairs.
 
         Raises:
-            PlanError: If no predicate is given, or one is not an expression.
+            PlanError: If no predicate is given, one is not an expression, or one compares
+                a column both sides have with itself.
 
         Examples:
             .. doctest::
@@ -2406,6 +2411,7 @@ class Dataset:
         left_on: str | list[str] | None = None,
         right_on: str | list[str] | None = None,
         include_nulls: bool = False,
+        validate: str = "m:m",
     ) -> Dataset:
         """Overwrite values with `other`'s where the keys match (Polars ``update``).
 
@@ -2419,7 +2425,9 @@ class Dataset:
         Polars pairs rows by position when it has none, and a relation has no row order to
         pair by, so number both sides with `with_row_index` where they are read and join on
         that. A null key matches nothing, and a key repeated in `other` repeats the row, as
-        in any join.
+        in any join. Pass ``validate="m:1"`` to refuse that instead: the update then raises,
+        quoting the repeated keys, before it is built. It is `join`'s ``validate=`` and
+        executes eagerly in the same way.
 
         Args:
             other: The dataset supplying the new values.
@@ -2428,12 +2436,16 @@ class Dataset:
             left_on: This dataset's key column(s), when the names differ.
             right_on: `other`'s key column(s), when the names differ.
             include_nulls: Let a null in `other` overwrite a value.
+            validate: ``"m:m"`` (the default) checks nothing; ``"m:1"`` requires `other`'s
+                keys to be unique, ``"1:1"`` both sides' too. See `join`.
 
         Returns:
             A new `Dataset` with the matched values replaced.
 
         Raises:
-            PlanError: If `how` is unknown or no key is given.
+            PlanError: If `how` or `validate` is unknown, or no key is given.
+            DataQualityError: If `validate` finds a repeated key on a side that must be
+                unique.
 
         Examples:
             .. doctest::
@@ -2445,8 +2457,14 @@ class Dataset:
                 {'id': [1, 2, 3], 'price': [10, 25, 30]}
                 >>> prices.update(fixes, on="id", include_nulls=True).sort("id").to_pydict()
                 {'id': [1, 2, 3], 'price': [10, 25, None]}
+                >>> twice = bt.from_pydict({"id": [2, 2], "price": [25, 26]})
+                >>> try:
+                ...     prices.update(twice, on="id", validate="m:1")
+                ... except bt.DataQualityError as e:
+                ...     print(type(e).__name__)
+                DataQualityError
         """
-        return build_update(self, other, on, how, left_on, right_on, include_nulls)
+        return build_update(self, other, on, how, left_on, right_on, include_nulls, validate)
 
     def zip(
         self,
@@ -4628,31 +4646,77 @@ class Dataset:
     def join(
         self,
         other: Dataset,
-        on: str | list[str] | None = None,
+        on: str | Expr | list[str | Expr] | None = None,
         *,
-        left_on: str | list[str] | None = None,
-        right_on: str | list[str] | None = None,
+        left_on: str | Expr | list[str | Expr] | None = None,
+        right_on: str | Expr | list[str | Expr] | None = None,
         how: str = "inner",
         suffix: str = "_right",
+        validate: str = "m:m",
+        nulls_equal: bool | Sequence[bool] = False,
+        coalesce: bool | None = None,
+        indicator: str | None = None,
     ) -> Dataset:
         """Equi-join with another dataset.
 
-        Specify keys with `on` (shared column names) or `left_on`/`right_on`.
-        `how` is one of inner/left/right/semi/anti. Output keeps the key columns
-        (named after the left keys), then the remaining left columns, then the
-        remaining right columns (colliding names get `suffix`).
+        Specify keys with `on` (shared column names) or `left_on`/`right_on`. `how` is one
+        of inner/left/right/full (``"outer"`` is the same)/semi/anti/cross. The output keeps
+        the key columns (named after the left keys), then the remaining left columns, then
+        the remaining right columns, a colliding right name getting `suffix`. Semi and anti
+        joins return the left columns only.
+
+        Each named key pair is *coalesced* into one column by default: an inner or left join
+        reads it from the left side, a right join from the right, and a full join takes
+        whichever side matched. ``coalesce=False`` keeps both instead: the left key leads
+        under its own name, and the right key stays among the right columns under its own
+        name (``k_right`` when the names are equal), null where the right side did not
+        match. ``coalesce=True`` is the default behaviour spelled out.
+
+        A key may be an expression, such as ``left_on=bt.col("email").str.lower()``,
+        evaluated on its own side; an expression given as `on` is evaluated on both. A
+        bare ``bt.col("k")`` is the name ``"k"``. A computed key produces no output column:
+        the columns it reads stay as ordinary left or right columns.
+
+        A null key matches nothing, as with SQL ``=``. ``nulls_equal=True`` makes a null key
+        match a null key, as SQL ``IS NOT DISTINCT FROM`` does; pass a list for one flag per
+        key. It is a rewrite onto the same hash join, not a nested loop.
+
+        ``validate`` checks the key cardinality before anything is joined, as pandas
+        ``merge(validate=)`` does: ``"1:1"`` requires unique keys on both sides, ``"1:m"``
+        on the left, ``"m:1"`` on the right, and ``"m:m"`` (the default) checks nothing. A
+        null key does not count as a repeat unless `nulls_equal` makes it matchable,
+        because it cannot multiply a row. The check executes when `join` is called, one
+        uniqueness pass per checked side, so a large source is read for it.
+
+        ``indicator="name"`` adds a column saying where each row came from: ``"both"``,
+        ``"left_only"`` or ``"right_only"``. It reads hidden markers rather than the
+        payload, so it is right even when a matched row's columns are all null.
 
         Args:
             other: The right-hand dataset.
-            on: Shared key column name(s) present on both sides.
-            left_on: The left key column(s), when the key names differ.
-            right_on: The right key column(s), when the key names differ.
+            on: Shared key column name(s) or expression(s) present on both sides.
+            left_on: The left key column(s) or expression(s), when the keys differ.
+            right_on: The right key column(s) or expression(s), when the keys differ.
             how: The join type — inner/left/right/full/outer/cross/semi/anti.
                 ``"cross"`` takes no keys and delegates to :meth:`cross_join`.
             suffix: Suffix appended to right columns whose names collide.
+            validate: ``"1:1"``, ``"1:m"``, ``"m:1"`` or ``"m:m"``; the side(s) whose keys
+                must be unique.
+            nulls_equal: Whether a null key matches a null key, for every key or per key.
+            coalesce: Whether each named key pair becomes one column. ``None`` and
+                ``True`` coalesce; ``False`` keeps the right key as its own column.
+            indicator: The name of an added column saying which side(s) each row came
+                from. Not accepted for semi, anti or cross joins.
 
         Returns:
             A new `Dataset` of the joined rows.
+
+        Raises:
+            PlanError: For an unknown `how` or `validate`, keys given with a cross join, a
+                keyword the join type cannot honour, or a key type `nulls_equal` cannot
+                compare.
+            DataQualityError: If `validate` finds a repeated key on a side that must be
+                unique. The message quotes up to five of them.
 
         Examples:
             .. doctest::
@@ -4662,6 +4726,18 @@ class Dataset:
                 >>> right = bt.from_pydict({"id": [1, 2], "w": ["x", "y"]})
                 >>> left.join(right, on="id").to_pydict()
                 {'id': [1, 2], 'v': ['a', 'b'], 'w': ['x', 'y']}
+
+                >>> # Which side each row came from, and both key columns kept.
+                >>> r = bt.from_pydict({"id": [2, 3], "w": ["y", "z"]})
+                >>> full = left.join(r, on="id", how="full", coalesce=False, indicator="src")
+                >>> full.sort("src").select("id_right", "src").to_pydict()
+                {'id_right': [2, None, 3], 'src': ['both', 'left_only', 'right_only']}
+
+                >>> # A null key pairs with a null key only when asked to.
+                >>> a = bt.from_pydict({"k": [1, None], "x": [10, 20]})
+                >>> b = bt.from_pydict({"k": [1, None], "y": [30, 40]})
+                >>> a.join(b, on="k").count(), a.join(b, on="k", nulls_equal=True).count()
+                (1, 2)
         """
         how = "full" if how == "outer" else how
         if how == "cross":
@@ -4670,49 +4746,27 @@ class Dataset:
             # through key resolution.
             if on is not None or left_on is not None or right_on is not None:
                 raise PlanError("join(how='cross') takes no keys — a cross join is unconditional")
+            if validate != "m:m" or nulls_equal is not False or indicator is not None:
+                raise PlanError(
+                    "join(how='cross') takes no validate=, nulls_equal= or indicator=: a "
+                    "cross join pairs every row with every row, with no keys to check"
+                )
             return self.cross_join(other, suffix=suffix)
-        if how not in {"inner", "left", "right", "full", "semi", "anti"}:
-            raise PlanError(
-                f"unsupported join type {how!r} (inner|left|right|full|outer|cross|semi|anti)"
-            )
-        left_keys, right_keys = _resolve_join_keys(on, left_on, right_on)
-
-        left_cols = self.columns
-        right_cols = other.columns
-        output = _join_output(left_cols, right_cols, left_keys, right_keys, how, suffix)
-
-        # Append the right side's sources after the left's and shift its scans.
-        offset = len(self._sources)
-        right_plan = remap_sources(other._plan, offset)
-        combined_sources = self._sources + other._sources
-
-        # Two sources rarely agree on a key's exact type — `decimal(10,2)` against
-        # `decimal(12,4)`, `timestamp[ms]` against `timestamp[us]` — while the row encoder
-        # the join builds needs them identical. Widen both sides to the pair's common
-        # supertype first, so the join runs on the same pairs a union would reconcile.
-        # Types with no common supertype are left alone and `Join` rejects them.
-        left_plan, right_plan = align_join_key_types(
-            self._plan, right_plan, tuple(left_keys), tuple(right_keys)
-        )
-
         if self._watermark is not None or other._watermark is not None:
             _warn_watermark_dropped("join")
-        node = Join(left_plan, right_plan, tuple(left_keys), tuple(right_keys), how, tuple(output))
-        if how != "full":
-            return Dataset(node, combined_sources)
-
-        # Full outer join: coalesce each side's key columns into the final key and
-        # drop the temporaries, keeping the standard [keys, left, right] layout.
-        from batcher.plan.expr_ir import Coalesce
-
-        items = [
-            Projection(lk, Coalesce([Col(f"__fk_l_{i}"), Col(f"__fk_r_{i}")]))
-            for i, lk in enumerate(left_keys)
-        ]
-        items += [
-            Projection(c, Col(c)) for c in node.available_columns() if not c.startswith("__fk_")
-        ]
-        return Dataset(Project(node, tuple(items)), combined_sources)
+        return build_join(
+            self,
+            other,
+            on,
+            left_on,
+            right_on,
+            how=how,
+            suffix=suffix,
+            validate=validate,
+            nulls_equal=nulls_equal,
+            coalesce_keys=coalesce,
+            indicator=indicator,
+        )
 
     def join_stream(
         self,
@@ -4840,6 +4894,13 @@ class Dataset:
         instead. Give a duration (``"5m"``, or a `datetime.timedelta`) for a timestamp or
         date key, and a plain number for a numeric key.
 
+        Two right rows with the same `by` and the same `on` value are a tie, and the engine
+        breaks it by row order: ``"backward"`` takes the later of them and ``"forward"`` the
+        earlier. Row order is arrival order, which partitioning and distribution do not
+        preserve, so the matched row is not deterministic. When ties are possible, remove
+        them first with a column that orders them, such as a sequence number:
+        ``other.distinct([*by, on], keep="last", order_by="seq")``.
+
         Args:
             other: The right-hand dataset to match against.
             on: The shared nearest-match key column.
@@ -4891,6 +4952,12 @@ class Dataset:
                 [None, 'same', 'same']
                 >>> left.join_asof(same, on="t", allow_exact_matches=False).to_pydict()["w"]
                 [None, None, 'same']
+
+                >>> # Two quotes at t=4 tie; keep the latest by sequence number first.
+                >>> quotes = bt.from_pydict({"t": [4, 4], "seq": [2, 1], "w": ["new", "old"]})
+                >>> latest = quotes.distinct(["t"], keep="last", order_by="seq")
+                >>> left.join_asof(latest, on="t").to_pydict()["w"]
+                [None, 'new', 'new']
         """
         l_on, r_on = left_on or on, right_on or on
         if l_on is None or r_on is None:

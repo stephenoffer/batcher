@@ -183,8 +183,56 @@ def build_join_where(
                 f"join_where() predicates must be expressions such as bt.col('a') < "
                 f"bt.col('b'), got {type(p).__name__}"
             )
+    shared = set(left.columns) & set(right.columns)
+    for p in flat:
+        _reject_self_comparison(p, shared, suffix)
     condition = reduce(lambda acc, p: acc & p, flat[1:], flat[0])
     return left.cross_join(right, suffix=suffix).filter(condition)
+
+
+#: The comparison operators whose two operands `join_where` pairs across the two sides.
+_COMPARISONS = frozenset({"eq", "ne", "lt", "le", "gt", "ge"})
+
+
+def _reject_self_comparison(predicate: Expr, shared: set[str], suffix: str) -> None:
+    """Refuse a comparison of a column with itself when both sides have that column.
+
+    ``ds["k"]`` is ``bt.col("k")``: a name, not bound to `ds`. So ``L["k"] == R["k"]`` is
+    ``col("k") == col("k")``, and after the cross join both operands resolve to the *left*
+    ``k`` -- the predicate is true on every pair whose ``k`` is not null and the join
+    silently returns the cross product. Nothing a predicate can spell means "the right
+    side's ``k``" except its suffixed name, so the comparison is refused with that name.
+
+    Args:
+        predicate: One `join_where` predicate.
+        shared: The column names both sides have.
+        suffix: The suffix the right side's colliding columns take.
+
+    Raises:
+        PlanError: Naming the column and the right side's spelling of it.
+    """
+    from batcher.plan.expr_ir.core import Binary
+    from batcher.plan.expr_rewrite import transform_expr_up
+
+    def check(node: Expr) -> Expr:
+        if (
+            isinstance(node, Binary)
+            and node.op in _COMPARISONS
+            and isinstance(node.left, Col)
+            and isinstance(node.right, Col)
+            and node.left.name == node.right.name
+            and node.left.name in shared
+        ):
+            name = node.left.name
+            raise PlanError(
+                f"join_where(): both sides of this comparison read the LEFT column {name!r} "
+                f"-- ds[{name!r}] is bt.col({name!r}), a name that is not bound to its "
+                f"dataset, so the predicate compares the left column with itself. Refer to "
+                f"the right side's column as bt.col({name + suffix!r}) (suffix={suffix!r})"
+            )
+        return node
+
+    transform_expr_up(predicate, check)
 
 
 def build_update(
@@ -195,6 +243,7 @@ def build_update(
     left_on: str | list[str] | None,
     right_on: str | list[str] | None,
     include_nulls: bool,
+    validate: str = "m:m",
 ) -> Dataset:
     """Overwrite `ds`'s values from `other` where the keys match (see `Dataset.update`).
 
@@ -206,12 +255,14 @@ def build_update(
         left_on: `ds`'s key column(s), when the names differ.
         right_on: `other`'s key column(s), when the names differ.
         include_nulls: Let a null in `other` overwrite a value.
+        validate: The `Dataset.join` cardinality check, run on the internal join.
 
     Returns:
         `ds`'s columns, in `ds`'s order, with matched values replaced.
 
     Raises:
         PlanError: If `how` is unknown or no key is given.
+        DataQualityError: If `validate` finds a repeated key on a side that must be unique.
     """
     if how not in _UPDATE_HOWS:
         raise PlanError(f"update(): how must be one of {list(_UPDATE_HOWS)}, got {how!r}")
@@ -234,7 +285,7 @@ def build_update(
         *(Col(c).alias(h) for c, h in hidden.items()),
         lit(True).alias(matched),
     )
-    joined = ds.join(source, left_on=left_keys, right_on=right_keys, how=how)
+    joined = ds.join(source, left_on=left_keys, right_on=right_keys, how=how, validate=validate)
     new_values = {}
     for c, h in hidden.items():
         if include_nulls:
