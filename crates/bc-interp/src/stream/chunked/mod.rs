@@ -27,10 +27,12 @@
 //! Peak memory is the build sides, the aggregate state and two chunks (the one folding and the
 //! one the producer is decoding), independent of the driving relation's size.
 
+mod drive;
 mod orient;
 mod partial;
 mod top_n;
 
+pub use drive::{execute_chunked, execute_chunked_metered};
 pub use partial::partial_aggregate_units;
 pub(crate) mod units;
 
@@ -132,77 +134,6 @@ fn find_aggregate<'a>(plan: &'a RelOp, driving: usize, path: &mut Vec<usize>) ->
         path.pop();
     }
     None
-}
-
-/// Execute `plan` with `sources[driving]` supplied by `next_chunk` rather than resident.
-///
-/// `sources[driving]` carries only the driving relation's schema — a zero-row batch — and is
-/// what the plan runs over when the chunks hold no rows at all. Returns the same rows the
-/// resident executors return for the same plan over the concatenated chunks.
-///
-/// # Errors
-/// [`InterpError::NotChunkable`] when the plan is not [`chunkable`] — the caller should run it
-/// resident instead; [`InterpError::MemoryBudgetExceeded`] when the aggregate state (or the
-/// collected output of a spine) outgrows `budget` — the caller routes the query to an executor
-/// that spills; anything a chunk producer or an operator reports.
-pub fn execute_chunked(
-    plan: &RelOp,
-    sources: &[Vec<RecordBatch>],
-    driving: usize,
-    next_chunk: &mut NextChunk<'_>,
-    workers: usize,
-    budget: usize,
-    opts: &ExecOptions,
-) -> Result<Vec<RecordBatch>, InterpError> {
-    let oriented = orient(plan, driving);
-    let plan = &oriented;
-    let Some(core) = oriented_core(plan, driving) else {
-        return Err(InterpError::NotChunkable);
-    };
-    let run = Run {
-        driving,
-        workers: workers.max(1),
-        budget,
-        opts,
-        carrier: sources[driving].clone(),
-        driving_rows: None,
-        pool: crate::par::pool_for(workers.max(1))?,
-    };
-    let mut srcs: Vec<Vec<RecordBatch>> = sources.to_vec();
-    srcs[driving] = next_chunk().transpose()?.unwrap_or_default();
-    match core {
-        Core::Aggregate { path, node } => {
-            let result = run.aggregate(node, &mut srcs, next_chunk)?;
-            if path.is_empty() {
-                return Ok(result);
-            }
-            // The rest of the plan reads the aggregate's result as a new source.
-            let mut rest = plan.clone();
-            *node_at(&mut rest, &path) = RelOp::Scan {
-                source_id: srcs.len(),
-            };
-            let mut rest_srcs = srcs;
-            rest_srcs[driving] = Vec::new();
-            rest_srcs.push(result);
-            crate::par::execute_parallel_with(&rest, &rest_srcs, opts)
-        }
-        Core::Spine { depth, node } => {
-            let result = run.collect(node, &mut srcs, next_chunk)?;
-            if depth == 0 {
-                return Ok(result);
-            }
-            // The global sort/limit above the spine reads its collected rows as a new source.
-            let path = vec![0; depth];
-            let mut post = plan.clone();
-            *node_at(&mut post, &path) = RelOp::Scan {
-                source_id: srcs.len(),
-            };
-            let mut post_srcs = srcs;
-            post_srcs[driving] = Vec::new();
-            post_srcs.push(result);
-            crate::execute(&post, &post_srcs)
-        }
-    }
 }
 
 /// Execute `plan` with `sources[driving]` read unit by unit from `src` by the workers themselves.
@@ -488,6 +419,7 @@ impl Run<'_> {
         node: &RelOp,
         srcs: &mut [Vec<RecordBatch>],
         next_chunk: &mut NextChunk<'_>,
+        meter: Option<&super::Meter>,
     ) -> Result<Vec<RecordBatch>, InterpError> {
         let RelOp::Aggregate {
             input,
@@ -504,7 +436,7 @@ impl Run<'_> {
             prebuild_joins_for_chunks(
                 input,
                 srcs,
-                None,
+                meter,
                 self.budget,
                 self.workers,
                 Some(self.opts),
@@ -522,7 +454,7 @@ impl Run<'_> {
                 views
                     .par_iter()
                     .map(|view| {
-                        let ctx = Ctx::new(view, &cache, None, self.budget);
+                        let ctx = Ctx::new(view, &cache, meter, self.budget);
                         Ok(fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)?.0)
                     })
                     .collect::<Result<Vec<_>, InterpError>>()
@@ -564,12 +496,13 @@ impl Run<'_> {
         node: &RelOp,
         srcs: &mut [Vec<RecordBatch>],
         next_chunk: &mut NextChunk<'_>,
+        meter: Option<&super::Meter>,
     ) -> Result<Vec<RecordBatch>, InterpError> {
         let cache = self.pool.install(|| {
             prebuild_joins_for_chunks(
                 node,
                 srcs,
-                None,
+                meter,
                 self.budget,
                 self.workers,
                 Some(self.opts),
@@ -586,7 +519,7 @@ impl Run<'_> {
                 views
                     .par_iter()
                     .map(|view| {
-                        let ctx = Ctx::new(view, &cache, None, self.budget);
+                        let ctx = Ctx::new(view, &cache, meter, self.budget);
                         build_with(node, ctx)?.collect::<Result<Vec<_>, InterpError>>()
                     })
                     .collect::<Result<Vec<_>, InterpError>>()

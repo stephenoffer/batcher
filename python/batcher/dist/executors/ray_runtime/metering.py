@@ -34,7 +34,12 @@ import pyarrow as pa
 
 from batcher._internal.native import engine
 
-__all__ = ["drain_worker_metrics", "execute_metered", "record_worker_metrics"]
+__all__ = [
+    "drain_worker_metrics",
+    "execute_chunked_metered",
+    "execute_metered",
+    "record_worker_metrics",
+]
 
 
 def execute_metered(
@@ -62,6 +67,40 @@ def execute_metered(
     if metered is None:
         return nat.execute_plan(plan_ir, sources, engine_config), ""
     batches, metrics_json = metered(plan_ir, sources, engine_config)
+    return batches, _stamped_with_this_worker(metrics_json)
+
+
+def execute_chunked_metered(
+    plan_ir: str,
+    sources: list[list[pa.RecordBatch]],
+    driving: int,
+    chunks,
+    engine_config: str,
+    memory_budget: int = 0,
+) -> tuple[list[pa.RecordBatch], str]:
+    """`execute_metered` with `sources[driving]` streamed from `chunks` past resident builds.
+
+    The engine prepares every build side once and folds each chunk through the plan
+    (`bc_interp::execute_chunked_metered`); its metrics sum every chunk's counts, so they are
+    the split's real cardinalities. Raises the engine's `MemoryBudgetExceededError` past
+    `memory_budget`, and its not-chunkable error for a plan that cannot run this way (ask
+    `plan_chunkable` first).
+
+    Args:
+        plan_ir: The lowered sub-plan IR, already JSON-encoded.
+        sources: Input relations, one list per source id; `sources[driving]` is a zero-row
+            batch carrying the driving relation's schema.
+        driving: The source id the chunks feed.
+        chunks: An iterator of batch lists, the driving relation in order.
+        engine_config: The driver's engine config JSON, shipped to the worker.
+        memory_budget: Bytes the path may hold; `0` leaves the engine config's.
+
+    Returns:
+        A pair of the result batches and the raw `ExecMetrics` JSON.
+    """
+    batches, metrics_json = engine().execute_plan_chunked_metered(
+        plan_ir, sources, driving, chunks, engine_config, None, memory_budget
+    )
     return batches, _stamped_with_this_worker(metrics_json)
 
 

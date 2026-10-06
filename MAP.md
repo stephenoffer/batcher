@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1558 Python modules across 220 packages and 329 Rust files across 14 crates.
+Covering 1558 Python modules across 220 packages and 330 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -946,7 +946,7 @@ Window-function translation for the SQL front-end.
 |---|---|---|
 | `executor.py` | 3297 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 894 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_broadcast.py` | 560 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
+| `flight_broadcast.py` | 616 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
@@ -1022,7 +1022,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `fleet_health.py` | 340 | Live device health across the fleet — every accelerator node, never cached. |
 | `hardware_probe.py` | 568 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 719 | Ray lifecycle + single-node fallback for the distributed executor. |
-| `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
+| `metering.py` | 233 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
 | `readiness.py` | 502 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
@@ -3044,7 +3044,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
-| `chunked/mod.rs` | 611 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/mod.rs` | 653 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 329 | What the engine's own process knows about its hardware and its allocator. |
@@ -3103,7 +3103,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 634 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 775 | Preparing a hash join's build side once, for every worker that will probe it. |
-| `stream/chunked/mod.rs` | 793 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
+| `stream/chunked/drive.rs` | 147 | The chunk-driven entry points: [`execute_chunked`] and its metered twin. |
+| `stream/chunked/mod.rs` | 726 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |

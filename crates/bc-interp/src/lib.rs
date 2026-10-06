@@ -54,8 +54,8 @@ pub use par::{
     install_on_pool, ExecOptions,
 };
 pub use stream::chunked::{
-    chunkable, execute_chunked, execute_units, execute_units_metered, partial_aggregate_units,
-    NextChunk,
+    chunkable, execute_chunked, execute_chunked_metered, execute_units, execute_units_metered,
+    partial_aggregate_units, NextChunk,
 };
 pub use stream::{
     execute_streaming, execute_streaming_metered, execute_streaming_parallel,

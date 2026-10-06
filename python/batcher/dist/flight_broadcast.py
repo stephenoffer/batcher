@@ -17,6 +17,7 @@ makes it scale with workers rather than flatten out.
 
 from __future__ import annotations
 
+import itertools
 import json
 from collections.abc import Callable
 
@@ -195,6 +196,15 @@ def stream_probe_join(
     # cluster-wide OOM. Going over raises, the driver catches it, and the co-partition path
     # (which streams both sides) answers the query instead.
     budget = _output_budget(output_budget)
+    if gk is None:
+        joined = _join_chunked(
+            nat, probe_ir, join_ir, probe_batches, build_side, engine_config, budget
+        )
+        if joined is not None:
+            out_rows, metrics_json = joined
+            if on_metrics is not None and metrics_json:
+                on_metrics(metrics_json)
+            return out_rows
     held = 0
     out: list[pa.RecordBatch] = []
     for chunk in _byte_chunks(probe_batches, _PROBE_CHUNK_BYTES):
@@ -219,6 +229,52 @@ def stream_probe_join(
         out.extend(kept)
         held = _charge(held, budget, kept)
     return out
+
+
+def _join_chunked(nat, probe_ir, join_ir, probe_batches, build_side, engine_config, budget):
+    """The plain probe join in one engine call, the build side prepared once; `None` if the
+    join cannot run that way.
+
+    One native call per probe chunk prepared the replicated build side again on every call: on
+    TPC-H q9 at SF1000 the broadcast stage probed ~6B `lineitem` rows against a 10M-row `part`
+    build in thousands of 32 MiB chunks per worker, with 1-5 of 16 cores busy, for 4.6 minutes.
+    Measured locally on an 8-core box, 8 chunks against a 5M-row build: 268 ms per-chunk, 70 ms
+    chunked. The map prefix still runs per chunk, inside the iterator the engine pulls from.
+
+    Returns:
+        `(batches, metrics_json)`, or `None` for a join the chunked path does not take.
+
+    Raises:
+        BroadcastOutputTooLarge: The joined output outgrew `budget`, or the node ran short.
+    """
+    from batcher._internal.errors import MemoryBudgetExceededError
+    from batcher.dist.executors.ray_runtime.metering import execute_chunked_metered
+
+    if not nat.plan_chunkable(join_ir, 0):
+        return None
+    chunks = (
+        kept
+        for chunk in _byte_chunks(probe_batches, _PROBE_CHUNK_BYTES)
+        if (kept := [b for b in nat.execute_plan(probe_ir, [chunk], engine_config) if b.num_rows])
+    )
+    first = next(chunks, None)
+    if first is None:
+        return [], ""
+    carrier = [first[0].slice(0, 0)]
+    try:
+        return execute_chunked_metered(
+            join_ir,
+            [carrier, build_side],
+            0,
+            itertools.chain([first], chunks),
+            engine_config,
+            budget,
+        )
+    except MemoryBudgetExceededError as exc:
+        raise BroadcastOutputTooLarge(
+            f"broadcast probe output outgrew its {budget / (1 << 30):.1f} GiB bound or the node "
+            f"ran short of memory ({exc}); falling back to the co-partition shuffle"
+        ) from exc
 
 
 def _charge(held: int, budget: int, batches) -> int:
