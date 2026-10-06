@@ -1379,7 +1379,11 @@ class Writer:
             path: Output path/URI (file or directory) to write to.
             trigger: Run the write as a streaming query on this cadence and return its
                 `StreamingQuery` handle instead of a manifest.
-            opts: Additional write options forwarded to the sink.
+            opts: Write options, each also accepted under its pandas or Polars spelling:
+                ``delimiter`` (the field separator), ``header`` (write a header row),
+                ``null_value`` (the token a null is written as; a string equal to it is
+                quoted, so it reads back unchanged), and ``index`` (accepted and dropped:
+                there is no row index). Plus ``filesystem`` and ``storage_options``.
 
         Returns:
             A `WriteManifest` describing the files written. A `StreamingQuery` handle
@@ -1657,6 +1661,8 @@ class Writer:
     ) -> WriteManifest:
         """Write rows as XML elements under one root element, in Spark's XML layout.
 
+        Requires the ``xml`` extra: ``pip install 'batcher-engine[xml]'``.
+
         Each row is a `row_tag` element with one child per column, all inside a single
         `root_tag` element. A null field is omitted, a list repeats its element, a struct
         nests, and a field named with the ``"_"`` attribute prefix becomes an attribute.
@@ -1688,6 +1694,8 @@ class Writer:
 
     def numpy(self, path: PathLike, *, column: str | None = None, **opts: Any) -> WriteManifest:
         """Write one column as NumPy ``.npy`` arrays, the inverse of `bt.read.numpy`.
+
+        Requires the ``numpy`` extra: ``pip install 'batcher-engine[numpy]'``.
 
         A numeric, boolean or temporal column is written as a 1-D array, a fixed-size list
         of numbers as ``(rows, width)``, and a fixed-shape tensor column as
@@ -1744,6 +1752,8 @@ class Writer:
         self, path: PathLike, *, record_format: str = "example", **opts: Any
     ) -> WriteManifest:
         """Write rows as TFRecord files, one ``tf.train.Example`` per row by default.
+
+        Requires the ``tfrecord`` extra: ``pip install 'batcher-engine[tfrecord]'``.
 
         Integer and boolean columns become ``Int64List`` features, float columns
         ``FloatList`` (float32), string and binary columns ``BytesList``, and list columns
@@ -2235,6 +2245,8 @@ class Writer:
     def snowflake(self, table: str, **opts: Any) -> WriteManifest:
         """Write to a Snowflake table.
 
+        Requires the ``snowflake`` extra: ``pip install 'batcher-engine[snowflake]'``.
+
         Args:
             table: Destination Snowflake table name.
             opts: ``connection_kwargs=`` — a dict passed to the Snowflake connector
@@ -2291,6 +2303,8 @@ class Writer:
     def mongo(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write to a MongoDB collection — upsert, append, overwrite, or delete.
 
+        Requires the ``mongo`` extra: ``pip install 'batcher-engine[mongo]'``.
+
         `mode` defaults to ``"upsert"`` rather than to `ds.write`'s usual ``"overwrite"``:
         a collection is an operational store that is maintained rather than replaced, and
         defaulting to the destructive mode would empty it on a call that did not say so.
@@ -2317,6 +2331,8 @@ class Writer:
 
     def dynamodb(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write rows into a DynamoDB table with ``BatchWriteItem``.
+
+        Requires the ``dynamodb`` extra: ``pip install 'batcher-engine[dynamodb]'``.
 
         `mode` defaults to ``"upsert"``, which is what a ``PutItem`` does: it replaces the
         item holding the same primary key. There is no ``append`` here, because DynamoDB
@@ -2347,6 +2363,8 @@ class Writer:
     def cassandra(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write rows into a Cassandra or ScyllaDB table with one prepared statement.
 
+        Requires the ``cassandra`` extra: ``pip install 'batcher-engine[cassandra]'``.
+
         `mode` defaults to ``"upsert"``, which is what a CQL ``INSERT`` does: it replaces
         the row holding the same primary key. Statements run concurrently rather than in a
         ``BATCH``, because a batch spanning partitions makes one coordinator responsible
@@ -2375,6 +2393,8 @@ class Writer:
     def redis(self, key_prefix: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write rows into a Redis keyspace, one pipeline per batch.
 
+        Requires the ``redis`` extra: ``pip install 'batcher-engine[redis]'``.
+
         A two-column ``(key, value)`` frame — the shape `bt.read.table("redis", ...)`
         returns — is written as one string per key. A wider frame is written as one hash
         per key, one field per remaining column.
@@ -2400,6 +2420,8 @@ class Writer:
 
     def elasticsearch(self, index: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Index rows into an Elasticsearch index over the ``_bulk`` API.
+
+        Requires the ``elasticsearch`` extra: ``pip install 'batcher-engine[elasticsearch]'``.
 
         Every ``_bulk`` response is inspected per item rather than by status code, because
         Elasticsearch reports per-document failures inside an HTTP 200.
@@ -2427,6 +2449,8 @@ class Writer:
 
     def hbase(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write rows into an HBase table, one happybase batch per Arrow batch.
+
+        Requires the ``hbase`` extra: ``pip install 'batcher-engine[hbase]'``.
 
         A column named ``family:qualifier`` keeps its family, and one without a colon is
         placed in ``column_family=`` (default ``"cf"``). That is what lets a frame read by

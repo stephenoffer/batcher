@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 import pyarrow as pa
 
@@ -14,13 +14,16 @@ from batcher.config import active_config
 from batcher.config.env import env_int
 from batcher.io.base import FileSink, FileSource
 from batcher.io.base._bad_rows import bad_row_handler
-from batcher.io.base._options import BASE_SOURCE_OPTIONS, OptionSpec
+from batcher.io.base._options import BASE_SOURCE_OPTIONS, BaseReadOptions, OptionSpec
 from batcher.io.formats.base import SINKS, SOURCES
-from batcher.io.formats.semistructured.json_tolerance import read_json_records
+from batcher.io.formats.semistructured.json_tolerance import (
+    ARRAY_DOCUMENT_MESSAGE,
+    read_json_records,
+)
 from batcher.io.splits import FileSplit, LineRangeSplit, Split
 from batcher.plan.types import logical_bytes
 
-__all__ = ["JSONSink", "JSONSource"]
+__all__ = ["JSONReadOptions", "JSONSink", "JSONSource"]
 
 #: The JSON reader's keyword vocabulary. Batcher reads **newline-delimited** JSON, which is
 #: what `pandas.read_json(..., lines=True)` and `polars.read_ndjson` produce, so `lines=True`
@@ -137,6 +140,21 @@ from batcher.io.formats.semistructured.json_encoding import (  # noqa: E402
 )
 
 
+class JSONReadOptions(BaseReadOptions, total=False):
+    """`bt.read.json`'s keywords, typed: the `_JSON_READ_OPTIONS` vocabulary.
+
+    Kept equal to the spec's accepted names by `tests/unit/test_reader_option_types.py`.
+    `lines` is typed `bool` because only its value can say the file is not NDJSON;
+    `lines=False` is refused at runtime with the conversion that fixes it.
+    """
+
+    lines: bool
+    on_bad_lines: Literal["error", "warn", "skip"]
+    on_bad_rows: Literal["error", "warn", "skip"]
+    typ: str
+    precise_float: bool
+
+
 @SOURCES.register("json")
 class JSONSource(FileSource):
     """One or more newline-delimited (line) JSON files (file, directory, or glob).
@@ -173,12 +191,7 @@ class JSONSource(FileSource):
         # silent whole-corpus loss.
         bad_row_handler(self._on_bad_lines)
         if not lines:
-            raise FormatError(
-                "json: lines=False names a JSON-array file (a single '[...]' document), "
-                "which is a different format from the newline-delimited JSON Batcher "
-                "reads — one object per line, so it streams and splits. Convert it first, "
-                "e.g. pandas.read_json(p).to_json(out, orient='records', lines=True)."
-            )
+            raise FormatError(f"lines=False: {ARRAY_DOCUMENT_MESSAGE}")
         super().__init__(path, **base_kwargs)
 
     def _estimated_row_count(self, byte_total: int | None) -> int | None:

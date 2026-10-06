@@ -264,6 +264,26 @@ That is the ad-hoc shape. Against a real topic, name `value_format` instead and 
 decodes in the reader, so the schema is known before a message is polled rather than
 recovered per expression.
 
+### Keep the raw payload for a dead-letter route
+
+A nulled record is gone once the decoded column replaces `value`, so it can't be replayed after the producer is fixed. `raw_value_column=` keeps each message's undecoded bytes in an extra binary column of that name. It needs `value_format=` and `value_decode_mode="permissive"`, and the column is the same Arrow array the codec read, so it costs no copy. A dead letter is then a row whose `value` is null and whose raw column is not, which keeps a tombstone out of the route:
+
+```python
+# docs: skip
+events = bt.read.kafka(
+    "events",
+    bootstrap_servers="broker-1:9092",
+    value_format="json",
+    value_schema={"user": "string", "amount": "int64"},
+    value_decode_mode="permissive",
+    raw_value_column="value_raw",
+)
+dead = events.filter(col("value").is_null() & col("value_raw").is_not_null())
+dead.select("topic", "partition", "offset", "value_raw").write.parquet(
+    "s3://lake/dead-letters/events/", trigger=bt.Trigger.processing_time("1 minute")
+)
+```
+
 ## Writing
 
 The write side takes the same options, so a pipeline that reads Avro off one topic and

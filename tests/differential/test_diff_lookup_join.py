@@ -167,3 +167,57 @@ def test_the_result_does_not_depend_on_the_batch_size(duck, batch_size):
         got,
         duck.sql("select p.k, p.v, d.name, d.tier from probe p left join dim d on p.k = d.k"),
     )
+
+
+@pytest.mark.differential
+@pytest.mark.parametrize("shape", sorted(_SHAPES))
+@pytest.mark.parametrize("how", ["left", "inner"])
+def test_the_indicator_matches_a_join_key_null_check(duck, shape, how):
+    rows = _SHAPES[shape]
+    _load(duck, "probe", rows)
+    got = (
+        bt.from_pydict({"k": rows["k"], "v": rows["v"]})
+        .lookup_join(
+            "memory://",
+            on="k",
+            schema={"name": "string", "tier": "int64"},
+            how=how,
+            indicator="found",
+        )
+        .collect()
+    )
+    join = "left join" if how == "left" else "join"
+    assert_same(
+        got,
+        duck.sql(
+            "select p.k, p.v, d.name, d.tier, d.k is not null as found "
+            f"from probe p {join} dim d on p.k = d.k"
+        ),
+    )
+
+
+@pytest.mark.differential
+def test_the_indicator_tells_a_stored_null_from_a_missing_record():
+    got = (
+        bt.from_pydict({"k": ["c3", "zz", None]})
+        .lookup_join(
+            "memory://", on="k", schema={"name": "string", "tier": "int64"}, indicator="found"
+        )
+        .sort("k", nulls_first=False)
+        .to_pydict()
+    )
+    # c3 is stored with a null name; zz is not stored at all; a null key is a miss. The
+    # name column cannot tell the first two apart, and the indicator is never null.
+    assert got == {
+        "k": ["c3", "zz", None],
+        "name": [None, None, None],
+        "tier": [3, None, None],
+        "found": [True, False, False],
+    }
+
+
+def test_an_indicator_name_that_collides_is_refused():
+    with pytest.raises(bt.PlanError, match="already exist"):
+        bt.from_pydict({"k": ["c1"], "v": [1]}).lookup_join(
+            "memory://", on="k", schema={"name": "string"}, indicator="v"
+        )

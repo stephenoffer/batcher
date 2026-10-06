@@ -7,9 +7,20 @@ lives in one readable place.
 
 from __future__ import annotations
 
-from batcher.io.base._options import BASE_SINK_OPTIONS, BASE_SOURCE_OPTIONS, OptionSpec
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, Literal
 
-__all__ = ["NO_INDEX", "READ_SPEC", "WRITE_SPEC"]
+from batcher.io.base._options import (
+    BASE_SINK_OPTIONS,
+    BASE_SOURCE_OPTIONS,
+    BaseReadOptions,
+    OptionSpec,
+)
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+__all__ = ["NO_INDEX", "READ_SPEC", "WRITE_SPEC", "CsvReadOptions"]
 
 NO_INDEX = (
     "Batcher has no row index; every column is a real column. Drop it, and select the "
@@ -135,3 +146,49 @@ WRITE_SPEC = OptionSpec(
         "index_col": NO_INDEX,
     },
 )
+
+
+class CsvReadOptions(BaseReadOptions, total=False):
+    """`bt.read.csv`'s keywords, typed: `READ_SPEC`'s vocabulary, aliases and no-ops included.
+
+    Kept equal to `READ_SPEC.accepted` by `tests/unit/test_reader_option_types.py`, so the
+    static view cannot drift from the runtime one. An alias carries its canonical option's
+    type.
+    """
+
+    delimiter: str
+    quote_char: str | Literal[False]
+    escape_char: str
+    has_header: bool | int | None
+    column_names: list[str]
+    null_values: str | list[str]
+    skip_rows: int
+    skip_rows_after_header: int
+    encoding: str
+    schema: pa.Schema | Mapping[str, Any]
+    true_values: list[str]
+    false_values: list[str]
+    decimal_point: str
+    try_parse_dates: bool | list[str]
+    on_bad_lines: Literal["error", "warn", "skip"]
+    on_bad_rows: Literal["error", "warn", "skip"]
+    sep: str
+    separator: str
+    quotechar: str | Literal[False]
+    escapechar: str
+    header: bool | int | None
+    names: list[str]
+    new_columns: list[str]
+    na_values: str | list[str]
+    skiprows: int
+    skip_rows_after_names: int
+    dtype: pa.Schema | Mapping[str, Any]
+    dtypes: pa.Schema | Mapping[str, Any]
+    schema_overrides: pa.Schema | Mapping[str, Any]
+    parse_dates: bool | list[str]
+    low_memory: bool
+    memory_map: bool
+    engine: str
+    use_threads: bool
+    rechunk: bool
+    cache: bool

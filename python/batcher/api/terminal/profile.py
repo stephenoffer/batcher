@@ -9,6 +9,9 @@ subsystems, and is split out of `terminal.core` to keep that module within size 
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import Any
+
 from batcher.api.orchestration.logical_profile import (
     _logical_estimates,
     _logical_op_profiles,
@@ -176,7 +179,7 @@ def _elide(text: str) -> str:
     return text[: _PUSHED_MAX_CHARS - 1].rstrip() + "…"
 
 
-def detail_labels(ir: dict | None) -> dict[int, str]:
+def detail_labels(ir: dict | None, sources: Sequence[Any] = ()) -> dict[int, str]:
     """Per `op_id`, what that operator does in its own terms, for `explain()`.
 
     The join type and keys, the group keys and aggregates, the sort keys, the filter
@@ -190,8 +193,13 @@ def detail_labels(ir: dict | None) -> dict[int, str]:
     a release and show the same operator two ways, which is the failure that makes a reader
     stop trusting both.
 
+    A scan whose source names the backend it was routed to (a database read's
+    `explain_label`, such as ``dbapi(sqlite3)``) carries that too, since routing picks it
+    from the URI and what is installed and nothing else in the plan says which.
+
     Args:
         ir: The optimized plan IR, walked in the pre-order that assigns `op_id`.
+        sources: The plan's sources, indexed by a scan's `source_id`.
 
     Returns:
         A mapping from `op_id` to its label; operators with nothing worth naming are absent.
@@ -204,12 +212,25 @@ def detail_labels(ir: dict | None) -> dict[int, str]:
     labels: dict[int, str] = {}
     for op_id, (_depth, node) in enumerate(walk_ir(ir)):
         text = describe(str(node.get("op", "")), node)
+        if node.get("op") == "scan":
+            text = " · ".join(filter(None, (text, _source_label(sources, node))))
         if text:
             labels[op_id] = _elide(text)
     return labels
 
 
-def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
+def _source_label(sources: Sequence[Any], node: dict) -> str:
+    """The backend a scan's source was routed to, or `""` when it does not say."""
+    source_id = node.get("source_id", 0)
+    if not isinstance(source_id, int) or not 0 <= source_id < len(sources):
+        return ""
+    label = getattr(sources[source_id], "explain_label", None)
+    return label() if callable(label) else ""
+
+
+def record_plan(
+    prof, opt, plan, distributed: bool, decisions: list, sources: Sequence[Any] = ()
+) -> None:
     """Record the optimized plan + its join decisions into the profile collector."""
     prof.optimized_ir = opt.ir
     prof.logical_ir = plan.to_ir()
@@ -220,7 +241,13 @@ def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
     # execution before this memo: ~0.9 ms profiled per TPC-H q8, for labels that never change.
     # Copied out because the collector owns its dicts.
     prof.source_pushdown = dict(opt.derived("pushdown_labels", pushdown_labels))
-    prof.node_details = dict(opt.derived("detail_labels", lambda o: detail_labels(o.ir)))
+    # Memoized on the plan unless a source names its backend: the label then depends on the
+    # sources, which the plan-cache-shared memo is not keyed on.
+    prof.node_details = (
+        detail_labels(opt.ir, sources)
+        if any(hasattr(s, "explain_label") for s in sources)
+        else dict(opt.derived("detail_labels", lambda o: detail_labels(o.ir)))
+    )
     prof.distributed = distributed
     prof.decisions.extend(build_side_decisions(decisions))
 
@@ -450,7 +477,9 @@ def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
         plan, sources=sources, hub=hub, source_stats=source_stats
     )
     return QueryProfile(
-        ops=build_op_profiles(opt.ir, opt.ops, None, pushdown_labels(opt), detail_labels(opt.ir)),
+        ops=build_op_profiles(
+            opt.ir, opt.ops, None, pushdown_labels(opt), detail_labels(opt.ir, sources)
+        ),
         decisions=(
             *build_side_decisions(decisions),
             *_io_throughput_decisions(sources, hub),

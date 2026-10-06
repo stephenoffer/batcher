@@ -32,7 +32,7 @@ import pyarrow as pa
 
 from batcher.io.base._bad_rows import BadRowPolicy
 
-__all__ = ["MAX_DROPPED_LINES", "read_json_records"]
+__all__ = ["ARRAY_DOCUMENT_MESSAGE", "MAX_DROPPED_LINES", "read_json_records"]
 
 #: pyarrow reports the failing record as ``... in row N``, zero-based within the buffer it
 #: was handed. That index is the only machine-readable part of the message, and without it
@@ -49,6 +49,19 @@ _SCHEMA_MARKERS = ("changed from", "column(")
 #: it. Hitting the cap re-raises Arrow's own message, which is the honest outcome: at this
 #: density the file is not newline-delimited JSON.
 MAX_DROPPED_LINES = 1000
+
+#: Why a JSON-array document is refused, said once for both ways of meeting one: naming it
+#: with ``lines=False``, and handing one to the newline-delimited reader by default.
+ARRAY_DOCUMENT_MESSAGE = (
+    "json: this is a JSON-array file (a single '[...]' document), which is a different "
+    "format from the newline-delimited JSON Batcher reads — one object per line, so it "
+    "streams and splits. Convert it first, e.g. "
+    "pandas.read_json(p).to_json(out, orient='records', lines=True)."
+)
+
+#: How far into a file to look for its first non-whitespace byte. A pretty-printer's
+#: leading indentation is a few bytes; this only bounds the sniff.
+_SNIFF_BYTES = 4096
 
 #: ASCII newline, the record separator this format is defined by.
 _NEWLINE = 0x0A
@@ -104,6 +117,11 @@ def read_json_records(
     try:
         return pajson.read_json(reader, **kwargs)
     except pa.ArrowInvalid as first:
+        if _is_array_document(source):
+            # Only on the failure path, so a clean file pays nothing for the sniff.
+            from batcher._internal.errors import FormatError
+
+            raise FormatError(ARRAY_DOCUMENT_MESSAGE) from first
         if policy is None or not _is_unparseable(first):
             raise
         data = source if isinstance(source, bytes) else _rewound_bytes(source)
@@ -112,6 +130,29 @@ def read_json_records(
             # file and return it as a success, which is worse than the error being raised.
             raise
         return _drop_and_retry(data, kwargs, policy, first)
+
+
+def _is_array_document(source: bytes | Any) -> bool:
+    """Whether `source` opens with ``[``, the mark of a JSON-array document.
+
+    Args:
+        source: The bytes that failed to parse, or a handle over them.
+
+    Returns:
+        True when the first non-whitespace byte is ``[``; False when it is anything else
+        or the handle cannot be rewound to look.
+    """
+    if isinstance(source, bytes):
+        head = source[:_SNIFF_BYTES]
+    else:
+        try:
+            source.seek(0)
+            head = source.read(_SNIFF_BYTES)
+        except (AttributeError, OSError, ValueError):
+            return False
+    if isinstance(head, str):
+        head = head.encode()
+    return head.lstrip()[:1] == b"["
 
 
 def _rewound_bytes(handle: Any) -> bytes | None:

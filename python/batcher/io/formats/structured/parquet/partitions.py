@@ -15,17 +15,20 @@ another for pruning does not read too much, it drops rows.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
 from batcher._internal.logging import note_suppressed
+from batcher.io.base._options import BaseReadOptions
 
 if TYPE_CHECKING:
     from batcher.plan.stats import ColumnStat
 
 __all__ = [
     "HIVE_NULL",
+    "ParquetReadOptions",
     "date_typed_partitioning",
     "partition_bounds",
     "partition_type_overrides",
@@ -40,6 +43,17 @@ _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 #: The value a Hive writer puts in the path for a NULL key. It is not a date, and it must
 #: not veto the promotion — pyarrow maps it back to null for whatever type the field has.
 HIVE_NULL = "__HIVE_DEFAULT_PARTITION__"
+
+
+class ParquetReadOptions(BaseReadOptions, total=False):
+    """`bt.read.parquet`'s keywords, typed: the base file options plus ``partitioning``.
+
+    ``partitioning`` is what routes a Hive directory to the partition-aware reader, and the
+    one option this module gives meaning to (`partition_type_overrides`). Kept equal to the
+    runtime vocabulary by `tests/unit/test_reader_option_types.py`.
+    """
+
+    partitioning: str | pa.Schema | Mapping[str, Any]
 
 
 def _all_dates(values: Any) -> bool:

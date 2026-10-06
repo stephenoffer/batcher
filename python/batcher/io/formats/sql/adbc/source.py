@@ -39,8 +39,11 @@ import pyarrow as pa
 from batcher.io.credentials import resolve_secret
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.sql._common import (
+    bound_params,
     connection_fingerprint,
+    execute_bound,
     identifier_quoter,
+    params_suffix,
     probe_is_typed,
     push_down,
     pushed_sql,
@@ -83,12 +86,14 @@ class _ADBCQuerySplit:
     db_kwargs: dict[str, Any] = field(repr=False)
     conn_kwargs: dict[str, Any] | None = field(repr=False)
     sql: str
+    #: Values bound to the query's placeholders (`bound_params`), or None.
+    params: tuple[Any, ...] | dict[str, Any] | None = field(default=None, repr=False)
 
     def _table(self) -> pa.Table:
         conn = _connect(self.driver, self.db_kwargs, self.conn_kwargs)
         try:
             cur = conn.cursor()
-            cur.execute(self.sql)
+            execute_bound(cur, self.sql, self.params)
             return cur.fetch_arrow_table()
         finally:
             conn.close()
@@ -106,7 +111,7 @@ class _ADBCQuerySplit:
         conn = _connect(self.driver, self.db_kwargs, self.conn_kwargs)
         try:
             cur = conn.cursor()
-            cur.execute(self.sql)
+            execute_bound(cur, self.sql, self.params)
             return cur.fetch_record_batch().schema
         finally:
             conn.close()
@@ -121,7 +126,7 @@ class _ADBCQuerySplit:
         conn = _connect(self.driver, self.db_kwargs, self.conn_kwargs)
         try:
             cur = conn.cursor()
-            cur.execute(self.sql)
+            execute_bound(cur, self.sql, self.params)
             reader = cur.fetch_record_batch()
             for batch in reader:
                 yield batch.select(projection) if projection is not None else batch
@@ -162,7 +167,7 @@ class _ADBCQuerySplit:
         return None
 
     def identity(self) -> str:
-        return f"adbc:{self.driver}:{self.sql}"
+        return f"adbc:{self.driver}:{self.sql}{params_suffix(self.params)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +256,8 @@ class ADBCSource:
         lower_bound: Approximate minimum of `partition_on` — a cut point, not a filter.
         upper_bound: Approximate maximum of `partition_on` — a cut point, not a filter.
         num_partitions: How many parallel queries to issue.
+        params: Values for the query's placeholders (ADBC's are ``?``, or ``$1`` on
+            PostgreSQL): a sequence, bound on every statement the read runs.
 
     Raises:
         BackendError: If `adbc_driver_manager` is not installed, neither `query`
@@ -281,12 +288,14 @@ class ADBCSource:
     lower_bound: float | None = None
     upper_bound: float | None = None
     num_partitions: int = 1
+    params: Any = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         from batcher._internal.errors import BackendError
 
         if self.query is None and self.table is None:
             raise BackendError("ADBCSource requires either query= or table=")
+        object.__setattr__(self, "params", bound_params(self.params, query=self.query))
         if self.partition_on is not None and (self.lower_bound is None or self.upper_bound is None):
             raise BackendError(
                 f"partition_on={self.partition_on!r} requires lower_bound= and upper_bound=. "
@@ -402,12 +411,7 @@ class ADBCSource:
         """
         if self._schema_cache is not None:
             return self._schema_cache
-        probed = _ADBCQuerySplit(
-            self.driver,
-            self.db_kwargs,
-            self.conn_kwargs,
-            schema_probe(self.query, table=self.table),
-        ).schema()
+        probed = self._query_split(schema_probe(self.query, table=self.table)).schema()
         resolved = probed if probe_is_typed(probed) else self.splits()[0].schema()
         object.__setattr__(self, "_schema_cache", resolved)
         return resolved
@@ -434,7 +438,11 @@ class ADBCSource:
             parts = self._execute_partitions(sql)
             if parts is not None:
                 return parts
-        return [_ADBCQuerySplit(self.driver, self.db_kwargs, self.conn_kwargs, sql)]
+        return [self._query_split(sql)]
+
+    def _query_split(self, sql: str) -> _ADBCQuerySplit:
+        """One split running `sql` over a fresh connection, with this read's parameters."""
+        return _ADBCQuerySplit(self.driver, self.db_kwargs, self.conn_kwargs, sql, self.params)
 
     def read(
         self,
@@ -498,8 +506,17 @@ class ADBCSource:
         # gives the optimizer one table's cardinalities for the other's data.
         return (
             f"adbc:{self.driver}:{connection_fingerprint(self.db_kwargs or {})}:"
-            f"{self.query or self.table}"
+            f"{self.query or self.table}{params_suffix(self.params)}"
         )
+
+    def explain_label(self) -> str:
+        """The backend this read was routed to, for the scan line `explain()` prints.
+
+        Routing picks the backend from the URI and what is installed, so which one serves a
+        read is otherwise invisible: an ``sqlite://`` read takes the slow DB-API path when
+        ``adbc_driver_sqlite`` is missing, and the plan looked the same either way.
+        """
+        return f"adbc({self.driver})"
 
     def governed_name(self) -> str:
         """The table this ADBC read names, when it names one rather than a query.
@@ -539,13 +556,8 @@ class ADBCSource:
                 return parts
         assert self.lower_bound is not None and self.upper_bound is not None  # __post_init__
         return [
-            _ADBCQuerySplit(
-                self.driver,
-                self.db_kwargs,
-                self.conn_kwargs,
-                push_down(
-                    self.query, predicate, projection, table=self.table, extra_where=fragment
-                ),
+            self._query_split(
+                push_down(self.query, predicate, projection, table=self.table, extra_where=fragment)
             )
             for fragment in range_predicates(
                 self.partition_on,
@@ -561,7 +573,11 @@ class ADBCSource:
         conn = _connect(self.driver, self.db_kwargs, self.conn_kwargs)
         try:
             cur = conn.cursor()
-            descriptors, _schema, _rows = cur.adbc_execute_partitions(sql)
+            descriptors, _schema, _rows = (
+                cur.adbc_execute_partitions(sql)
+                if self.params is None
+                else cur.adbc_execute_partitions(sql, self.params)
+            )
         except (AttributeError, NotImplementedError):
             return None
         finally:

@@ -23,10 +23,14 @@ from batcher.api.session.read import _read_table
 from batcher.io.formats.sql.routing import read_backend
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
+    from typing import Unpack
 
     from batcher.api.dataset import Dataset
+    from batcher.io.formats.semistructured.json import JSONReadOptions
+    from batcher.io.formats.structured._csv_options.spec import CsvReadOptions
+    from batcher.io.formats.structured.parquet.partitions import ParquetReadOptions
 
 __all__ = ["Reader", "read"]
 
@@ -122,7 +126,7 @@ class Reader:
         return _read_table(format, *args, **opts)
 
     # --- File / object-store formats (path-addressed) ----------------------
-    def parquet(self, path: PathLike, **opts: Any) -> Dataset:
+    def parquet(self, path: PathLike, **opts: Unpack[ParquetReadOptions]) -> Dataset:
         """Read a Parquet file, directory, or glob (e.g. ``d/*.parquet``).
 
         Kyber pushes column projection and row-group predicates into the read, so a
@@ -130,7 +134,12 @@ class Reader:
 
         Args:
             path: A Parquet file, directory, or glob to read.
-            opts: Format-specific reader options forwarded to the source.
+            opts: Reader options. The file-reader options every format takes:
+                ``columns`` (also ``usecols``), ``n_rows`` (also ``nrows``/``num_rows``),
+                ``files``, ``schema_mode``, ``on_error``, ``filesystem``,
+                ``storage_options``, ``include_path`` (a column naming each row's file)
+                and ``require_success``. Plus ``partitioning``: a `pyarrow.Schema` or
+                ``{column: type}`` declaring Hive partition-key types.
 
         Returns:
             A lazy `Dataset` over the Parquet source.
@@ -176,7 +185,7 @@ class Reader:
         """
         return _read(path, format="parquet_dataset", **opts)
 
-    def csv(self, path: PathLike, **opts: Any) -> Dataset:
+    def csv(self, path: PathLike, **opts: Unpack[CsvReadOptions]) -> Dataset:
         r"""Read a CSV file, directory, or glob (e.g. ``d/*.csv``).
 
         The header row and column types are auto-inferred; column projection is pushed
@@ -199,10 +208,17 @@ class Reader:
 
         Args:
             path: A CSV file, directory, or glob to read.
-            opts: Format-specific reader options forwarded to the source — notably
-                ``schema`` (a `pyarrow.Schema` declaring the column types), ``on_error``
-                (drop an unreadable *file*), and ``on_bad_lines`` (drop a malformed *row*:
-                ``"error"``, ``"warn"``, or ``"skip"``).
+            opts: Reader options, each also accepted under its pandas or Polars spelling:
+                ``delimiter`` (the field separator), ``quote_char`` (``False`` for none),
+                ``escape_char``, ``has_header`` (``False`` for no header row, or the
+                header's line number), ``column_names``, ``null_values`` (extra null
+                tokens), ``skip_rows`` and ``skip_rows_after_header``, ``encoding``,
+                ``schema`` (a `pyarrow.Schema`, or ``{column: type}`` overriding some),
+                ``true_values`` and ``false_values``, ``decimal_point``,
+                ``try_parse_dates``, and ``on_bad_lines`` (drop a malformed *row*:
+                ``"error"``, ``"warn"``, or ``"skip"``). Plus the options every file
+                reader takes, such as ``on_error`` (drop an unreadable *file*),
+                ``columns``, ``n_rows`` and ``include_path``.
 
         Returns:
             A lazy `Dataset` over the CSV source.
@@ -218,7 +234,7 @@ class Reader:
         """
         return _read(path, format="csv", **opts)
 
-    def json(self, path: PathLike, **opts: Any) -> Dataset:
+    def json(self, path: PathLike, **opts: Unpack[JSONReadOptions]) -> Dataset:
         r"""Read newline-delimited JSON: a file, directory, or glob.
 
         One JSON object per line; column types are inferred from the records.
@@ -231,9 +247,11 @@ class Reader:
 
         Args:
             path: A JSON file, directory, or glob to read.
-            opts: Format-specific reader options forwarded to the source — notably
-                ``on_error`` (drop an unreadable *file*) and ``on_bad_lines`` (drop an
-                unparseable *record*: ``"error"``, ``"warn"``, or ``"skip"``).
+            opts: Reader options: ``lines`` (``True``; ``False`` names a JSON-array file,
+                which is refused with the conversion that fixes it) and ``on_bad_lines``
+                (drop an unparseable *record*: ``"error"``, ``"warn"``, or ``"skip"``).
+                Plus the options every file reader takes, such as ``on_error`` (drop an
+                unreadable *file*), ``columns``, ``n_rows`` and ``include_path``.
 
         Returns:
             A lazy `Dataset` over the JSON source.
@@ -717,6 +735,8 @@ class Reader:
     def numpy(self, path: PathLike, **opts: Any) -> Dataset:
         """Read NumPy ``.npy``/``.npz`` file(s) — file, directory, or glob — as tensor rows.
 
+        Requires the ``numpy`` extra: ``pip install 'batcher-engine[numpy]'``.
+
         Args:
             path: A NumPy ``.npy``/``.npz`` file, directory, or glob to read.
             opts: Format-specific reader options forwarded to the source.
@@ -737,6 +757,8 @@ class Reader:
 
     def point_cloud(self, path: PathLike, **opts: Any) -> Dataset:
         """Read LiDAR / point-cloud file(s) — ``.pcd`` / ``.ply`` / raw ``.bin`` — as points.
+
+        Requires the ``numpy`` extra: ``pip install 'batcher-engine[numpy]'``.
 
         The native robotics / autonomous-driving point-cloud formats, with no third-party
         dependency. Each file is one frame; every point becomes a row with a column per
@@ -766,6 +788,8 @@ class Reader:
 
     def mcap(self, path: PathLike, **opts: Any) -> Dataset:
         """Read MCAP robot / vehicle log(s) — the ROS 2 and ADAS recording format — as messages.
+
+        Requires the ``robotics`` extra: ``pip install 'batcher-engine[robotics]'``.
 
         One log multiplexes every sensor as timestamped messages on named topics, so a row
         is a *message*: ``{topic, log_time, publish_time, sequence, schema_name,
@@ -803,6 +827,8 @@ class Reader:
 
     def mdf(self, path: PathLike, **opts: Any) -> Dataset:
         """Read ASAM MDF4 (``.mf4``) vehicle measurement(s) — CAN/LIN and sensor channels.
+
+        Requires the ``robotics`` extra: ``pip install 'batcher-engine[robotics]'``.
 
         MDF is what automotive OEMs and test fleets log to. A file holds several *channel
         groups*, each with its own sampling raster, so this reads **long format** — one row
@@ -854,6 +880,8 @@ class Reader:
 
     def tfrecord(self, path: PathLike, **opts: Any) -> Dataset:
         """Read TFRecord file(s) — the Waymo Open Dataset / TFDS / RLDS container format.
+
+        Requires the ``tfrecord`` extra: ``pip install 'batcher-engine[tfrecord]'``.
 
         Each length-prefixed, CRC-checked record becomes a row in a ``record`` binary
         column (the raw serialized payload — commonly a ``tf.train.Example`` protobuf);
@@ -1258,6 +1286,7 @@ class Reader:
         *,
         uri: str | None = None,
         connection: Any = None,
+        params: Sequence[Any] | Mapping[str, Any] | None = None,
         **opts: Any,
     ) -> Dataset:
         """Read any SQL database from a standard connection URI, in a single submission.
@@ -1294,11 +1323,19 @@ class Reader:
         DB-API path, so it stays on this process and cannot be partitioned; `uri=` is
         what scales out.
 
+        ``params=`` binds values to the query's placeholders instead of splicing them into
+        the SQL text, through ``cursor.execute(sql, params)``. The placeholder style is the
+        driver's own: ``?`` for sqlite3, duckdb and ADBC, ``%s`` for psycopg and pymysql.
+        It works on the DB-API and ADBC paths; ConnectorX has no parameter binding, so a
+        ConnectorX scheme with `params` raises and names the DB-API route instead.
+
         Args:
             query: SQL text to execute, or ``None`` when reading via ``table=``.
             uri: A connection URI, e.g. ``"postgresql://user@host:5432/mydb"``.
             connection: An already-open PEP 249 connection or SQLAlchemy handle.
                 Mutually exclusive with `uri`.
+            params: Values for the query's placeholders: a sequence for positional ones,
+                a mapping for named ones.
             opts: Further options — ``table=``, ``password=``, the partitioning
                 keywords above, ``governed_as=`` (the table a governance policy is
                 matched against for a query read), or any driver-specific keyword.
@@ -1320,9 +1357,18 @@ class Reader:
                 ...     uri="postgresql://svc@warehouse:5432/shop",
                 ...     password="env:PGPASSWORD",
                 ... )
+
+                >>> import sqlite3
+                >>> con = sqlite3.connect(":memory:")
+                >>> _ = con.execute("CREATE TABLE t (a INTEGER)")
+                >>> _ = con.executemany("INSERT INTO t VALUES (?)", [(1,), (2,), (3,)])
+                >>> bt.read.sql("SELECT a FROM t WHERE a > ?", connection=con, params=[1]).count()
+                2
         """
         # Bound by name, not positionally: `ADBCSource`'s first field is `driver`, so a
         # positional `query` silently became the driver name. Same bug as `bigquery` below.
+        if params is not None:
+            opts["params"] = params
         if connection is not None:
             if uri is not None:
                 from batcher._internal.errors import BackendError
@@ -1346,6 +1392,15 @@ class Reader:
             from batcher.io.formats.sql.uri import parse_uri
 
             if backend == "connectorx":
+                if params is not None:
+                    from batcher._internal.errors import BackendError
+
+                    raise BackendError(
+                        f"the {parse_uri(uri).scheme!r} scheme routes to ConnectorX, which "
+                        "has no parameter binding. Bind through a PEP 249 driver instead: "
+                        "pass module= (e.g. module='pymysql') to take the DB-API path, which "
+                        "accepts params=."
+                    )
                 # ConnectorX takes credentials *inside* its URI, so it gets the original
                 # string rather than the password-stripped one `parse_uri` returns. It has
                 # no separate password channel, and silently dropping one would leave the
@@ -1367,6 +1422,8 @@ class Reader:
 
     def snowflake(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a Snowflake SQL query, fetching result chunks in parallel as Arrow.
+
+        Requires the ``snowflake`` extra: ``pip install 'batcher-engine[snowflake]'``.
 
         Connection credentials go in ``connection_kwargs``, a dict passed to
         ``snowflake.connector.connect``.
@@ -1394,6 +1451,8 @@ class Reader:
     def databricks(self, table: str, **opts: Any) -> Dataset:
         """Read a Databricks/Unity Catalog table by name.
 
+        Requires the ``databricks`` extra: ``pip install 'batcher-engine[databricks]'``.
+
         Uses credential vending to read the underlying Delta files directly.
 
         Args:
@@ -1413,6 +1472,8 @@ class Reader:
 
     def bigquery(self, query: str | None = None, **opts: Any) -> Dataset:
         """Read BigQuery via the Storage Read API as parallel Arrow streams.
+
+        Requires the ``bigquery`` extra: ``pip install 'batcher-engine[bigquery]'``.
 
         Supply a SQL ``query`` positionally, or ``table=`` to read a whole table.
 
@@ -1443,6 +1504,8 @@ class Reader:
     def clickhouse(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a ClickHouse SQL query over the Arrow-native interface.
 
+        Requires the ``clickhouse`` extra: ``pip install 'batcher-engine[clickhouse]'``.
+
         Connection details are passed as keyword options.
 
         Args:
@@ -1465,6 +1528,8 @@ class Reader:
     # --- NoSQL -------------------------------------------------------------
     def mongo(self, **opts: Any) -> Dataset:
         """Read a MongoDB collection Arrow-natively via pymongoarrow.
+
+        Requires the ``mongo`` extra: ``pip install 'batcher-engine[mongo]'``.
 
         Pass connection, database, collection, and any query/projection as keyword options.
 
@@ -1489,6 +1554,8 @@ class Reader:
     def cassandra(self, **opts: Any) -> Dataset:
         """Read a Cassandra/Scylla table, fanning out across token-range splits for parallelism.
 
+        Requires the ``cassandra`` extra: ``pip install 'batcher-engine[cassandra]'``.
+
         Pass connection, keyspace, and table as keyword options.
 
         Args:
@@ -1512,6 +1579,8 @@ class Reader:
     def dynamodb(self, **opts: Any) -> Dataset:
         """Read a DynamoDB table using native parallel scan segments.
 
+        Requires the ``dynamodb`` extra: ``pip install 'batcher-engine[dynamodb]'``.
+
         Pass the table name and AWS connection options as keywords.
 
         Args:
@@ -1530,6 +1599,8 @@ class Reader:
 
     def elasticsearch(self, **opts: Any) -> Dataset:
         """Read an Elasticsearch index via ES|QL Arrow output (or a sliced scroll fallback).
+
+        Requires the ``elasticsearch`` extra: ``pip install 'batcher-engine[elasticsearch]'``.
 
         Pass the hosts, index, and query as keyword options.
 
@@ -1553,6 +1624,8 @@ class Reader:
     def redis(self, **opts: Any) -> Dataset:
         """Read a Redis keyspace as ``(key, value)`` rows, partitioned by hash slot.
 
+        Requires the ``redis`` extra: ``pip install 'batcher-engine[redis]'``.
+
         The read walks the keyspace with ``SCAN`` over contiguous slot ranges, one split
         per range, so it parallelizes on a cluster and never blocks the server the way
         ``KEYS`` does. Narrow it with ``match=`` — a glob such as ``"session:*"`` — rather
@@ -1575,6 +1648,8 @@ class Reader:
 
     def hbase(self, **opts: Any) -> Dataset:
         """Read an HBase table, one split per region key range.
+
+        Requires the ``hbase`` extra: ``pip install 'batcher-engine[hbase]'``.
 
         Rows arrive as ``row_key`` plus one column per cell, named
         ``family:qualifier`` and decoded as UTF-8, which is the shape
@@ -1728,6 +1803,8 @@ class Reader:
         self, topic: str, *, connection_str: str = "", consumer_group: str = "$Default", **opts: Any
     ) -> Dataset:
         """Read an Azure Event Hubs stream as an unbounded source.
+
+        Requires the ``eventhubs`` extra: ``pip install 'batcher-engine[eventhubs]'``.
 
         Uses the AMQP client (the ``eventhubs`` extra); Event Hubs also exposes a
         Kafka endpoint, so `read.kafka` works against it without the extra.

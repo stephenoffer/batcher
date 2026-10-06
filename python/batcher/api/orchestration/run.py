@@ -525,7 +525,7 @@ def _run_relational_scoped(
     if ctx.profile is not None:
         from batcher.api.terminal.profile import record_plan
 
-        record_plan(ctx.profile, opt, plan, distributed, decisions)
+        record_plan(ctx.profile, opt, plan, distributed, decisions, sources)
 
     # Kyber's zone-map rules can *prove* a plan empty and record that by rewriting the root
     # to `Limit(x, 0)`. Executing it would read every source in full and throw every row

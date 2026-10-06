@@ -34,6 +34,7 @@ class LookupStage:
         cache_size: int = 100_000,
         cache_ttl: str | None = None,
         hash_values: bool = False,
+        indicator: str | None = None,
     ) -> None:
         """Open the store and build this worker's enricher.
 
@@ -46,6 +47,7 @@ class LookupStage:
             cache_size: Entries this worker's cache holds.
             cache_ttl: How long an entry stays usable, as a duration string.
             hash_values: Read a Redis key as a hash rather than a JSON string.
+            indicator: Name of the appended found-in-store column, or None for none.
         """
         from batcher.io.lookup.join import LookupEnricher
         from batcher.io.lookup.spec import build_lookup, lookup_schema
@@ -59,6 +61,7 @@ class LookupStage:
             prefix=prefix,
             cache_size=cache_size,
             cache_ttl_seconds=_ttl_seconds(cache_ttl),
+            indicator=indicator,
         )
 
     def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:

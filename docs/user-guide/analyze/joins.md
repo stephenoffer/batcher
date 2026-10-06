@@ -218,6 +218,8 @@ The cost scales with the distinct keys in your data rather than with the size of
 
 `how="left"`, the default, keeps every row and null-fills the misses. `how="inner"` drops them. A right or full outer join is not offered, because producing one would mean enumerating the store, which is the scan this exists to avoid.
 
+A null-filled miss looks exactly like a stored record whose fields are null. When the difference matters, such as when a missing customer should be flagged and a customer with no tier should not, pass `indicator="found"`. It appends a boolean column that is true when the store held the key, and it's never null, because a null key is a miss.
+
 ### Why it is fast, and what it costs
 
 Repeated keys are the whole mechanism. Each worker keeps an LRU of what it has looked up, so a fact stream that hits the same few thousand customers over and over pays for a few thousand lookups rather than a few million. It also caches *absences*, which is what stops an unmatched key from costing a round trip on every batch. On a dirty join key that is the larger of the two wins.

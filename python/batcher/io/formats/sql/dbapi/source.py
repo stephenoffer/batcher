@@ -45,8 +45,12 @@ from batcher._internal.errors import BackendError, MissingDependencyError
 from batcher.io.credentials import resolve_secret
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.sql._common import (
+    bound_params,
     connection_fingerprint,
+    execute_bound,
     identifier_quoter,
+    params_suffix,
+    percent_escaped,
     probe_is_typed,
     pushed_sql,
     schema_probe,
@@ -161,6 +165,8 @@ class _DBAPISplit:
     declared_schema: pa.Schema | None = None
     #: A caller-owned connection to borrow instead of opening one. Never closed here.
     borrowed: Any = field(default=None, repr=False, compare=False)
+    #: Values bound to the query's placeholders (`bound_params`), or None.
+    params: tuple[Any, ...] | dict[str, Any] | None = field(default=None, repr=False)
 
     def _driver_module(self) -> Any:
         """The driver module, for its PEP 249 type objects.
@@ -263,7 +269,7 @@ class _DBAPISplit:
         already holding.
         """
         with self._cursor() as cur:
-            cur.execute(self.sql)
+            execute_bound(cur, self.sql, self.params)
             description = cur.description or []
             names = [d[0] for d in description]
             module = self._driver_module()
@@ -288,7 +294,7 @@ class _DBAPISplit:
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         with self._cursor() as cur:
-            cur.execute(self.sql)
+            execute_bound(cur, self.sql, self.params)
             names = [d[0] for d in (cur.description or [])]
             running = self.declared_schema
             for rows in iter(lambda: cur.fetchmany(self.batch_size), []):
@@ -305,7 +311,7 @@ class _DBAPISplit:
         return None
 
     def identity(self) -> str:
-        return f"dbapi:{self.module_name}:{self.sql}"
+        return f"dbapi:{self.module_name}:{self.sql}{params_suffix(self.params)}"
 
 
 @SOURCES.register("dbapi")
@@ -347,6 +353,10 @@ class DBAPISource:
         lower_bound: Approximate minimum of `partition_on`.
         upper_bound: Approximate maximum of `partition_on`.
         num_partitions: How many parallel queries to issue.
+        params: Values for the query's placeholders, in the driver's own paramstyle
+            (``?`` for sqlite3 and duckdb, ``%s`` for psycopg and pymysql): a sequence for
+            positional placeholders, a mapping for named ones. Bound on every statement
+            the read runs, the schema probe and each partition's query included.
 
     Raises:
         BackendError: If the driver is not installed or is not a DB-API 2.0 module,
@@ -372,6 +382,7 @@ class DBAPISource:
     lower_bound: float | None = None
     upper_bound: float | None = None
     num_partitions: int = 1
+    params: Any = field(default=None, repr=False)
     #: Memoized `schema()`. `init=False` so it is not part of the public constructor, and
     #: `compare=False` so two sources that describe the same relation stay equal whether or
     #: not either has been asked for its schema yet — which matters because `identity()` and
@@ -383,6 +394,7 @@ class DBAPISource:
     def __post_init__(self) -> None:
         if self.query is None and self.table is None:
             raise BackendError("DBAPISource requires either query= or table=")
+        object.__setattr__(self, "params", bound_params(self.params, query=self.query))
         if self.uri is not None and not self.module:
             # The same URI `bt.read.sql` takes, resolved to a driver and its connect
             # kwargs. Doing it here rather than at the call site is what lets a URI reach
@@ -471,19 +483,35 @@ class DBAPISource:
         ``LIMIT`` but cannot spell ``NULLS FIRST|LAST`` must drop the cap too, or it
         returns its own idea of the first n. That is the one pushdown that can be wrong
         rather than merely incomplete, so it is decided here and in one place.
+
+        With `params` bound under a ``format``/``pyformat`` driver, every ``%`` pushdown
+        adds (a ``LIKE 'a%'`` literal) is doubled, or the driver would read it as a
+        placeholder; the caller's own query reaches the driver exactly as written.
         """
-        return pushed_sql(
-            self.query,
-            predicate=predicate,
-            projection=projection,
-            limit=limit,
-            ordering=ordering,
-            extra_where=extra_where,
-            table=self.table,
-            quote=self._quote,
-            supports_ordering=self.supports_ordering,
-            supports_limit=self.supports_limit,
-        )
+
+        def render(query: str | None) -> str:
+            return pushed_sql(
+                query,
+                predicate=predicate,
+                projection=projection,
+                limit=limit,
+                ordering=ordering,
+                extra_where=extra_where,
+                table=self.table,
+                quote=self._quote,
+                supports_ordering=self.supports_ordering,
+                supports_limit=self.supports_limit,
+            )
+
+        if self.params is not None and self.query is not None and self._percent_paramstyle:
+            return percent_escaped(self.query, render)
+        return render(self.query)
+
+    @property
+    def _percent_paramstyle(self) -> bool:
+        """Whether this driver's placeholders are ``%``-based (``format``/``pyformat``)."""
+        driver = self.module or type(self.connection).__module__.split(".")[0]
+        return getattr(_import_driver(driver), "paramstyle", "") in ("format", "pyformat")
 
     def _split(self, sql: str) -> _DBAPISplit:
         return _DBAPISplit(
@@ -493,6 +521,7 @@ class DBAPISource:
             self.batch_size,
             self.schema_override,
             self.connection,
+            self.params,
         )
 
     def schema(self) -> pa.Schema:
@@ -619,11 +648,21 @@ class DBAPISource:
         # is the spelling that gets a precise key.
         if self.connection is not None:
             driver = type(self.connection).__module__.split(".")[0]
-            return f"dbapi:{driver}:conn:{self.query or self.table}"
+            return f"dbapi:{driver}:conn:{self.query or self.table}{params_suffix(self.params)}"
         return (
             f"dbapi:{self.module}:{connection_fingerprint(self.connect_kwargs)}:"
-            f"{self.query or self.table}"
+            f"{self.query or self.table}{params_suffix(self.params)}"
         )
+
+    def explain_label(self) -> str:
+        """The backend this read was routed to, for the scan line `explain()` prints.
+
+        Routing picks the backend from the URI and what is installed, so which one serves a
+        read is otherwise invisible: an ``sqlite://`` read takes the slow DB-API path when
+        ``adbc_driver_sqlite`` is missing, and the plan looked the same either way.
+        """
+        driver = self.module or type(self.connection).__module__.split(".")[0]
+        return f"dbapi({driver})"
 
     def governed_name(self) -> str:
         """The table this DB-API read names, when it names one rather than a query.

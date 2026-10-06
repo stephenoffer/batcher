@@ -4926,6 +4926,7 @@ class Dataset:
         hash_values: bool = False,
         batch_size: int | None = None,
         num_workers: int | str = "auto",
+        indicator: str | None = None,
     ) -> Dataset:
         """Enrich each row from a key-value store, by point lookup rather than by scan.
 
@@ -4976,6 +4977,10 @@ class Dataset:
                 per worker, so this multiplies the round trips for the same distinct keys
                 — the right trade against a store you are waiting on, the wrong one
                 against a store you are close to rate-limiting.
+            indicator: Name of a boolean column to append that is true when the store held
+                the row's key. A left join null-fills a miss exactly as it reads a stored
+                null, so this is the one way to tell "no record" from "a record whose
+                fields are null". Never null itself: a null key is a miss.
 
         Returns:
             A new `Dataset` with the looked-up columns appended.
@@ -5022,6 +5027,8 @@ class Dataset:
         # temporal lookup column resolved on the driver and then failed on the worker.
         resolved = lookup_schema(schema)
         added = [prefix + field.name for field in resolved]
+        if indicator is not None:
+            added.append(indicator)
         collision = sorted(set(added) & set(self._plan.available_columns()))
         if collision:
             raise PlanError(
@@ -5044,6 +5051,7 @@ class Dataset:
                 "cache_size": cache_size,
                 "cache_ttl": cache_ttl,
                 "hash_values": hash_values,
+                "indicator": indicator,
             },
         )
 

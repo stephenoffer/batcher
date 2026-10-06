@@ -152,6 +152,7 @@ class BrokerSource(ABC):
         schema_registry_auth: str | None = None,
         value_codec_options: dict[str, Any] | None = None,
         key_codec_options: dict[str, Any] | None = None,
+        raw_value_column: str | None = None,
         **options: Any,
     ) -> None:
         """Create a broker source for ``topic`` polling ``poll_size`` per batch.
@@ -171,6 +172,14 @@ class BrokerSource(ABC):
         ``value_codec_options`` / ``key_codec_options`` pass codec-specific settings through
         to that side's codec, such as Protobuf's ``message_indexes`` or the string codec's
         ``encoding``.
+
+        ``raw_value_column`` keeps each message's undecoded payload as an extra binary
+        column of that name, beside the decoded ``value``. It needs a ``value_format`` and
+        ``value_decode_mode="permissive"``: permissive decoding nulls a record that will not
+        decode, and without the raw bytes that record cannot be replayed once the producer
+        is fixed. The column is the same Arrow array the codec read, so it costs no copy.
+        Route dead letters with plain Dataset code, keeping the rows whose ``value`` is null
+        and whose raw column is not.
 
         ``max_offsets_per_trigger`` and ``max_bytes_per_trigger`` are the Spark spellings of
         the same two bounds, accepted so a ported job's options carry over verbatim. One
@@ -202,6 +211,7 @@ class BrokerSource(ABC):
         # leaves the column null rather than refusing the option.
         self._include_headers = include_headers
         self.topic = topic
+        _check_raw_value_column(raw_value_column, value_format, value_decode_mode)
         # Kept verbatim (not as built codec objects) because a `BrokerSplit` is pickled to a
         # worker and a live `SchemaRegistry` holds a lock, while a parsed Avro schema holds
         # nothing a worker could reuse anyway. The worker rebuilds from this.
@@ -218,6 +228,9 @@ class BrokerSource(ABC):
             "schema_registry_auth": schema_registry_auth,
             "value_codec_options": value_codec_options,
             "key_codec_options": key_codec_options,
+            # Carried here rather than as a split option so a worker rebuilding the source
+            # from `BrokerSplit.codecs` declares the same extra column the driver planned.
+            "raw_value_column": raw_value_column,
         }
         self._value_codec, self._key_codec = build_payload_codecs(topic, self._codec_config)
         self._schema: pa.Schema | None = None
@@ -303,11 +316,13 @@ class BrokerSource(ABC):
         codec's `arrow_type()` is fixed at construction, so there is nothing to invalidate.
         """
         if self._schema is None:
-            self._schema = broker_schema(
+            schema = broker_schema(
                 self._include_headers,
                 value_type=None if self._value_codec is None else self._value_codec.arrow_type(),
                 key_type=None if self._key_codec is None else self._key_codec.arrow_type(),
             )
+            raw = self._codec_config.get("raw_value_column")
+            self._schema = schema if raw is None else schema.append(pa.field(raw, pa.binary()))
         return self._schema
 
     def row_count(self) -> int | None:
@@ -618,9 +633,18 @@ class BrokerSource(ABC):
             schema = pa.schema([schema.field(name) for name in projection])
         wanted = set(schema.names)
 
+        raw: list[pa.Array] = []
+
+        def raw_values() -> pa.Array:
+            # Built once even when both `value` and the raw column are wanted: the raw
+            # column is the very array the codec decodes below, not a second copy of it.
+            if not raw:
+                raw.append(pa.array([m.value for m in messages], type=pa.binary()))
+            return raw[0]
+
         builders: dict[str, Any] = {
             "key": lambda: pa.array([m.key for m in messages], type=pa.binary()),
-            "value": lambda: pa.array([m.value for m in messages], type=pa.binary()),
+            "value": raw_values,
             "partition": lambda: pa.array([m.partition for m in messages], type=pa.int64()),
             "offset": lambda: pa.array([m.offset for m in messages], type=pa.int64()),
             "timestamp": lambda: pa.array([m.timestamp for m in messages], type=pa.timestamp("ms")),
@@ -629,6 +653,9 @@ class BrokerSource(ABC):
                 [_header_rows(m.headers) for m in messages], type=HEADERS_TYPE
             ),
         }
+        raw_name = self._codec_config.get("raw_value_column")
+        if raw_name is not None:
+            builders[raw_name] = raw_values
         columns: dict[str, Any] = {name: builders[name]() for name in schema.names}
         # Decode here rather than downstream: one call per column per poll, on the batch the
         # source already holds, so the wire format never becomes per-row work in the plan.
@@ -650,6 +677,43 @@ class BrokerSource(ABC):
         Returns a (possibly empty) list of messages, or ``None`` to signal
         end-of-stream for a bounded source.
         """
+
+
+def _check_raw_value_column(name: str | None, value_format: Any, decode_mode: str) -> None:
+    """Refuse a `raw_value_column` that could not do what it is for.
+
+    Without a value format there is nothing decoded to keep the raw bytes beside: ``value``
+    already is the raw bytes. Under ``"fail"`` a bad record stops the stream, so no row is
+    ever nulled and there is no dead letter to route. A name the broker schema already
+    uses would shadow a real column.
+
+    Args:
+        name: The requested column name, or None.
+        value_format: The source's ``value_format``.
+        decode_mode: The source's ``value_decode_mode``.
+
+    Raises:
+        PlanError: On any of the three.
+    """
+    if name is None:
+        return
+    from batcher._internal.errors import PlanError
+
+    if value_format is None:
+        raise PlanError(
+            f"raw_value_column={name!r} needs value_format=: without a decoded value, the "
+            "value column already holds the raw payload."
+        )
+    if decode_mode != "permissive":
+        raise PlanError(
+            f"raw_value_column={name!r} needs value_decode_mode='permissive': under 'fail' a "
+            "record that will not decode stops the stream, so there is no dead letter to keep."
+        )
+    if name in broker_schema(include_headers=True).names:
+        raise PlanError(
+            f"raw_value_column={name!r} is already a broker column; pick another name, such "
+            "as 'value_raw'."
+        )
 
 
 def _header_rows(headers: list[tuple[str, Any]] | None) -> list[dict[str, Any]] | None:

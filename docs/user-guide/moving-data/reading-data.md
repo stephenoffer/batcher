@@ -46,6 +46,18 @@ print(ds.to_pydict())
 # {'x': [1, 2, 3], 'y': ['a', 'b', 'c']}
 ```
 
+File content you already hold in memory, such as an upload in an `io.BytesIO`, goes through Arrow too. The `bt.read.*` readers take paths, because their splits are what lets a read be distributed, and a buffer exists only in this process. Parse it with `pyarrow.csv.read_csv`, `pyarrow.parquet.read_table`, or `pyarrow.json.read_json` and wrap the table. Passing the buffer to a reader raises an error that names this idiom.
+
+```python
+import io
+
+import pyarrow.csv
+
+upload = io.BytesIO(b"id,amount\n1,10\n2,20\n")
+print(bt.from_arrow(pyarrow.csv.read_csv(upload)).to_pydict())
+# {'id': [1, 2], 'amount': [10, 20]}
+```
+
 ### From a streaming factory
 
 {py:func}`from_batches <batcher.from_batches>` builds a streaming source from a callable that returns a fresh
@@ -244,6 +256,20 @@ large = inventory.filter(bt.col("size") > 10_000_000)
 or hold only whitespace, the way Daft's `read_text` does, and the kept rows keep their original
 `line_number`.
 
+Every file reader takes `include_path=True`, which adds a `path` column naming the file each row came from. It's the Batcher spelling of Spark's `input_file_name()` and DuckDB's `filename=true`, and a string names the column instead. The read then runs one file per split, which gives up the row-group and byte-range splits a large file would otherwise get. A Hive-partitioned directory read this way is read flat, without its partition columns.
+
+```python
+import os
+import tempfile
+
+landing = tempfile.mkdtemp()
+bt.from_pydict({"id": [1, 2]}).write.csv(os.path.join(landing, "a.csv"), single_file=True)
+bt.from_pydict({"id": [3]}).write.csv(os.path.join(landing, "b.csv"), single_file=True)
+per_file = bt.read.csv(landing, include_path="source").group_by("source").agg(n=bt.count())
+print(sorted(os.path.basename(p) for p in per_file.to_pydict()["source"]))
+# ['a.csv', 'b.csv']
+```
+
 ## Files whose schemas differ
 
 A directory written over months drifts: a column is added, a type widens, a column is dropped. Every file reader takes `schema_mode=`, which decides what one read of those files returns. The following table lists the three modes.
@@ -281,6 +307,15 @@ print(bt.read.parquet(drift, schema_mode="union").sort("id").to_pydict())
 `union` widens a column only where no value can change: integers to `int64`, a date into a timestamp, a timestamp to the finer unit, a struct to the union of its fields. The one exception is an integer column beside a floating one, which becomes `float64` as DuckDB's `union_by_name` does. A pair with no such type raises instead of guessing: an integer and a string, a naive timestamp and a timezone-aware one, binary and string. Names are case-sensitive, so `A` and `a` are two columns where DuckDB folds them into one. A `uint64` column beside an `int64` one reads as `int64`, the type the engine holds every integer in, and a value above `2**63 - 1` raises naming its file. DuckDB widens that pair to a 128-bit integer. {doc}`/cookbook/data-engineering/modeling/schema-evolution` has the full type table.
 
 A distributed read answers exactly as a single-node one does in every mode: the same rows and column types, or the same `bt.SchemaError` about a file that breaks the contract. When several files do, which one is named depends on which is read first.
+
+A Hive partition key has no type on disk, so it's inferred from the directory names, and `k=01` reads back as the integer `1`. Pass `partitioning=` a `{column: type}` dict or a `pa.Schema` to declare it, as DuckDB's `hive_types` does. Keys you don't name are still inferred, and naming a column that is not a partition key raises.
+
+```python
+padded = os.path.join(tempfile.mkdtemp(), "t")
+bt.from_pydict({"k": ["01", "02"], "v": [1, 2]}).write.parquet(padded, partition_by=["k"])
+print(bt.read.parquet(padded, partitioning={"k": pa.string()}).sort("v").to_pydict())
+# {'v': [1, 2], 'k': ['01', '02']}
+```
 
 ## CSV options
 
