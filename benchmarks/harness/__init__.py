@@ -39,7 +39,14 @@ from .compare import (
 from .divergences import KNOWN_DIVERGENCES, Divergence, explain
 from .names import canonical_column_name, canonical_names
 from .order import OrderKey, order_keys_of, order_violation
-from .report import RESULT_PREFIX, emit_result, print_table, run_isolated
+from .report import (
+    RESULT_PREFIX,
+    case_payload,
+    emit_result,
+    print_table,
+    run_isolated,
+    write_run_record,
+)
 from .summary import (
     Summary,
     case_ratios,
@@ -69,6 +76,7 @@ __all__ = [
     "bench_samples",
     "canonical_column_name",
     "canonical_names",
+    "case_payload",
     "case_ratios",
     "column_classes",
     "compare",
@@ -88,4 +96,5 @@ __all__ = [
     "timing_order",
     "to_rowset",
     "type_differences",
+    "write_run_record",
 ]

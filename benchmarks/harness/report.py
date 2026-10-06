@@ -1,20 +1,26 @@
 """Rendering a run's results, and running each case in its own process.
 
 ``print_table`` renders the aligned per-engine table. ``emit_result`` / ``_parse_result``
-are the one-line wire format an isolated child uses to hand a result back, and
+are the one-line wire format an isolated child uses to hand a result back, built on
+``case_payload``, which ``write_run_record`` shares for the ``--json-out`` file, and
 ``run_isolated`` is what keeps a case that *kills its process* from taking the whole suite's
 report with it.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import signal
 import subprocess
 import sys
+from typing import TYPE_CHECKING, Any
 
 from .compare import CompareResult, EngineResult
+
+if TYPE_CHECKING:  # `summary` imports this module for `cell_status`
+    from .summary import Summary
 
 # Reporting
 # --------------------------------------------------------------------------- #
@@ -203,9 +209,14 @@ def print_distribution(results: list[CompareResult], engines: list[str]) -> None
 RESULT_PREFIX = "__BENCH_RESULT__ "
 
 
-def emit_result(result: CompareResult) -> None:
-    """Print `result` on the wire the parent reads. Called in the child."""
-    payload = {
+def case_payload(result: CompareResult) -> dict[str, Any]:
+    """One case as plain JSON: its status, note, and every engine's raw timings.
+
+    The single definition of a case's serialized form, shared by the child's wire line and
+    the ``--json-out`` run record, so the two cannot drift apart into a file that silently
+    lacks a field the wire carries.
+    """
+    return {
         "name": result.name,
         "status": result.status,
         "note": result.note,
@@ -221,7 +232,40 @@ def emit_result(result: CompareResult) -> None:
             for name, er in result.engines.items()
         },
     }
-    print(RESULT_PREFIX + json.dumps(payload), flush=True)
+
+
+def emit_result(result: CompareResult) -> None:
+    """Print `result` on the wire the parent reads. Called in the child."""
+    print(RESULT_PREFIX + json.dumps(case_payload(result)), flush=True)
+
+
+def write_run_record(
+    path: str | os.PathLike[str],
+    *,
+    fingerprint: dict[str, Any],
+    args: dict[str, Any],
+    runs: list[list[CompareResult]],
+    summaries: list[list[Summary]],
+) -> None:
+    """Write a whole run -- machine, arguments, and every case of every repeat -- as JSON.
+
+    The printed table is a rendering, and once the terminal scrolls nothing a reviewer can
+    recompute an aggregate from survives it. This file keeps the inputs to every aggregate:
+    each repeat's cases with their per-sample timings, *including* the ``FAILED``, ``ERROR``
+    and ``KILLED`` rows a geomean leaves out, because a denominator nobody can see is the
+    thing a published ratio is most often wrong about.
+    """
+    record = {
+        "fingerprint": fingerprint,
+        "args": args,
+        "runs": [[case_payload(r) for r in run] for run in runs],
+        "summaries": [[dataclasses.asdict(s) for s in run] for run in summaries],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        # `default=str` because an argparse value or a fingerprint field can be a path or
+        # another non-JSON scalar; losing the run over one would defeat the point.
+        json.dump(record, fh, indent=2, default=str)
+        fh.write("\n")
 
 
 def _parse_result(line: str) -> CompareResult:
