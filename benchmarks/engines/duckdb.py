@@ -112,6 +112,10 @@ class DuckDBEngine(Engine):
         region = os.environ.get("BENCH_S3_REGION")
         if region:
             con.sql(f"SET s3_region='{region}'")
+        if any(u.startswith("s3://") for u in uris.values()):
+            # A private bucket read through the instance's own credentials, as Batcher reads it
+            # and as `sources.tables` loads it; without this every case over S3 died in setup.
+            con.sql("CREATE SECRET (TYPE s3, PROVIDER credential_chain)")
         for name, uri in uris.items():
             cols = sql_projection((rename or {}).get(name))
             con.sql(f"CREATE OR REPLACE VIEW {name} AS SELECT {cols} FROM read_parquet('{uri}')")
