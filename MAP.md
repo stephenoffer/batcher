@@ -2169,7 +2169,7 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 
 | module | lines | what it is |
 |---|---|---|
-| `_native_stream.py` | 146 | Native-reader streaming for `ParquetSource._iter_file`, and the rule for when to use it. |
+| `_native_stream.py` | 154 | Native-reader streaming for `ParquetSource._iter_file`, and the rule for when to use it. |
 | `dataset.py` | 694 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
 | `partitions.py` | 219 | What a Hive ``col=value`` directory segment means, and what it proves. |
 | `routing.py` | 160 | How a predicated Parquet read spends its work: skip row groups on the footers, decode the rest. |
@@ -2768,7 +2768,7 @@ Configuration: one frozen, typed `Config` object.
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
 | `config.py` | 3448 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
-| `env.py` | 281 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
+| `env.py` | 282 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `options.py` | 357 | Dotted-string option access over the frozen `Config` tree. |
@@ -3062,7 +3062,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
 | `chunked/mod.rs` | 611 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
-| `flight.rs` | 715 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
+| `flight.rs` | 716 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
 | `lib.rs` | 799 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 787 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
@@ -3395,12 +3395,12 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | file | lines | what it is |
 |---|---|---|
 | `client_pool.rs` | 395 | The consumer-side connection pool: how a reducer dials a peer and how many streams it runs against it. |
-| `exchange.rs` | 643 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
+| `exchange.rs` | 653 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
 | `handler.rs` | 457 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 120 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 409 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 427 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
-| `store.rs` | 483 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
+| `store.rs` | 610 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 93 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 207 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |

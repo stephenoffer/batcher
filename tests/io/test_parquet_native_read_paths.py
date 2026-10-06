@@ -288,6 +288,21 @@ def test_native_stream_rule_matches_the_measured_crossover(depth, remote, expect
     assert _native_stream.use_native_stream(depth, remote) is expected
 
 
+def test_the_remote_override_can_disable_remote_native_streaming(monkeypatch):
+    """BT-121: the documented remote override must change the remote decision.
+
+    The old docstring promised `BATCHER_NATIVE_STREAM_MAX_DEPTH=2` would make remote follow
+    the local rule, but that is the default, and the remote branch ignored it, so no setting
+    could turn remote native streaming off. The remote knob is separate and does.
+    """
+    monkeypatch.setattr(_native_stream, "_LOCAL_MAX_DEPTH", 2)
+    monkeypatch.setattr(_native_stream, "_REMOTE_MAX_DEPTH", 2)
+    assert _native_stream.use_native_stream(100, remote=True) is False
+    assert _native_stream.use_native_stream(2, remote=True) is True
+    monkeypatch.setattr(_native_stream, "_REMOTE_MAX_DEPTH", 0)  # the default: never skip
+    assert _native_stream.use_native_stream(100, remote=True) is True
+
+
 def test_many_local_files_do_not_stream_natively(tmp_path, monkeypatch):
     """The regression this rule exists to prevent: at the default read-ahead depth a
     many-file local scan must NOT also fan out inside each file."""

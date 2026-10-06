@@ -59,6 +59,12 @@ _NATIVE_WINDOW_MAX_GROUPS = 8
 # exactly one place.
 _LOCAL_MAX_DEPTH = env_int("BATCHER_NATIVE_STREAM_MAX_DEPTH", 2, floor=1)
 
+# Remote reads take the native path at any depth by default (see `use_native_stream`). A
+# separate knob, because the local one cannot express "remote too": its default is already
+# the value an operator would set, so the override the docstring once promised changed
+# nothing. Positive values cap remote depth the way `_LOCAL_MAX_DEPTH` caps local; 0 is off.
+_REMOTE_MAX_DEPTH = env_int("BATCHER_NATIVE_STREAM_REMOTE_MAX_DEPTH", 0, floor=0)
+
 
 def use_native_stream(depth: int, remote: bool) -> bool:
     """Whether `_iter_file` should stream natively at this read-ahead `depth`.
@@ -72,8 +78,8 @@ def use_native_stream(depth: int, remote: bool) -> bool:
     local decodes above do. This branch is reasoned from that mechanism and from the
     distributed scan's measured `_SCAN_PREFETCH` (8 -> 32 cut a TPC-H sf100 agg ~53s ->
     ~31s); it is **not** measured here, because this machine has no object store. If a
-    cluster measurement disagrees, `BATCHER_NATIVE_STREAM_MAX_DEPTH=2` makes remote follow
-    the same rule as local without a code change.
+    cluster measurement disagrees, `BATCHER_NATIVE_STREAM_REMOTE_MAX_DEPTH=<n>` caps remote
+    depth the way the local rule does, without a code change.
 
     Args:
         depth: How many files the caller's read-ahead decodes concurrently.
@@ -82,7 +88,9 @@ def use_native_stream(depth: int, remote: bool) -> bool:
     Returns:
         True to stream through the native reader, False to use pyarrow's own iterator.
     """
-    return remote or depth <= _LOCAL_MAX_DEPTH
+    if remote:
+        return _REMOTE_MAX_DEPTH <= 0 or depth <= _REMOTE_MAX_DEPTH
+    return depth <= _LOCAL_MAX_DEPTH
 
 
 def row_group_windows(metadata: Any) -> Iterator[list[int]]:
