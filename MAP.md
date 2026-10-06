@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1569 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1573 Python modules across 222 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -422,7 +422,7 @@ The streaming-query surface: the public handle, and the launchers behind `ds.wri
 | `_diagnostics.py` | 149 | What a streaming plan will do to memory, said at `start()` rather than at the OOM. |
 | `_distributed.py` | 293 | Streaming with the micro-batch fanned across the cluster. |
 | `_launch.py` | 408 | The single-node streaming launcher: optimize once, then drive micro-batches. |
-| `_query.py` | 446 | The `StreamingQuery` handle users hold, and the registry of running queries. |
+| `_query.py` | 448 | The `StreamingQuery` handle users hold, and the registry of running queries. |
 
 ### `batcher/api/terminal/` — 5 · conductor
 
@@ -960,7 +960,7 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 3297 | The distributed executor — the dispatcher. |
+| `executor.py` | 3300 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 903 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 544 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
@@ -988,7 +988,7 @@ Per-operator distributed executor implementations.
 |---|---|---|
 | `aggregate.py` | 442 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
-| `join.py` | 874 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
+| `join.py` | 895 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
 | `map.py` | 3328 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 590 | Plan-shape analysis for the distributed dispatcher. |
@@ -1037,14 +1037,14 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `capacity.py` | 595 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `fleet_health.py` | 340 | Live device health across the fleet — every accelerator node, never cached. |
 | `hardware_probe.py` | 568 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
-| `lifecycle.py` | 719 | Ray lifecycle + single-node fallback for the distributed executor. |
+| `lifecycle.py` | 724 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
 | `readiness.py` | 502 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 432 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 331 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 796 | What the live cluster is, and what of it a query may use. |
-| `scheduling.py` | 800 | The metadata-driven scheduling envelope and placement-group machinery. |
+| `scheduling.py` | 811 | The metadata-driven scheduling envelope and placement-group machinery. |
 | `trace.py` | 133 | Why this query got the fan-out it got. |
 
 ### `batcher/dist/executors/ray_runtime/fabric/` — 4 · backend
@@ -1071,6 +1071,15 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 | `_drain.py` | 166 | Which workers are on a node that is going away. |
 | `_faults.py` | 507 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `_topn.py` | 112 | Worker-loss recovery for the distributed top-N fold. |
+
+### `batcher/dist/executors/ray_runtime/preflight/` — 4 · backend
+
+Worker binary-compatibility preflight: probe each node before it loads the engine.
+
+| module | lines | what it is |
+|---|---|---|
+| `report.py` | 286 | The facts a worker must share with the driver to load its engine, and the comparison. |
+| `run.py` | 315 | Schedule the compatibility probe on the workers and enforce what it finds. |
 
 ### `batcher/dist/fleet/` — 4 · backend
 
@@ -2693,6 +2702,7 @@ Resource contracts between Kyber (optimizer), Carbonite (resource manager), and 
 |---|---|---|
 | `_duration.py` | 144 | Duration parsing for streaming intervals — the one gate every trigger/lateness flows through. |
 | `driver_stats.py` | 114 | What a driver-produced stream reads and retains, for the micro-batch progress record. |
+| `fingerprint.py` | 97 | The fingerprint a streaming checkpoint binds its plan by, opaque nodes included. |
 | `listener.py` | 374 | `StreamingQueryListener` — a callback that sees every query start, batch, and stop. |
 | `progress.py` | 465 | What a micro-batch reported — the progress records a streaming query publishes. |
 | `rate.py` | 70 | The contract between a streaming query's rate controller and the loop it paces. |
