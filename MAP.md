@@ -961,7 +961,7 @@ Window-function translation for the SQL front-end.
 | module | lines | what it is |
 |---|---|---|
 | `executor.py` | 3297 | The distributed executor — the dispatcher. |
-| `flight_aggregate.py` | 894 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
+| `flight_aggregate.py` | 903 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 544 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
@@ -1041,7 +1041,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
 | `readiness.py` | 502 | Bounded waits for a Ray cluster that is not ready yet. |
-| `reduce.py` | 398 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
+| `reduce.py` | 432 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 331 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 796 | What the live cluster is, and what of it a query may use. |
 | `scheduling.py` | 800 | The metadata-driven scheduling envelope and placement-group machinery. |
@@ -1698,7 +1698,7 @@ Carbonite fault tolerance: surviving a fleet where nodes and devices fail.
 | `budget.py` | 170 | A ceiling on how much of a job may be spent retrying. |
 | `classify.py` | 510 | What kind of failure this was, and therefore what to do with it. |
 | `collectives.py` | 150 | Making a collective fail instead of hang. |
-| `lineage.py` | 113 | Shuffle lineage — how to recompute an output a lost worker produced. |
+| `lineage.py` | 119 | Shuffle lineage — how to recompute an output a lost worker produced. |
 | `preemption.py` | 484 | Preemption detection so the engine drains proactively, not reactively. |
 | `preflight.py` | 191 | The node-level readiness checks the device probe does not cover. |
 | `recovery.py` | 135 | Shuffle recovery — the recompute-on-failure coordination loop. |
@@ -2251,7 +2251,7 @@ Splits — independently-readable, picklable slices of a source.
 | `codecs.py` | 109 | Whether a file's compression is one the device can undo, or one that lands back on the CPU. |
 | `conformed.py` | 240 | The strict-mode contract, carried to the worker on the split itself. |
 | `device.py` | 214 | Which splits a GPU can read for itself, and the locators it needs to do it. |
-| `file.py` | 571 | File-locator splits — a whole file, an IPC stream file, or a byte range of one. |
+| `file.py` | 591 | File-locator splits — a whole file, an IPC stream file, or a byte range of one. |
 | `gds.py` | 222 | Whether a file's bytes can reach a device without a detour through host memory. |
 | `kvikio.py` | 145 | Whether a device read actually bypasses the host, or only reports that it did. |
 | `parquet.py` | 577 | Parquet-dataset split locators — row groups, the footer cache, the fragment index. |
@@ -3084,7 +3084,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `agg_par.rs` | 794 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `coalesce.rs` | 172 | Merge a result's small batches before it leaves the engine. |
-| `dist.rs` | 596 | Distributed-execution primitives. |
+| `dist.rs` | 627 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 146 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par/asof_stream.rs` | 454 | A keyless ASOF join that does not fit: a merge over two out-of-core sorted streams. |

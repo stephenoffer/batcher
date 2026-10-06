@@ -347,6 +347,36 @@ fn reduce_grace_partitions(paths: &[PathBuf], budget_bytes: usize) -> usize {
     crate::spill_split::grace_bucket_count(total as usize, budget as usize)
 }
 
+/// The Arrow IPC end-of-stream marker: a continuation token followed by a zero length.
+const IPC_EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+
+/// Fail unless `file` ends with the IPC end-of-stream marker, leaving it rewound to the start.
+///
+/// The stream reader treats a bare end of file as the end of the stream, so a staging file
+/// cut exactly between two batches decodes cleanly and its tail is simply gone: a short
+/// bucket, and a reduce that returns fewer groups with no error. Every gather file is
+/// written by a writer that finishes the stream (`write_gather_file`), so a missing marker
+/// can only mean the file was truncated after it was written.
+fn ensure_stream_finished(file: &mut std::fs::File, path: &Path) -> Result<(), InterpError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata().map_err(ArrowError::from)?.len();
+    let mut tail = [0u8; 8];
+    let finished = len >= tail.len() as u64
+        && file.seek(SeekFrom::End(-8)).is_ok()
+        && file.read_exact(&mut tail).is_ok()
+        && tail == IPC_EOS;
+    file.seek(SeekFrom::Start(0)).map_err(ArrowError::from)?;
+    if finished {
+        Ok(())
+    } else {
+        Err(InterpError::from(ArrowError::IpcError(format!(
+            "shuffle staging file {} has no end-of-stream marker: it was truncated after it \
+             was written, and reading it would silently drop its last batches",
+            path.display()
+        ))))
+    }
+}
+
 /// Read one Arrow-IPC stream file (a shuffle bucket for this reducer) into its partials.
 /// Bounded by a single file — the reducer never holds more than one at a time.
 fn read_partials_file(
@@ -354,7 +384,8 @@ fn read_partials_file(
     n_keys: usize,
     widths: &[usize],
 ) -> Result<Vec<agg::Partial>, InterpError> {
-    let file = std::fs::File::open(path).map_err(ArrowError::from)?;
+    let mut file = std::fs::File::open(path).map_err(ArrowError::from)?;
+    ensure_stream_finished(&mut file, path)?;
     let reader = StreamReader::try_new(std::io::BufReader::new(file), None)?;
     let batches = reader.collect::<Result<Vec<RecordBatch>, ArrowError>>()?;
     let partials = batches_to_partials(n_keys, widths, &batches)?;
@@ -1337,6 +1368,58 @@ mod tests {
                 (out.num_rows() > 0).then_some(out)
             })
             .collect()
+    }
+
+    /// A staging file truncated exactly between two batches decodes cleanly with its tail
+    /// gone. The spilling reduce must refuse it rather than return fewer groups (BT-033).
+    #[test]
+    fn a_staging_file_truncated_at_a_batch_boundary_is_refused() {
+        let g = gk("k");
+        let aggs = vec![agg(AggFunc::Sum, Some("v"), None, None, "a")];
+        let partials: Vec<RecordBatch> = agg_morsels()
+            .iter()
+            .map(|m| partial_aggregate(&g, &aggs, std::slice::from_ref(m)).unwrap())
+            .collect();
+        assert!(
+            partials.len() >= 2,
+            "the fixture needs two batches to cut between"
+        );
+        let scratch = ScratchDir::new();
+        let path = scratch.0.join("gather-0.arrow");
+        write_ipc_stream(&path, &partials);
+        let whole = combine_finalize_spilling(
+            &g,
+            &aggs,
+            std::slice::from_ref(&path),
+            1 << 20,
+            &scratch.0,
+            None,
+        );
+        assert!(whole.is_ok(), "an intact file must reduce");
+
+        // Cut just after the first batch: drop the rest and the end-of-stream marker.
+        let first_len = {
+            let probe = scratch.0.join("probe.arrow");
+            write_ipc_stream(&probe, &partials[..1]);
+            std::fs::metadata(&probe).unwrap().len() as usize - IPC_EOS.len()
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..first_len]).unwrap();
+        // Positive control: the format itself reads the cut file without complaint.
+        let file = std::fs::File::open(&path).unwrap();
+        let read: usize = StreamReader::try_new(file, None)
+            .unwrap()
+            .map(|b| b.unwrap().num_rows())
+            .sum();
+        assert_eq!(
+            read,
+            partials[0].num_rows(),
+            "the cut must land on a batch boundary"
+        );
+
+        let err = combine_finalize_spilling(&g, &aggs, &[path], 1 << 20, &scratch.0, None)
+            .expect_err("a truncated staging file must not reduce to fewer groups");
+        assert!(err.to_string().contains("end-of-stream"), "{err}");
     }
 
     /// An ordered `list_agg` is compared **exactly**, element order included: that order is
