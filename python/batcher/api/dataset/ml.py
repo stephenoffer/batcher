@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from batcher.api.dataset._build import build_random_split, build_train_test_split
 from batcher.api.dataset._dedup import (
@@ -22,7 +22,10 @@ from batcher.api.dataset._dedup import (
 from batcher.ml.stats._shared import require_columns
 
 if TYPE_CHECKING:
+    import datetime
+
     from batcher.api.dataset import Dataset
+    from batcher.ml.feature_spec import FeatureSpec
 
 __all__ = ["DatasetML"]
 
@@ -221,7 +224,7 @@ def _require_vector_column(ds: Dataset, column: str, *, method: str, param: str 
     )
 
 
-def _warn_extract_overwrites(ds: Dataset, schema: dict, prompt_column: str | None) -> None:
+def _warn_extract_overwrites(ds: Dataset, schema: list[str], prompt_column: str | None) -> None:
     """Warn when an `extract` schema field replaces a column that already exists.
 
     Extracted fields are written with `with_columns` semantics, so a schema field named
@@ -576,13 +579,14 @@ class DatasetML:
         self,
         model: object,
         *,
-        features: list[str] | None = None,
+        features: list[str] | FeatureSpec | None = None,
         framework: str | None = None,
         method: str = "predict",
         output_column: str = "prediction",
         output_columns: list[str] | None = None,
         as_list: bool = False,
         missing: float = float("nan"),
+        on_null: Literal["fill", "error"] = "fill",
         dtype: str | None = None,
         threads: int | None = None,
         batch_size: int | None = None,
@@ -617,20 +621,35 @@ class DatasetML:
         - ``"contrib"`` — per-feature SHAP contributions (boosters only).
 
         A null feature becomes NaN, which is what XGBoost and LightGBM treat as missing;
-        pass `missing` when the model was trained with a different sentinel. Feature order
+        pass `missing` when the model was trained with a different sentinel. A NaN already
+        in the data is scored as NaN. Pass ``on_null="error"`` to refuse a batch holding
+        either instead, naming each column and how many values it lacks. Feature order
         is checked against the model's own recorded feature names where it has them,
         because a re-ordered feature list silently changes every prediction rather than
-        raising anywhere.
+        raising anywhere. A model trained on a bare array records no names, so pass a
+        `FeatureSpec` as `features` to pin the order (and the dtypes) once: the matrix is
+        built in the spec's order, and a feature whose dtype drifted from the pinned one
+        raises when the query is built.
+
+        With ``method="predict_proba"`` the columns are ``prediction_0`` ..
+        ``prediction_{n-1}``, and ``prediction_i`` is the probability of
+        ``model.classes_[i]``, which scikit-learn, XGBoost and LightGBM all sort in
+        ascending label order. A binary model gets two columns, the negative class first.
+        To name them by class, pass ``output_columns=[f"p_{c}" for c in model.classes_]``;
+        a list of the wrong length raises rather than mislabelling a column.
 
         Args:
             model: A fitted model object, or a path/URI to a saved model.
-            features: The feature columns in model order; every column when omitted.
+            features: The feature columns in model order, or a `FeatureSpec` pinning
+                that order and each feature's dtype; every column when omitted.
             framework: Force the framework instead of detecting it.
             method: What to compute — see the list above.
             output_column: Base name of the appended prediction column(s).
             output_columns: Explicit names for a multi-output model's columns.
             as_list: Emit one `List<Float64>` column instead of one column per output.
             missing: The value a null feature takes in the matrix (NaN by default).
+            on_null: ``"fill"`` (default) scores a null as `missing` and a NaN as NaN;
+                ``"error"`` raises `DataQualityError` on any null or NaN feature value.
             dtype: Feature-matrix dtype, ``"float32"`` or ``"float64"``. Defaults to the
                 framework's own precision: float32 for the boosters, which compute in it
                 anyway, and float64 for scikit-learn, which does not — feeding a float64
@@ -654,8 +673,9 @@ class DatasetML:
             A new lazy `Dataset` with the prediction column(s) appended.
 
         Raises:
-            PlanError: On an unknown framework or method, an empty feature list, or a
-                feature order that contradicts the model's own.
+            PlanError: On an unknown framework or method, an empty feature list, a
+                feature order that contradicts the model's own, or a feature whose dtype
+                differs from the `FeatureSpec` it was declared with.
             ColumnNotFoundError: If a named feature column is not in the dataset.
 
         Examples:
@@ -668,7 +688,15 @@ class DatasetML:
                 >>> scored = ds.ml.predict(model, features=["x"])
                 >>> [round(v, 6) for v in scored.to_pydict()["prediction"]]
                 [6.0, 8.0]
+
+                >>> # A FeatureSpec pins the order once, for a model with no recorded names.
+                >>> from batcher.ml import FeatureSpec
+                >>> spec = FeatureSpec(["x"], {"x": "double"})
+                >>> scored = ds.ml.predict(model, features=spec)
+                >>> [round(v, 6) for v in scored.to_pydict()["prediction"]]
+                [6.0, 8.0]
         """
+        from batcher.ml.feature_spec import FeatureSpec
         from batcher.ml.tabular import (
             detect_framework,
             predicted_column_names,
@@ -676,7 +704,14 @@ class DatasetML:
             tabular_predictor,
         )
 
-        feature_list = resolve_features(features, self._ds.columns)
+        spec = features if isinstance(features, FeatureSpec) else None
+        feature_list = resolve_features(
+            spec.features if spec is not None else features, self._ds.columns
+        )
+        if spec is not None:
+            # Selected in the spec's order, so only presence and dtype drift can fail: the
+            # matrix is assembled by name, and the frame's own column order never matters.
+            spec.validate(self._ds.select(*feature_list))
         resolved = framework or detect_framework(model)
         appended = predicted_column_names(
             model,
@@ -696,6 +731,7 @@ class DatasetML:
             output_columns=tuple(appended),
             as_list=as_list,
             missing=missing,
+            on_null=on_null,
             dtype=dtype,
             threads=threads,
             options=tuple(sorted((options or {}).items())),
@@ -728,6 +764,8 @@ class DatasetML:
         positive: object = 1,
         threshold: float = 0.5,
         by: str | list[str] | None = None,
+        weight: str | None = None,
+        support: bool = False,
     ) -> dict[str, float] | Dataset:
         """Score predictions against labels, returning the task's whole metric set.
 
@@ -756,14 +794,20 @@ class DatasetML:
             positive: The label value that counts as the positive class.
             threshold: The cutoff turning `y_score` into a hard prediction.
             by: Column(s) to report a separate row of metrics for.
+            weight: A sample-weight column, as scikit-learn's ``sample_weight``. Applies
+                to accuracy, precision, recall, f1, balanced_accuracy (binary), mse, rmse,
+                mae and r2; naming another metric with it raises rather than ignoring it.
+            support: Also report ``n`` (the rows each metric was computed over) and, for a
+                binary task, ``n_positive``, so an empty slice is not mistaken for a
+                measured 0.0.
 
         Returns:
             A ``{metric: value}`` dict, or a `Dataset` of one row per group when `by` is
             given.
 
         Raises:
-            PlanError: On an unknown task or metric name, or when neither `y_pred` nor
-                `y_score` is given.
+            PlanError: On an unknown task or metric name, when neither `y_pred` nor
+                `y_score` is given, or when `weight` meets a metric with no weighted form.
             ColumnNotFoundError: If a named column is not in the dataset.
 
         Examples:
@@ -773,6 +817,8 @@ class DatasetML:
                 >>> ds = bt.from_pydict({"y": [1, 0, 1, 0], "s": [0.9, 0.2, 0.8, 0.4]})
                 >>> ds.ml.evaluate("y", y_score="s")["accuracy"]
                 1.0
+                >>> ds.ml.evaluate("y", y_score="s", metrics=["recall"], support=True)
+                {'recall': 1.0, 'n': 4, 'n_positive': 2}
         """
         from batcher.ml.metrics import evaluate
 
@@ -786,6 +832,8 @@ class DatasetML:
             positive=positive,
             threshold=threshold,
             by=by,
+            weight=weight,
+            support=support,
         )
 
     def train_test_split(
@@ -957,7 +1005,12 @@ class DatasetML:
         return kfold(self._ds, k, seed=seed, key=key)
 
     def time_series_split(
-        self, time_column: str, n_splits: int = 5, *, expanding: bool = True
+        self,
+        time_column: str,
+        n_splits: int = 5,
+        *,
+        expanding: bool = True,
+        gap: float | datetime.timedelta = 0,
     ) -> list[tuple[Dataset, Dataset]]:
         """Split chronologically into ``(train, validation)`` pairs — never train on the future.
 
@@ -970,16 +1023,25 @@ class DatasetML:
         matching a model retrained on all history; ``expanding=False`` slides a
         fixed-width window instead, matching one that deliberately forgets.
 
+        `gap` leaves a buffer between each training window and its validation window:
+        training stops at ``cut_i - gap`` while validation still starts at ``cut_i``, so a
+        trailing-window feature or a label that resolves later cannot leak across. The
+        column may be numeric (`gap` in its units) or a timestamp or date (`gap` a
+        `datetime.timedelta`).
+
         Args:
             time_column: The column defining chronological order.
             n_splits: How many train/validation pairs to produce.
             expanding: Grow the training window (default) rather than sliding it.
+            gap: How much of `time_column` to leave out before each validation window;
+                0 (default) makes the two adjacent.
 
         Returns:
             `n_splits` ``(train, validation)`` pairs, earliest first.
 
         Raises:
-            PlanError: If `n_splits` is less than 1.
+            PlanError: If `n_splits` is less than 1, or `gap` is negative or of the wrong
+                kind for the column.
             ColumnNotFoundError: If `time_column` is not in the dataset.
 
         Examples:
@@ -989,6 +1051,9 @@ class DatasetML:
                 >>> ds = bt.from_pydict({"t": list(range(100)), "x": list(range(100))})
                 >>> [(tr.count(), va.count()) for tr, va in ds.ml.time_series_split("t", 4)]
                 [(20, 20), (40, 20), (60, 20), (80, 19)]
+                >>> splits = ds.ml.time_series_split("t", 4, gap=5)
+                >>> [(tr.count(), va.count()) for tr, va in splits]
+                [(15, 20), (35, 20), (55, 20), (75, 19)]
 
         Note:
             Each validation window is half-open, ``[cut_i, cut_i+1)``, and the last cut is
@@ -998,7 +1063,7 @@ class DatasetML:
         """
         from batcher.ml.splitting import time_series_split
 
-        return time_series_split(self._ds, time_column, n_splits, expanding=expanding)
+        return time_series_split(self._ds, time_column, n_splits, expanding=expanding, gap=gap)
 
     def random_split(
         self, fractions: list[float], *, seed: int = 0, key: str | list[str] | None = None
@@ -2155,6 +2220,7 @@ class DatasetML:
         temperature_column: str | None = None,
         few_shot: list[tuple[str, str]] | None = None,
         parse_json: bool = False,
+        raw_column: str | None = None,
         usage: bool = False,
         finish_reason: bool = False,
         logprobs: bool = False,
@@ -2205,6 +2271,9 @@ class DatasetML:
                 prompt, so the task format is shown once rather than baked into a template.
             parse_json: Parse each output as JSON into a struct column (null on a parse
                 error). Pair with ``vllm_engine(guided_json=...)`` for reliable output.
+            raw_column: With `parse_json`, also append each generation's unparsed text
+                under this name, so a parse failure (a null struct) keeps the text that
+                failed. Requires ``parse_json=True``.
             usage: Also append ``prompt_tokens`` / ``completion_tokens`` columns.
             finish_reason: Also append a ``finish_reason`` column, so a generation cut off
                 at ``max_tokens`` (``"length"``) is detectable rather than silently
@@ -2264,15 +2333,18 @@ class DatasetML:
             temperature_column=temperature_column,
             few_shot=few_shot,
             parse_json=parse_json,
+            raw_column=raw_column,
             usage=usage,
             finish_reason=finish_reason,
             logprobs=logprobs,
             dedup=dedup,
             skip_null_prompts=skip_null_prompts,
         )
-        # Order must match GenerateSpec.appended_columns: output, usage, finish_reason, logprob.
+        # Order must match GenerateSpec.appended_columns: output, raw, usage, finish_reason,
+        # logprob.
         appended = [
             output_column,
+            *([raw_column] if raw_column is not None else []),
             *(["prompt_tokens", "completion_tokens"] if usage else []),
             *(["finish_reason"] if finish_reason else []),
             *(["logprob"] if logprobs else []),
@@ -2297,11 +2369,13 @@ class DatasetML:
         self,
         engine: Callable,
         *,
-        schema: dict[str, str],
+        schema: dict[str, object],
         prompt_column: str | None = None,
         template: str | None = None,
         instruct: bool = True,
         image_column: str | None = None,
+        raw_column: str | None = None,
+        diagnostics_column: str | None = None,
         batch_size: int | None = None,
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
@@ -2325,18 +2399,28 @@ class DatasetML:
         batch*: ask for ``{label, score}``, have the model omit ``score`` on one batch,
         and the scan fails at concat time with the GPU work already paid for.
 
-        Degradation is per row: an unparseable response, a missing key, or a value that
-        will not coerce becomes null in that column. One bad generation over a million
-        rows costs you one row, and ``ds.filter(col("total").is_null()).count()`` tells
-        you how many.
+        `schema` may nest: a ``dict`` value declares a struct, a one-element ``list``
+        (``["string"]``) a list of that type, and a ``set`` of strings (``{"low", "high"}``)
+        an enum whose column holds only those spellings. A `pyarrow.DataType` is accepted
+        too. Every declared field is required, at every level.
+
+        Degradation is per row: an unparseable response, a missing key, an off-menu enum
+        value, or a value that will not coerce becomes null in that column. One bad
+        generation over a million rows costs you one row, and
+        ``ds.filter(col("total").is_null()).count()`` tells you how many. To tell a failure
+        from a model that answered null, keep the model's text with `raw_column` and the
+        reasons with `diagnostics_column`: ``total is null and diagnostics is not null`` is
+        a row that failed validation.
 
         Pair with ``vllm_engine(guided_json=json_schema(schema))`` to constrain decoding
         so that every row parses in the first place.
 
         Args:
             engine: The `EngineFactory` to build once per worker.
-            schema: Output column name → Batcher dtype (``"string"``, ``"int64"``,
-                ``"float64"``, ``"bool"``, …).
+            schema: Output column name → field declaration: a Batcher dtype
+                (``"string"``, ``"int64"``, ``"float64"``, ``"bool"``, …), a nested ``dict``
+                (struct), a one-element ``list`` (list), a ``set`` of strings (enum), or a
+                `pyarrow.DataType`.
             prompt_column: The text column to send (ignored when `template` is set).
             template: A ``str.format`` template over the row's columns.
             instruct: Append a "reply with JSON having exactly these keys" instruction to
@@ -2344,6 +2428,12 @@ class DatasetML:
             image_column: An image column (bytes or an ``(H, W, 3)`` tensor) for a vision
                 model, so fields are extracted from an image (an invoice photo →
                 ``{vendor, total}``). The engine must be vision-capable.
+            raw_column: Also append the model's unparsed text under this name, so a row
+                whose typed values are null can be inspected or re-parsed.
+            diagnostics_column: Also append a ``list<string>`` column naming every value
+                of the row that did not fit the schema (``"total: missing required
+                field"``, ``'level: "urgent" is not one of ["high", "low"]'``, ``"response
+                is not a JSON object"``). Null for a row that matched.
             batch_size: Rebatch before each engine call; leave unset for the engine's own.
             num_gpus: GPUs to reserve per worker.
             concurrency: Size of the distributed actor pool.
@@ -2359,7 +2449,8 @@ class DatasetML:
             A new lazy `Dataset` with one typed column appended per `schema` field.
 
         Raises:
-            PlanError: If `schema` is empty or names an unknown dtype.
+            PlanError: If `schema` is empty, names an unknown dtype or an unsupported
+                declaration, or `raw_column`/`diagnostics_column` repeats an output name.
 
         Examples:
             .. doctest::
@@ -2372,6 +2463,18 @@ class DatasetML:
                 ... )
                 >>> out.to_pydict()
                 {'note': ['Paid 42 USD to Acme'], 'vendor': ['Acme'], 'total': [42.0]}
+
+                >>> # A nested schema, with the failure reasons kept per row.
+                >>> reply = '{"vendor": {"name": "Acme"}, "level": "urgent"}'
+                >>> stub = lambda: (lambda ps: [reply] * len(ps))
+                >>> out = ds.ml.extract(
+                ...     stub,
+                ...     schema={"vendor": {"name": "string"}, "level": {"low", "high"}},
+                ...     prompt_column="note",
+                ...     diagnostics_column="problems",
+                ... )
+                >>> out.to_pydict()["problems"]
+                [['level: "urgent" is not one of ["high", "low"]']]
         """
         _require_llm_columns(
             self._ds,
@@ -2381,6 +2484,7 @@ class DatasetML:
             image_column=image_column,
         )
         from batcher.ml.llm import llm_extract_udf
+        from batcher.ml.llm.structured import extract_output_columns
 
         udf = llm_extract_udf(
             engine,
@@ -2389,9 +2493,12 @@ class DatasetML:
             template=template,
             instruct=instruct,
             image_column=image_column,
+            raw_column=raw_column,
+            diagnostics_column=diagnostics_column,
         )
-        new = [c for c in schema if c not in self._ds.columns]
-        _warn_extract_overwrites(self._ds, schema, prompt_column)
+        appended = extract_output_columns(schema, raw_column, diagnostics_column)
+        new = [c for c in appended if c not in self._ds.columns]
+        _warn_extract_overwrites(self._ds, appended, prompt_column)
         return self._ds.map_batches(
             udf,
             output_columns=[*self._ds.columns, *new] if new else None,

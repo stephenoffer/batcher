@@ -67,6 +67,9 @@ class BinaryEncoder(Preprocessor):
     def fit(self, ds: Dataset) -> BinaryEncoder:
         """Learn the category set and how many bits its integer codes need.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 

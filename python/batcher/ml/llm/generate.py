@@ -50,6 +50,7 @@ def llm_udf(
     temperature_column: str | None = None,
     few_shot: list[tuple[str, str]] | None = None,
     parse_json: bool = False,
+    raw_column: str | None = None,
     usage: bool = False,
     finish_reason: bool = False,
     logprobs: bool = False,
@@ -88,6 +89,8 @@ def llm_udf(
         few_shot: fixed ``(input, output)`` demonstration pairs prepended to every prompt,
             so the model is shown the task format once rather than per row in a template.
         parse_json: parse each output as JSON into a struct column (null on error).
+        raw_column: with `parse_json`, also keep each output's unparsed text in this
+            column, so a row whose struct is null (a parse failure) still has the text.
         usage: also append ``prompt_tokens`` / ``completion_tokens``.
         finish_reason: also append a ``finish_reason`` column, so a generation truncated
             at ``max_tokens`` is detectable rather than silently corrupting a parse.
@@ -107,7 +110,11 @@ def llm_udf(
     Returns:
         A class whose instances map a `pyarrow.RecordBatch` to the batch plus the
         generated column(s).
+
+    Raises:
+        PlanError: If `raw_column` is set without `parse_json`, or names `output_column`.
     """
+    _check_raw_column(raw_column, parse_json=parse_json, output_column=output_column)
     spec = GenerateSpec(
         prompt_column=prompt_column,
         output_column=output_column,
@@ -118,6 +125,7 @@ def llm_udf(
         temperature_column=temperature_column,
         few_shot=tuple(tuple(pair) for pair in few_shot) if few_shot else None,
         parse_json=parse_json,
+        raw_column=raw_column,
         usage=usage,
         finish_reason=finish_reason,
         logprobs=logprobs,
@@ -355,6 +363,8 @@ def _generate_batch(
             )
 
     arrays = [_output_column(outputs, spec)]
+    if spec.raw_column is not None:
+        arrays.append(_text_column(outputs))
     # Everything is already in row order (order un-applied, uniques fanned out), so the
     # column builders un-permute nothing: pass order=None.
     arrays += _reported_columns(engine, outputs, None, row_reported, spec)
@@ -502,6 +512,13 @@ def _output_column(outputs: list, spec: GenerateSpec) -> Any:
 
     if spec.parse_json:
         return pa.array([_safe_json(o) for o in outputs])
+    return _text_column(outputs)
+
+
+def _text_column(outputs: list) -> Any:
+    """The outputs as a string column, a missing generation staying null."""
+    import pyarrow as pa
+
     # A row the engine could not generate for stays **null**. `str(None)` renders the
     # four-letter word "None", which is a plausible-looking generation that no downstream
     # filter can tell from a real one — the same trap `requests._cell` guards on the input
@@ -525,6 +542,23 @@ def _reported_columns(
     if spec.logprobs:
         arrays.append(_logprob_column(reported.logprobs, n, order))
     return arrays
+
+
+def _check_raw_column(raw_column: str | None, *, parse_json: bool, output_column: str) -> None:
+    """Refuse a `raw_column` that would duplicate or collide with the generated column."""
+    if raw_column is None:
+        return
+    from batcher._internal.errors import PlanError
+
+    if not parse_json:
+        raise PlanError(
+            "generate(raw_column=...) keeps the text a JSON parse replaces, so it needs "
+            "parse_json=True; without it the output column already is the raw text"
+        )
+    if raw_column == output_column:
+        raise PlanError(
+            f"generate(): raw_column and output_column are both {raw_column!r}; name them apart"
+        )
 
 
 def _count_mismatch(engine: object, got: int, expected: int) -> Exception:

@@ -234,6 +234,9 @@ class CountVectorizer(Preprocessor):
     def fit(self, ds: Dataset) -> CountVectorizer:
         """Learn the vocabulary and each term's document frequency.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 

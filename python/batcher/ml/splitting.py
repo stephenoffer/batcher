@@ -17,6 +17,7 @@ four here are instead a **content hash** of each row compared against fold bound
 
 from __future__ import annotations
 
+import datetime
 from typing import TYPE_CHECKING
 
 from batcher._internal.errors import PlanError
@@ -26,6 +27,7 @@ from batcher.plan.expr_ir.constructors import col, lit
 
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
+    from batcher.plan.expr_ir.core import Expr
 
 __all__ = [
     "fold_column",
@@ -244,7 +246,12 @@ def group_kfold(
 
 
 def time_series_split(
-    ds: Dataset, time_column: str, n_splits: int = 5, *, expanding: bool = True
+    ds: Dataset,
+    time_column: str,
+    n_splits: int = 5,
+    *,
+    expanding: bool = True,
+    gap: float | datetime.timedelta = 0,
 ) -> list[tuple[Dataset, Dataset]]:
     """Chronological ``(train, validation)`` splits — never train on the future.
 
@@ -258,17 +265,29 @@ def time_series_split(
     retrained on all history does; with ``expanding=False`` it is a fixed-width rolling
     window, which is what a model that deliberately forgets does.
 
+    `gap` leaves a buffer between the two: training stops at ``cut_i - gap`` while the
+    validation window still starts at ``cut_i``, so a feature built from a trailing window,
+    or a label that resolves later (a 30-day churn flag), cannot leak across the boundary.
+    A rolling window keeps its width and moves back by the same amount.
+
+    `time_column` may be numeric, a timestamp, or a date. A temporal column is cut on its
+    underlying instant, and its `gap` is a `datetime.timedelta`; a numeric column's `gap` is
+    a number in the column's own units.
+
     Args:
         ds: The dataset to split.
         time_column: The column defining chronological order.
         n_splits: How many train/validation pairs to produce.
         expanding: Grow the training window (default) rather than sliding it.
+        gap: How much of `time_column` to leave out between each training window and its
+            validation window. 0 (default) makes them adjacent.
 
     Returns:
         `n_splits` ``(train, validation)`` pairs, earliest first.
 
     Raises:
-        PlanError: If `n_splits` is less than 1.
+        PlanError: If `n_splits` is less than 1, `gap` is negative, or `gap` is a number
+            for a temporal column (or a timedelta for a numeric one).
         ColumnNotFoundError: If `time_column` is not a column of `ds`.
 
     Examples:
@@ -280,6 +299,9 @@ def time_series_split(
             >>> splits = time_series_split(ds, "t", 4)
             >>> [(tr.count(), va.count()) for tr, va in splits]
             [(20, 20), (40, 20), (60, 20), (80, 19)]
+            >>> gapped = time_series_split(ds, "t", 4, gap=5)
+            >>> [(tr.count(), va.count()) for tr, va in gapped]
+            [(15, 20), (35, 20), (55, 20), (75, 19)]
 
     Note:
         Each validation window is half-open, ``[cut_i, cut_i+1)``, and the last cut is the
@@ -289,8 +311,9 @@ def time_series_split(
     _check_columns(ds, time_column)
     if n_splits < 1:
         raise PlanError(f"time_series_split needs at least 1 split, got {n_splits}")
+    axis, offset = _time_axis(ds, time_column, gap)
     fractions = [(i + 1) / (n_splits + 1) for i in range(n_splits + 1)]
-    aggregates = {f"q{i}": col(time_column).quantile(f) for i, f in enumerate(fractions)}
+    aggregates = {f"q{i}": axis.quantile(f) for i, f in enumerate(fractions)}
     row = ds.agg(**aggregates).collect()
     cuts = [row.column(f"q{i}")[0].as_py() for i in range(len(fractions))]
     if any(cut is None for cut in cuts):
@@ -302,12 +325,46 @@ def time_series_split(
     splits = []
     for index in range(n_splits):
         start, end = cuts[index], cuts[index + 1]
-        train = ds.filter(col(time_column) < lit(start))
+        train = ds.filter(axis < lit(start - offset))
         if not expanding and index > 0:
-            train = train.filter(col(time_column) >= lit(cuts[index - 1]))
-        validate = ds.filter((col(time_column) >= lit(start)) & (col(time_column) < lit(end)))
+            train = train.filter(axis >= lit(cuts[index - 1] - offset))
+        validate = ds.filter((axis >= lit(start)) & (axis < lit(end)))
         splits.append((train, validate))
     return splits
+
+
+def _time_axis(ds: Dataset, time_column: str, gap: object) -> tuple[Expr, float]:
+    """The orderable expression to cut `time_column` on, and `gap` in that expression's units.
+
+    A temporal column is cut on its integer instant (the engine's quantile is numeric-only),
+    so a timestamp splits rather than raising, and a `timedelta` gap converts to the
+    column's own unit.
+    """
+    import pyarrow as pa
+
+    dtype = ds.schema.field(time_column).type
+    temporal = pa.types.is_timestamp(dtype) or pa.types.is_date(dtype)
+    if isinstance(gap, bool) or not isinstance(gap, (int, float, datetime.timedelta)):
+        raise PlanError(f"gap must be a number or a datetime.timedelta, got {gap!r}")
+    if isinstance(gap, datetime.timedelta) is not temporal:
+        want = "a datetime.timedelta" if temporal else "a number in the column's units"
+        raise PlanError(f"gap for {time_column!r} ({dtype}) must be {want}, got {gap!r}")
+    if isinstance(gap, datetime.timedelta):
+        if gap < datetime.timedelta(0):
+            raise PlanError(f"gap must not be negative, got {gap!r}")
+        if pa.types.is_date32(dtype):
+            return col(time_column).cast("int64"), gap / datetime.timedelta(days=1)
+        unit = "ms" if pa.types.is_date64(dtype) else dtype.unit
+        micros = gap / datetime.timedelta(microseconds=1)
+        return col(time_column).cast("int64"), micros * _TICKS_PER_MICROSECOND[unit]
+    if gap < 0:
+        raise PlanError(f"gap must not be negative, got {gap!r}")
+    return col(time_column), float(gap)
+
+
+#: Ticks of each Arrow timestamp unit in one microsecond. Nanoseconds are below a
+#: `timedelta`'s resolution, so the conversion goes through microseconds for every unit.
+_TICKS_PER_MICROSECOND = {"s": 1e-6, "ms": 1e-3, "us": 1.0, "ns": 1e3}
 
 
 def stratified_split(

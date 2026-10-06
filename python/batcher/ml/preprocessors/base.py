@@ -474,6 +474,10 @@ class Preprocessor(abc.ABC):
     #: ``Ln expected a numeric argument, got Utf8`` or ``could not convert string to float``.
     numeric_only: bool = False
 
+    #: Why this transform cannot be undone, quoted by `inverse_transform`. Left empty on a
+    #: transform that is simply not implemented as reversible; set on the lossy ones.
+    _irreversible: str = ""
+
     @property
     def is_fitted(self) -> bool:
         """Whether `fit` (or `fit_transform`) has run, so `transform` is ready.
@@ -532,6 +536,9 @@ class Preprocessor(abc.ABC):
 
     def fit(self, ds: Dataset) -> Preprocessor:
         """Learn this preprocessor's state from `ds` and return ``self`` (fitted).
+
+        This default runs no query; a stateful subclass's `fit` executes, running a
+        query over `ds` now, where `transform` only builds a lazy plan.
 
         The default is the stateless case: there is nothing to learn, so it just marks
         the preprocessor fitted. Stateful preprocessors (scalers, encoders, imputers)
@@ -618,6 +625,50 @@ class Preprocessor(abc.ABC):
             A new lazy `Dataset` with the just-fitted transform applied.
         """
         return self.fit(ds).transform(ds)
+
+    def inverse_transform(self, ds: Dataset) -> Dataset:
+        """Map transformed values back to the original ones, where that is exact.
+
+        Implemented only by the transforms whose fitted state determines the original value:
+        the affine scalers (`StandardScaler`, `MinMaxScaler`, `MaxAbsScaler`, `RobustScaler`)
+        and the code-to-category encoders (`OrdinalEncoder`, `LabelEncoder`). Every other
+        preprocessor raises here, saying why, rather than returning an approximation: a
+        binner, an imputer or a hashing encoder maps distinct inputs to one output, so the
+        input is not recoverable.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import KBinsDiscretizer, StandardScaler
+                >>> ds = bt.from_pydict({"x": [1.0, 3.0]})
+                >>> pre = StandardScaler("x").fit(ds)
+                >>> pre.inverse_transform(pre.transform(ds)).to_pydict()
+                {'x': [1.0, 3.0]}
+                >>> from batcher import PlanError
+                >>> try:
+                ...     KBinsDiscretizer("x", n_bins=2).fit(ds).inverse_transform(ds)
+                ... except PlanError as exc:
+                ...     print("lossy" in str(exc))
+                True
+
+        Args:
+            ds: A dataset holding this preprocessor's output columns.
+
+        Returns:
+            A new lazy `Dataset` with each source column restored from its output column.
+
+        Raises:
+            PlanError: Always, on a preprocessor with no exact inverse.
+        """
+        del ds  # there is no inverse to build, so the frame is never read
+        why = f" It is lossy: {self._irreversible}." if self._irreversible else ""
+        raise PlanError(
+            f"{type(self).__name__} has no inverse_transform.{why} Only StandardScaler, "
+            "MinMaxScaler, MaxAbsScaler, RobustScaler, OrdinalEncoder and LabelEncoder "
+            "can be inverted exactly from their fitted state; keep the original column "
+            "(output_columns=...) if you need it back."
+        )
 
     def save(self, path: str) -> None:
         """Write this fitted preprocessor to `path` as readable JSON.

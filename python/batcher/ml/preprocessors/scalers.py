@@ -94,6 +94,9 @@ class StandardScaler(Preprocessor):
     def fit(self, ds: Dataset) -> StandardScaler:
         """Learn each column's mean and population standard deviation from `ds`.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Both come from one mergeable pass: `mean_[c]` is ``E[x]`` and `scale_[c]` is
         the population standard deviation from the engine's stable variance aggregate
         (1.0 for a zero-variance column).
@@ -175,6 +178,35 @@ class StandardScaler(Preprocessor):
             new[out] = expr
         return ds.with_columns(**new)
 
+    def inverse_transform(self, ds: Dataset) -> Dataset:
+        """Undo the standardization: ``x = z * std + mean``, written back to each source column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import StandardScaler
+                >>> pre = StandardScaler("x").fit(bt.from_pydict({"x": [1.0, 3.0]}))
+                >>> pre.inverse_transform(bt.from_pydict({"x": [-1.0, 0.0]})).to_pydict()
+                {'x': [1.0, 2.0]}
+
+        Args:
+            ds: A dataset holding the standardized (output) columns.
+
+        Returns:
+            A new lazy `Dataset` with each source column restored.
+        """
+        self._require_fitted()
+        new = {}
+        for c, out in output_pairs(self.columns, self.output_columns):
+            expr = col(out)
+            if self.with_std and self.scale_[c] != 1.0:
+                expr = expr * self.scale_[c]
+            if self.with_mean:
+                expr = expr + self.mean_[c]
+            new[c] = expr
+        return ds.with_columns(**new)
+
 
 class MinMaxScaler(Preprocessor):
     """Scale columns into ``feature_range`` (default ``[0, 1]``) by min and max.
@@ -224,6 +256,9 @@ class MinMaxScaler(Preprocessor):
 
     def fit(self, ds: Dataset) -> MinMaxScaler:
         """Learn each column's min and max from `ds` (one mergeable aggregate).
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Stored as `data_min_[c]` / `data_max_[c]`; `transform` reads them as constants.
 
@@ -287,6 +322,38 @@ class MinMaxScaler(Preprocessor):
                 new[out] = scaled * (hi - lo) + lo if (hi - lo) != 1.0 or lo != 0.0 else scaled
         return ds.with_columns(**new)
 
+    def inverse_transform(self, ds: Dataset) -> Dataset:
+        """Undo the rescaling back to each column's fitted ``[min, max]``.
+
+        A constant column (``min == max``) maps every value back to that constant, which is
+        the only value it ever held.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import MinMaxScaler
+                >>> pre = MinMaxScaler("x").fit(bt.from_pydict({"x": [0.0, 10.0]}))
+                >>> pre.inverse_transform(bt.from_pydict({"x": [0.25, 1.0]})).to_pydict()
+                {'x': [2.5, 10.0]}
+
+        Args:
+            ds: A dataset holding the rescaled (output) columns.
+
+        Returns:
+            A new lazy `Dataset` with each source column restored.
+        """
+        self._require_fitted()
+        lo, hi = self.feature_range
+        new = {}
+        for c, out in output_pairs(self.columns, self.output_columns):
+            span = self.data_max_[c] - self.data_min_[c]
+            if span == 0.0:
+                new[c] = col(out) * 0.0 + self.data_min_[c]
+            else:
+                new[c] = (col(out) - lo) / (hi - lo) * span + self.data_min_[c]
+        return ds.with_columns(**new)
+
 
 class MaxAbsScaler(Preprocessor):
     """Scale each column by its maximum absolute value into ``[-1, 1]``.
@@ -326,6 +393,9 @@ class MaxAbsScaler(Preprocessor):
 
     def fit(self, ds: Dataset) -> MaxAbsScaler:
         """Learn each column's maximum absolute value from `ds`.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Computed as ``max(|min|, |max|)`` (stored in `max_abs_`) so `fit` reuses the
         mergeable min/max aggregates.
@@ -386,6 +456,31 @@ class MaxAbsScaler(Preprocessor):
             new[out] = col(c) / scale if scale != 0.0 else col(c)
         return ds.with_columns(**new)
 
+    def inverse_transform(self, ds: Dataset) -> Dataset:
+        """Undo the scaling: ``x = x' * max(|x|)``, written back to each source column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import MaxAbsScaler
+                >>> pre = MaxAbsScaler("x").fit(bt.from_pydict({"x": [-2.0, 4.0]}))
+                >>> pre.inverse_transform(bt.from_pydict({"x": [-0.5, 1.0]})).to_pydict()
+                {'x': [-2.0, 4.0]}
+
+        Args:
+            ds: A dataset holding the scaled (output) columns.
+
+        Returns:
+            A new lazy `Dataset` with each source column restored.
+        """
+        self._require_fitted()
+        new = {}
+        for c, out in output_pairs(self.columns, self.output_columns):
+            scale = self.max_abs_[c]
+            new[c] = col(out) * scale if scale != 0.0 else col(out)
+        return ds.with_columns(**new)
+
 
 class RobustScaler(Preprocessor):
     """Scale columns by the median and interquartile range (outlier-robust).
@@ -423,6 +518,9 @@ class RobustScaler(Preprocessor):
 
     def fit(self, ds: Dataset) -> RobustScaler:
         """Learn each column's median (`center_`) and interquartile range (`iqr_`).
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Both come from one mergeable quantile aggregate; a zero-IQR column keeps a
         scale of 1.0.
@@ -489,6 +587,34 @@ class RobustScaler(Preprocessor):
             new[c] = expr
         return ds.with_columns(**new)
 
+    def inverse_transform(self, ds: Dataset) -> Dataset:
+        """Undo the scaling: ``x = x' * IQR + median``, in place.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import RobustScaler
+                >>> ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0]})
+                >>> pre = RobustScaler("x").fit(ds)
+                >>> pre.inverse_transform(pre.transform(ds)).to_pydict()
+                {'x': [1.0, 2.0, 3.0, 4.0, 5.0]}
+
+        Args:
+            ds: A dataset holding the scaled columns.
+
+        Returns:
+            A new lazy `Dataset` with each column restored.
+        """
+        self._require_fitted()
+        new = {}
+        for c in self.columns:
+            expr = col(c)
+            if self.iqr_[c] != 0.0:
+                expr = expr * self.iqr_[c]
+            new[c] = expr + self.center_[c]
+        return ds.with_columns(**new)
+
 
 class Normalizer(Preprocessor):
     """Scale each **row** to unit norm across the given columns (sklearn ``Normalizer``).
@@ -522,6 +648,7 @@ class Normalizer(Preprocessor):
     numeric_only = True
 
     __slots__ = ("columns", "norm", "output_columns")
+    _irreversible = "scaling a row to unit norm discards the row's norm, which it does not keep"
 
     def __init__(
         self,

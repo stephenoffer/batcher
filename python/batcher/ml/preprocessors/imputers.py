@@ -61,6 +61,8 @@ class SimpleImputer(Preprocessor):
             ``output_columns``). ``None`` (the default) fills the columns in place.
     """
 
+    _irreversible = "a filled null is indistinguishable from a value that was really there"
+
     __slots__ = ("columns", "fill_value", "output_columns", "statistics_", "strategy")
 
     def __init__(
@@ -105,6 +107,9 @@ class SimpleImputer(Preprocessor):
 
     def fit(self, ds: Dataset) -> SimpleImputer:
         """Learn each column's fill value into `statistics_` per the chosen strategy.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         ``"mean"`` / ``"median"`` run one mergeable aggregate; ``"most_frequent"`` a
         grouped count; ``"constant"`` just reuses `fill_value`.
@@ -239,6 +244,8 @@ class IterativeImputer(Preprocessor):
 
     numeric_only = True
 
+    _irreversible = "a filled null is indistinguishable from a value that was really there"
+
     __slots__ = (
         "columns",
         "imputations_",
@@ -309,6 +316,9 @@ class IterativeImputer(Preprocessor):
 
     def fit(self, ds: Dataset) -> IterativeImputer:
         """Learn the initial fills and the per-round regression schedule.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::

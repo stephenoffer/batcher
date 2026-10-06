@@ -116,6 +116,9 @@ class RBFSampler(Preprocessor):
     def fit(self, ds: Dataset) -> RBFSampler:
         """Draw the random frequencies and phases. No data is read.
 
+        Unlike most preprocessors' `fit`, this one runs no query: it reads only the
+        schema of `ds`, so it is as cheap as building a plan.
+
         Examples:
             .. doctest::
 
@@ -254,6 +257,9 @@ class Nystroem(Preprocessor):
 
     def fit(self, ds: Dataset) -> Nystroem:
         """Sample the landmarks and factor their kernel matrix.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::

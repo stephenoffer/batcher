@@ -138,6 +138,9 @@ class GroupStatEncoder(Preprocessor):
     def fit(self, ds: Dataset) -> GroupStatEncoder:
         """Learn each group's statistics with one `group_by` aggregate.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -242,6 +245,9 @@ class GroupImputer(Preprocessor):
 
     def fit(self, ds: Dataset) -> GroupImputer:
         """Learn each group's per-column mean, and the global mean as a fallback.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::
