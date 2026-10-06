@@ -91,12 +91,12 @@ The individual sections have no `.replace` method of their own. Use `dataclasses
 
 ## Making a config active
 
-{py:func}`set_config(Config(...)) <batcher.set_config>` installs a `Config` process-wide. {py:func}`config_context(Config(...)) <batcher.config_context>` activates one for a `with` block and restores the previous config on exit. Both take a `Config` object, not keyword fields.
+{py:func}`set_config(Config(...)) <batcher.set_config>` installs a `Config` for the current context, meaning the calling thread and the asyncio tasks it starts. A thread started afterwards begins from the import-time config instead, so use the environment or the config file for a value every thread must see. {py:func}`config_context(Config(...)) <batcher.config_context>` activates one for a `with` block and restores the previous config on exit. Both take a `Config` object, not keyword fields.
 
 ```python
 from batcher import Config, set_config, config_context
 
-set_config(cfg)  # process-wide
+set_config(cfg)  # this thread and its asyncio tasks
 
 with config_context(Config()):
     result = bt.from_pydict({"x": [1, 2, 3]}).to_pydict()
@@ -162,6 +162,16 @@ print(cfg.non_defaults())
 # {'execution.morsel_rows': 4096}
 ```
 
+Pass `with_origin=True` to also learn which layer set each value: `"auto-detected"`, `"file"`, `"environment"`, `"explicit"` for `set_config` and `set_option`, or `"context"` for an enclosing `config_context`, `option_context`, or `tenant` block. The layers are listed under "Precedence" below.
+
+```python
+from batcher.config import active_config, option_context
+
+with option_context("execution.morsel_rows", 4096):
+    print(active_config().non_defaults(with_origin=True)["execution.morsel_rows"])
+# {'value': 4096, 'origin': 'context'}
+```
+
 ## Loading from the environment or a file
 
 {py:meth}`Config.from_env() <batcher.Config.from_env>` overlays `BATCHER_*` environment variables onto a base config. {py:meth}`Config.from_file(path) <batcher.Config.from_file>` overlays a JSON, TOML, or YAML document, choosing the parser from the suffix, and {py:meth}`Config.from_toml <batcher.Config.from_toml>` and {py:meth}`Config.from_yaml <batcher.Config.from_yaml>` force a format. See {doc}`environment` for variable naming and the file format.
@@ -189,6 +199,20 @@ print(config_to_dict(Config())["execution"]["morsel_rows"])
 # 16384
 ```
 
+Secrets are redacted in every printable view: the `repr`, `to_dict()`, `non_defaults()`, `diff()`, and `describe_options()`. The secret options are `distributed.shuffle_token` and `observability.openlineage_api_key`. A set secret reads as `"<redacted>"`, and loading that placeholder back raises {py:exc}`ConfigError <batcher.ConfigError>` naming the field, so a redacted document can't authenticate with the placeholder. Pass `redact_secrets=False` for a round trip that carries the real values:
+
+```python
+from batcher import Config
+from batcher.config import DistributedConfig
+
+cfg = Config().replace(distributed=DistributedConfig(shuffle_token="s3cret"))
+print(cfg.to_dict(only_non_default=True))
+# {'distributed': {'shuffle_token': '<redacted>'}}
+
+print(Config.from_dict(cfg.to_dict(redact_secrets=False)).distributed.shuffle_token)
+# s3cret
+```
+
 :::{note}
 {py:meth}`from_dict <batcher.Config.from_dict>` re-runs the environment resolution every entry point does, which auto-detects a spot node or an autoscaling cluster. A config captured on one machine can therefore differ from raw defaults when reloaded on another. Reloading an already-resolved config is idempotent.
 :::
@@ -198,7 +222,7 @@ print(config_to_dict(Config())["execution"]["morsel_rows"])
 When the engine resolves the active config, the layers apply highest first:
 
 1. `config_context(...)`, the innermost active context.
-1. `set_config(...)`, process-wide.
+1. `set_config(...)`, for the current thread and its asyncio tasks.
 1. `BATCHER_*` environment variables.
 1. A config file named by `BATCHER_CONFIG_FILE`.
 1. Built-in defaults.
@@ -207,7 +231,7 @@ The environment and file layers are read once when `batcher` is imported. `set_c
 
 The following diagram shows the same five layers as a stack, grouped by when each one is set:
 
-![Five layers are stacked from highest precedence at the top to lowest at the bottom. The top two are set at runtime. config_context, which option_context and tenant are built on, applies to the innermost with block and is restored on exit. set_config, which set_option goes through, is process-wide until changed. The bottom three are read once at import. BATCHER_* environment variables, loaded with Config.from_env, overlay the file named by BATCHER_CONFIG_FILE, loaded with Config.from_file, which overlays the built-in defaults. The defaults are the dataclass field values, and they are what reset_option restores rather than the values the environment produced.](/_static/diagrams/config_precedence.svg)
+![Five layers are stacked from highest precedence at the top to lowest at the bottom. The top two are set at runtime. config_context, which option_context and tenant are built on, applies to the innermost with block and is restored on exit. set_config, which set_option goes through, applies to the calling thread and its asyncio tasks until changed. The bottom three are read once at import. BATCHER_* environment variables, loaded with Config.from_env, overlay the file named by BATCHER_CONFIG_FILE, loaded with Config.from_file, which overlays the built-in defaults. The defaults are the dataclass field values, and they are what reset_option restores rather than the values the environment produced.](/_static/diagrams/config_precedence.svg)
 
 ## See also
 

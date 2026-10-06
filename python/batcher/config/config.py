@@ -335,6 +335,13 @@ class ExecutionConfig:
     admission_queue_depth: int = 1000
     # Seconds a query waits for a slot before raising `AdmissionTimeout`. 0 waits forever.
     admission_timeout_s: float = 0.0
+    # Wall-clock seconds one terminal operation (`collect`, a write, `iter_batches`) may
+    # take before it is cancelled through the same path `bt.cancel_query` uses. None (the
+    # default) is no limit. It is enforced at the engine's morsel and operator boundaries
+    # and between `map_batches` calls; `iter_batches` counts only the time spent producing
+    # batches, never the time the consumer holds one. A timed-out query raises
+    # `QueryCancelledError` naming the limit and the phase it was in.
+    query_timeout_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2416,6 +2423,12 @@ class ObservabilityConfig:
     # logs, so exposing it on a routable address must be a deliberate act.
     ui_host: str = "127.0.0.1"
     ui_port: int = 4040
+    # A caller-chosen name for the queries run under this config, such as
+    # ``"nightly-orders-etl"``. Empty (the default) is no label. Set it in a scope with
+    # `option_context("observability.query_label", ...)` and every query inside carries it:
+    # the `QUERY_START` progress event, a failing query's exception notes, the
+    # `query_label` column of `bt.query_history()`, and a write's `WriteManifest`.
+    query_label: str = ""
 
     @property
     def resolved_log_level(self) -> str:
@@ -2947,8 +2960,16 @@ class Config:
 
         return cls.from_dict(read_document(path, fmt="yaml"), base=base)
 
-    def to_dict(self, *, only_non_default: bool = False) -> dict[str, object]:
+    def to_dict(
+        self, *, only_non_default: bool = False, redact_secrets: bool = True
+    ) -> dict[str, object]:
         """Convert to a nested plain-dict, round-tripping through `from_dict`.
+
+        Secret options (`distributed.shuffle_token`, `observability.openlineage_api_key`)
+        are replaced with ``"<redacted>"`` unless ``redact_secrets=False``, because a config
+        dict is more often logged or attached to a manifest than reloaded. A redacted
+        secret cannot be loaded back: `from_dict` raises `ConfigError` naming the field
+        rather than authenticating with the placeholder.
 
         The round-trip is closed over *resolved* configs. `from_dict` runs the same
         resolution step every entry point does, which auto-detects the environment (a spot
@@ -2964,23 +2985,39 @@ class Config:
                 >>> Config.from_dict(resolved.to_dict()) == resolved
                 True
 
+            .. doctest::
+
+                >>> from batcher.config import Config, DistributedConfig
+                >>> cfg = Config().replace(distributed=DistributedConfig(shuffle_token="s3cret"))
+                >>> cfg.to_dict(only_non_default=True)
+                {'distributed': {'shuffle_token': '<redacted>'}}
+                >>> Config.from_dict(cfg.to_dict(redact_secrets=False)).distributed.shuffle_token
+                's3cret'
+
         Args:
             only_non_default: Emit only the values differing from the built-in defaults,
                 producing the smallest document that reproduces this config.
+            redact_secrets: Replace each set secret with ``"<redacted>"``. Pass False to
+                serialize the real values for a round trip through `from_dict`.
 
         Returns:
             A nested dict mirroring the section structure.
         """
         from batcher.config.serde import config_to_dict
 
-        return config_to_dict(self, only_non_default=only_non_default)
+        return config_to_dict(
+            self, only_non_default=only_non_default, redact_secrets=redact_secrets
+        )
 
-    def non_defaults(self) -> dict[str, object]:
+    def non_defaults(self, *, with_origin: bool = False) -> dict[str, object]:
         """The options that differ from the built-in defaults, as a flat dotted-key dict.
 
         The answer to "what is actually set here?" — the first thing worth printing when a
         run behaves differently on one machine than another, because environment variables
-        and config files both land here.
+        and config files both land here. ``with_origin=True`` also answers "who set it?":
+        each value comes back with the layer it came from, one of ``"auto-detected"``,
+        ``"file"``, ``"environment"``, ``"explicit"`` or ``"context"``. Secrets are shown
+        as ``"<redacted>"``.
 
         Examples:
             .. doctest::
@@ -2989,9 +3026,25 @@ class Config:
                 >>> Config().replace(execution=ExecutionConfig(morsel_rows=4096)).non_defaults()
                 {'execution.morsel_rows': 4096}
 
+            .. doctest::
+
+                >>> from batcher.config import active_config, option_context
+                >>> with option_context("execution.morsel_rows", 4096):
+                ...     active_config().non_defaults(with_origin=True)["execution.morsel_rows"]
+                {'value': 4096, 'origin': 'context'}
+
+        Args:
+            with_origin: Return ``{"value": v, "origin": layer}`` for each option instead
+                of the bare value.
+
         Returns:
-            A dict mapping dotted option path to its current value, for changed options only.
+            A dict mapping dotted option path to its current value (or to its value and
+            origin), for changed options only.
         """
+        if with_origin:
+            from batcher.config.serde import non_default_origins
+
+            return dict(non_default_origins(self))
         return self.diff(Config())
 
     def diff(self, other: Config) -> dict[str, object]:
@@ -3012,12 +3065,15 @@ class Config:
 
         Returns:
             A dict mapping dotted option path to *this* config's value, for each option
-            whose value differs.
+            whose value differs. Secrets are shown as ``"<redacted>"``.
         """
         from batcher.config.options import _leaves
+        from batcher.config.serde import redact
 
         theirs = dict(_leaves(other))
-        return {path: value for path, value in _leaves(self) if theirs.get(path) != value}
+        return {
+            path: redact(path, value) for path, value in _leaves(self) if theirs.get(path) != value
+        }
 
     def __repr__(self) -> str:
         """A one-line summary naming only the options that differ from the defaults.
@@ -3025,7 +3081,8 @@ class Config:
         The generated dataclass repr is 180 fields and roughly 4,500 characters, which is
         unreadable in a traceback and useless in a notebook. This shows what was changed,
         which is the only part that carries information; `describe_options` prints the full
-        table when you want it.
+        table when you want it. Secrets print as ``'<redacted>'``, since a repr ends up in
+        logs and tracebacks.
         """
         changed = self.non_defaults()
         if not changed:
@@ -3215,13 +3272,46 @@ def _resolved(cfg: Config) -> Config:
 # Active-config plumbing -------------------------------------------------------
 
 
+#: The static layers `_initial_config` composed, least specific first, kept so
+#: `Config.non_defaults(with_origin=True)` can say which one set each value.
+_STATIC_LAYERS: list[tuple[str, Config]] = []
+#: The config `set_config` installed in this context, or None. A `ContextVar` for the same
+#: reason the active config is one: `set_config` is context-scoped, so the layer it adds is
+#: too, and another thread's origin report must not attribute values to it.
+_explicit_config: contextvars.ContextVar[Config | None] = contextvars.ContextVar(
+    "batcher_explicit_config", default=None
+)
+
+
 def _initial_config() -> Config:
     """Layer the static config sources once at import: defaults < file < env."""
     base = Config()
+    _STATIC_LAYERS.append(("auto-detected", _resolved(base)))
     path = os.environ.get("BATCHER_CONFIG_FILE")
     if path:
         base = Config.from_file(path, base=base)
-    return Config.from_env(base=base)
+        _STATIC_LAYERS.append(("file", base))
+    env = Config.from_env(base=base)
+    _STATIC_LAYERS.append(("environment", env))
+    return env
+
+
+def origin_layers() -> list[tuple[str, Config]]:
+    """The layers that built the active config, least specific first, each with its name.
+
+    The static layers from import time, then the `set_config` config when there is one,
+    then the active config itself as ``"context"``. A layer that changed nothing is
+    harmless: attribution looks for the last layer where a value *changed*.
+
+    Returns:
+        ``(origin name, config)`` pairs, ending with the active config.
+    """
+    layers = list(_STATIC_LAYERS)
+    explicit = _explicit_config.get()
+    if explicit is not None:
+        layers.append(("explicit", explicit))
+    layers.append(("context", active_config()))
+    return layers
 
 
 _active: contextvars.ContextVar[Config] = contextvars.ContextVar(
@@ -3235,8 +3325,8 @@ _active: contextvars.ContextVar[Config] = contextvars.ContextVar(
 def active_config() -> Config:
     """The Config in effect for the current context.
 
-    Resolves to the innermost of: an enclosing `config_context` block, the process-wide
-    `set_config`, then the static defaults layered with the config file and env vars.
+    Resolves to the innermost of: an enclosing `config_context` block, the `set_config` of
+    the current context, then the static defaults layered with the config file and env vars.
 
     Examples:
         .. doctest::
@@ -3253,7 +3343,14 @@ def active_config() -> Config:
 
 
 def set_config(config: Config) -> None:
-    """Set the process-wide active Config (above env/file, below `config_context`).
+    """Set the active Config for the current context (above env/file, below `config_context`).
+
+    The active config is a `ContextVar`, so this sets it for the calling thread and for any
+    asyncio task or `contextvars.copy_context()` snapshot taken from it afterwards. It is
+    **not** process-wide: a thread started afterwards begins from the import-time config
+    (defaults, then ``BATCHER_CONFIG_FILE``, then ``BATCHER_*`` variables), so call
+    `set_config` inside that thread, or run its target in a copied context, to carry it
+    over. Use environment variables or the config file for a value every thread must see.
 
     Validates `config` first, so a bad tunable raises `ConfigError` here rather than
     surfacing later as a confusing runtime failure.
@@ -3270,7 +3367,9 @@ def set_config(config: Config) -> None:
     Args:
         config: The Config to make active. It is validated before being installed.
     """
-    _active.set(_resolved(config))
+    resolved = _resolved(config)
+    _active.set(resolved)
+    _explicit_config.set(resolved)
 
 
 @contextlib.contextmanager

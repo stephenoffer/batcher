@@ -101,7 +101,7 @@ cfg = Config.from_file("/etc/batcher/config.json")
 
 ## set_config
 
-{py:func}`set_config(config) <batcher.set_config>` installs a `Config` as the process-wide active configuration.
+{py:func}`set_config(config) <batcher.set_config>` installs a `Config` as the active configuration for the current context: the calling thread and any asyncio task it starts afterwards. It is not process-wide. The active config is a `ContextVar`, so a thread started afterwards begins from the import-time config, meaning the defaults with the config file and `BATCHER_*` variables applied. Call `set_config` inside that thread, or run its target under `contextvars.copy_context()`, to carry the config over, and use the environment or the config file for a value every thread must see.
 It takes a `Config` object, not keyword fields, and sits above the environment and
 file layers but below {py:func}`config_context <batcher.config_context>`.
 
