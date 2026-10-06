@@ -2717,7 +2717,7 @@ The neutral type vocabulary and inference for the plan layer.
 |---|---|---|
 | `compact.py` | 82 | Compacting Arrow batches into one, without the row loss the obvious spelling causes. |
 | `domains.py` | 306 | The input type each aggregate, window function, and temporal expression accepts. |
-| `footprint.py` | 155 | How much memory live Arrow data actually keeps resident. |
+| `footprint.py` | 219 | How much memory live Arrow data actually keeps resident. |
 | `ipc.py` | 94 | Arrow tables to bytes and back, for anything that stores a result outside the process. |
 | `lattice.py` | 330 | The lossless numeric type lattice and the FFI narrow-widening mirror. |
 | `layout.py` | 216 | Respell the Arrow *layouts* the FFI boundary cannot import (neutral layer). |
