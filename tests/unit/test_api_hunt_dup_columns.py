@@ -34,7 +34,9 @@ def test_select_positional_and_keyword_collide_rejected():
 @pytest.mark.unit
 def test_rename_onto_existing_column_rejected():
     ds = bt.from_pydict({"x": [1], "y": [2]})
-    with pytest.raises(PlanError, match="duplicate output column"):
+    # rename() names itself and the colliding target, rather than the select/with_columns
+    # message the projection it builds would raise.
+    with pytest.raises(PlanError, match=r"rename\(\): target\(s\) \['y'\] already name a column"):
         ds.rename(x="y")
 
 

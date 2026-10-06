@@ -55,7 +55,7 @@ Each returns a new lazy Dataset.
 | `.filter(expr)` | keep rows where the predicate is true |
 | {py:meth}`.select(*names, **derived) <batcher.Dataset.select>` | choose or derive the full output |
 | {py:meth}`.with_columns(**named) <batcher.Dataset.with_columns>` | add or replace columns |
-| `.drop(*names)` | remove columns |
+| `.drop(*names, strict=True)` | remove columns; `strict=False` ignores a name that is not a column |
 | `.rename({old: new})` | rename columns |
 | `.sort(*by, descending=False, nulls_first=False)` | order rows |
 | `.limit(n, offset=0)` | take a prefix |
@@ -87,7 +87,7 @@ reverse:
 | --- | --- |
 | {py:meth}`.explode(column, alias=None) <batcher.Dataset.explode>` | one row per element of a list column |
 | {py:meth}`.with_row_index(name="index", offset=0) <batcher.Dataset.with_row_index>` | prepend a sequential row-index column (Polars) |
-| {py:meth}`.with_random(name="random", seed=0, normal=False) <batcher.Dataset.with_random>` | add a reproducible seeded random column (uniform or standard normal) |
+| {py:meth}`.with_random(name="random", seed=0, normal=False, key=None) <batcher.Dataset.with_random>` | add a reproducible seeded random column (uniform or standard normal), keyed on row position or on `key` columns |
 | {py:meth}`.unnest(*columns) <batcher.Dataset.unnest>` | lift struct fields into top-level columns |
 | {py:meth}`.pivot(index=[...], on=, values=, aggregate="sum") <batcher.Dataset.pivot>` | long -> wide |
 | {py:meth}`.unpivot(on=[...], index=[...], ...) <batcher.Dataset.unpivot>` | wide -> long |
@@ -99,12 +99,12 @@ Each of these executes the plan and returns a result or writes it out:
 
 | Method | Returns |
 | --- | --- |
-| {py:meth}`.collect(distributed=False, num_workers=None, spill=False, num_partitions=16, adaptive=False, transport="disk") <batcher.Dataset.collect>` | pyarrow Table |
+| {py:meth}`.collect(distributed="auto", num_workers=None, spill=False, num_partitions=None, adaptive="auto", transport="auto", backend="cpu", *, max_rows=None) <batcher.Dataset.collect>` | pyarrow Table; `max_rows` raises rather than returning a larger result |
 | {py:meth}`.to_pydict() <batcher.Dataset.to_pydict>` | `dict[str, list]` |
 | {py:meth}`.to_pylist() <batcher.Dataset.to_pylist>` | `list[dict]` |
 | `.count()` | row count (`int`) |
 | {py:meth}`.iter_batches(batch_size=None) <batcher.Dataset.iter_batches>` | iterator of RecordBatch |
-| `.explain()` | optimized plan as text |
+| `.explain(analyze=False, *, format="text", backend="cpu")` | optimized plan as text; `backend="gpu"` adds whether the plan translates to the GPU tier and what blocks it |
 | {py:meth}`.show(limit=10) <batcher.Dataset.show>` | prints a preview |
 | {py:obj}`.write(path, fmt=None, partition_by=None, distributed=False, num_workers=None, **kw) <batcher.Dataset.write>` | WriteManifest |
 | `.write.parquet(path, compression="zstd", **kw)` | writes Parquet |

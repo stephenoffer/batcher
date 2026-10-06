@@ -72,6 +72,16 @@ print(shuffled.select("value").to_pydict())
 
 That sort is a full breaker over the whole relation, so reach for it on the small side of a pipeline, not before a 10 TB scan.
 
+By default the draw is keyed on each row's position, so it reproduces for the same input order. Pass `key=` to key it on column values instead. Each row's draw is then a seeded hash of its key, so filtering, reordering or re-partitioning the input leaves it unchanged, and rows that share a key share a draw:
+
+```python
+keyed = ds.with_random("r", seed=3, key="value")
+first = keyed.filter(bt.col("value") < 5).sort("value").to_pydict()["r"]
+later = ds.sort("value", descending=True).with_random("r", seed=3, key="value")
+print(first == later.filter(bt.col("value") < 5).sort("value").to_pydict()["r"])
+# True
+```
+
 ## Train/test splits
 
 {py:meth}`train_test_split <batcher.api.dataset.ml.DatasetML.train_test_split>` is the split you want for modeling. The two parts are disjoint, they cover every row, and neither materializes. Each is a row-wise filter, so both stay lazy.
@@ -186,7 +196,7 @@ Sample when you want *rows*. Sketch when you want a *number*. The decision table
 | A distinct count or a quantile | `approx_count_distinct` / `approx_quantile` | one pass, mergeable, bounded error |
 :::
 
-Sampling to *estimate* an aggregate is usually the wrong tool. The engine already has exact and sketch-based answers that read the same data in one pass. `approx_count_distinct` runs a HyperLogLog, and `ds.approx_quantile` streams a TDigest, or answers from a learned KLL sketch left behind by a past run when one is available. Both are mergeable, so they scale across a cluster in bounded memory. A HyperLogLog merges to the same estimate in any order, while a TDigest's merge can land at a slightly different value, inside the error the sketch promises. The `approx_quantile` aggregate inside `agg` uses a DDSketch instead, which merges identically in any order.
+Sampling to *estimate* an aggregate is usually the wrong tool. The engine already has exact and sketch-based answers that read the same data in one pass. `approx_count_distinct` runs a HyperLogLog, and `ds.approx_quantile` streams a TDigest, or answers from a learned KLL sketch left behind by a past run when one is available. A learned sketch describes the data as that run saw it, so pass `use_learned=False` to `approx_count_distinct`, `approx_quantile`, `approx_median` or `approx_percentile` to force a fresh pass over the data as it is now. Both are mergeable, so they scale across a cluster in bounded memory. A HyperLogLog merges to the same estimate in any order, while a TDigest's merge can land at a slightly different value, inside the error the sketch promises. The `approx_quantile` aggregate inside `agg` uses a DDSketch instead, which merges identically in any order.
 
 ```python
 estimate, exact = ds.approx_count_distinct("value"), ds.count_distinct("value")

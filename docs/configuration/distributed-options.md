@@ -58,7 +58,7 @@ print(cfg.distributed.namespace)
 
 ### Pin terminals that take no distributed argument
 
-`collect()` and `iter_batches()` accept `distributed=`, but many terminals don't. The scalar terminals such as `count()` and `min()`, `to_arrow()` and `to_pydict()`, the fallbacks behind `ds.meta`, and `ds.dq.validate()` and `ds.dq.fail()` all run with `distributed="auto"`. Set `mode` to decide for all of them at once. Scope it with `option_context` so it covers one block of work:
+`collect()` and `iter_batches()` accept `distributed=`, but their defaults differ. `collect()` defaults to `distributed="auto"`, while `iter_batches()` defaults to `distributed=False` and streams locally unless you pass `True` or `"auto"`. Pass the same value to both when a stream must run where the materialized result would. Many terminals take no `distributed=` at all. The scalar terminals such as `count()` and `min()`, `to_arrow()` and `to_pydict()`, the fallbacks behind `ds.meta`, and `ds.dq.validate()` and `ds.dq.fail()` all run with `distributed="auto"`. Set `mode` to decide for all of them at once. Scope it with `option_context` so it covers one block of work:
 
 ```python
 import batcher as bt

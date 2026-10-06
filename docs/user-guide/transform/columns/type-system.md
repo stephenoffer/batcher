@@ -246,6 +246,13 @@ print(
 Look at the `nan` column: {py:meth}`is_nan() <batcher.plan.expr_ir.core.Expr.is_nan>` on a *null* is null, not False. Three-valued logic applies to every predicate, which is why `filter(bt.col("x") > 0)` drops null rows: `null > 0` is null, and a filter keeps only rows that are *true*. A predicate you expect to partition the data into two halves partitions it into three.
 :::
 
+The frame-wide masks follow the same rule. {py:meth}`Dataset.isna <batcher.Dataset.isna>` and {py:meth}`Dataset.notna <batcher.Dataset.notna>` test for null only, which differs from pandas, where a NaN is missing too. Pass `nan=True` for the pandas reading. It ORs `is_nan()` into the test on every floating-point column, and the null row stays true because `true | null` is true:
+
+```python
+print(mixed.isna().to_pydict(), mixed.isna(nan=True).to_pydict())
+# {'x': [False, False, True]} {'x': [False, True, True]}
+```
+
 Where NaN and `-0.0` do get canonicalized is in a hash key: grouping, `distinct`, joins, and shuffles all treat every NaN as one key and `-0.0` as `0.0`, so a group cannot split across partitions. See {doc}`distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`.
 
 ## Integer division and mixed arithmetic
