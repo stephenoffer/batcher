@@ -304,12 +304,13 @@ impl FlightShuffleServer {
             .map(|b| normalize_batch(&b.0))
             .collect::<PyResult<_>>()?;
         py.detach(|| {
-            shared_runtime().block_on(self.exchange.publish(&t, batches));
+            let published = shared_runtime().block_on(self.exchange.publish(&t, batches));
             // Charge the new footprint (and spill if the pool will not cover it) while the
             // GIL is still released: reconciliation can write a bucket to disk.
             self.spiller.reconcile();
-        });
-        Ok(())
+            published
+        })
+        .map_err(transport_to_pyerr)
     }
 
     /// High-water mark of in-flight batches for `ticket` (peak the producer ever
@@ -329,7 +330,9 @@ impl FlightShuffleServer {
         ticket: &str,
     ) -> PyResult<Option<Vec<PyArrowType<RecordBatch>>>> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
-        let batches = py.detach(|| shared_runtime().block_on(self.exchange.local_partition(&t)));
+        let batches = py
+            .detach(|| shared_runtime().block_on(self.exchange.local_partition(&t)))
+            .map_err(transport_to_pyerr)?;
         Ok(batches.map(|bs| bs.into_iter().map(PyArrowType).collect()))
     }
 
@@ -676,7 +679,11 @@ impl ShuffleClient {
     }
 
     /// Fetch `ticket` from `addr` over a credit-gated stream on a pooled channel.
-    #[pyo3(signature = (addr, ticket, credits=bc_transport::DEFAULT_CREDITS, token=None))]
+    ///
+    /// `required=True` is for a ticket the caller knows was published (a replica copy, a
+    /// stage-output handle): absence raises a retryable shuffle error instead of reading as
+    /// an empty partition.
+    #[pyo3(signature = (addr, ticket, credits=bc_transport::DEFAULT_CREDITS, token=None, required=false))]
     fn fetch(
         &self,
         py: Python<'_>,
@@ -684,10 +691,19 @@ impl ShuffleClient {
         ticket: &str,
         credits: u32,
         token: Option<&str>,
+        required: bool,
     ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
         let batches = py
-            .detach(|| shared_runtime().block_on(self.pool.fetch_secured(addr, &t, credits, token)))
+            .detach(|| {
+                shared_runtime().block_on(async {
+                    if required {
+                        self.pool.fetch_required(addr, &t, credits, token).await
+                    } else {
+                        self.pool.fetch_secured(addr, &t, credits, token).await
+                    }
+                })
+            })
             .map_err(transport_to_pyerr)?;
         Ok(batches.into_iter().map(PyArrowType).collect())
     }

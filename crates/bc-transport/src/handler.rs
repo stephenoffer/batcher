@@ -95,6 +95,7 @@ impl FlightService for FlightHandler {
             .store
             .get(&ticket)
             .await
+            .map_err(|e| lost_bucket_status(&e))?
             .ok_or_else(|| Status::not_found(format!("unknown ticket: {ticket}")))?;
 
         // Empty partition: still send the schema so the reducer can reconstruct
@@ -240,18 +241,37 @@ impl FlightService for FlightHandler {
         let names: Vec<&str> = ticket.split(',').filter(|t| !t.is_empty()).collect();
         let mut buckets: Vec<Arc<Vec<arrow::array::RecordBatch>>> = Vec::with_capacity(names.len());
         let mut first_gauge = None;
+        let mut missing: Vec<&str> = Vec::new();
         for name in &names {
-            if let Some((batches, gauge)) = self.store.get_with_gauge(name).await {
-                if first_gauge.is_none() {
-                    first_gauge = Some(gauge);
+            match self.store.get_with_gauge(name).await {
+                Ok(Some((batches, gauge))) => {
+                    if first_gauge.is_none() {
+                        first_gauge = Some(gauge);
+                    }
+                    buckets.push(batches);
                 }
-                buckets.push(batches);
+                Ok(None) => missing.push(name),
+                // Registered but unreadable: the bucket is lost, and the consumer must hear
+                // that rather than "unknown", which a lenient reader treats as empty.
+                Err(e) => return Err(lost_bucket_status(&e)),
             }
         }
-        // Every requested bucket missing is the empty-bucket case the consumer already maps
-        // to "no rows" — the same `NotFound` a single unpublished ticket has always raised.
-        let Some(gauge) = first_gauge else {
-            return Err(Status::not_found(format!("unknown ticket: {ticket}")));
+        // **All or nothing.** A group with any member missing is refused, naming the missing
+        // members, rather than streamed with the members that exist. Serving the partial
+        // group made the response indistinguishable from a complete one: a stream of two of
+        // three required buckets decoded cleanly and the third bucket's rows were gone. The
+        // consumer answers this refusal by fetching bucket by bucket, which tells it exactly
+        // which source to recover.
+        let gauge = match first_gauge {
+            Some(gauge) if missing.is_empty() => gauge,
+            _ => {
+                let absent = if missing.is_empty() {
+                    ticket.clone()
+                } else {
+                    missing.join(",")
+                };
+                return Err(Status::not_found(format!("unknown ticket: {absent}")));
+            }
         };
 
         // Credits available to the producer. The consumer feeds this by sending
@@ -425,4 +445,13 @@ pub(crate) fn decode_credits(meta: &[u8]) -> u32 {
 /// Encode a `u32` credit grant as little-endian bytes for `app_metadata`.
 pub(crate) fn encode_credits(n: u32) -> Vec<u8> {
     n.to_le_bytes().to_vec()
+}
+
+/// The status for a bucket the store registered but can no longer read back.
+///
+/// `DataLoss`, not `NotFound`: the ticket *was* published, so "unknown" would be false, and
+/// a lenient consumer would read it as an empty bucket. The consumer classifies `DataLoss`
+/// as retryable, so the reducer tries a replica and then recomputes the mapper.
+fn lost_bucket_status(err: &crate::store::SpillReadError) -> Status {
+    Status::data_loss(err.to_string())
 }

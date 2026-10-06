@@ -824,7 +824,12 @@ try:
             """
             _use_plan(plan_id)
             for ticket in tickets:
-                self.session.publish(ticket, self.session.fetch(primary_addr, ticket))
+                # `required`: the primary published this ticket, so an absent one is lost
+                # data, and copying it leniently would publish an *empty* replica that every
+                # later reducer would trust as the bucket.
+                self.session.publish(
+                    ticket, self.session.fetch(primary_addr, ticket, required=True)
+                )
             return self.session.addr
 
         def reduce_fetch(

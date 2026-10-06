@@ -201,6 +201,23 @@ pub enum TransportError {
     /// Address parsing / IO error.
     #[error("io error: {0}")]
     Io(String),
+    /// A bucket the consumer requires is not registered on the peer it asked.
+    ///
+    /// Distinct from an empty bucket, which a shuffle mapper publishes as a ticket with no
+    /// rows. Absence used to be read as emptiness, so a bucket that was evicted early, never
+    /// replicated, or lost with its spill file became a successful fetch of nothing. A
+    /// consumer that knows the bucket must exist (the reducer gather) gets this error, which
+    /// classifies as retryable: the recovery loop tries a replica and then recomputes the
+    /// mapper. It never becomes fewer rows. The string names the missing ticket(s).
+    #[error("shuffle bucket not published on the peer: {0}")]
+    MissingTicket(String),
+    /// A publish the store could neither hold under its byte cap nor spill to disk.
+    ///
+    /// Fatal: retrying on the same worker meets the same full or unwritable disk. The store
+    /// refuses the bucket rather than hold it over its cap, which is what keeps a disk fault
+    /// from turning into an out-of-memory kill of the worker.
+    #[error("{0}")]
+    StoreFull(String),
 }
 
 /// Process-wide transport tunables, settable once per worker process from the
@@ -457,8 +474,18 @@ impl FlightServer {
 
     /// Register a named partition. The `ticket` is the routing key reducers use
     /// in [`FlightClient::fetch`]; `batches` are served verbatim over `DoGet`.
-    pub async fn register(&self, ticket: impl Into<String>, batches: Vec<RecordBatch>) {
-        self.store.register(ticket.into(), batches).await;
+    ///
+    /// Fails with [`TransportError::StoreFull`] when the store is over its cap and the
+    /// bucket cannot be spilled.
+    pub async fn register(
+        &self,
+        ticket: impl Into<String>,
+        batches: Vec<RecordBatch>,
+    ) -> TransportResult<()> {
+        self.store
+            .register(ticket.into(), batches)
+            .await
+            .map_err(|e| TransportError::StoreFull(e.to_string()))
     }
 
     /// Build the tonic [`Server`] future bound to `addr`.
@@ -795,9 +822,10 @@ mod tests {
         let server = FlightServer::new();
         server
             .register("p1/s0/0/0", vec![batch_a(), batch_a2()])
-            .await;
-        server.register("p1/s0/0/1", vec![batch_b()]).await;
-        server.register("empty", vec![]).await;
+            .await
+            .unwrap();
+        server.register("p1/s0/0/1", vec![batch_b()]).await.unwrap();
+        server.register("empty", vec![]).await.unwrap();
         server.serve_ephemeral().await.unwrap()
     }
 
@@ -816,7 +844,7 @@ mod tests {
         let server = FlightServer::new();
         // A canonical 5-field ticket, so the credit-gated `fetch_secured` path is the one
         // measured (the plain-string keys `start_server` registers are `DoGet` only).
-        server.register("7/0/0/0/0", vec![batch_b()]).await;
+        server.register("7/0/0/0/0", vec![batch_b()]).await.unwrap();
         let (addr, _handle) = server.serve_ephemeral().await.unwrap();
         let pool = ClientPool::new();
         let addr = addr.to_string();
@@ -853,7 +881,7 @@ mod tests {
         )
         .unwrap();
         let server = FlightServer::new();
-        server.register("wide", vec![batch.clone()]).await;
+        server.register("wide", vec![batch.clone()]).await.unwrap();
         let (addr, _handle) = server.serve_ephemeral().await.unwrap();
         let mut client = FlightClient::connect(addr.to_string()).await.unwrap();
         let got = client.fetch("wide").await.unwrap();
@@ -968,8 +996,11 @@ mod tests {
 
         let t0 = ShuffleTicket::new(1, 0, 0, 0, 0);
         let t1 = ShuffleTicket::new(1, 0, 0, 1, 0);
-        producer.publish(&t0, vec![batch_a(), batch_a2()]).await;
-        producer.publish(&t1, vec![batch_b()]).await;
+        producer
+            .publish(&t0, vec![batch_a(), batch_a2()])
+            .await
+            .unwrap();
+        producer.publish(&t1, vec![batch_b()]).await.unwrap();
 
         // A second node acting purely as a reducer fetches both.
         let reducer = ShuffleExchange::bind_ephemeral().await.unwrap();
@@ -1010,7 +1041,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(2, 1, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(0, N)).await;
+        producer.publish(&ticket, seq_batches(0, N)).await.unwrap();
 
         let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, WINDOW)
             .await
@@ -1048,7 +1079,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(9, 0, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(0, N)).await;
+        producer.publish(&ticket, seq_batches(0, N)).await.unwrap();
 
         let mut client = FlightClient::connect(&addr).await.unwrap();
         let (grant_tx, grant_rx) = tokio::sync::mpsc::channel::<FlightData>(64);
@@ -1130,7 +1161,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(4, 0, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(0, 3)).await;
+        producer.publish(&ticket, seq_batches(0, 3)).await.unwrap();
 
         let pool = ClientPool::new();
         assert_eq!(
@@ -1173,7 +1204,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(11, 0, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(0, N)).await;
+        producer.publish(&ticket, seq_batches(0, N)).await.unwrap();
 
         let mut client = FlightClient::connect(&addr).await.unwrap();
         let (grant_tx, grant_rx) = tokio::sync::mpsc::channel::<FlightData>(64);
@@ -1232,7 +1263,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(41, 0, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(0, 24)).await;
+        producer.publish(&ticket, seq_batches(0, 24)).await.unwrap();
 
         let pool = ClientPool::new();
         let got = pool.fetch_secured(&addr, &ticket, 4, None).await.unwrap();
@@ -1282,7 +1313,7 @@ mod tests {
             let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
             let addr = producer.addr().to_string();
             let ticket = ShuffleTicket::new(12, 0, 0, 0, 0);
-            producer.publish(&ticket, seq_batches(0, n)).await;
+            producer.publish(&ticket, seq_batches(0, n)).await.unwrap();
 
             let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, window)
                 .await
@@ -1311,7 +1342,10 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(3, 0, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(100, N)).await;
+        producer
+            .publish(&ticket, seq_batches(100, N))
+            .await
+            .unwrap();
 
         let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, 1)
             .await
@@ -1341,7 +1375,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(9, 1, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(0, N)).await;
+        producer.publish(&ticket, seq_batches(0, N)).await.unwrap();
 
         let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, WINDOW)
             .await
@@ -1381,7 +1415,10 @@ mod tests {
         let addr = producer.addr().to_string();
         let tickets: Vec<_> = (0..6).map(|d| ShuffleTicket::new(8, 0, 0, d, 0)).collect();
         for (d, t) in tickets.iter().enumerate() {
-            producer.publish(t, seq_batches(d as i64 * 100, 4)).await;
+            producer
+                .publish(t, seq_batches(d as i64 * 100, 4))
+                .await
+                .unwrap();
         }
 
         let pool = ClientPool::new();
@@ -1414,7 +1451,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(9, 0, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(0, N)).await;
+        producer.publish(&ticket, seq_batches(0, N)).await.unwrap();
 
         let pool = ClientPool::new();
         let got = pool
@@ -1497,7 +1534,10 @@ mod tests {
         let mut tickets = Vec::new();
         for b in 0..BUCKETS {
             let t = ShuffleTicket::new(11, 0, b as u32, 0, 0);
-            producer.publish(&t, seq_batches(b * PER, PER)).await;
+            producer
+                .publish(&t, seq_batches(b * PER, PER))
+                .await
+                .unwrap();
             tickets.push(t);
         }
 
@@ -1539,33 +1579,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_group_of_unpublished_buckets_is_empty_and_a_partial_group_is_not() {
-        // An unpublished ticket is the expected empty-bucket case, so a group of nothing but
-        // those must read as no rows rather than as a fault — and a group that mixes a live
-        // bucket with dead ones must still deliver the live one, never fail the whole group.
+    async fn a_group_with_any_unpublished_bucket_is_refused_not_served_partially() {
+        // Every shuffle mapper publishes every bucket, empty ones included, so an absent
+        // member of a group is lost data. Serving the live members made a response carrying
+        // two of three required buckets indistinguishable from a complete one (BT-003).
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let live = ShuffleTicket::new(12, 0, 0, 0, 0);
-        producer.publish(&live, seq_batches(0, 3)).await;
+        producer.publish(&live, seq_batches(0, 3)).await.unwrap();
         let dead_a = ShuffleTicket::new(12, 0, 1, 0, 0);
         let dead_b = ShuffleTicket::new(12, 0, 2, 0, 0);
 
         let pool = ClientPool::new();
-        let none = pool
-            .fetch_secured_group_striped(&addr, &[dead_a, dead_b], 8, None, 1)
-            .await
-            .unwrap();
-        assert!(none.is_empty(), "a group of unpublished buckets is empty");
-
-        let some = pool
-            .fetch_secured_group_striped(&addr, &[dead_a, live, dead_b], 8, None, 1)
-            .await
-            .unwrap();
+        for group in [vec![dead_a, dead_b], vec![dead_a, live, dead_b]] {
+            match pool
+                .fetch_secured_group_striped(&addr, &group, 8, None, 1)
+                .await
+            {
+                Err(TransportError::MissingTicket(m)) => {
+                    assert!(m.contains("12/0/1/0/0") && m.contains("12/0/2/0/0"), "{m}");
+                    assert!(
+                        !m.contains("12/0/0/0/0"),
+                        "the live bucket is not missing: {m}"
+                    );
+                }
+                other => panic!("a group with missing members must be refused: {other:?}"),
+            }
+        }
+        // The missing-ticket error is retryable for the recovery loop.
         assert_eq!(
-            some.len(),
-            3,
-            "a live bucket in the group is still delivered whole"
+            classify(&TransportError::MissingTicket("x".into())),
+            FetchFault::Retryable
         );
+        // The complete group is still served whole.
+        let whole = pool
+            .fetch_secured_group_striped(&addr, &[live], 8, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(whole.len(), 3);
     }
 
     #[tokio::test]
@@ -1579,7 +1630,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ints = ShuffleTicket::new(13, 0, 0, 0, 0);
-        producer.publish(&ints, seq_batches(0, 2)).await;
+        producer.publish(&ints, seq_batches(0, 2)).await.unwrap();
 
         let strings = ShuffleTicket::new(13, 0, 1, 0, 0);
         let schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -1589,7 +1640,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["a"]))])
             .expect("build a string batch");
-        producer.publish(&strings, vec![batch]).await;
+        producer.publish(&strings, vec![batch]).await.unwrap();
 
         let pool = ClientPool::new();
         let err = pool
@@ -1613,7 +1664,7 @@ mod tests {
             let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
             let addr = producer.addr().to_string();
             let ticket = ShuffleTicket::new(11, 0, 0, code as u32, 0);
-            producer.publish(&ticket, seq_batches(0, N)).await;
+            producer.publish(&ticket, seq_batches(0, N)).await.unwrap();
 
             let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, 4)
                 .await
@@ -1634,9 +1685,9 @@ mod tests {
         // unknown ticket.
         let exchange = ShuffleExchange::bind_ephemeral().await.unwrap();
         let ticket = ShuffleTicket::new(4, 0, 0, 0, 0);
-        exchange.publish(&ticket, seq_batches(0, 5)).await;
+        exchange.publish(&ticket, seq_batches(0, 5)).await.unwrap();
 
-        let local = exchange.local_partition(&ticket).await.unwrap();
+        let local = exchange.local_partition(&ticket).await.unwrap().unwrap();
         assert_eq!(local.len(), 5);
         for (i, b) in local.iter().enumerate() {
             let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -1644,7 +1695,7 @@ mod tests {
         }
 
         let missing = ShuffleTicket::new(4, 0, 0, 9, 0);
-        assert!(exchange.local_partition(&missing).await.is_none());
+        assert!(exchange.local_partition(&missing).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1658,7 +1709,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(5, 2, 0, 0, 0);
-        producer.publish(&ticket, seq_batches(0, N)).await;
+        producer.publish(&ticket, seq_batches(0, N)).await.unwrap();
 
         let ticket_str = ticket.to_string();
         let got = tokio::task::spawn_blocking(move || {
@@ -1694,7 +1745,7 @@ mod tests {
             .unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         let mut anonymous = FlightClient::connect(&addr).await.unwrap();
         let err = anonymous
@@ -1722,7 +1773,7 @@ mod tests {
             .unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         let mut client = FlightClient::connect_with_token(&addr, Some("s3cret"))
             .await
@@ -1739,7 +1790,7 @@ mod tests {
         let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         let mut client = FlightClient::connect(&addr).await.unwrap();
         assert_eq!(
@@ -1768,7 +1819,7 @@ mod tests {
             .unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         let client_tls = crate::TlsClientConfig::new(certs::CA_CRT, "localhost");
         let mut client = FlightClient::connect_tls(&addr, &client_tls).await.unwrap();
@@ -1788,7 +1839,7 @@ mod tests {
             .unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         // A plaintext client either fails to connect or fails the fetch; either way it
         // never receives partition data.
@@ -1830,7 +1881,7 @@ mod tests {
             .unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         let client_tls = crate::TlsClientConfig::new(certs::CA_CRT, "localhost").with_identity(
             crate::TlsIdentity::from_pem(certs::CLIENT_CRT, certs::CLIENT_KEY),
@@ -1853,7 +1904,7 @@ mod tests {
             .unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         // A rogue client cert signed by an unrelated CA.
         let rogue = crate::TlsClientConfig::new(certs::CA_CRT, "localhost").with_identity(
@@ -1880,7 +1931,7 @@ mod tests {
             .unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         // Server-auth only (no client identity) against a server that requires one.
         let no_cert = crate::TlsClientConfig::new(certs::CA_CRT, "localhost");
@@ -1906,7 +1957,7 @@ mod tests {
                 .unwrap();
         let addr = producer.addr().to_string();
         let ticket = ShuffleTicket::new(1, 0, 0, 0, 0);
-        producer.publish(&ticket, vec![batch_a()]).await;
+        producer.publish(&ticket, vec![batch_a()]).await.unwrap();
 
         let client_tls = crate::TlsClientConfig::new(certs::CA_CRT, "localhost");
         // Right cert, wrong (absent) token → rejected over the encrypted connection.
@@ -1935,7 +1986,8 @@ mod tests {
                 &ticket,
                 vec![zero_row_batch(), zero_row_batch(), zero_row_batch()],
             )
-            .await;
+            .await
+            .unwrap();
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             ShuffleExchange::fetch_with_credits(&addr, &ticket, 2),
@@ -1956,11 +2008,12 @@ mod tests {
         let ticket = ShuffleTicket::new(99, 0, 0, 0, 0);
         producer
             .publish(&ticket, vec![one_row(1), zero_row_batch(), one_row(2)])
-            .await;
+            .await
+            .unwrap();
         let net = ShuffleExchange::fetch_with_credits(&addr, &ticket, 4)
             .await
             .unwrap();
-        let local = producer.local_partition(&ticket).await.unwrap();
+        let local = producer.local_partition(&ticket).await.unwrap().unwrap();
         assert_eq!(
             local, net,
             "DIRECT_MEMORY must return the same batches as a network fetch"
@@ -1981,7 +2034,10 @@ mod tests {
             let producer = ShuffleExchange::bind_ephemeral().await.unwrap();
             let addr = producer.addr().to_string();
             let ticket = ShuffleTicket::new(88, code as u32, 0, 0, 0);
-            producer.publish(&ticket, vec![batch_a(), batch_a2()]).await;
+            producer
+                .publish(&ticket, vec![batch_a(), batch_a2()])
+                .await
+                .unwrap();
             let got = ShuffleExchange::fetch_with_credits(&addr, &ticket, 2)
                 .await
                 .unwrap();

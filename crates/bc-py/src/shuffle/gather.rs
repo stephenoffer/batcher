@@ -181,14 +181,20 @@ pub(crate) async fn drive(
 
         // A copy on this very worker is free (local store, no socket) wherever it sits in
         // the candidate list — so a replica that landed here also skips the network.
+        let mut local_fault: Option<String> = None;
         if candidates.contains(&own_addr) {
-            if let Some(batches) = own.exchange.local_partition(ticket).await {
-                if !batches.is_empty() {
-                    on_batches(batches).map_err(GatherErr::Combine)?;
+            match own.exchange.local_partition(ticket).await {
+                Ok(Some(batches)) => {
+                    if !batches.is_empty() {
+                        on_batches(batches).map_err(GatherErr::Combine)?;
+                    }
+                    continue;
                 }
-                continue;
+                // Not registered here: fall through to a remote copy.
+                Ok(None) => local_fault = Some(format!("bucket {ticket} not published here")),
+                // Registered but its spill file is unreadable: try a remote copy.
+                Err(e) => local_fault = Some(e.to_string()),
             }
-            // Not actually registered here — fall through to a remote copy.
         }
         let remote: Vec<String> = candidates
             .iter()
@@ -196,7 +202,15 @@ pub(crate) async fn drive(
             .map(|c| (*c).to_string())
             .collect();
         if remote.is_empty() {
-            continue; // only copy is a local one that read back empty (unchanged behavior)
+            // The only copy was local and it is gone. Every shuffle mapper publishes every
+            // bucket, empty ones included, so this is lost data, not an empty bucket: report
+            // the source so the driver recomputes it. Skipping it, as this once did, returned
+            // the reduce without that mapper's rows.
+            unreachable.push((
+                idx,
+                local_fault.unwrap_or_else(|| format!("bucket {ticket} has no copy")),
+            ));
+            continue;
         }
         by_peer
             .entry(remote[0].clone())

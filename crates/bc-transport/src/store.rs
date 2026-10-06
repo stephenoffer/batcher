@@ -3,7 +3,7 @@
 //! prove the credit bound.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -96,6 +96,10 @@ pub(crate) struct Partition {
     /// A spilled partition still knows this: it is what returns to the total if it is
     /// ever read back, and what makes the spill decision reversible in principle.
     nbytes: usize,
+    /// A spiller has chosen this partition and is writing it out, without the map lock.
+    /// Other spillers skip it so two never write the same bucket; readers still get the
+    /// in-memory copy until the write commits.
+    spilling: bool,
 }
 
 impl Partition {
@@ -104,13 +108,24 @@ impl Partition {
     /// A spilled read deliberately does **not** re-populate the heap copy. The store spilled
     /// it because memory was short; silently restoring it on the first fetch would undo the
     /// bound exactly when it is being relied on, and a bucket is typically fetched once.
-    fn batches(&self) -> Option<Arc<Vec<RecordBatch>>> {
+    ///
+    /// **A spilled read that fails is an error, never an empty bucket.** The spill file is
+    /// the partition's only copy, so a file that has gone missing, been truncated, or can no
+    /// longer be opened means the rows are lost. This used to be `.ok()`'d into `None`, which
+    /// the server reported as an unknown ticket and the consumer read as an empty bucket: a
+    /// disk fault became a successful query with fewer rows. The error carries the ticket so
+    /// the server can tell the reducer which bucket is lost, and the reducer's recovery loop
+    /// can recompute that mapper.
+    fn batches(&self, ticket: &str) -> Result<Arc<Vec<RecordBatch>>, SpillReadError> {
         match &self.body {
-            Body::Memory(b) => Some(b.clone()),
-            Body::Spilled(path) => crate::shared::read_ipc_file(path)
-                .ok()
-                .flatten()
-                .map(Arc::new),
+            Body::Memory(b) => Ok(b.clone()),
+            Body::Spilled(path) => crate::shared::read_ipc_file_strict(path)
+                .map(Arc::new)
+                .map_err(|cause| SpillReadError {
+                    ticket: ticket.to_string(),
+                    path: path.clone(),
+                    cause,
+                }),
         }
     }
 
@@ -126,6 +141,61 @@ impl Partition {
         }
     }
 }
+
+/// A spilled partition whose file could not be read back.
+///
+/// Registered-but-unreadable is a different state from never-registered, and the whole point
+/// of this type is that the two never collapse into one `None` again.
+#[derive(Debug)]
+pub(crate) struct SpillReadError {
+    pub(crate) ticket: String,
+    pub(crate) path: PathBuf,
+    pub(crate) cause: std::io::Error,
+}
+
+impl std::fmt::Display for SpillReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "spilled shuffle bucket {} could not be read back from {}: {}",
+            self.ticket,
+            self.path.display(),
+            self.cause
+        )
+    }
+}
+
+/// A publish the store could neither hold under its cap nor write to disk.
+///
+/// The policy this type carries: when the cap is set and spilling fails, the publish fails.
+/// The store used to stop spilling on the first write error and keep every bucket resident,
+/// so a full or unwritable scratch disk turned into unbounded memory growth on exactly the
+/// worker that was already short of it. Refusing the new bucket keeps the store inside its
+/// envelope; the map task fails with an error naming the disk, and the bucket's memory goes
+/// back the moment the caller drops it.
+#[derive(Debug)]
+pub(crate) struct SpillWriteError {
+    pub(crate) ticket: String,
+    pub(crate) cap: usize,
+    pub(crate) retained: usize,
+    pub(crate) cause: std::io::Error,
+}
+
+impl std::fmt::Display for SpillWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shuffle bucket {} cannot be published: the shuffle store holds {} bytes against a \
+             {}-byte cap and spilling to disk failed ({}); free or enlarge the shuffle spill \
+             directory, or raise the shuffle store cap",
+            self.ticket, self.retained, self.cap, self.cause
+        )
+    }
+}
+
+/// What a lookup found: `Ok(None)` is a ticket that was never published (or was evicted),
+/// `Err` one that was published and spilled but whose file is now unreadable.
+pub(crate) type Lookup<T> = Result<Option<T>, SpillReadError>;
 
 /// Make a ticket safe as a filename (`plan/stage/src/dst/epoch` → `plan_stage_src_dst_epoch`).
 fn sanitize_ticket(ticket: &str) -> String {
@@ -166,6 +236,9 @@ pub(crate) struct PartitionStore {
     cap: usize,
     /// Scratch directory for spilled buckets, created on first spill.
     spill_dir: std::sync::OnceLock<Option<PathBuf>>,
+    /// Makes every spill file name unique, so an abandoned write (its partition was replaced
+    /// or removed mid-write) can never collide with a later one for the same ticket.
+    spill_seq: std::sync::atomic::AtomicU64,
 }
 
 /// Remove every `<pid>_<store>` directory under `root` whose process no longer exists.
@@ -205,17 +278,58 @@ impl PartitionStore {
             retained: AtomicUsize::new(0),
             cap,
             spill_dir: std::sync::OnceLock::new(),
+            spill_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    pub(crate) async fn register(&self, ticket: String, batches: Vec<RecordBatch>) {
+    /// Publish `batches` under `ticket`, reserving their bytes against the cap first.
+    ///
+    /// **Reserve, then admit.** The bytes are charged to the running total before the bucket
+    /// is visible. If that takes the store over its cap, resident buckets are spilled to make
+    /// room; if there is still no room, the new bucket goes straight to disk and is never
+    /// held in memory at all. Charging after insertion, as this once did, let concurrent
+    /// publishes each see a total that did not yet include the others.
+    ///
+    /// **Disk failure is a refusal, not an overrun** (see [`SpillWriteError`]). With no cap
+    /// configured nothing changes: the bucket is held in memory as it always was.
+    pub(crate) async fn register(
+        &self,
+        ticket: String,
+        batches: Vec<RecordBatch>,
+    ) -> Result<(), SpillWriteError> {
         let nbytes = batch_bytes(&batches);
+        let batches = Arc::new(batches);
+        let reserved = self.retained.fetch_add(nbytes, Ordering::Relaxed) + nbytes;
+        let mut body = Body::Memory(batches.clone());
+        if self.cap > 0 && reserved > self.cap {
+            // A failed victim write is not decisive on its own: the new bucket's own write
+            // below is the last resort, and only its failure refuses the publish.
+            let _ = self.spill_resident_down_to(self.cap).await;
+            if self.retained.load(Ordering::Relaxed) > self.cap && nbytes > 0 {
+                // Still no room: the new bucket is the one that goes to disk, and its
+                // reservation is handed back either way.
+                let written = self.write_spill(&ticket, &batches);
+                let retained = self.retained.fetch_sub(nbytes, Ordering::Relaxed) - nbytes;
+                match written {
+                    Ok(path) => body = Body::Spilled(path),
+                    Err(cause) => {
+                        return Err(SpillWriteError {
+                            ticket,
+                            cap: self.cap,
+                            retained,
+                            cause,
+                        })
+                    }
+                }
+            }
+        }
         let previous = self.partitions.write().await.insert(
             ticket,
             Partition {
-                body: Body::Memory(Arc::new(batches)),
+                body,
                 gauge: Arc::new(InflightGauge::default()),
                 nbytes,
+                spilling: false,
             },
         );
         // Re-registering a ticket (a recompute republishing under a bumped epoch, or a
@@ -223,41 +337,55 @@ impl PartitionStore {
         // back the old ones makes the total drift up forever, and a monotonically rising
         // "retained bytes" that never falls is worse than no number at all: it reads as a
         // leak in the one place someone would look to find one.
-        self.retained.fetch_add(nbytes, Ordering::Relaxed);
         if let Some(old) = previous {
             if old.in_memory() {
                 self.retained.fetch_sub(old.nbytes, Ordering::Relaxed);
             }
             old.discard_spill_file();
         }
-        self.enforce_cap().await;
+        Ok(())
     }
 
-    /// Spill published buckets to disk until the store is back under its byte cap.
+    /// Spill resident buckets, largest first, until `retained <= floor` or none is left.
     ///
     /// **The gap this closes.** Everything else Carbonite bounds is *reserved* memory — an
     /// operator asks the pool before it allocates, and spills when refused. A published
     /// shuffle bucket is never asked for: a mapper hands it to this store and it stays
     /// resident until a reducer fetches it. With `workers` mappers each producing `workers`
     /// buckets, a node holds its whole share of the shuffle in anonymous memory that no
-    /// reservation covers and the kernel cannot reclaim. That is the classic shuffle OOM,
-    /// and `PressureMonitor` can only see it indirectly, as unexplained RSS.
+    /// reservation covers and the kernel cannot reclaim. That is the classic shuffle OOM.
     ///
     /// Largest-first, because the point is to get back under the cap in the fewest reads
     /// later: one big bucket costs one re-read, many small ones cost many. Spilling is
-    /// result-preserving — the same batches come back through the Arrow IPC round-trip —
-    /// so this trades a re-read for a memory bound and can never change an answer.
+    /// result-preserving — the same batches come back through the Arrow IPC round-trip.
     ///
-    /// Off unless a cap is configured (`set_shuffle_store_cap`), so the default path is
-    /// byte-for-byte what it was.
-    async fn enforce_cap(&self) {
-        let cap = self.cap;
-        if cap == 0 || self.retained.load(Ordering::Relaxed) <= cap {
-            return;
+    /// **The disk write happens outside the map lock.** The lock is taken to choose a victim
+    /// and again to commit it, never across the write: holding the write guard through a
+    /// multi-megabyte write stalled every fetch on the worker, including the ones that would
+    /// have drained the store. Returns the last write error if a write failed.
+    async fn spill_resident_down_to(&self, floor: usize) -> std::io::Result<usize> {
+        let mut freed = 0usize;
+        let mut last_err = None;
+        while self.retained.load(Ordering::Relaxed) > floor {
+            let claimed = Self::claim_victim(&mut *self.partitions.write().await);
+            let Some((ticket, batches)) = claimed else {
+                break;
+            };
+            let written = self.write_spill(&ticket, &batches);
+            let mut guard = self.partitions.write().await;
+            match written {
+                Ok(path) => freed += self.commit_spill(&mut guard, &ticket, &batches, path),
+                Err(e) => {
+                    Self::release_claim(&mut guard, &ticket, &batches);
+                    last_err = Some(e);
+                    break;
+                }
+            }
         }
-        let Some(dir) = self.spill_dir() else { return };
-        let mut guard = self.partitions.write().await;
-        self.spill_down_to(&mut guard, dir, cap);
+        match last_err {
+            Some(e) => Err(e),
+            None => Ok(freed),
+        }
     }
 
     /// Free at least `target` bytes on demand, returning what was actually freed.
@@ -272,9 +400,9 @@ impl PartitionStore {
     /// **Synchronous and non-blocking on purpose.** The pool calls this from whatever
     /// thread lost a reservation, which may be a tokio worker; blocking on an async lock
     /// there would deadlock the runtime serving the very fetches that would drain this
-    /// store. `try_write` instead: if the map is busy, this returns `0`, which the
-    /// `Spillable` contract explicitly allows and the pool treats as "this consumer cannot
-    /// help right now". A missed opportunity is recoverable; a hung shuffle server is not.
+    /// store. `try_write` instead: if the map is busy, this stops, which the `Spillable`
+    /// contract explicitly allows and the pool treats as "this consumer cannot help right
+    /// now". The disk write itself runs with no lock held, as in the async path.
     ///
     /// Independent of `cap`: a store with no configured cap still answers, because the
     /// caller here is real memory pressure rather than a configured bound.
@@ -282,65 +410,102 @@ impl PartitionStore {
         if target == 0 {
             return 0;
         }
-        let held = self.retained.load(Ordering::Relaxed);
-        if held == 0 {
-            return 0;
-        }
-        let Some(dir) = self.spill_dir() else {
-            return 0;
-        };
-        let Ok(mut guard) = self.partitions.try_write() else {
-            return 0;
-        };
-        let floor = held.saturating_sub(target);
-        self.spill_down_to(&mut guard, dir, floor)
-    }
-
-    /// Spill resident buckets, largest first, until `retained <= floor`. Returns bytes freed.
-    ///
-    /// Largest-first, because the point is to get back under the bound in the fewest
-    /// re-reads later: one big bucket costs one, many small ones cost many. Spilling is
-    /// result-preserving — the same batches return through the Arrow IPC round trip — so
-    /// this trades a re-read for a memory bound and can never change an answer.
-    ///
-    /// Caller holds the map's write guard, which is what lets the async cap enforcement and
-    /// the synchronous cooperative path share one implementation of the choice of victim.
-    fn spill_down_to(
-        &self,
-        guard: &mut HashMap<String, Partition>,
-        dir: &Path,
-        floor: usize,
-    ) -> usize {
+        let floor = self.retained.load(Ordering::Relaxed).saturating_sub(target);
         let mut freed = 0usize;
-        loop {
-            if self.retained.load(Ordering::Relaxed) <= floor {
-                break;
-            }
-            // The largest still-resident bucket.
-            let victim = guard
-                .iter()
-                .filter(|(_, p)| p.in_memory())
-                .max_by_key(|(_, p)| p.nbytes)
-                .map(|(t, _)| t.clone());
-            let Some(ticket) = victim else { break };
-            let Some(p) = guard.get_mut(&ticket) else {
+        while self.retained.load(Ordering::Relaxed) > floor {
+            let Ok(mut guard) = self.partitions.try_write() else {
                 break;
             };
-            let Body::Memory(batches) = &p.body else {
+            let Some((ticket, batches)) = Self::claim_victim(&mut guard) else {
                 break;
             };
-            let path = dir.join(format!("{}.arrow", sanitize_ticket(&ticket)));
-            if crate::shared::write_ipc_file(&path, batches).is_err() {
-                // Nowhere to put it: stop rather than spin. Staying over the bound is worse
-                // than it was, but failing the publish would be worse still — the bucket
-                // is already produced and a reducer is waiting for it.
-                break;
+            drop(guard);
+            let written = self.write_spill(&ticket, &batches);
+            // Committing needs the lock again. Readers hold it only to clone an `Arc`, so a
+            // short spin acquires it; a claim must not be left set, or no spiller could ever
+            // choose that bucket again.
+            let mut guard = loop {
+                if let Ok(guard) = self.partitions.try_write() {
+                    break guard;
+                }
+                std::thread::yield_now();
+            };
+            let got = match written {
+                Ok(path) => self.commit_spill(&mut guard, &ticket, &batches, path),
+                Err(_) => {
+                    Self::release_claim(&mut guard, &ticket, &batches);
+                    0
+                }
+            };
+            if got == 0 {
+                break; // a failed or superseded write: stop rather than retry the same victim
             }
-            p.body = Body::Spilled(path);
-            self.retained.fetch_sub(p.nbytes, Ordering::Relaxed);
-            freed += p.nbytes;
+            freed += got;
         }
         freed
+    }
+
+    /// Mark the largest resident, unclaimed bucket as being spilled, and hand back its batches.
+    fn claim_victim(
+        guard: &mut HashMap<String, Partition>,
+    ) -> Option<(String, Arc<Vec<RecordBatch>>)> {
+        let (ticket, p) = guard
+            .iter_mut()
+            .filter(|(_, p)| p.in_memory() && !p.spilling)
+            .max_by_key(|(_, p)| p.nbytes)?;
+        let Body::Memory(batches) = &p.body else {
+            return None;
+        };
+        p.spilling = true;
+        Some((ticket.clone(), batches.clone()))
+    }
+
+    /// Clear a claim whose write failed, if the same bucket is still registered.
+    fn release_claim(
+        guard: &mut HashMap<String, Partition>,
+        ticket: &str,
+        batches: &Arc<Vec<RecordBatch>>,
+    ) {
+        if let Some(p) = guard.get_mut(ticket) {
+            if matches!(&p.body, Body::Memory(b) if Arc::ptr_eq(b, batches)) {
+                p.spilling = false;
+            }
+        }
+    }
+
+    /// Swap a claimed bucket's body to its spill file, if it is still the bucket that was
+    /// written. A bucket removed or re-registered during the write keeps its new state and
+    /// the orphaned file is deleted. Returns the bytes freed.
+    fn commit_spill(
+        &self,
+        guard: &mut HashMap<String, Partition>,
+        ticket: &str,
+        batches: &Arc<Vec<RecordBatch>>,
+        path: PathBuf,
+    ) -> usize {
+        match guard.get_mut(ticket) {
+            Some(p) if matches!(&p.body, Body::Memory(b) if Arc::ptr_eq(b, batches)) => {
+                p.body = Body::Spilled(path);
+                p.spilling = false;
+                self.retained.fetch_sub(p.nbytes, Ordering::Relaxed);
+                p.nbytes
+            }
+            _ => {
+                let _ = std::fs::remove_file(&path);
+                0
+            }
+        }
+    }
+
+    /// Write `batches` to a fresh spill file for `ticket`. No lock is held by the caller.
+    fn write_spill(&self, ticket: &str, batches: &[RecordBatch]) -> std::io::Result<PathBuf> {
+        let dir = self.spill_dir().ok_or_else(|| {
+            std::io::Error::other("the shuffle spill directory could not be created")
+        })?;
+        let seq = self.spill_seq.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{}_{seq}.arrow", sanitize_ticket(ticket)));
+        crate::shared::write_ipc_file(&path, batches)?;
+        Ok(path)
     }
 
     /// This store's spill directory, created once on first use.
@@ -369,18 +534,23 @@ impl PartitionStore {
         self.retained.load(Ordering::Relaxed)
     }
 
-    pub(crate) async fn get(&self, ticket: &str) -> Option<Arc<Vec<RecordBatch>>> {
-        self.partitions.read().await.get(ticket)?.batches()
+    pub(crate) async fn get(&self, ticket: &str) -> Lookup<Arc<Vec<RecordBatch>>> {
+        match self.partitions.read().await.get(ticket) {
+            None => Ok(None),
+            Some(p) => p.batches(ticket).map(Some),
+        }
     }
 
     /// Fetch both the batches and the in-flight gauge for an exchange.
     pub(crate) async fn get_with_gauge(
         &self,
         ticket: &str,
-    ) -> Option<(Arc<Vec<RecordBatch>>, Arc<InflightGauge>)> {
+    ) -> Lookup<(Arc<Vec<RecordBatch>>, Arc<InflightGauge>)> {
         let guard = self.partitions.read().await;
-        let p = guard.get(ticket)?;
-        Some((p.batches()?, p.gauge.clone()))
+        let Some(p) = guard.get(ticket) else {
+            return Ok(None);
+        };
+        Ok(Some((p.batches(ticket)?, p.gauge.clone())))
     }
 
     /// The in-flight gauge for a ticket (for tests/observability).
@@ -477,17 +647,21 @@ mod tests {
         let store = PartitionStore::default();
         store
             .register("7/0/0/0".into(), vec![one_batch(1), one_batch(2)])
-            .await;
-        let got = store.get("7/0/0/0").await.expect("registered");
+            .await
+            .unwrap();
+        let got = store.get("7/0/0/0").await.unwrap().expect("registered");
         assert_eq!(got.len(), 2);
-        assert!(store.get("7/0/0/9").await.is_none()); // unregistered ticket
+        assert!(store.get("7/0/0/9").await.unwrap().is_none()); // unregistered ticket
     }
 
     #[tokio::test]
     async fn gauge_tracks_inflight_high_water() {
         let store = PartitionStore::default();
-        store.register("p/0/0/0".into(), vec![one_batch(1)]).await;
-        let (_b, gauge) = store.get_with_gauge("p/0/0/0").await.unwrap();
+        store
+            .register("p/0/0/0".into(), vec![one_batch(1)])
+            .await
+            .unwrap();
+        let (_b, gauge) = store.get_with_gauge("p/0/0/0").await.unwrap().unwrap();
         // Two sends in flight, then one ack: current drops but the max is sticky.
         gauge.on_send();
         gauge.on_send();
@@ -499,12 +673,18 @@ mod tests {
     #[tokio::test]
     async fn remove_and_clear_free_partitions() {
         let store = PartitionStore::default();
-        store.register("9/0/0/0".into(), vec![one_batch(1)]).await;
-        store.register("9/0/0/1".into(), vec![one_batch(2)]).await;
+        store
+            .register("9/0/0/0".into(), vec![one_batch(1)])
+            .await
+            .unwrap();
+        store
+            .register("9/0/0/1".into(), vec![one_batch(2)])
+            .await
+            .unwrap();
         assert_eq!(store.len().await, 2);
         store.remove("9/0/0/0").await;
         assert_eq!(store.len().await, 1);
-        assert!(store.get("9/0/0/0").await.is_none());
+        assert!(store.get("9/0/0/0").await.unwrap().is_none());
         store.clear().await;
         assert_eq!(store.len().await, 0);
     }
@@ -514,14 +694,20 @@ mod tests {
         let store = PartitionStore::default();
         assert_eq!(store.retained_bytes(), 0);
 
-        store.register("b/0/0/0".into(), vec![one_batch(1)]).await;
+        store
+            .register("b/0/0/0".into(), vec![one_batch(1)])
+            .await
+            .unwrap();
         let one = store.retained_bytes();
         assert!(
             one > 0,
             "a registered partition holds memory nothing accounts for"
         );
 
-        store.register("b/0/0/1".into(), vec![one_batch(2)]).await;
+        store
+            .register("b/0/0/1".into(), vec![one_batch(2)])
+            .await
+            .unwrap();
         assert_eq!(store.retained_bytes(), one * 2);
 
         store.remove("b/0/0/0").await;
@@ -538,11 +724,15 @@ mod tests {
         // A recompute republishes under the same ticket. Charging the new bytes without
         // crediting the old ones makes the total rise forever and read as a leak.
         let store = PartitionStore::default();
-        store.register("r/0/0/0".into(), vec![one_batch(1)]).await;
+        store
+            .register("r/0/0/0".into(), vec![one_batch(1)])
+            .await
+            .unwrap();
         let one = store.retained_bytes();
         store
             .register("r/0/0/0".into(), vec![one_batch(2), one_batch(3)])
-            .await;
+            .await
+            .unwrap();
         assert_eq!(store.len().await, 1);
         assert_eq!(
             store.retained_bytes(),
@@ -554,9 +744,18 @@ mod tests {
     #[tokio::test]
     async fn remove_prefix_credits_back_every_partition_it_evicts() {
         let store = PartitionStore::default();
-        store.register("p9/0/0/0".into(), vec![one_batch(1)]).await;
-        store.register("p9/1/0/0".into(), vec![one_batch(2)]).await;
-        store.register("p8/0/0/0".into(), vec![one_batch(3)]).await;
+        store
+            .register("p9/0/0/0".into(), vec![one_batch(1)])
+            .await
+            .unwrap();
+        store
+            .register("p9/1/0/0".into(), vec![one_batch(2)])
+            .await
+            .unwrap();
+        store
+            .register("p8/0/0/0".into(), vec![one_batch(3)])
+            .await
+            .unwrap();
         let all = store.retained_bytes();
 
         store.remove_prefix("p9/").await;
@@ -570,16 +769,25 @@ mod tests {
     #[tokio::test]
     async fn remove_prefix_evicts_matching_stage() {
         let store = PartitionStore::default();
-        store.register("9/0/0/0".into(), vec![one_batch(1)]).await; // plan 9, stage 0
-        store.register("9/1/0/0".into(), vec![one_batch(2)]).await; // plan 9, stage 1
-        store.register("8/0/0/0".into(), vec![one_batch(3)]).await; // plan 8
+        store
+            .register("9/0/0/0".into(), vec![one_batch(1)])
+            .await
+            .unwrap(); // plan 9, stage 0
+        store
+            .register("9/1/0/0".into(), vec![one_batch(2)])
+            .await
+            .unwrap(); // plan 9, stage 1
+        store
+            .register("8/0/0/0".into(), vec![one_batch(3)])
+            .await
+            .unwrap(); // plan 8
         store.remove_prefix("9/0/").await; // evict only plan 9, stage 0
-        assert!(store.get("9/0/0/0").await.is_none());
-        assert!(store.get("9/1/0/0").await.is_some());
-        assert!(store.get("8/0/0/0").await.is_some());
+        assert!(store.get("9/0/0/0").await.unwrap().is_none());
+        assert!(store.get("9/1/0/0").await.unwrap().is_some());
+        assert!(store.get("8/0/0/0").await.unwrap().is_some());
         // A whole-plan prefix evicts every stage of that plan.
         store.remove_prefix("9/").await;
-        assert!(store.get("9/1/0/0").await.is_none());
+        assert!(store.get("9/1/0/0").await.unwrap().is_none());
         assert_eq!(store.len().await, 1);
     }
 
@@ -601,7 +809,8 @@ mod tests {
         for i in 0..6 {
             store
                 .register(format!("50/0/{i}/0/0"), vec![wide_batch(i * 1000, 4096)])
-                .await;
+                .await
+                .unwrap();
         }
 
         assert_eq!(store.len().await, 6, "spilling must not lose partitions");
@@ -625,13 +834,15 @@ mod tests {
         for (i, batches) in expected.iter().enumerate() {
             store
                 .register(format!("51/0/{i}/0/0"), batches.clone())
-                .await;
+                .await
+                .unwrap();
         }
 
         for (i, want) in expected.iter().enumerate() {
             let got = store
                 .get(&format!("51/0/{i}/0/0"))
                 .await
+                .unwrap()
                 .unwrap_or_else(|| panic!("bucket {i} vanished after spilling"));
             assert_eq!(got.len(), want.len(), "bucket {i}: batch count");
             for (a, b) in got.iter().zip(want.iter()) {
@@ -643,6 +854,212 @@ mod tests {
         }
     }
 
+    /// A store whose spill directory cannot be written: the disk-full / read-only case.
+    fn store_with_dead_disk(cap: usize) -> PartitionStore {
+        let store = PartitionStore::with_cap(cap);
+        let dead = std::env::temp_dir().join(format!("bc_no_such_dir_{}/x/y", std::process::id()));
+        store.spill_dir.set(Some(dead)).unwrap();
+        store
+    }
+
+    /// BT-005: when the cap is set and spilling fails, a publish that would take the store
+    /// over its cap is refused -- the store does not silently keep it resident.
+    #[tokio::test]
+    async fn a_failed_spill_refuses_the_publish_instead_of_overrunning_the_cap() {
+        let one = batch_bytes(&[wide_batch(0, 4096)]);
+        let store = store_with_dead_disk(one * 2);
+        for i in 0..2 {
+            store
+                .register(format!("60/0/{i}/0/0"), vec![wide_batch(i, 4096)])
+                .await
+                .expect("under the cap, no disk is needed");
+        }
+        let err = store
+            .register("60/0/2/0/0".into(), vec![wide_batch(9, 4096)])
+            .await
+            .expect_err("over the cap with a dead disk must refuse");
+        assert_eq!(err.ticket, "60/0/2/0/0");
+        assert!(err.to_string().contains("spill"), "{err}");
+        assert!(
+            store.retained_bytes() <= one * 2,
+            "a refused publish must hand its reservation back: {} > {}",
+            store.retained_bytes(),
+            one * 2
+        );
+        assert!(
+            store.get("60/0/2/0/0").await.unwrap().is_none(),
+            "refused means unpublished"
+        );
+        assert_eq!(store.len().await, 2);
+        // An empty bucket costs nothing and must always publish, dead disk or not.
+        store.register("60/0/3/0/0".into(), vec![]).await.unwrap();
+    }
+
+    /// BT-022: the bytes are reserved before the bucket is visible, so concurrent publishers
+    /// cannot each see a total that excludes the others and leave the store over its cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publishes_end_within_the_cap() {
+        let one = batch_bytes(&[wide_batch(0, 4096)]);
+        let store = Arc::new(PartitionStore::with_cap(one * 3));
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .register(format!("61/0/{i}/0/0"), vec![wide_batch(i, 4096)])
+                    .await
+                    .unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(store.len().await, 32);
+        assert!(
+            store.retained_bytes() <= one * 3,
+            "{} resident against a cap of {}",
+            store.retained_bytes(),
+            one * 3
+        );
+        for i in 0..32 {
+            let got = store.get(&format!("61/0/{i}/0/0")).await.unwrap().unwrap();
+            assert_eq!(
+                got[0],
+                wide_batch(i, 4096),
+                "bucket {i} changed through the spill"
+            );
+        }
+    }
+
+    /// BT-044: the spill write runs without the map lock, so the bucket can be removed or
+    /// replaced mid-write. The commit must notice, keep the new state, and delete the file.
+    #[tokio::test]
+    async fn a_bucket_replaced_during_its_spill_write_keeps_the_new_bytes() {
+        let store = PartitionStore::with_cap(0);
+        store
+            .register("62/0/0/0/0".into(), vec![wide_batch(1, 512)])
+            .await
+            .unwrap();
+        let (ticket, batches) =
+            PartitionStore::claim_victim(&mut *store.partitions.write().await).unwrap();
+        // Claimed buckets are skipped by other spillers: no double write of one bucket.
+        assert!(PartitionStore::claim_victim(&mut *store.partitions.write().await).is_none());
+        let path = store.write_spill(&ticket, &batches).unwrap();
+
+        // Meanwhile a retried map task republishes the ticket.
+        store
+            .register("62/0/0/0/0".into(), vec![wide_batch(2, 512)])
+            .await
+            .unwrap();
+        let before = store.retained_bytes();
+        let freed = store.commit_spill(
+            &mut *store.partitions.write().await,
+            &ticket,
+            &batches,
+            path.clone(),
+        );
+        assert_eq!(freed, 0, "a superseded write frees nothing");
+        assert!(!path.exists(), "the orphaned spill file must be deleted");
+        assert_eq!(store.retained_bytes(), before);
+        let got = store.get("62/0/0/0/0").await.unwrap().unwrap();
+        assert_eq!(got[0], wide_batch(2, 512), "the republished bytes must win");
+    }
+
+    /// The cooperative path spills outside the lock too, and still frees what it is asked for.
+    #[tokio::test]
+    async fn cooperative_spill_frees_without_holding_the_map() {
+        let store = PartitionStore::with_cap(0);
+        for i in 0..4 {
+            store
+                .register(format!("63/0/{i}/0/0"), vec![wide_batch(i, 4096)])
+                .await
+                .unwrap();
+        }
+        let held = store.retained_bytes();
+        let freed = store.try_spill_at_least(held / 2);
+        assert!(freed >= held / 2, "freed {freed} of the {} asked", held / 2);
+        assert_eq!(store.retained_bytes(), held - freed);
+        for i in 0..4 {
+            let got = store.get(&format!("63/0/{i}/0/0")).await.unwrap().unwrap();
+            assert_eq!(got[0], wide_batch(i, 4096));
+        }
+    }
+
+    /// The path a spilled bucket was written to.
+    async fn spill_path(store: &PartitionStore, ticket: &str) -> PathBuf {
+        match &store
+            .partitions
+            .read()
+            .await
+            .get(ticket)
+            .expect("registered")
+            .body
+        {
+            Body::Spilled(path) => path.clone(),
+            Body::Memory(_) => panic!("{ticket} was expected to be spilled"),
+        }
+    }
+
+    /// A spilled bucket whose file is truncated, deleted, or unreadable is *lost*, and the
+    /// store must say so rather than report the ticket as unknown -- which every consumer
+    /// used to read as an empty bucket, turning a disk fault into a short result.
+    #[tokio::test]
+    async fn an_unreadable_spill_file_is_an_error_not_an_empty_bucket() {
+        let store = PartitionStore::with_cap(1); // everything spills
+        for i in 0..3 {
+            store
+                .register(format!("54/0/{i}/0/0"), vec![wide_batch(i, 512)])
+                .await
+                .unwrap();
+        }
+
+        // Truncated: half the file survives a crash mid-copy or a full disk.
+        let truncated = spill_path(&store, "54/0/0/0/0").await;
+        let bytes = std::fs::read(&truncated).unwrap();
+        std::fs::write(&truncated, &bytes[..bytes.len() / 2]).unwrap();
+        // Deleted: a scratch sweeper or an operator removed it.
+        std::fs::remove_file(spill_path(&store, "54/0/1/0/0").await).unwrap();
+
+        for ticket in ["54/0/0/0/0", "54/0/1/0/0"] {
+            let err = store
+                .get(ticket)
+                .await
+                .expect_err("an unreadable spill must not read as absent or empty");
+            assert_eq!(err.ticket, ticket, "the error must name the lost bucket");
+            assert!(
+                store.get_with_gauge(ticket).await.is_err(),
+                "do_exchange's lookup must see the same error"
+            );
+        }
+        // The untouched bucket still reads back, and a never-published ticket is still absent.
+        assert_eq!(store.get("54/0/2/0/0").await.unwrap().unwrap().len(), 1);
+        assert!(store.get("54/0/9/0/0").await.unwrap().is_none());
+    }
+
+    /// Permission loss on a spill file (a remounted read-only-for-others scratch, a changed
+    /// owner) is the third way the only copy becomes unreadable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_permission_denied_spill_file_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let store = PartitionStore::with_cap(1);
+        store
+            .register("55/0/0/0/0".into(), vec![wide_batch(3, 512)])
+            .await
+            .unwrap();
+        let path = spill_path(&store, "55/0/0/0/0").await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root ignores file modes; the assertion only means something when the open fails.
+        if std::fs::File::open(&path).is_err() {
+            let err = store
+                .get("55/0/0/0/0")
+                .await
+                .expect_err("denied read must error");
+            assert_eq!(err.cause.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
     /// The gauge and the fetch path must work for a spilled bucket exactly as for a
     /// resident one — `do_exchange` reads through `get_with_gauge`.
     #[tokio::test]
@@ -650,11 +1067,13 @@ mod tests {
         let store = PartitionStore::with_cap(1);
         store
             .register("52/0/0/0/0".into(), vec![wide_batch(1, 512)])
-            .await;
+            .await
+            .unwrap();
 
         let (batches, gauge) = store
             .get_with_gauge("52/0/0/0/0")
             .await
+            .unwrap()
             .expect("spilled bucket");
         assert_eq!(batches.len(), 1);
         gauge.on_send();
@@ -668,13 +1087,16 @@ mod tests {
         let store = PartitionStore::with_cap(1);
         store
             .register("53/0/0/0/0".into(), vec![wide_batch(1, 512)])
-            .await;
+            .await
+            .unwrap();
         store
             .register("53/1/0/0/0".into(), vec![wide_batch(2, 512)])
-            .await;
+            .await
+            .unwrap();
         store
             .register("54/0/0/0/0".into(), vec![wide_batch(3, 512)])
-            .await;
+            .await
+            .unwrap();
 
         let dir = store.spill_dir().expect("a spill dir").clone();
         let count = || std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
@@ -698,7 +1120,8 @@ mod tests {
         for i in 0..8 {
             store
                 .register(format!("55/0/{i}/0/0"), vec![wide_batch(i, 4096)])
-                .await;
+                .await
+                .unwrap();
         }
         let resident = store.retained_bytes();
         assert_eq!(resident, batch_bytes(&[wide_batch(0, 4096)]) * 8);
@@ -719,7 +1142,8 @@ mod tests {
         for i in 0..6 {
             store
                 .register(format!("70/0/{i}/0/0"), vec![wide_batch(i, 20_000)])
-                .await;
+                .await
+                .unwrap();
         }
         let held = store.retained_bytes();
         assert!(held > 0);
@@ -742,7 +1166,8 @@ mod tests {
         for i in 0..8 {
             store
                 .register(format!("71/0/{i}/0/0"), vec![wide_batch(i, 20_000)])
-                .await;
+                .await
+                .unwrap();
         }
         let held = store.retained_bytes();
         store.try_spill_at_least(1); // one byte: the smallest possible ask
@@ -764,12 +1189,19 @@ mod tests {
         for i in 0..4 {
             let batch = wide_batch(i, 20_000);
             expected.push(batch.clone());
-            store.register(format!("72/0/{i}/0/0"), vec![batch]).await;
+            store
+                .register(format!("72/0/{i}/0/0"), vec![batch])
+                .await
+                .unwrap();
         }
         store.try_spill_at_least(store.retained_bytes()); // spill everything
 
         for (i, want) in expected.iter().enumerate() {
-            let got = store.get(&format!("72/0/{i}/0/0")).await.expect("bucket");
+            let got = store
+                .get(&format!("72/0/{i}/0/0"))
+                .await
+                .unwrap()
+                .expect("bucket");
             assert_eq!(got.len(), 1);
             assert_eq!(&got[0], want, "bucket {i} changed across the spill");
         }
@@ -783,7 +1215,8 @@ mod tests {
 
         store
             .register("73/0/0/0/0".to_string(), vec![wide_batch(0, 20_000)])
-            .await;
+            .await
+            .unwrap();
         assert_eq!(store.try_spill_at_least(0), 0, "zero-byte request spilled");
         assert!(store.retained_bytes() > 0);
     }
@@ -799,7 +1232,8 @@ mod tests {
         let store = PartitionStore::with_cap(0);
         store
             .register("74/0/0/0/0".to_string(), vec![wide_batch(0, 20_000)])
-            .await;
+            .await
+            .unwrap();
         let held = store.retained_bytes();
 
         let guard = store.partitions.write().await;
@@ -851,7 +1285,8 @@ mod tests {
             for i in 0..BUCKETS {
                 bounded
                     .register(format!("{tag}/0/{i}/0/0"), vec![wide_batch(i, ROWS)])
-                    .await;
+                    .await
+                    .unwrap();
             }
             let bounded_growth = rss_bytes().saturating_sub(base);
             assert!(
@@ -866,7 +1301,8 @@ mod tests {
             for i in 0..BUCKETS {
                 unbounded
                     .register(format!("{}/0/{i}/0/0", tag + 1), vec![wide_batch(i, ROWS)])
-                    .await;
+                    .await
+                    .unwrap();
             }
             let unbounded_growth = rss_bytes().saturating_sub(base2);
             assert!(

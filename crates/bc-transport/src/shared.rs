@@ -254,6 +254,21 @@ pub(crate) fn read_ipc_file(path: &std::path::Path) -> std::io::Result<Option<Ve
     Ok(read_mmap_zero_copy(mmap).ok())
 }
 
+/// Read an IPC file this process wrote and must find again, failing on anything short of it.
+///
+/// [`read_ipc_file`] is best-effort by design: on the shared-memory path a missing, short or
+/// undecodable file is a miss that Flight answers. A spilled shuffle bucket has no fallback.
+/// The store dropped its only in-memory copy when it wrote the file, so a missing, truncated
+/// or unreadable spill file means the data is lost. Reading that as "no batches" would serve
+/// a reducer an empty bucket. This reader reports each of those cases as an error instead.
+pub(crate) fn read_ipc_file_strict(path: &std::path::Path) -> std::io::Result<Vec<RecordBatch>> {
+    let file = File::open(path)?;
+    // SAFETY: as in `read_ipc_file` -- spill files are written temp-then-rename and never
+    // mutated in place.
+    let mmap = unsafe { Mmap::map(&file)? };
+    read_mmap_zero_copy(mmap).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Read the batches a same-node peer published under `(addr, ticket)`, or `None` if no
 /// usable file exists (an empty bucket, an un-shm'd peer, shm disabled, or a
 /// corrupt/truncated file — every case falls back to Flight). The file is memory-mapped,

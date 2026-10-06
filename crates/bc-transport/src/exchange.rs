@@ -35,7 +35,9 @@ pub enum FetchFault {
 #[must_use]
 pub fn classify(err: &TransportError) -> FetchFault {
     match err {
-        TransportError::Transport(_) | TransportError::IdleTimeout(_) => FetchFault::Retryable,
+        TransportError::Transport(_)
+        | TransportError::IdleTimeout(_)
+        | TransportError::MissingTicket(_) => FetchFault::Retryable,
         TransportError::Status(s) if is_retryable_status(s) => FetchFault::Retryable,
         TransportError::Flight(arrow_flight::error::FlightError::Tonic(s))
             if is_retryable_status(s) =>
@@ -88,11 +90,21 @@ fn lost_connection(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// gRPC status codes that mean "the peer/connection is transiently gone".
+/// gRPC status codes that mean "the peer/connection is transiently gone", or that the
+/// bucket on it is lost and must come from a replica or a recompute.
+///
+/// `DataLoss` is what the server answers when a bucket it registered can no longer be read
+/// back (its spill file was truncated, deleted or became unreadable). The peer is healthy
+/// but the bucket is gone, which is exactly what the recovery loop exists for. Treating it
+/// as fatal would fail a query a recompute can finish. Treating it as `NotFound` would
+/// return the query short.
 fn is_retryable_code(code: tonic::Code) -> bool {
     matches!(
         code,
-        tonic::Code::Unavailable | tonic::Code::Aborted | tonic::Code::Cancelled
+        tonic::Code::Unavailable
+            | tonic::Code::Aborted
+            | tonic::Code::Cancelled
+            | tonic::Code::DataLoss
     )
 }
 
@@ -230,9 +242,19 @@ impl ShuffleExchange {
     /// any reducer that [`fetch`]es the ticket. Re-publishing the same ticket
     /// replaces the previous batches.
     ///
+    /// Fails with [`TransportError::StoreFull`] when a byte cap is configured, the store is
+    /// over it, and the bucket cannot be spilled to disk: the bucket is then not published.
+    ///
     /// [`fetch`]: ShuffleExchange::fetch
-    pub async fn publish(&self, ticket: &ShuffleTicket, batches: Vec<RecordBatch>) {
-        self.store.register(ticket.to_string(), batches).await;
+    pub async fn publish(
+        &self,
+        ticket: &ShuffleTicket,
+        batches: Vec<RecordBatch>,
+    ) -> TransportResult<()> {
+        self.store
+            .register(ticket.to_string(), batches)
+            .await
+            .map_err(|e| TransportError::StoreFull(e.to_string()))
     }
 
     /// Read a partition this exchange itself published, without any network hop.
@@ -251,11 +273,18 @@ impl ShuffleExchange {
     /// `local_partition` did *not*, a co-located source would hand the reducer stray
     /// zero-row batches a remote source never would — a divergence between the
     /// DIRECT_MEMORY and network transfer modes for the same published partition.
-    pub async fn local_partition(&self, ticket: &ShuffleTicket) -> Option<Vec<RecordBatch>> {
-        self.store
-            .get(&ticket.to_string())
-            .await
-            .map(|b| b.iter().filter(|rb| rb.num_rows() > 0).cloned().collect())
+    ///
+    /// `Err` when the ticket was published and spilled but its file can no longer be read:
+    /// a `DataLoss` status, the same answer a remote consumer gets, so the co-located path
+    /// cannot read a lost bucket as an absent or empty one either.
+    pub async fn local_partition(
+        &self,
+        ticket: &ShuffleTicket,
+    ) -> TransportResult<Option<Vec<RecordBatch>>> {
+        let found = self.store.get(&ticket.to_string()).await.map_err(|e| {
+            TransportError::Status(Box::new(tonic::Status::data_loss(e.to_string())))
+        })?;
+        Ok(found.map(|b| b.iter().filter(|rb| rb.num_rows() > 0).cloned().collect()))
     }
 
     /// High-water mark of how many batches the producer had in flight (sent but
@@ -370,12 +399,10 @@ impl ShuffleExchange {
     }
 }
 
-/// Whether a transport error is a Flight `NotFound` — i.e. the ticket was never
-/// published. In a shuffle this is the *expected* empty-bucket case (a mapper that
-/// produced no rows for a reducer never publishes the ticket), so callers map it to
-/// an empty partition rather than an error. Every *other* error (a dead/unreachable
-/// peer, a decode failure) is a real fault and must propagate — the reducer must not
-/// silently treat it as an empty bucket.
+/// Whether a transport error is a Flight `NotFound` — i.e. the ticket is not registered on
+/// the peer. The low-level exchange turns it into [`TransportError::MissingTicket`], and
+/// only a caller that has *chosen* lenient semantics ([`absent_as_empty`]) reads it as an
+/// empty partition.
 fn is_ticket_not_found(err: &TransportError) -> bool {
     let code = match err {
         TransportError::Status(s) => Some(s.code()),
@@ -385,6 +412,17 @@ fn is_ticket_not_found(err: &TransportError) -> bool {
     code == Some(tonic::Code::NotFound)
 }
 
+/// The server's message on a `NotFound`, which names the missing ticket(s).
+fn not_found_detail(err: &TransportError) -> Option<String> {
+    match err {
+        TransportError::Status(s) => Some(s.message().to_string()),
+        TransportError::Flight(arrow_flight::error::FlightError::Tonic(s)) => {
+            Some(s.message().to_string())
+        }
+        _ => None,
+    }
+}
+
 /// Run the credit-gated `DoExchange` over an already-connected client.
 ///
 /// The consumer seeds `credits` and tops up by one per consumed batch, so the
@@ -392,15 +430,33 @@ fn is_ticket_not_found(err: &TransportError) -> bool {
 /// so both the connect-fresh [`ShuffleExchange::fetch_with_credits`] and the
 /// channel-pooling [`ClientPool`] share one implementation.
 ///
-/// A `NotFound` (unpublished ticket) resolves to an empty partition — the expected
-/// empty-bucket case — so only genuine faults surface as errors.
+/// Lenient: an unpublished ticket resolves to an empty partition (see [`absent_as_empty`]).
+/// This is the single-ticket fetch a caller uses when it cannot know whether the producer
+/// published at all, such as a streaming relay polling a morsel.
 pub(crate) async fn credit_exchange(
     client: &mut FlightClient,
     ticket: &ShuffleTicket,
     credits: u32,
     token: Option<&str>,
 ) -> TransportResult<(Vec<RecordBatch>, Duration, Duration)> {
-    credit_exchange_shard(client, ticket, credits, token, 0, 1).await
+    absent_as_empty(credit_exchange_shard(client, ticket, credits, token, 0, 1).await)
+}
+
+/// Read [`TransportError::MissingTicket`] as an empty partition, passing everything else.
+///
+/// The one place the lenient interpretation lives, so a caller opts into it by name. A
+/// consumer that knows the bucket was published -- every shuffle mapper publishes every
+/// bucket, empty ones included -- must not call this: for it an absent ticket is lost data,
+/// and reading it as empty is a short result.
+pub(crate) fn absent_as_empty(
+    out: TransportResult<(Vec<RecordBatch>, Duration, Duration)>,
+) -> TransportResult<(Vec<RecordBatch>, Duration, Duration)> {
+    match out {
+        // An unpublished ticket measures nothing: reporting its round trip as starvation
+        // would tell the controller to widen a window that carried no rows.
+        Err(TransportError::MissingTicket(_)) => Ok((Vec::new(), Duration::ZERO, Duration::ZERO)),
+        other => other,
+    }
 }
 
 /// As [`credit_exchange`], but fetches only the `shard`-th of `nshards` interleaved
@@ -463,10 +519,12 @@ pub(crate) async fn credit_exchange_group_shard(
     nshards: u32,
 ) -> TransportResult<(Vec<RecordBatch>, Duration, Duration)> {
     match credit_exchange_inner(client, name, credits, token, shard, nshards).await {
-        // An unpublished ticket is the expected empty-bucket case, and it measures nothing:
-        // reporting its round trip as starvation would tell the controller to widen a window
-        // that carried no rows.
-        Err(ref e) if is_ticket_not_found(e) => Ok((Vec::new(), Duration::ZERO, Duration::ZERO)),
+        // Typed rather than resolved here: whether an absent bucket is "empty" or "lost" is
+        // the caller's knowledge, not the wire's. The server names every missing ticket of a
+        // group in its message, which is carried through.
+        Err(ref e) if is_ticket_not_found(e) => Err(TransportError::MissingTicket(
+            not_found_detail(e).unwrap_or_else(|| name.to_string()),
+        )),
         other => other,
     }
 }
@@ -659,7 +717,7 @@ mod tests {
         )
         .unwrap();
         let server = crate::FlightServer::new();
-        server.register("big", vec![batch; 64]).await;
+        server.register("big", vec![batch; 64]).await.unwrap();
         let (upstream, _handle) = server.serve_ephemeral().await.unwrap();
 
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
