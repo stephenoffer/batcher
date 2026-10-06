@@ -142,9 +142,28 @@ def start_query_report(label: str, signature: str = "") -> str:
         return ""
     query_id = _query_id(next(_counter))
     events.publish(
-        events.QUERY_START, query_id=query_id, name=label, label=label, signature=signature
+        events.QUERY_START,
+        query_id=query_id,
+        name=label,
+        label=label,
+        signature=signature,
+        query_label=user_query_label(),
     )
     return query_id
+
+
+def user_query_label() -> str:
+    """The caller's `observability.query_label` for the query running now, or ``""``.
+
+    Read on the caller's thread, where the scope that set it is active: the event-log
+    writer thread would see the process default instead.
+
+    Returns:
+        The label, or the empty string when none is set.
+    """
+    from batcher.config import active_config
+
+    return active_config().observability.query_label
 
 
 def write_event_log(
@@ -214,9 +233,12 @@ def write_event_log(
     file_only = cfg.event_log and not (
         events.listening() or otel_enabled() or openlineage_enabled()
     )
-    if file_only and _WRITER.submit(_emit, collector, plan, sources, total_ms, rows, query_id):
+    label = user_query_label()
+    if file_only and _WRITER.submit(
+        _emit, collector, plan, sources, total_ms, rows, query_id, label
+    ):
         return
-    _emit(collector, plan, sources, total_ms, rows, query_id)
+    _emit(collector, plan, sources, total_ms, rows, query_id, label)
 
 
 def flush_event_log(timeout_s: float | None = None) -> bool:
@@ -248,6 +270,7 @@ def _emit(
     total_ms: float,
     rows: int,
     query_id: str | None,
+    query_label: str = "",
 ) -> None:
     """Assemble one query's profile and send it to every enabled sink (`write_event_log`)."""
     from batcher._internal.logging import get_logger
@@ -264,6 +287,8 @@ def _emit(
     # One render, both sinks: `to_dict` walks the whole operator tree, and the bus payload
     # and the on-disk document are the same document.
     document = profile.to_dict()
+    if query_label:
+        document["query_label"] = query_label  # the `query_label` column of `query_history()`
     _publish_stages(profile, query_id)
     _publish_end(
         query_id,
@@ -393,6 +418,9 @@ def report_failure(query_id: str | None, *, total_ms: float, exc: BaseException)
     from batcher.api.terminal.lineage import emit_run_failure
     from batcher.api.terminal.otel import emit_failure_span
 
+    label = user_query_label()
+    if label:
+        exc.add_note(f"query_label: {label}")
     if not query_id:
         return
     events.publish(
@@ -537,6 +565,7 @@ def report_stream(batches: Iterator[Any], *, label: str, signature: str = "") ->
         label=label,
         stage="streaming",
         signature=signature,
+        query_label=user_query_label(),
     )
     rows = 0
     t0 = time.perf_counter()

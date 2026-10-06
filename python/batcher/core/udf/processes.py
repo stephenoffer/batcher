@@ -25,6 +25,7 @@ from batcher._internal.errors import ExecutionError
 from batcher._internal.hardware import available_cpu_count
 from batcher._internal.mathx import ceil_div
 from batcher._internal.paths import open_private
+from batcher.core.runtime import expire_query, query_time_remaining
 from batcher.core.udf.isolation import (
     ResourceLimits,
     child_initializer,
@@ -258,12 +259,16 @@ def run_map_processes(
             "nor cloudpickle-serializable).",
             hint="Install `cloudpickle`, or pass a module-level function or a class.",
         )
+    # The wait is also bounded by `execution.query_timeout_s`: a cancellation flag cannot
+    # reach a child process, so the pool's own timeout is the only lever.
+    remaining = query_time_remaining()
     paths, _size = _input_shards(batches, n_procs)
     try:
         # One task per shard (not per batch): the worker opens its mmap once and returns
         # all its results, so a moderate-input map isn't dominated by per-batch opens. Flat
         # in shard order == original batch order (shards are contiguous batch ranges).
-        kwargs = {"timeout": timeout} if timeout > 0 else {}
+        limits = [t for t in (timeout if timeout > 0 else None, remaining) if t is not None]
+        kwargs = {"timeout": min(limits)} if limits else {}
         tasks = [(wire_fn, p, batch_format, budget_key, max_errored_rows) for p in paths]
         per_shard = pool.map(_call_shard, tasks, **kwargs)
         return [r for shard in per_shard for r in shard]
@@ -272,6 +277,8 @@ def run_map_processes(
         # torn down rather than reused: its children are still running the stuck
         # call, so handing them the next query's work would propagate the wedge.
         shutdown_pool()
+        if remaining is not None and (timeout <= 0 or remaining < timeout):
+            raise expire_query("map_batches") from exc
         raise ExecutionError(
             f"a map_batches UDF did not finish within udf_timeout_s={timeout}s.",
             hint=(

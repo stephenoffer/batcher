@@ -27,6 +27,7 @@ import logging
 
 from batcher._internal import events
 from batcher._internal.logging import get_logger, log_kv
+from batcher.core.runtime import note_stage
 
 __all__ = ["MAX_LABEL", "PHASE_LABELS", "begin", "record"]
 
@@ -64,6 +65,7 @@ def begin(name: str) -> None:
     Returns:
         None.
     """
+    note_stage(name)  # so a query timeout can say which phase it interrupted
     events.publish(events.PHASE, name=PHASE_LABELS.get(name, name), phase=name)
 
 

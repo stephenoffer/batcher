@@ -16,8 +16,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pyarrow as pa
 
+from batcher._internal.errors import QueryCancelledError
 from batcher._internal.mathx import ceil_div
 from batcher.config import active_config
+from batcher.core.runtime import cancellable
 from batcher.core.udf import strategy as strat
 from batcher.core.udf.async_udf import is_async_udf, run_async_batches
 from batcher.core.udf.call import (
@@ -234,6 +236,10 @@ def _dispatch_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.Reco
                 budget_key=strat.budget_key(op),
                 max_errored_rows=op.max_errored_rows,
             )
+        except QueryCancelledError:
+            # A cancelled or timed-out query is not a broken pool: falling back to threads
+            # would re-run the stage and disable processes for the rest of the session.
+            raise
         except Exception as exc:
             # A process pool can be unavailable for the whole session — e.g. a script
             # that runs the pipeline at import time is not import-safe, so forkserver/
@@ -299,8 +305,11 @@ def _run_sync_udf(op: MapBatches, batches: list[pa.RecordBatch], strategy: str) 
             budget = strat.error_budget(op)
             is_gpu = op.num_gpus > 0
 
-            def _emit(b: pa.RecordBatch) -> list[pa.RecordBatch]:
+            def _resilient(b: pa.RecordBatch) -> list[pa.RecordBatch]:
                 return _resilient_call(call, b, budget, is_gpu)
+
+            # Checked outside the bisection, so a cancellation is never charged as a bad row.
+            _emit = cancellable(_resilient, "map_batches")
 
             if strategy == "threads":
                 with _leased_pool(op.num_workers) as pool:
@@ -311,6 +320,9 @@ def _run_sync_udf(op: MapBatches, batches: list[pa.RecordBatch], strategy: str) 
             for c in chunks:
                 out.extend(c)
             return out
+        # Polled per batch, outside the retry wrapper so a cancellation is never retried:
+        # the engine's morsel-boundary check cannot see a loop running on the driver.
+        call = cancellable(call, "map_batches")
         if strategy == "threads":
             # ThreadPoolExecutor.map keeps input order; concurrency only helps when `fn`
             # releases the GIL (Rust/GPU/NumPy inference), which is the intended use.

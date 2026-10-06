@@ -905,6 +905,9 @@ def _commit(
 
     if schema is not None and manifest.schema is None:
         manifest = dataclasses.replace(manifest, schema=schema)
+    label = active_config().observability.query_label
+    if label:
+        manifest = dataclasses.replace(manifest, query_label=label)
     sink.commit(manifest, path)
     _report_write(manifest, fmt)
     if auto_compact:

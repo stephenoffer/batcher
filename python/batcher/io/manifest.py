@@ -66,6 +66,9 @@ class WriteManifest:
 
     files: tuple[WrittenFile, ...] = ()
     schema: Any | None = None
+    #: The `observability.query_label` the write ran under, stamped by the driver at commit
+    #: so the manifest a job keeps says which job produced it. Empty when none was set.
+    query_label: str = ""
 
     @property
     def total_rows(self) -> int:
@@ -138,4 +141,8 @@ class WriteManifest:
         Returns:
             A new manifest holding both manifests' files.
         """
-        return WriteManifest(files=self.files + other.files, schema=self.schema or other.schema)
+        return WriteManifest(
+            files=self.files + other.files,
+            schema=self.schema or other.schema,
+            query_label=self.query_label or other.query_label,
+        )
