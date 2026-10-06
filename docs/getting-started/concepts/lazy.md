@@ -55,6 +55,28 @@ for batch in plan.iter_batches():
 # 3
 ```
 
+## What runs when
+
+Not every call is either free or a full run. The following table labels the common calls by what they do when you make them, from cheapest to most far-reaching:
+
+| Label | What it does | Calls |
+|---|---|---|
+| Plan-building | Extends or records a plan. Reads no data and runs nothing. | transformations such as `filter`, `select`, `join`, and `group_by(...).agg(...)`; `cache()`; `columns`; `explain()`; `Session.register`; a SQL `SELECT`, `CREATE VIEW`, or `CREATE TABLE AS` on a session table |
+| Metadata-reading | Touches storage or resolves types, but scans no rows. | `bt.read.*` constructors, which check the path and read the source's schema; `schema` |
+| Executing | Runs the whole plan and returns a result. | `collect`, `to_pydict`, `to_pylist`, `to_pandas`, `count`, `len(ds)`, `shape`, `explain(analyze=True)`, and an ML estimator's `fit` |
+| Streaming | Runs the plan incrementally as you consume it. | `iter_batches` and `iter_rows`, which start work at the first `next()`, not when called |
+| Externally mutating | Runs the plan and changes something outside the process. | every `ds.write.*` sink, and SQL `CREATE TABLE ... AS`, `INSERT`, `DELETE`, or `UPDATE` on a *catalog* table, which write immediately |
+
+Two cases need care. `len(ds)` and `shape` look like attribute reads but execute a `count`, often answered from file metadata and otherwise from a full run. And a Python callable such as `map_batches(fn)` has output types Batcher can't know without running it, so `schema`, or an `INSERT` into a session table built on it, can call `fn` on input data. A SQL `INSERT`, `DELETE`, or `UPDATE` on a session table otherwise only rebinds the name to a new lazy plan.
+
+`iter_batches` doesn't start a query until you ask for the first batch:
+
+```python
+stream = plan.iter_batches()  # nothing has run yet
+print(next(stream).num_rows)  # runs here
+# 3
+```
+
 ## Cache and explain
 
 A dataset doesn't keep its result, so a second terminal call runs the plan again. Mark an expensive intermediate with {py:meth}`cache() <batcher.Dataset.cache>` and the first materializing call stores it:
