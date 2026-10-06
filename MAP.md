@@ -2406,7 +2406,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | module | lines | what it is |
 |---|---|---|
 | `core.py` | 91 | The dashboard's lifecycle: bind a port, serve in a daemon thread, detach cleanly. |
-| `handler.py` | 257 | The HTTP layer: dispatch, compression, caching, and the headers a browser needs. |
+| `handler.py` | 324 | The HTTP layer: dispatch, compression, caching, and the headers a browser needs. |
 | `routes.py` | 131 | The read-only JSON API — one table mapping a path to the store call behind it. |
 
 ### `batcher/plan/` — 1 · contract

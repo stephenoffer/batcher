@@ -14,6 +14,13 @@ localhost, so this is `http.server` and not a framework — but "small" is not t
 * **Security headers.** The dashboard renders query text and log lines, which are user
   data. `nosniff` plus a `self`-only CSP means a log line containing markup can never be
   interpreted as anything but text, whatever a future renderer forgets to escape.
+* **Host and origin checks.** A loopback bind does not make the dashboard private to the
+  user: any page their browser opens can *send* to `127.0.0.1`. A `text/plain` POST is a
+  CORS "simple request" that goes out with no preflight, and a domain that re-resolves to
+  `127.0.0.1` (DNS rebinding) becomes same-origin with the dashboard and can read it. Both
+  carry a `Host` or `Origin` that is not the dashboard's, so every request is refused with
+  `403` unless its `Host` names the bound address or loopback, and the one write further
+  requires `application/json` and, when an `Origin` is sent, one matching the `Host`.
 """
 
 from __future__ import annotations
@@ -47,6 +54,15 @@ _CONTENT_TYPES = {
     ".woff2": "font/woff2",
     ".ico": "image/x-icon",
 }
+
+#: The names a browser uses for loopback. A `Host` naming one of these (or the bound address
+#: itself) is a request the user's own browser addressed to the dashboard; anything else is
+#: a page that reached the socket under another name.
+_LOOPBACK_NAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+#: Bind addresses meaning "every interface". The operator has chosen to serve whatever name
+#: the machine is reached by, so no `Host` can be checked against an allowlist there.
+_WILDCARD_BINDS = frozenset({"", "0.0.0.0", "::"})
 
 #: Below this, compressing costs more CPU and bytes (the gzip header) than it saves.
 _GZIP_MIN_BYTES = 1024
@@ -85,6 +101,9 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch(body=False)
 
     def _dispatch(self, *, body: bool) -> None:
+        if not self._host_allowed():
+            self._forbid(body=body)
+            return
         parsed = urlparse(self.path)
         route = unquote(parsed.path).rstrip("/") or "/"
         try:
@@ -114,9 +133,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         """Handle the single write route; reject every other mutation."""
+        if not self._host_allowed():
+            self._forbid()
+            return
         route = unquote(urlparse(self.path).path).rstrip("/")
         if route != self._WRITE_ROUTE:
             self._reject_method()
+            return
+        if not self._write_is_same_origin():
+            self._forbid()
             return
         try:
             self._write_pipeline_meta()
@@ -132,6 +157,40 @@ class Handler(BaseHTTPRequestHandler):
 
     do_DELETE = do_PUT
     do_PATCH = do_PUT
+
+    def _host_allowed(self) -> bool:
+        """Whether the `Host` header names this dashboard rather than some other site.
+
+        A DNS-rebinding page reaches the socket with its own domain in `Host`, so refusing
+        any name but the bound address and loopback is what keeps it from reading query text
+        and plans. The port is not compared: the rebinding page necessarily uses the
+        dashboard's port, so only the name distinguishes it.
+        """
+        bound = str(self.server.server_address[0]).lower()
+        if bound in _WILDCARD_BINDS:
+            return True
+        name = _host_name(self.headers.get("Host", ""))
+        return name in _LOOPBACK_NAMES or name == bound
+
+    def _write_is_same_origin(self) -> bool:
+        """Whether a POST is one the dashboard's own page could have sent.
+
+        The app always sends `application/json`, which a cross-site page can only send after
+        a CORS preflight this server never approves; `text/plain` is what a forged form or
+        a `no-cors` fetch would use. A browser also attaches `Origin` to every cross-site
+        POST, so one that does not name this `Host` is a different site.
+        """
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        return urlparse(origin).netloc.lower() == self.headers.get("Host", "").lower()
+
+    def _forbid(self, *, body: bool = True) -> None:
+        """Refuse a request that did not come from the dashboard's own origin."""
+        self._respond(403, b'{"error":"forbidden"}', "application/json", body=body)
 
     def _reject_method(self) -> None:
         """Every mutating verb we don't serve, answered once."""
@@ -255,3 +314,11 @@ class Handler(BaseHTTPRequestHandler):
         dashboard that spams the terminal it exists to keep clean.
         """
         get_logger("observe").debug("ui %s", format % args)
+
+
+def _host_name(header: str) -> str:
+    """The name part of a `Host` header, lowercased: `[::1]:4040` gives `::1`."""
+    header = header.strip().lower()
+    if header.startswith("["):
+        return header[1:].split("]", 1)[0]
+    return header.rsplit(":", 1)[0].rstrip(".") if ":" in header else header.rstrip(".")
