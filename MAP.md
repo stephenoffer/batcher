@@ -966,7 +966,7 @@ Window-function translation for the SQL front-end.
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1916 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1921 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 532 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 312 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 446 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -1730,8 +1730,8 @@ Carbonite data transfer: the standalone, locality-aware shuffle engine.
 | `locality.py` | 180 | Transfer-mode selection — move a partition the cheapest way its placement allows. |
 | `peers.py` | 188 | What each peer carried, so a slow shuffle can name the node it was slow on. |
 | `placement.py` | 153 | Locality-aware reducer placement — put a reducer where its data already is. |
-| `server.py` | 415 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
-| `session.py` | 540 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
+| `server.py` | 418 | The node-local Arrow Flight shuffle server — Carbonite's transfer endpoint. |
+| `session.py` | 554 | The ShuffleSession — Carbonite's operator-agnostic data-movement engine. |
 | `staging.py` | 271 | How a transfer crosses the host link: chunk size, how many are in flight, and pinned or not. |
 | `tls.py` | 86 | Load the shuffle TLS material a worker presents and trusts. |
 
@@ -1788,7 +1788,7 @@ Streaming (incremental) aggregation and the bounded-memory operator drivers.
 | module | lines | what it is |
 |---|---|---|
 | `drivers.py` | 634 | Bounded-memory drivers for a top-level operator over a streaming source. |
-| `keyed_state.py` | 372 | Arbitrary keyed state over a stream — the fold behind `transform_with_state`. |
+| `keyed_state.py` | 409 | Arbitrary keyed state over a stream — the fold behind `transform_with_state`. |
 | `spill.py` | 227 | Cold windows of a streaming aggregate's state, held on disk instead of in memory. |
 
 ### `batcher/core/streaming/folds/` — 3 · subsystem
@@ -3062,14 +3062,14 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
 | `chunked/mod.rs` | 611 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
-| `flight.rs` | 700 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
+| `flight.rs` | 715 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
 | `lib.rs` | 799 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 787 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 165 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
 | `route.rs` | 175 | Which executor a plan runs on, and the two different affordability tests behind that. |
-| `shuffle/gather.rs` | 419 | The reducer's gather: how a worker pulls its bucket from every mapper. |
+| `shuffle/gather.rs` | 433 | The reducer's gather: how a worker pulls its bucket from every mapper. |
 | `shuffle/mod.rs` | 554 | Shuffle FFI: partitioners and the concurrent reducer gather. |
 | `sketches.rs` | 584 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
 | `tracing_init.rs` | 194 | Rust data-plane `tracing` → Python `logging` bridge. |
@@ -3394,13 +3394,13 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 
 | file | lines | what it is |
 |---|---|---|
-| `client_pool.rs` | 344 | The consumer-side connection pool: how a reducer dials a peer and how many streams it runs against it. |
-| `exchange.rs` | 595 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
-| `handler.rs` | 428 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
+| `client_pool.rs` | 395 | The consumer-side connection pool: how a reducer dials a peer and how many streams it runs against it. |
+| `exchange.rs` | 643 | The node-level [`ShuffleExchange`]: the ergonomic API the distributed layer calls to publish and fetch shuffle partitions between nodes with credit-bounded… |
+| `handler.rs` | 457 | The [`FlightService`] implementation backing a `FlightServer`, plus the credit-grant encode/decode helpers it shares with the exchange client. |
 | `lib.rs` | 120 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 409 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
-| `shared.rs` | 412 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
-| `store.rs` | 440 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
+| `shared.rs` | 427 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
+| `store.rs` | 483 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 93 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 207 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |
