@@ -38,6 +38,8 @@ from batcher._internal.errors.hierarchy import (
     RetryableShuffleError,
     SchemaError,
     SecurityWarning,
+    SQLSyntaxError,
+    SQLUnsupportedError,
     TransportError,
     unknown_value,
 )
@@ -79,6 +81,8 @@ __all__ = [
     "QueryCancelledError",
     "ResourceError",
     "RetryableShuffleError",
+    "SQLSyntaxError",
+    "SQLUnsupportedError",
     "SchemaError",
     "SecurityWarning",
     "TransportError",

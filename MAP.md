@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1564 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1566 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -159,7 +159,7 @@ Batcher — a native, JIT-compiling, adaptive data engine.
 
 | module | lines | what it is |
 |---|---|---|
-| `_exports.py` | 1455 | The routing tables behind Batcher's lazy re-export façades — GENERATED, do not edit. |
+| `_exports.py` | 1459 | The routing tables behind Batcher's lazy re-export façades — GENERATED, do not edit. |
 | `_lazy.py` | 136 | PEP 562 lazy re-export façades, shared by every package that is one. |
 
 ### `batcher/api/` — 5 · conductor
@@ -219,7 +219,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 6691 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 6715 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -383,7 +383,7 @@ Session entry points that create `Dataset`s.
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
 | `onboarding.py` | 149 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
 | `read.py` | 133 | The generic read dispatch behind the `bt.read` namespace. |
-| `sql.py` | 302 | The default session: `bt.sql`, `bt.register_function`, `bt.register_model` and its accessors. |
+| `sql.py` | 292 | The default session: `bt.sql`, `bt.register_function`, `bt.register_model` and its accessors. |
 | `versions.py` | 125 | Version and environment reporting (`engine_version`, `show_versions`). |
 
 ### `batcher/api/session/accelerators/` — 5 · conductor
@@ -406,8 +406,9 @@ The SQL `Session`: a table catalog, a Python-function registry, and a read diale
 | module | lines | what it is |
 |---|---|---|
 | `catalog_sql.py` | 396 | SQL over a session's catalogs: ``USE``, ``SHOW``, schema DDL, and catalog table references. |
+| `params.py` | 258 | The per-call bindings of a SQL statement: the tables it names and the values it binds. |
 | `registry.py` | 103 | What a Python function registered for SQL looks like to the translator. |
-| `session.py` | 798 | The SQL `Session` — a context binding named tables, Python functions, and a dialect. |
+| `session.py` | 1036 | The SQL `Session` — a context binding named tables, Python functions, and a dialect. |
 | `statements.py` | 288 | SQL statements that change the catalog rather than only reading it. |
 | `views.py` | 145 | Session views bound at query time, and the one case rule every session name follows. |
 
@@ -874,7 +875,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `grouping_sets.py` | 321 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
 | `statements.py` | 328 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 331 | Built-in table functions in the FROM clause: the series generators and model scoring. |
-| `translator.py` | 647 | The `_Translator` skeleton plus the public `sql()` entry point. |
+| `translator.py` | 671 | The `_Translator` skeleton plus the public `sql()` entry point. |
 | `udf.py` | 196 | Registered-Python-function support for the SQL translator. |
 
 ### `batcher/_sql/parser/expressions/` — 6 · front-end
@@ -901,16 +902,17 @@ The scalar lowerings big enough to own a module, kept out of the `scalar` dispat
 
 | module | lines | what it is |
 |---|---|---|
-| `accessors.py` | 225 | SQL → the typed accessor namespaces, by name. |
+| `accessors.py` | 230 | SQL → the typed accessor namespaces, by name. |
 | `buckets.py` | 121 | `time_bucket` — snapping a timestamp to the start of the period that contains it. |
 | `derived.py` | 44 | The dispatches *derived* from the public expression surface, in the order they run. |
 | `dynamic.py` | 139 | String functions whose parameters are columns rather than constants. |
-| `families.py` | 319 | SQL → the public function library, by name. |
+| `families.py` | 332 | SQL → the public function library, by name. |
 | `intervals.py` | 170 | SQL ``INTERVAL`` literals → the ``(months, days, microseconds)`` triple. |
 | `matching.py` | 78 | ``LIKE`` / ``ILIKE`` lowering, including the shapes that skip the pattern matcher. |
 | `membership.py` | 127 | ``IN``, ``BETWEEN`` and ``IS DISTINCT FROM`` — SQL's set and null-safe comparisons. |
+| `named.py` | 225 | Named SQL arguments (``name => value``): consume them, or refuse them by name. |
 | `nulls.py` | 164 | Typing a bare SQL ``NULL`` from the position it is written in. |
-| `signatures.py` | 334 | What a Python signature means to the SQL translator. |
+| `signatures.py` | 350 | What a Python signature means to the SQL translator. |
 
 ### `batcher/_sql/parser/joins/` — 6 · front-end
 
@@ -2799,7 +2801,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `paths.py` | 130 | Filesystem locations of the installed package, and how to create things there safely. |
 | `prefetch.py` | 116 | Overlap a producer generator with its consumer on a background thread. |
 | `registry.py` | 306 | Keyed lookup tables: the generic extension-point registry and the identity memo. |
-| `sql_errors.py` | 95 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
+| `sql_errors.py` | 275 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
 
 ### `batcher/_internal/concurrency/` — 0 · utility
 
@@ -2826,7 +2828,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 
 | module | lines | what it is |
 |---|---|---|
-| `hierarchy.py` | 720 | The Batcher exception hierarchy. |
+| `hierarchy.py` | 794 | The Batcher exception hierarchy. |
 | `suggest.py` | 401 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 125 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 

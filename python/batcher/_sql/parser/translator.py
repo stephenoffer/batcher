@@ -14,8 +14,8 @@ from typing import Any
 import pyarrow as pa
 from sqlglot import expressions as exp
 
-from batcher._internal.errors import PlanError
-from batcher._internal.sql_errors import parse_sql
+from batcher._internal.errors import PlanError, SQLUnsupportedError
+from batcher._internal.sql_errors import parse_sql, unsupported
 from batcher._sql.parser import (
     clauses,
     expressions,
@@ -33,6 +33,7 @@ from batcher._sql.parser.core_utils import (
     _row_window,
     _unwrap_alias,
 )
+from batcher._sql.parser.expressions.lowering import named
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
 from batcher.plan.expr_ir import AggExpr, Expr, Lit, col, nullif
@@ -70,6 +71,7 @@ def translate_ast(
     functions: dict[str, Any] | None = None,
     models: dict[str, Any] | None = None,
     engines: dict[str, Any] | None = None,
+    max_recursion: int = 1024,
     **tables: Dataset | pa.Table,
 ) -> Dataset:
     """Translate an already-parsed sqlglot statement into a lazy `Dataset`.
@@ -80,7 +82,8 @@ def translate_ast(
     `models` is the catalog `ML_PREDICT(t, m)` resolves a model name against; a query that
     scores by path instead needs none. `engines` is its generative counterpart, which
     `AI_GENERATE(t, e)` and friends resolve against; an engine has no path spelling, so a
-    query using one always needs it.
+    query using one always needs it. `max_recursion` caps the iterations of a
+    ``WITH RECURSIVE`` fixpoint.
     """
     registry = {name: _as_dataset(t) for name, t in tables.items()}
     # Normalize the quantified comparisons into the `IN`/`NOT IN` they are defined as before
@@ -88,13 +91,9 @@ def translate_ast(
     # than each having to learn a second.
     subquery.normalize_quantified(ast)
     ast = windowing.normalize_limit_modifiers(ast)
-    return _Translator(registry, functions or {}, models or {}, engines or {}).statement(ast)
-
-
-# Iteration cap for a recursive CTE. A wrong or missing stop condition would otherwise
-# loop forever; failing loudly at a generous bound is better than hanging. DuckDB's
-# equivalent guard is 1024 by default.
-_MAX_RECURSION = 1024
+    translator = _Translator(registry, functions or {}, models or {}, engines or {})
+    translator._max_recursion = max_recursion
+    return translator.statement(ast)
 
 
 def _references(node, name: str) -> bool:
@@ -254,6 +253,10 @@ class _Translator:
         # reached through a different stage than a fitted estimator, and one catalog holding
         # both would make `ML_PREDICT(t, e)` look legal.
         self._engines = engines or {}
+        # Iteration cap for a recursive CTE. A wrong or missing stop condition would
+        # otherwise loop forever; failing loudly at a bound is better than hanging. DuckDB's
+        # equivalent guard is 1024 by default, and `Session(max_recursion=...)` moves it.
+        self._max_recursion = 1024
         self._agg_map: dict[str, tuple[str, AggExpr]] | None = None
         # Per select node (by id), which joined-relation column each source contributed:
         # `{alias: {bare column -> column now carrying it}}`. Written by
@@ -309,7 +312,7 @@ class _Translator:
         This is necessarily **eager** — the fixpoint has to run before anything downstream
         can read the CTE — so it materializes, unlike an ordinary lazy CTE. That is also why
         it is bounded: a non-terminating recursion (a missing or wrong stop predicate) would
-        otherwise hang, so it raises past `_MAX_RECURSION` iterations rather than spin.
+        otherwise hang, so it raises past `_max_recursion` iterations rather than spin.
 
         Args:
             cte: The `CTE` node whose body is self-referential.
@@ -341,7 +344,7 @@ class _Translator:
 
         saved = self._registry.get(cte.alias)
         try:
-            for _ in range(_MAX_RECURSION):
+            for _ in range(self._max_recursion):
                 if frontier.num_rows == 0:
                     break
                 # The recursive term sees only the previous iteration's rows — that is what
@@ -351,18 +354,22 @@ class _Translator:
                 if distinct and produced.num_rows:
                     # `UNION` (not ALL) is a set fixpoint: rows already derived must not be
                     # fed forward, or a step that keeps re-deriving them never terminates
-                    # (`SELECT 1 FROM c` is the degenerate case). Anti-join through the
-                    # engine rather than comparing rows in Python.
+                    # (`SELECT 1 FROM c` is the degenerate case). Set difference, not an
+                    # anti-join: a join never matches NULL keys, so a row holding a NULL was
+                    # "new" on every iteration and the recursion ran to the cap. EXCEPT
+                    # compares NULLs as equal, as the set fixpoint needs.
                     seen = pa.concat_tables(accumulated, promote_options="default")
-                    produced = (
-                        from_arrow(produced).join(from_arrow(seen), on=names, how="anti").collect()
-                    )
+                    produced = from_arrow(produced).except_(from_arrow(seen)).collect()
                 frontier = produced
                 accumulated.append(frontier)
             else:
-                raise NotImplementedError(
+                total = sum(t.num_rows for t in accumulated)
+                raise SQLUnsupportedError(
                     f"recursive CTE {cte.alias!r} did not terminate within "
-                    f"{_MAX_RECURSION} iterations; check its stop condition"
+                    f"{self._max_recursion} iterations ({total} rows accumulated, "
+                    f"{frontier.num_rows} in the last iteration); check its stop condition",
+                    hint="If the recursion is meant to run longer, raise the cap with "
+                    "bt.Session(max_recursion=...).",
                 )
         finally:
             if saved is None:
@@ -534,7 +541,24 @@ class _Translator:
 
     # --- scalar expressions (expressions/) ---------------------------------
     def _scalar(self, node) -> Expr:
-        return expressions._scalar(self, node)
+        """Translate one value node, refusing any named argument no handler consumed.
+
+        A bare ``NotImplementedError`` from a handler becomes a `SQLUnsupportedError`
+        located at `node`. The innermost node a refusal passes through is the most specific
+        one, and the error is already the typed one by the time it reaches the next frame.
+        """
+        if isinstance(node, exp.Kwarg):
+            raise named.misplaced(node)
+        try:
+            built = named.round_with_mode(self, node)
+            if built is None:
+                built = expressions._scalar(self, node)
+        except SQLUnsupportedError:
+            raise
+        except NotImplementedError as exc:
+            raise unsupported(str(exc), node) from exc
+        named.refuse_unconsumed(node)
+        return built
 
     def bind_scope(self, ds: Dataset) -> None:
         """Record `ds`'s column types, for the name whose meaning depends on them.
