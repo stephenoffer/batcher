@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1568 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1569 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -3033,7 +3033,7 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 | `receivers.py` | 585 | Which expressions in a script are engine objects, and which receiver each one is. |
 | `snippets.py` | 151 | Apply the canonical-name rewrite to code that lives inside text: doctests and Markdown blocks. |
 | `templates.py` | 425 | Apply one registry template, or check one call against a signature, on libcst nodes. |
-| `translate.py` | 429 | Rewrite a PySpark, Polars, Daft or Ray Data script onto Batcher, driven by the registry. |
+| `translate.py` | 453 | Rewrite a PySpark, Polars, Daft or Ray Data script onto Batcher, driven by the registry. |
 
 ### `batcher/migrate/semantics/` — ?
 
@@ -3045,6 +3045,7 @@ The `sem.<name>` transforms registry templates call for what the template DSL ca
 | `columns.py` | 241 | Transforms over column references, argument checks, positions and date patterns. |
 | `ordering.py` | 224 | Transforms over sort and window keys, whose null placement differs per engine. |
 | `relational.py` | 220 | Transforms over relational spellings: joins, writes, sessions, constructors, aggregates. |
+| `writes.py` | 130 | Save-mode intent for a ported write: carry the source engine's mode, or refuse the rewrite. |
 
 ## Rust data plane — `crates/`
 

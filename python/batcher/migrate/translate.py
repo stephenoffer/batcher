@@ -27,7 +27,7 @@ from batcher._internal.optional import require
 from batcher.migrate.engines import ENGINE_LABELS, Tables, tables
 from batcher.migrate.finish import Report, SiteRecorder, finish
 from batcher.migrate.receivers import Inference, Member, infer_module
-from batcher.migrate.semantics import columns, lookup, relational
+from batcher.migrate.semantics import columns, lookup, relational, writes
 from batcher.migrate.templates import Bound, Signature, parens, render
 
 cst = require("libcst", feature="batcher.migrate", provides="libcst", extra="migrate")
@@ -184,6 +184,12 @@ class _Translate(SiteRecorder):
         if new is None:
             why = f"is `{target}` in Batcher, but this call does not carry over 1:1"
             return self._leave(original, updated, row, why)
+        if writes.is_write(row):
+            new = self._save_mode(row, original, new)
+            if new is None:
+                return self._leave(
+                    original, updated, row, f"is `{target}` in Batcher, but {writes.REFUSAL}"
+                )
         if row.status is Status.PARAM:
             marker = (
                 f"{self.label} `{spelling}` was rewritten to `{target}`, which lacks: {row.need}"
@@ -211,7 +217,25 @@ class _Translate(SiteRecorder):
         self.consumed |= {
             i for i in inner if all(site.action != "marked" for site, _ in self.sites.get(i, []))
         }
-        return updated.with_changes(args=original.args)
+        left = updated.with_changes(args=original.args)
+        if not (writes.is_write(row) and writes.on_write(original)):
+            return left
+        # `df.write.csv(p)` left as written is still a Batcher call, and would run under
+        # Batcher's default save mode; give it the source's instead.
+        member = original.func.attr.value
+        if member not in self.tables.batcher_params.get("Dataset.write", {}):
+            return left
+        return self._save_mode(row, original, left) or left
+
+    def _save_mode(self, row: Mapping, original: Any, call: Any) -> Any | None:
+        """`call` with the save mode the source meant (`writes.carry`), or `None`."""
+        tokens = self.tables.params.get(row.surface, {}).get(row.name)
+        source = Signature.parse(tokens) if tokens else None
+        direct = writes.on_write(original)
+        new = writes.carry(self.tables.spec.name, row, source, call, direct)
+        if new is not None and new is not call and direct:
+            self.consumed.add(id(original.func.value))  # `df.write`'s marker asks for this mode
+        return new
 
     def _render(self, row: Mapping, original: Any, updated: Any, base: Any, spelling: str) -> Any:
         template = _template(str(row.template), row.name)
