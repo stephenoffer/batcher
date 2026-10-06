@@ -111,6 +111,33 @@ def _stall_diagnosis(task_cpus: float, outstanding: int) -> str | None:
         return None
 
 
+def _unschedulable(diagnosis: str | None, waited: float) -> bool:
+    """Whether a stall is one waiting cannot fix, and the autoscaler has had its turn.
+
+    `describe_pending_demand` words its two unsatisfiable verdicts — no node advertises the
+    resource, no node is wide enough for one task — as "no node ...", the prefix the actor-pool
+    path (`map._room_for_actors`) already fails fast on. Without the same check here the
+    barrier logged that exact verdict every two minutes, forever. Any other diagnosis (the
+    cluster is merely full) can clear, so it is reported and waited on. An unsatisfiable one
+    can still clear if the autoscaler adds a node of a new shape, so it is given
+    `distributed.autoscale_wait_s` first; on a fixed cluster that is 0, and the first stall
+    report is the last.
+    """
+    if not diagnosis or not diagnosis.startswith("no node"):
+        return False
+    return waited >= max(0.0, float(active_config().distributed.autoscale_wait_s))
+
+
+def _cancel_inflight(ray, inflight: dict) -> None:
+    """Cancel tasks that will never place, so they do not outlive the query that failed."""
+    for ref in inflight:
+        try:
+            ray.cancel(ref)
+        except Exception as exc:  # cancelling is cleanup; the ResourceError is the answer
+            note_suppressed("dist", "cancel an unschedulable map task", exc)
+            return
+
+
 def _relieve_stall(task_cpus: float, *, pinned: bool) -> bool:
     """Hand the idle session fleet's cores back, so this stage's pending tasks can place.
 
@@ -288,7 +315,13 @@ def gather_map_results(
                     relieved = True
                     if _relieve_stall(task_cpus, pinned=on_lost is not None):
                         continue
-                warn_barrier_stalled(waited, n, _stall_diagnosis(task_cpus, len(inflight)))
+                diagnosis = _stall_diagnosis(task_cpus, len(inflight))
+                if _unschedulable(diagnosis, waited):
+                    from batcher._internal.errors import ResourceError
+
+                    _cancel_inflight(ray, inflight)
+                    raise ResourceError(f"cannot schedule this map stage: {diagnosis}")
+                warn_barrier_stalled(waited, n, diagnosis)
             continue
         for ref in _ready_batch(ray, done[0], inflight):
             finished += 1

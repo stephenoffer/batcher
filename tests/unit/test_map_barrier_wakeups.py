@@ -84,3 +84,75 @@ def test_a_retry_inside_a_drained_batch_is_still_resubmitted(monkeypatch):
 
     assert out == list(range(8))
     assert seen[3] == 2
+
+
+def _stalled_barrier(monkeypatch, diagnosis: str, autoscale_wait_s: float):
+    """A barrier whose tasks never finish, with `diagnosis` as the cluster's verdict on why.
+
+    The stall-report cadence is set to zero so the first empty wait already counts as a
+    stall; a real barrier reaches the same branch after two minutes.
+    """
+    import dataclasses
+
+    from batcher.config import Config, config_context
+    from batcher.dist.executors.ray_runtime import gather_map_results
+    from batcher.dist.executors.ray_runtime.policies import _barrier
+
+    install_fake_ray(monkeypatch)
+    cancelled: list = []
+    monkeypatch.setattr(sys.modules["ray"], "cancel", cancelled.append, raising=False)
+    calls = _counting_wait(monkeypatch, ready=False, limit=50)
+    monkeypatch.setattr("batcher.carbonite.resilience.STALL_WARN_AFTER_S", 0.0)
+    monkeypatch.setattr("batcher.carbonite.resilience.warn_barrier_stalled", lambda *a: None)
+    monkeypatch.setattr(_barrier, "_stall_diagnosis", lambda *_a: diagnosis)
+    monkeypatch.setattr(_barrier, "_relieve_stall", lambda *_a, **_k: False)
+    base = Config()
+    cfg = base.replace(
+        distributed=dataclasses.replace(base.distributed, autoscale_wait_s=autoscale_wait_s)
+    )
+
+    def run():
+        with config_context(cfg):
+            return gather_map_results(lambda i: object(), 4, RecoveryPolicy(max_attempts=1))
+
+    return run, calls, cancelled
+
+
+_UNSATISFIABLE = (
+    "no node advertises accelerator_type:TPU: this stage asks for 1 TPU per task and the "
+    "cluster has none of that resource, so waiting cannot schedule it"
+)
+
+
+def test_a_stage_no_node_can_host_fails_instead_of_polling_forever(monkeypatch):
+    """BT-068: the barrier logged 'waiting cannot schedule it' every two minutes, forever."""
+    from batcher._internal.errors import ResourceError
+
+    run, calls, cancelled = _stalled_barrier(monkeypatch, _UNSATISFIABLE, autoscale_wait_s=0.0)
+
+    with pytest.raises(ResourceError, match="no node advertises"):
+        run()
+    assert len(calls) == 1  # failed on the first stall report, with no autoscaler to wait on
+    assert len(cancelled) == 4  # and took its never-placeable tasks with it
+
+
+def test_an_unsatisfiable_stall_waits_out_the_autoscale_budget(monkeypatch):
+    """An autoscaler may yet add a node of the missing shape, so the budget is honored."""
+    run, _, cancelled = _stalled_barrier(monkeypatch, _UNSATISFIABLE, autoscale_wait_s=3600.0)
+
+    with pytest.raises(AssertionError, match="never left"):
+        run()
+    assert not cancelled
+
+
+def test_a_merely_full_cluster_is_waited_on(monkeypatch):
+    """A cluster short of *free* capacity clears when other work finishes; never fail it."""
+    run, _, cancelled = _stalled_barrier(
+        monkeypatch,
+        "the cluster is short of free capacity: 4 outstanding at 1 CPU each",
+        autoscale_wait_s=0.0,
+    )
+
+    with pytest.raises(AssertionError, match="never left"):
+        run()
+    assert not cancelled

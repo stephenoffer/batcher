@@ -1067,7 +1067,7 @@ Config-driven fault-tolerance, recovery, and skew policies for the distributed e
 
 | module | lines | what it is |
 |---|---|---|
-| `_barrier.py` | 642 | The map-stage barrier: gather partition results under worker-loss recovery. |
+| `_barrier.py` | 675 | The map-stage barrier: gather partition results under worker-loss recovery. |
 | `_drain.py` | 166 | Which workers are on a node that is going away. |
 | `_faults.py` | 475 | Config-driven fault-tolerance, recovery, and skew policies for the distributed |
 | `_topn.py` | 112 | Worker-loss recovery for the distributed top-N fold. |
