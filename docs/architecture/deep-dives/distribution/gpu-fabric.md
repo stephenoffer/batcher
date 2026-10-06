@@ -30,7 +30,7 @@ Two rules keep that safe. Nothing is set that a probe did not answer, so an unre
 
 ### A collective is placed inside one fabric
 
-A stage flagged as running its own collective is gang-scheduled with `STRICT_PACK`, so its workers are co-located. Co-location alone does not make a node wide enough. The bundle layout therefore comes from the fleet's topology: a node whose coherent domain already holds the whole world size is preferred, the largest domain is filled first when none does, and a node excluded by a data-residency rule or a power-zone budget is skipped before placement rather than after.
+A stage flagged as running its own collective is gang-scheduled with `STRICT_PACK`, so its workers are co-located. Co-location alone does not make a node wide enough. The bundle layout therefore comes from the fleet's topology: a node whose coherent domain already holds the whole world size is preferred, and the largest domain is filled first when none does. The planner, `plan_collective`, can also skip a node excluded by a data-residency rule or a power-zone budget before placement rather than after, but only when its caller names the stage's datasets and a zone budget. The scheduler passes neither, so on the live path neither filter removes a node.
 
 A plan that covers fewer devices than the stage asked for is not used, because a partial gang would wait on a world size it never receives.
 
