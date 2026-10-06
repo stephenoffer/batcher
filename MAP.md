@@ -174,7 +174,7 @@ The public, fluent, lazy, expression-first API surface.
 | `functions.py` | 817 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
 | `groupby.py` | 1159 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
-| `history.py` | 259 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
+| `history.py` | 262 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `multi_group.py` | 431 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
@@ -219,7 +219,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 6687 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 6688 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2760 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -345,12 +345,12 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 
 | module | lines | what it is |
 |---|---|---|
-| `autoconfig.py` | 124 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
+| `autoconfig.py` | 129 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
 | `chunked.py` | 434 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
 | `chunked_sideways.py` | 647 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
-| `phases.py` | 95 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
+| `phases.py` | 97 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 273 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
 | `run.py` | 674 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 342 | What the conductor needs to know about a plan's size before it runs it. |
@@ -430,9 +430,9 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 736 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1517 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1520 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
-| `event_log.py` | 800 | Per-query event log — one JSON document per query (Spark's event-log analog). |
+| `event_log.py` | 829 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
 | `map_stream.py` | 190 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 215 | Emit a query's execution profile as OpenTelemetry spans. |
@@ -1730,7 +1730,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 | `executor.py` | 468 | The Core local executor. |
 | `gpu_transform.py` | 312 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 191 | The one running fold over the mergeable aggregate algebra. |
-| `runtime.py` | 268 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
+| `runtime.py` | 489 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
 | `scan_only.py` | 162 | A bare scan needs no engine — the reader has already produced the plan's output. |
 | `stats.py` | 256 | Column-statistics measurement — Core's lane. |
 | `streaming_runner.py` | 423 | How one micro-batch gets run — the seam between the loop and where the work happens. |
@@ -1801,13 +1801,13 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 
 | module | lines | what it is |
 |---|---|---|
-| `apply.py` | 403 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
+| `apply.py` | 415 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
 | `async_udf.py` | 193 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
 | `call.py` | 473 | The per-batch `map_batches` call boundary (Core, layer 3). |
 | `execute.py` | 313 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
 | `isolation.py` | 236 | What a UDF child process is allowed to see and consume. |
 | `lifecycle.py` | 90 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
-| `processes.py` | 450 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
+| `processes.py` | 457 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
 | `resilience.py` | 158 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
 | `sizing.py` | 281 | What the streaming UDF path learned last run, folded back into this run's sizing. |
 | `strategy.py` | 495 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
@@ -1854,8 +1854,8 @@ Credential verification: turning a presented credential into a verified `Princip
 | `detect.py` | 467 | Format and layout detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 720 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 681 | Framework-interop ingestion — build a `Source` from a foreign object. |
-| `manifest.py` | 141 | Write results — the manifest a sink returns and a commit consumes. |
-| `secret_backends.py` | 300 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
+| `manifest.py` | 148 | Write results — the manifest a sink returns and a commit consumes. |
+| `secret_backends.py` | 317 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
 
 ### `batcher/io/base/` — 2 · neutral IO
@@ -2750,14 +2750,14 @@ Configuration: one frozen, typed `Config` object.
 | module | lines | what it is |
 |---|---|---|
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
-| `config.py` | 3349 | The single frozen `Config` and its typed sections. |
+| `config.py` | 3448 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
 | `env.py` | 281 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
-| `options.py` | 353 | Dotted-string option access over the frozen `Config` tree. |
+| `options.py` | 357 | Dotted-string option access over the frozen `Config` tree. |
 | `profiles.py` | 299 | Named fault-tolerance profiles for the distributed engine. |
-| `serde.py` | 175 | Converting a `Config` to and from dicts, files, and environment-variable names. |
+| `serde.py` | 282 | Converting a `Config` to and from dicts, files, and environment-variable names. |
 
 ### `batcher/config/validation/` — 0 · utility
 
@@ -2769,7 +2769,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `distributed.py` | 269 | Range and combination checks for the `distributed` section and its shuffle TLS block. |
 | `gate.py` | 58 | The validation gate: run every section check once per distinct `Config` object. |
 | `gpu.py` | 58 | Range checks for the GPU packing and merge tunables. |
-| `sections.py` | 397 | The range and consistency checks themselves, one function per `Config` section. |
+| `sections.py` | 409 | The range and consistency checks themselves, one function per `Config` section. |
 
 ### `batcher/_internal/` — 0 · utility
 
