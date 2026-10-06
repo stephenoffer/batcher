@@ -67,12 +67,15 @@ print(stats.rows, stats.bottleneck is not None)
 Batch writes are atomic and resumable, so a preempted job re-runs without losing or duplicating data:
 
 ```python
+import tempfile
+
 import batcher as bt
 
+out = tempfile.mkdtemp()  # a fresh directory, so the demo replaces nothing of yours
 ds = bt.from_pydict({"v": list(range(1000))})
-ds.write.parquet("/tmp/bt_resume_demo", max_rows_per_file=400)  # 3 part files
-ds.write.parquet("/tmp/bt_resume_demo", max_rows_per_file=400, resume=True)  # skips committed
-print(bt.read.parquet("/tmp/bt_resume_demo").count())
+ds.write.parquet(out, max_rows_per_file=400)  # 3 part files
+ds.write.parquet(out, max_rows_per_file=400, resume=True)  # skips committed
+print(bt.read.parquet(out).count())
 # 1000
 ```
 

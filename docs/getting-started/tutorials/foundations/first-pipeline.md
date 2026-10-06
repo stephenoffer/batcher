@@ -166,11 +166,15 @@ sort  [revenue]                                   est≈1  (default)
 
 ## The same pipeline over files
 
-Only the source changes when the data lives in files. Write the result and read it back:
+Only the source changes when the data lives in files. Write the result and read it back. A write replaces whatever is at its path unless you name another save mode, so this one writes to a fresh temporary directory with `mode="error"`, which raises instead:
 
 ```python
-result.write.parquet("revenue.parquet")
-print(bt.read.parquet("revenue.parquet").to_pydict())
+import os
+import tempfile
+
+out = os.path.join(tempfile.mkdtemp(), "revenue.parquet")
+result.write.parquet(out, mode="error")
+print(bt.read.parquet(out).to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0], 'orders': [3, 2]}
 ```
 
@@ -186,7 +190,7 @@ import batcher as bt
     .group_by("category")
     .agg(revenue=bt.col("total").sum(), orders=bt.count())
     .sort("revenue", descending=True)
-    .write.parquet("output/revenue_by_category.parquet")
+    .write.parquet("output/revenue_by_category.parquet", mode="overwrite")
 )
 ```
 
