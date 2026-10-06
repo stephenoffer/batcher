@@ -2088,7 +2088,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `_dsn.py` | 313 | Connection URI → the PEP 249 driver and the ``connect()`` kwargs it wants. |
 | `_staged.py` | 146 | Staged SQL writes: every shard into its own staging table, one transaction to publish. |
 | `_statements.py` | 483 | Dialect-aware DML for the DB-API write path — the statement each write mode runs. |
-| `sink.py` | 640 | The row-level SQL write path — ``INSERT``, ``UPSERT``, ``UPDATE``, ``DELETE``. |
+| `sink.py` | 690 | The row-level SQL write path — ``INSERT``, ``UPSERT``, ``UPDATE``, ``DELETE``. |
 | `source.py` | 677 | DB-API 2.0 (PEP 249) source — the universal fallback for any Python driver. |
 
 ### `batcher/io/formats/streaming/` — 2 · neutral IO
