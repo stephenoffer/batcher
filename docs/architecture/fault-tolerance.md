@@ -261,7 +261,7 @@ storage and re-run the map, usually the longest phase of a query. Setting
 on an off-node survivor, so a reducer fetches the byte-identical bucket instead, at the
 cost of one extra network copy.
 
-A mapper publishes pre-aggregated partial state, typically far smaller than its source, so copying it is cheaper than regenerating it. A replica is advertised only once
+An aggregate's mapper publishes pre-aggregated partial state, typically far smaller than its source, so copying it is cheaper than regenerating it. A join, sort or window mapper publishes rows, so its copy is larger. A replica is advertised only once
 its copy has been acknowledged, and a source's replicas are retired when it's
 recomputed, so a reducer can never read a stale replica under a superseded epoch.
 
@@ -276,7 +276,7 @@ because a level's output is several partials already merged into one.
 Fault tolerance applies to the distributed path, which needs the optional `[ray]` extra. Single-node execution has none of this machinery and none of its overhead.
 
 - Shuffle output lives on the worker that produced it, in memory with a local-disk spill. A lost worker's buckets are recomputed.
-- Keep `shuffle_replication` at its default of 1, which recovers exactly. Above 1, worker loss can drop that worker's share of the rows instead of failing, as [`tests/integration/test_shuffle_replication.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_shuffle_replication.py) records.
+- Keep `shuffle_replication` at its default of 1, which recovers exactly. A recorded 3-node run found that above 1 a worker loss dropped that worker's share of the rows instead of failing. The cause, replicas copying a shuffle stage nobody had published, is fixed and pinned in [`tests/integration/test_shuffle_replication.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_shuffle_replication.py), but no cluster run since the fix is recorded, so replication above 1 is unverified on real hardware.
 - Draining runs under the `"spot"` profile. A cluster whose signals Batcher can't see needs `BATCHER_SPOT=1`, an exported `BATCHER_DEADLINE_EPOCH_S`, or `resilience="spot"`.
 - Recovery covers workers, not the driver. A job that must survive its driver runs as a streaming query with `checkpoint=`, which restarts from its last committed offset ({doc}`Streaming </user-guide/moving-data/streaming/index>`).
 
