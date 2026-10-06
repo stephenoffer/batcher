@@ -576,11 +576,18 @@ impl FlightServer {
 /// these server-side windows govern the consumer→producer control stream and any
 /// server-received data, and keep both peers off the 64 KiB default so no direction is
 /// silently window-throttled. `tcp_nodelay` avoids Nagle-delaying credit acks.
+///
+/// With [`keepalive`] configured the server pings too, not only the client. A consumer host
+/// that vanishes without a RST is otherwise invisible to the producer's side of the
+/// connection, so the producer's exchange task -- and the bucket batches it holds -- outlive
+/// the peer until the credit wait's own deadline; a failed ping tears the connection down
+/// sooner. Read when the server is built, so it must be set first, like the store cap.
 fn tuned_server() -> Server {
     Server::builder()
         .initial_stream_window_size(Some(H2_STREAM_WINDOW))
         .initial_connection_window_size(Some(H2_CONNECTION_WINDOW))
         .tcp_nodelay(true)
+        .http2_keepalive_interval(crate::keepalive())
 }
 
 /// Keeps a background Flight server alive; dropping it aborts the server task.

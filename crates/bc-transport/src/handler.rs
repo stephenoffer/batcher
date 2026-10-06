@@ -2,19 +2,22 @@
 //! credit-grant encode/decode helpers it shares with the exchange client.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
-use futures::stream::{BoxStream, StreamExt, TryStreamExt};
+use futures::stream::{BoxStream, Stream, StreamExt, TryStreamExt};
 use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::store::PartitionStore;
+use crate::store::{InflightGauge, PartitionStore};
 
 /// The gRPC metadata key a `DoGet` caller presents its shuffle token under.
 pub(crate) const AUTH_HEADER: &str = "authorization";
@@ -239,7 +242,7 @@ impl FlightService for FlightHandler {
         // constant the consumer chooses rather than a function of the cluster's width.
         // A single ticket takes exactly the path it always did.
         let names: Vec<&str> = ticket.split(',').filter(|t| !t.is_empty()).collect();
-        let mut buckets: Vec<Arc<Vec<arrow::array::RecordBatch>>> = Vec::with_capacity(names.len());
+        let mut buckets: Vec<Arc<Vec<RecordBatch>>> = Vec::with_capacity(names.len());
         let mut first_gauge = None;
         let mut missing: Vec<&str> = Vec::new();
         for name in &names {
@@ -390,26 +393,7 @@ impl FlightService for FlightHandler {
                 .collect()
         };
 
-        // Build a credit-gated source stream: await one credit per batch before
-        // letting it flow into the Flight encoder. Acquiring *before* yielding is
-        // what bounds the producer to `credits` batches in flight.
-        let gated = async_stream::stream! {
-            let _pump = pump; // keep the credit pump alive for the stream's life
-            for batch in batch_vec {
-                // Block here at zero credits until the consumer grants more.
-                match credits.acquire().await {
-                    Ok(permit) => permit.forget(),
-                    // Semaphore closed (shouldn't happen) -> stop the stream.
-                    Err(_) => break,
-                }
-                // Account this batch as in-flight the instant we hand it to the
-                // encoder; the matching on_ack() fires when the consumer's
-                // top-up grant arrives. The gauge's high-water mark therefore
-                // bounds how far ahead of the consumer the producer ran.
-                gauge.on_send();
-                yield Ok(batch);
-            }
-        };
+        let gated = credit_gated(batch_vec, credits, gauge, pump, crate::fetch_idle_timeout());
 
         // Compress each batch's Arrow buffers on the wire (the consumer auto-decompresses
         // from the codec in the IPC metadata). A cross-node fetch is NIC-bound, so sending
@@ -426,9 +410,56 @@ impl FlightService for FlightHandler {
             .with_options(opts)
             .with_schema(schema)
             .build(gated)
-            .map_err(|e| Status::internal(format!("flight encode error: {e}")));
+            .map_err(|e| match e {
+                // A status the source chose -- the credit wait's deadline -- reaches the
+                // consumer as itself rather than as an opaque encode failure.
+                FlightError::Tonic(status) => *status,
+                e => Status::internal(format!("flight encode error: {e}")),
+            });
 
         Ok(Response::new(stream.boxed()))
+    }
+}
+
+/// The credit-gated source a `DoExchange` serves: one credit is awaited per batch before
+/// it flows into the Flight encoder. Acquiring *before* yielding is what bounds the
+/// producer to `credits` batches in flight.
+///
+/// **The wait is bounded by `wait`** (the fetch idle timeout). A consumer whose host dies
+/// after acking everything it received leaves no unacked bytes and need not send a RST,
+/// so nothing on the connection ever fails: an unbounded `acquire` then parked this task at
+/// zero credits for the life of the worker, pinning `batches` -- cloned bucket data, possibly
+/// re-read from spill -- and the pump task with it, once per lost peer on a long-lived
+/// fleet. The consumer applies the same bound between batches from its side, so a live
+/// consumer that has not granted within it has already given up on this stream. On expiry
+/// the stream ends with `DeadlineExceeded` and the pump is aborted.
+fn credit_gated(
+    batches: Vec<RecordBatch>,
+    credits: Arc<Semaphore>,
+    gauge: Arc<InflightGauge>,
+    pump: tokio::task::JoinHandle<()>,
+    wait: Duration,
+) -> impl Stream<Item = Result<RecordBatch, FlightError>> {
+    async_stream::stream! {
+        for batch in batches {
+            match tokio::time::timeout(wait, credits.acquire()).await {
+                Ok(Ok(permit)) => permit.forget(),
+                // Semaphore closed (shouldn't happen) -> stop the stream.
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    pump.abort();
+                    yield Err(FlightError::Tonic(Box::new(Status::deadline_exceeded(format!(
+                        "do_exchange: no credit granted within {wait:?}; the consumer is gone"
+                    )))));
+                    break;
+                }
+            }
+            // Account this batch as in-flight the instant we hand it to the encoder; the
+            // matching on_ack() fires when the consumer's top-up grant arrives. The gauge's
+            // high-water mark therefore bounds how far ahead of the consumer the producer ran.
+            gauge.on_send();
+            yield Ok(batch);
+        }
     }
 }
 
@@ -454,4 +485,80 @@ pub(crate) fn encode_credits(n: u32) -> Vec<u8> {
 /// as retryable, so the reducer tries a replica and then recomputes the mapper.
 fn lost_bucket_status(err: &crate::store::SpillReadError) -> Status {
     Status::data_loss(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field};
+
+    fn batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap()
+    }
+
+    /// A consumer that stops granting -- its host died after acking what it had -- must not
+    /// park the producer at zero credits forever. The stream sends what the window allows,
+    /// then ends with `DeadlineExceeded` once the wait passes, and the pump is torn down
+    /// rather than left reading a connection nothing will ever write to.
+    #[tokio::test]
+    async fn a_credit_wait_with_no_grant_ends_at_the_deadline() {
+        let credits = Arc::new(Semaphore::new(1));
+        let gauge = Arc::new(InflightGauge::default());
+        let pump = tokio::spawn(futures::future::pending::<()>());
+        let pump_probe = pump.abort_handle();
+        let gated = credit_gated(
+            vec![batch(), batch(), batch()],
+            credits,
+            gauge.clone(),
+            pump,
+            Duration::from_millis(50),
+        );
+        let out: Vec<_> = tokio::time::timeout(Duration::from_secs(10), gated.collect())
+            .await
+            .expect("the producer hung at zero credits");
+
+        assert_eq!(out.len(), 2, "one granted batch, then the deadline");
+        assert!(out[0].is_ok());
+        match &out[1] {
+            Err(FlightError::Tonic(status)) => {
+                assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+            }
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+        assert_eq!(gauge.max(), 1, "sent past the window");
+        for _ in 0..100 {
+            if pump_probe.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            pump_probe.is_finished(),
+            "the credit pump outlived the stream"
+        );
+    }
+
+    /// With credits granted the bound never binds: every batch streams and the pump is left
+    /// alone, so a healthy exchange is unchanged.
+    #[tokio::test]
+    async fn granted_credits_stream_every_batch() {
+        let credits = Arc::new(Semaphore::new(3));
+        let gauge = Arc::new(InflightGauge::default());
+        let pump = tokio::spawn(futures::future::pending::<()>());
+        let pump_probe = pump.abort_handle();
+        let gated = credit_gated(
+            vec![batch(), batch(), batch()],
+            credits,
+            gauge.clone(),
+            pump,
+            Duration::from_millis(50),
+        );
+        let out: Vec<_> = gated.collect().await;
+        assert_eq!(out.len(), 3);
+        assert!(out.iter().all(Result::is_ok));
+        assert!(!pump_probe.is_finished());
+        pump_probe.abort();
+    }
 }
