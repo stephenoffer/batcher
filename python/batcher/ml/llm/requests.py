@@ -34,6 +34,7 @@ class GenerateSpec:
         temperature_column: a column giving each row its own sampling temperature.
         few_shot: fixed ``(input, output)`` demonstration pairs prepended to every prompt.
         parse_json: parse each output as JSON into a struct column (null on error).
+        raw_column: with `parse_json`, also keep each output's unparsed text in this column.
         usage: append ``prompt_tokens`` / ``completion_tokens`` columns.
         finish_reason: append a ``finish_reason`` column.
         logprobs: append a ``logprob`` column.
@@ -60,6 +61,7 @@ class GenerateSpec:
     temperature_column: str | None = None
     few_shot: tuple[tuple[str, str], ...] | None = None
     parse_json: bool = False
+    raw_column: str | None = None
     usage: bool = False
     finish_reason: bool = False
     logprobs: bool = False
@@ -70,6 +72,8 @@ class GenerateSpec:
     def appended_columns(self) -> list[str]:
         """The columns this spec appends to a batch, in the order they are appended."""
         names = [self.output_column]
+        if self.raw_column is not None:
+            names.append(self.raw_column)
         if self.usage:
             names += ["prompt_tokens", "completion_tokens"]
         if self.finish_reason:

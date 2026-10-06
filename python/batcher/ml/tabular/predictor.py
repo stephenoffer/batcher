@@ -167,6 +167,39 @@ def _null_feature_error(exc: Exception, matrix: Any, features: Sequence[str]) ->
     )
 
 
+#: The ways `tabular_predictor(on_null=...)` treats a null or NaN feature value.
+NULL_POLICIES = ("fill", "error")
+
+
+def _refuse_missing_features(batch: pa.RecordBatch, features: Sequence[str]) -> None:
+    """Raise `DataQualityError` when any feature column of `batch` holds a null or a NaN.
+
+    Counted with Arrow kernels over whole columns, so the check costs a pass per feature
+    column and never a Python loop over rows.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    found: dict[str, int] = {}
+    for name in features:
+        column = batch.column(name)
+        bad = column.null_count
+        if pa.types.is_floating(column.type):
+            bad += int(pc.sum(pc.is_nan(column)).as_py() or 0)
+        if bad:
+            found[name] = bad
+    if found:
+        from batcher._internal.errors import DataQualityError
+
+        detail = ", ".join(f"{name!r}: {count}" for name, count in found.items())
+        raise DataQualityError(
+            f"predict(on_null='error') found null or NaN feature values ({detail}). Fill them "
+            "first (batcher.ml.SimpleImputer, or fill_null), or score with on_null='fill' to "
+            "pass a null as missing= and a NaN through unchanged.",
+            violations=found,
+        )
+
+
 @functools.cache
 def _inspect_saved(path: str, framework: str) -> Any:
     """Load a saved model on the driver so its output width can be read (cached per path)."""
@@ -184,6 +217,7 @@ def tabular_predictor(
     output_columns: tuple[str, ...] | None = None,
     as_list: bool = False,
     missing: float = float("nan"),
+    on_null: str = "fill",
     dtype: str | None = None,
     threads: int | None = None,
     options: tuple[tuple[str, Any], ...] = (),
@@ -206,6 +240,8 @@ def tabular_predictor(
         output_columns: Explicit names for a multi-output model's columns.
         as_list: Emit one `List<Float64>` column instead of one column per output.
         missing: The value a null feature becomes (NaN, the boosters' own convention).
+        on_null: ``"fill"`` (default) scores a null feature as `missing` and a NaN as NaN;
+            ``"error"`` refuses a batch holding either, naming each column and count.
         dtype: The feature-matrix dtype, ``"float32"`` or ``"float64"``; the framework's
             own precision when omitted (float32 for the boosters, float64 for sklearn).
         threads: The model's thread-pool size inside one worker; auto-capped when unset.
@@ -216,7 +252,8 @@ def tabular_predictor(
         A class whose instances score one Arrow batch each.
 
     Raises:
-        PlanError: If `features` is empty, or `framework`/`method` is unknown.
+        PlanError: If `features` is empty, `framework`/`method` is unknown, or `on_null`
+            is not ``"fill"`` or ``"error"``.
 
     Examples:
         .. doctest::
@@ -232,6 +269,8 @@ def tabular_predictor(
     """
     if not features:
         raise PlanError("a tabular predictor needs at least one feature column")
+    if on_null not in NULL_POLICIES:
+        raise PlanError(f"on_null must be one of {list(NULL_POLICIES)}, got {on_null!r}")
     resolved_framework = framework or detect_framework(model)
     adapter = get_adapter(resolved_framework)
     if method not in adapter.methods:
@@ -261,6 +300,8 @@ def tabular_predictor(
         def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
             if batch.num_rows == 0:
                 return append_columns(batch, _empty_outputs(output_column, names, as_list))
+            if on_null == "error":
+                _refuse_missing_features(batch, feature_list)
             matrix = feature_matrix(batch, feature_list, dtype=matrix_dtype, missing=missing)
             call_opts = {"missing": missing, "threads": self._threads, **opts}
             try:

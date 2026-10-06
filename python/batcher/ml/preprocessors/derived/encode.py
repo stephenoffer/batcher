@@ -157,6 +157,9 @@ class LabelBinarizer(Preprocessor):
     def fit(self, ds: Dataset) -> LabelBinarizer:
         """Learn the sorted class set with one bounded `distinct`.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -255,6 +258,9 @@ class MultiLabelBinarizer(Preprocessor):
 
     def fit(self, ds: Dataset) -> MultiLabelBinarizer:
         """Learn the label set by exploding the list column, unless it was given.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::

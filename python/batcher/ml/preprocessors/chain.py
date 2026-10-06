@@ -148,6 +148,9 @@ class Chain(Preprocessor):
     def fit(self, ds: Dataset) -> Chain:
         """Fit every step, each on the output of the steps already fitted before it.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         This is the whole point of the class: step *i* must learn its statistics from
         data that steps *0..i-1* have already transformed, or it learns them from a
         distribution that will never be fed to it again.

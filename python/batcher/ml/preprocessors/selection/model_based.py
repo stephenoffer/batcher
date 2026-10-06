@@ -137,6 +137,9 @@ class SelectFromModel(Preprocessor):
     def fit(self, ds: Dataset) -> SelectFromModel:
         """Read the estimator's importances and apply the threshold.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         `ds` is not scored — the estimator carries the fit — so this runs no query. The
         argument is still taken because it is the `Preprocessor` contract, and because a
         `Chain` calls every step's `fit` with the same dataset.
@@ -287,6 +290,9 @@ class RFE(Preprocessor):
 
     def fit(self, ds: Dataset) -> RFE:
         """Eliminate the weakest features one round at a time, refitting each round.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::

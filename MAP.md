@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1563 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1564 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -220,7 +220,7 @@ The `Dataset` builder package.
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
 | `frame.py` | 6691 | `Dataset` — the lazy, immutable, fluent entry point. |
-| `ml.py` | 2760 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
+| `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
 ### `batcher/api/dataset/_build/` — 5 · conductor
@@ -513,7 +513,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `devices.py` | 448 | Zero-config device, dtype, and batch-size resolution for the ML surface. |
 | `discriminant.py` | 363 | Discriminant analysis — Gaussian classifiers that model each class's full covariance. |
 | `dummy.py` | 228 | Baseline predictors — the "does my model beat doing nothing" reference. |
-| `embed.py` | 523 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
+| `embed.py` | 533 | Embeddings — compute them (`embed`) and retrieve over them (`vector_search`). |
 | `embed_api.py` | 327 | Embedding encoders backed by a *served* endpoint, not a local model. |
 | `feature_scores.py` | 334 | Univariate feature scoring — rank every feature against the target in one pass each. |
 | `feature_spec.py` | 335 | `FeatureSpec` — pinning the exact feature contract between training and serving. |
@@ -531,7 +531,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `sampling.py` | 368 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
 | `selection.py` | 390 | Deciding which features to keep, before a model ever sees them. |
 | `sparse_linear.py` | 551 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
-| `splitting.py` | 392 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
+| `splitting.py` | 449 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 
 ### `batcher/ml/compose/` — 6 · front-end
 
@@ -593,12 +593,13 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 |---|---|---|
 | `channels.py` | 89 | Per-call side channels an engine uses to report token usage and finish reasons. |
 | `columns.py` | 234 | Building the columns a generation appends, from what the engine reported. |
-| `generate.py` | 536 | LLM batch generation — the columnar half of offline text generation. |
+| `extract_schema.py` | 398 | The declared schema of an `extract` call: resolution, JSON Schema, and per-value coercion. |
+| `generate.py` | 570 | LLM batch generation — the columnar half of offline text generation. |
 | `judge.py` | 384 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
 | `packing.py` | 251 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
-| `requests.py` | 312 | Turning a `RecordBatch` into the per-row requests an engine receives. |
-| `sizing.py` | 348 | Sizing an LLM engine from the workload instead of from the model's maximum. |
-| `structured.py` | 527 | Typed columns out of an LLM — the AI-powered-ETL primitives. |
+| `requests.py` | 316 | Turning a `RecordBatch` into the per-row requests an engine receives. |
+| `sizing.py` | 379 | Sizing an LLM engine from the workload instead of from the model's maximum. |
+| `structured.py` | 387 | Typed columns out of an LLM — the AI-powered-ETL primitives. |
 
 ### `batcher/ml/llm/engines/` — 6 · front-end
 
@@ -615,7 +616,7 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 | `parallelism.py` | 522 | How many GPUs one LLM engine replica needs, and what that choice costs. |
 | `sglang.py` | 348 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
-| `vllm.py` | 500 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
+| `vllm.py` | 515 | The vLLM backend: an offline, GPU-resident engine with LoRA multiplexing. |
 
 ### `batcher/ml/loader/` — 6 · front-end
 
@@ -639,7 +640,7 @@ Model evaluation over a `Dataset` — rank metrics, diagnostic tables, and `eval
 | `cluster_quality.py` | 165 | Internal clustering-quality scores — how good a clustering is with no reference labeling. |
 | `clustering.py` | 470 | Clustering-quality metrics — scoring a labeling against a reference, from a contingency table. |
 | `comparison.py` | 158 | Comparing several models on the same data, in one pass rather than N. |
-| `evaluate.py` | 482 | `evaluate` — every metric for a task in as few passes as the metrics allow. |
+| `evaluate.py` | 614 | `evaluate` — every metric for a task in as few passes as the metrics allow. |
 | `fairness.py` | 303 | Fairness metrics — does the model treat groups differently, and how. |
 | `ranked.py` | 329 | Rank-based classifier metrics — ROC AUC, average precision, KS, Gini. |
 | `ranking.py` | 468 | Ranking metrics — how good is the *order* a recommender produced, per query. |
@@ -673,17 +674,17 @@ Preprocessors — sklearn-style fit/transform that reuses Batcher's relational a
 
 | module | lines | what it is |
 |---|---|---|
-| `base.py` | 682 | The `Preprocessor` contract — sklearn-style fit/transform on a Dataset. |
-| `binning.py` | 259 | Binning / discretization preprocessors. |
-| `chain.py` | 232 | `Chain` — a sequence of preprocessors fitted and applied as one (sklearn ``Pipeline``). |
-| `imputers.py` | 415 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
+| `base.py` | 733 | The `Preprocessor` contract — sklearn-style fit/transform on a Dataset. |
+| `binning.py` | 264 | Binning / discretization preprocessors. |
+| `chain.py` | 235 | `Chain` — a sequence of preprocessors fitted and applied as one (sklearn ``Pipeline``). |
+| `imputers.py` | 425 | Missing-value imputation — fit a fill value per column, transform with COALESCE. |
 | `persistence.py` | 308 | Saving and restoring a fitted preprocessor — the train/serve parity contract. |
-| `polynomial.py` | 372 | Basis expansion — polynomial/interaction terms, and B-splines. |
-| `power.py` | 439 | The Yeo-Johnson power transform and its few-pass maximum-likelihood fit. |
-| `scalers.py` | 570 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
+| `polynomial.py` | 375 | Basis expansion — polynomial/interaction terms, and B-splines. |
+| `power.py` | 445 | The Yeo-Johnson power transform and its few-pass maximum-likelihood fit. |
+| `scalers.py` | 697 | Numeric scalers — fit summary statistics, transform with an `Expr` projection. |
 | `text.py` | 276 | Feature assembly and text tokenization. |
 | `text_features.py` | 160 | Surface features from a text column — the numbers a model can use before an embedding. |
-| `transforms.py` | 518 | Distribution-reshaping preprocessors — quantile, power, log, and clipping transforms. |
+| `transforms.py` | 524 | Distribution-reshaping preprocessors — quantile, power, log, and clipping transforms. |
 
 ### `batcher/ml/preprocessors/calibration/` — 6 · front-end
 
@@ -691,8 +692,8 @@ Probability calibration — turning a model's scores into numbers that mean what
 
 | module | lines | what it is |
 |---|---|---|
-| `isotonic.py` | 271 | Isotonic calibration — a monotone step function fitted to the observed rates. |
-| `platt.py` | 187 | Platt scaling — a one-dimensional logistic fit turning scores into probabilities. |
+| `isotonic.py` | 274 | Isotonic calibration — a monotone step function fitted to the observed rates. |
+| `platt.py` | 190 | Platt scaling — a one-dimensional logistic fit turning scores into probabilities. |
 
 ### `batcher/ml/preprocessors/derived/` — 6 · front-end
 
@@ -700,10 +701,10 @@ Derived-feature preprocessors — the columns a model needs that the table doesn
 
 | module | lines | what it is |
 |---|---|---|
-| `construct.py` | 399 | Feature construction — the columns a model needs that the source table doesn't have. |
-| `decomposition.py` | 364 | Dimensionality reduction — projecting many correlated columns onto a few components. |
-| `encode.py` | 315 | Rank and label transforms — order-based rescaling and one-vs-rest label expansion. |
-| `grouped.py` | 310 | Group-aggregate features — what a row's group looks like, attached to the row. |
+| `construct.py` | 402 | Feature construction — the columns a model needs that the source table doesn't have. |
+| `decomposition.py` | 370 | Dimensionality reduction — projecting many correlated columns onto a few components. |
+| `encode.py` | 321 | Rank and label transforms — order-based rescaling and one-vs-rest label expansion. |
+| `grouped.py` | 316 | Group-aggregate features — what a row's group looks like, attached to the row. |
 
 ### `batcher/ml/preprocessors/encoders/` — 6 · front-end
 
@@ -711,13 +712,13 @@ Categorical encoders — ordinal codes, 0/1 indicators, and target encoding.
 
 | module | lines | what it is |
 |---|---|---|
-| `binary.py` | 118 | Binary encoding — a compact base-2 code for a categorical column. |
-| `frequency.py` | 359 | Cardinality-tolerant categorical encoders — frequency, count, rare-bucketing, hashing. |
-| `onehot.py` | 240 | Indicator encoders — one 0/1 output column per learned category. |
-| `ordinal.py` | 302 | Ordinal encoders — fit the category set, transform with a CASE projection. |
-| `shrinkage.py` | 340 | Target encoders that shrink differently — leave-one-out, and James-Stein. |
-| `target.py` | 262 | Mean (likelihood) target encoding, plain and cross-fitted. |
-| `woe.py` | 190 | Weight-of-evidence encoding — the credit-scorecard categorical transform. |
+| `binary.py` | 121 | Binary encoding — a compact base-2 code for a categorical column. |
+| `frequency.py` | 367 | Cardinality-tolerant categorical encoders — frequency, count, rare-bucketing, hashing. |
+| `onehot.py` | 251 | Indicator encoders — one 0/1 output column per learned category. |
+| `ordinal.py` | 380 | Ordinal encoders — fit the category set, transform with a CASE projection. |
+| `shrinkage.py` | 346 | Target encoders that shrink differently — leave-one-out, and James-Stein. |
+| `target.py` | 267 | Mean (likelihood) target encoding, plain and cross-fitted. |
+| `woe.py` | 193 | Weight-of-evidence encoding — the credit-scorecard categorical transform. |
 
 ### `batcher/ml/preprocessors/projection/` — 6 · front-end
 
@@ -725,8 +726,8 @@ Dimensionality reduction and kernel approximation that need no covariance matrix
 
 | module | lines | what it is |
 |---|---|---|
-| `kernel.py` | 345 | Kernel approximation — the accuracy of an RBF kernel at the cost of a linear model. |
-| `random_projection.py` | 305 | Random projection — cut a wide feature block down without looking at the data. |
+| `kernel.py` | 351 | Kernel approximation — the accuracy of an RBF kernel at the cost of a linear model. |
+| `random_projection.py` | 308 | Random projection — cut a wide feature block down without looking at the data. |
 
 ### `batcher/ml/preprocessors/selection/` — 6 · front-end
 
@@ -734,9 +735,9 @@ Feature selection as fit/transform preprocessors.
 
 | module | lines | what it is |
 |---|---|---|
-| `model_based.py` | 353 | `SelectFromModel` and `RFE` — feature selection that reads a fitted model. |
-| `redundancy.py` | 117 | `DropCorrelated` — remove one of every pair of columns that say the same thing. |
-| `univariate.py` | 256 | `SelectKBest` and `SelectPercentile` — keep the features that score against the target. |
+| `model_based.py` | 359 | `SelectFromModel` and `RFE` — feature selection that reads a fitted model. |
+| `redundancy.py` | 120 | `DropCorrelated` — remove one of every pair of columns that say the same thing. |
+| `univariate.py` | 259 | `SelectKBest` and `SelectPercentile` — keep the features that score against the target. |
 
 ### `batcher/ml/preprocessors/timeseries/` — 6 · front-end
 
@@ -754,8 +755,8 @@ Bag-of-words text vectorizers — counts, TF-IDF, and the hashing trick.
 | module | lines | what it is |
 |---|---|---|
 | `assemble.py` | 213 | Turning a per-row list of term codes into a bag-of-words row, without a Python loop. |
-| `counts.py` | 362 | `CountVectorizer` — a learned vocabulary and the term counts of each document. |
-| `hashing.py` | 275 | `HashingVectorizer` — a bag of words with no vocabulary and therefore no fit. |
+| `counts.py` | 365 | `CountVectorizer` — a learned vocabulary and the term counts of each document. |
+| `hashing.py` | 277 | `HashingVectorizer` — a bag of words with no vocabulary and therefore no fit. |
 | `tokens.py` | 195 | The tokenization step every text vectorizer shares, as one native expression. |
 | `weighting.py` | 166 | `TfidfVectorizer` — counts reweighted by how rare each term is across the corpus. |
 
@@ -827,7 +828,7 @@ Tabular batch inference — XGBoost, LightGBM, CatBoost, scikit-learn, ONNX.
 | `estimators.py` | 207 | scikit-learn and ONNX Runtime adapters. |
 | `features.py` | 269 | Arrow batch → dense feature matrix, and model output → Arrow columns. |
 | `mlflow_model.py` | 165 | Scoring a model out of an MLflow registry, by URI, without leaving the pipeline. |
-| `predictor.py` | 298 | `tabular_predictor` — the load-once class UDF that scores a tabular model. |
+| `predictor.py` | 339 | `tabular_predictor` — the load-once class UDF that scores a tabular model. |
 | `registry.py` | 509 | The tabular-framework registry — detect, load, and score a model uniformly. |
 
 ### `batcher/ml/timeseries/` — 6 · front-end
@@ -2144,7 +2145,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `avro.py` | 417 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
 | `csv.py` | 617 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
 | `excel.py` | 103 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
-| `lance.py` | 331 | Lance format — columnar, random-access read + write via `pylance` (lance). |
+| `lance.py` | 342 | Lance format — columnar, random-access read + write via `pylance` (lance). |
 | `orc.py` | 416 | ORC format — lazy, projection-pushdown read + write via `pyarrow.orc`. |
 
 ### `batcher/io/formats/structured/_csv_options/` — 2 · neutral IO

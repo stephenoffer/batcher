@@ -71,6 +71,9 @@ class DropCorrelated(Preprocessor):
     def fit(self, ds: Dataset) -> DropCorrelated:
         """Find the redundant columns with one correlation pass and record them.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 

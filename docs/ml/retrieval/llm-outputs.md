@@ -46,6 +46,61 @@ Failures degrade one row, never the batch. An unparseable response, a missing ke
 bad = extracted.filter(bt.col("total").is_null()).count()
 ```
 
+A schema can nest. A `dict` value declares a struct, a one-element list such as `["string"]` declares a list of that type, and a set of strings such as `{"low", "high"}` declares an *enum*: a string column that only ever holds one of those spellings, matched without regard to case. A `pyarrow.DataType` works as a declaration too. Every declared field is required at every level, and `json_schema` emits the nested `object`, `array` and `enum` shapes with `required` lists to match:
+
+```python
+import batcher as bt
+
+tickets = bt.from_pydict({"body": ["Ann (41) wants a refund, tagged vip, very urgent"]})
+reply = '{"customer": {"name": "Ann", "age": 41}, "tags": ["vip"], "severity": "HIGH"}'
+stub = lambda: lambda ps: [reply] * len(ps)
+nested = tickets.ml.extract(
+    stub,
+    schema={
+        "customer": {"name": "string", "age": "int64"},
+        "tags": ["string"],
+        "severity": {"low", "high"},
+    },
+    prompt_column="body",
+)
+print(nested.schema.field("customer").type)
+# struct<name: string, age: int64>
+print(nested.select("customer", "tags", "severity").to_pydict())
+# {'customer': [{'name': 'Ann', 'age': 41}], 'tags': [['vip']], 'severity': ['high']}
+```
+
+## Keep the raw text and the reasons
+
+A null in an extracted column has two possible meanings. The model may have answered `null`, which the instruction asks it to do for anything it can't determine, or the answer may have failed validation. Two opt-in columns tell them apart. `raw_column=` keeps the model's own text beside the typed columns, so nothing a failed parse touched is lost. `diagnostics_column=` adds a `list<string>` column naming every value of the row that didn't fit, and it is null for a row that matched the schema:
+
+```python
+import batcher as bt
+
+rows = bt.from_pydict({"note": ["a", "b", "c"]})
+replies = {
+    "a": '{"total": 42, "currency": "usd"}',
+    "b": '{"total": "lots", "currency": "yen"}',
+    "c": "Sorry, I can't read that invoice.",
+}
+stub = lambda: lambda ps: [replies[p.split("\n")[0]] for p in ps]
+checked = rows.ml.extract(
+    stub,
+    schema={"total": "float64", "currency": {"USD", "EUR"}},
+    prompt_column="note",
+    raw_column="raw",
+    diagnostics_column="problems",
+)
+print(checked.select("total", "currency", "problems").to_pydict())
+# {'total': [42.0, None, None], 'currency': ['USD', None, None], 'problems': [None, ['total: expected double, got "lots"', 'currency: "yen" is not one of ["EUR", "USD"]'], ['response is not a JSON object']]}
+failed = checked.filter(bt.col("problems").is_not_null())
+print(failed.select("note", "raw").to_pydict()["note"])
+# ['b', 'c']
+```
+
+A missing key reads `"<field>: missing required field"`, with a dotted path for a nested one such as `customer.age`, and a list element is named by index, such as `tags[2]`. Batcher doesn't retry a failed row, because a retry re-bills a hosted call. Guided decoding is the remedy for malformed output, and the raw column is what you re-parse or send for review.
+
+`generate(parse_json=True)` takes the same `raw_column=`, so a row whose struct came back null still has the text that failed to parse.
+
 {py:meth}`ds.ml.classify(engine, labels=[...]) <batcher.api.dataset.ml.DatasetML.classify>` labels each row with exactly one of `labels`, in a column named `label` by default. A model asked for `"positive"` answers `"Positive."` or `"The sentiment is positive."`, and taken verbatim those give a category column with a long tail that never groups. `classify` resolves the answer against the declared set and nulls anything else, so the column's domain is exactly `labels`:
 
 ```python
@@ -162,7 +217,7 @@ print(
 
 ## Constrain the output shape
 
-Constrain generation to a JSON schema so every row parses, then parse it into a struct column. `guided_json` on {py:func}`vllm_engine <batcher.ml.vllm_engine>` constrains decoding to the schema, and `parse_json=True` on `llm_generate` or `ds.ml.generate` parses each output into a struct. A row that fails to parse gets a null instead of failing the batch. Prefer `ds.ml.extract` when the fields are known, because it pins the Arrow types.
+Constrain generation to a JSON schema so every row parses, then parse it into a struct column. `guided_json` on {py:func}`vllm_engine <batcher.ml.vllm_engine>` constrains decoding to the schema, and `parse_json=True` on `llm_generate` or `ds.ml.generate` parses each output into a struct. A row that fails to parse gets a null instead of failing the batch, and `ds.ml.generate(..., raw_column="raw")` keeps its text. Prefer `ds.ml.extract` when the fields are known, because it pins the Arrow types.
 
 ```python
 # docs: skip

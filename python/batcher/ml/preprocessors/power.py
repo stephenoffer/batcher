@@ -267,6 +267,9 @@ class PowerTransformer(_GridPowerTransformer):
     def fit(self, ds: Dataset) -> PowerTransformer:
         """Choose each column's lambda by profile likelihood, then learn its scaling.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -392,6 +395,9 @@ class BoxCoxTransformer(_GridPowerTransformer):
 
     def fit(self, ds: Dataset) -> BoxCoxTransformer:
         """Choose each column's lambda by profile likelihood, then learn its scaling.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::

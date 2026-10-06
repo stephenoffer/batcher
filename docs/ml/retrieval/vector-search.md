@@ -122,8 +122,15 @@ top = hits.collect()  # k rows, nearest first, with a _distance column
 `vector_search` returns a {py:class}`Dataset <batcher.Dataset>`, so the hits join, filter and aggregate like any other relation. `filter` is a SQL predicate applied with the search. `nprobes` trades latency for recall, because more probes search more of the index. `refine_factor` re-ranks `k * refine_factor` candidates with exact distances, buying back recall the approximate index lost. Both default to `None`, which leaves the choice to Lance. The index is IVF_PQ by default, and the column must be a `fixed_size_list` of floats, so embed with `output_type="fixed_size_list"`. Vector search needs the `batcher-engine[lance]` extra.
 
 :::{warning}
-An ANN index is approximate by construction. It can miss a true nearest neighbor and won't tell you it did. If your application can't tolerate that, as with a compliance lookup or a dedup key, use brute force over a filtered candidate set, not a higher `nprobes`.
+An ANN index is approximate by construction. It can miss a true nearest neighbor and won't tell you it did. If your application can't tolerate that, as with a compliance lookup or a dedup key, use brute force over a filtered candidate set, or pass `exact=True`, not a higher `nprobes`.
 :::
+
+`vector_search(..., exact=True)` asks Lance for the exact answer on an indexed column. It passes `use_index=False`, so Lance scans every vector instead of probing the index, and an exact request can't quietly become an approximate one because an index happens to exist. `nprobes` and `refine_factor` tune the index, so combining either with `exact=True` raises `PlanError` rather than being ignored. The scan costs what a brute-force query costs, and it runs as one driver call into Lance rather than sharding the way `ds.ml.nearest_neighbors` does.
+
+```python
+# docs: skip
+exact_hits = vector_search("s3://bucket/vectors.lance", query_vector, k=10, exact=True)
+```
 
 ## Join on meaning
 

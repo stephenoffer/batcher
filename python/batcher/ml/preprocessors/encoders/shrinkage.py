@@ -111,6 +111,9 @@ class LeaveOneOutEncoder(Preprocessor):
     def fit(self, ds: Dataset) -> LeaveOneOutEncoder:
         """Learn each category's target count and sum, plus the global mean.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -256,6 +259,9 @@ class JamesSteinEncoder(Preprocessor):
 
     def fit(self, ds: Dataset) -> JamesSteinEncoder:
         """Learn each category's shrunk mean from one grouped aggregate per column.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::

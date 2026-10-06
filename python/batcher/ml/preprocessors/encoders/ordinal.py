@@ -57,6 +57,20 @@ def ordinal_expr(subject: str | Expr, categories: list[Any], unknown_value: int)
     return builder.otherwise(unknown_value)
 
 
+def category_expr(subject: str | Expr, categories: list[Any]) -> Expr:
+    """The inverse of `ordinal_expr`: each code back to its category, anything else null.
+
+    The unknown code has no category to return to, because unseen values and nulls share it,
+    so it maps to null rather than to a guess.
+    """
+    value = col(subject) if isinstance(subject, str) else subject
+    builder = None
+    for idx, cat in enumerate(categories):
+        cond = value == idx
+        builder = when(cond).then(cat) if builder is None else builder.when(cond).then(cat)
+    return lit(None) if builder is None else builder
+
+
 def _is_list_column(ds: Dataset, column: str) -> bool:
     """Whether `column` is a list column, read from the schema without a scan."""
     import pyarrow as pa
@@ -130,6 +144,9 @@ class OrdinalEncoder(Preprocessor):
 
     def fit(self, ds: Dataset) -> OrdinalEncoder:
         """Learn each column's sorted distinct categories from `ds`.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Stored in `categories_[c]`; the code assigned to a value at transform time is
         its index into that sorted list. A list column learns from its elements.
@@ -205,6 +222,38 @@ class OrdinalEncoder(Preprocessor):
                 new[out] = ordinal_expr(c, self.categories_[c], self.unknown_value)
         return ds.with_columns(**new)
 
+    def inverse_transform(self, ds: Dataset) -> Dataset:
+        """Map each code back to its category, written to the source column.
+
+        Exact for every code `fit` assigned. The `unknown_value` code becomes null, since
+        the unseen values and nulls that share it cannot be told apart. A list column is
+        decoded element by element.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import OrdinalEncoder
+                >>> ds = bt.from_pydict({"c": ["b", "a", "c"]})
+                >>> pre = OrdinalEncoder("c").fit(ds)
+                >>> pre.inverse_transform(pre.transform(ds)).to_pydict()
+                {'c': ['b', 'a', 'c']}
+
+        Args:
+            ds: A dataset holding the code (output) columns.
+
+        Returns:
+            A new lazy `Dataset` with each source column restored.
+        """
+        self._require_fitted()
+        new = {}
+        for c, out in output_pairs(self.columns, self.output_columns):
+            if _is_list_column(ds, out):
+                new[c] = col(out).list.transform(category_expr(element(), self.categories_[c]))
+            else:
+                new[c] = category_expr(out, self.categories_[c])
+        return ds.with_columns(**new)
+
 
 class LabelEncoder(Preprocessor):
     """Encode a single (target) column's labels as integers ``0..k-1``.
@@ -254,6 +303,9 @@ class LabelEncoder(Preprocessor):
     def fit(self, ds: Dataset) -> LabelEncoder:
         """Learn the sorted distinct labels of the column into `classes_`.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -300,3 +352,29 @@ class LabelEncoder(Preprocessor):
         self._require_fitted()
         expr = ordinal_expr(self.column, self.classes_, self.unknown_value)
         return ds.with_columns(**{self.output_column or self.column: expr})
+
+    def inverse_transform(self, ds: Dataset) -> Dataset:
+        """Map each class index back to its label, written to the label column.
+
+        The `unknown_value` code becomes null. The usual use is decoding a model's
+        predicted class indices: ``enc.inverse_transform(scored)`` with the predictions in
+        the encoder's output column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> from batcher.ml.preprocessors import LabelEncoder
+                >>> enc = LabelEncoder("y").fit(bt.from_pydict({"y": ["cat", "dog"]}))
+                >>> enc.inverse_transform(bt.from_pydict({"y": [1, 0, -1]})).to_pydict()
+                {'y': ['dog', 'cat', None]}
+
+        Args:
+            ds: A dataset holding the codes, in `output_column` (or the label column).
+
+        Returns:
+            A new lazy `Dataset` with the label column restored.
+        """
+        self._require_fitted()
+        source = self.output_column or self.column
+        return ds.with_columns(**{self.column: category_expr(source, self.classes_)})

@@ -281,6 +281,80 @@ print(reranked.to_pydict()["passages"])
 
 Run the two rerankers in that order. The cross-encoder costs a model call and decides relevance. MMR costs nothing beyond the vectors you already hold and drops the near-duplicates among the survivors. Narrow 100 to 20 by relevance, then 20 to 5 by diversity.
 
+## Run it locally and score retrieval
+
+Every model in the pipeline is a plug-in point, so the whole chain runs on a laptop with stand-ins: an encoder that is any callable from a batch to the batch plus an `embedding` column, and an engine factory like the one `ds.ml.generate` already takes. Running it this way is how you test the data path, and it leaves room for the step most RAG pipelines skip, which is scoring retrieval against labelled relevant chunks before reading a single answer. The same steps, with assertions, are in `examples/ml/rag_local_eval.py`.
+
+```python
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+
+import batcher as bt
+from batcher import col
+
+TOPICS = ["cat", "train", "soup"]
+
+
+def toy_encoder(column):  # stands in for an embedding model: one dimension per topic word
+    def encode(batch):
+        text = pc.utf8_lower(batch.column(column))
+        hits = [pc.cast(pc.match_substring(text, t), pa.float64()) for t in TOPICS]
+        vectors = np.stack([h.to_numpy(zero_copy_only=False) for h in hits], axis=1)
+        embedding = pa.array(vectors.tolist(), type=pa.list_(pa.float64()))
+        return pa.RecordBatch.from_arrays(
+            [*batch.columns, embedding], names=[*batch.schema.names, "embedding"]
+        )
+
+    return encode
+
+
+chunks = bt.from_pydict(
+    {
+        "chunk_id": [0, 1, 2, 3],
+        "chunk": ["A cat sleeps all day", "Every cat purrs", "The train leaves at noon", "Soup is best hot"],
+    }
+)
+questions = bt.from_pydict({"qid": [1, 2], "question": ["Does a cat purr?", "When does the train leave?"]})
+corpus = chunks.ml.embed(toy_encoder("chunk"), output_columns=[*chunks.columns, "embedding"])
+queries = questions.ml.embed(toy_encoder("question"), output_columns=[*questions.columns, "embedding"])
+
+hits = corpus.ml.batched_nearest_neighbors(
+    queries, query_key="qid", query_column="embedding", corpus_key="chunk_id", k=2
+)
+relevant = bt.from_pydict({"qid": [1, 1, 2], "chunk_id": [0, 1, 2]})
+print(hits.ml.recall_at_k(relevant, query_key="qid", corpus_key="chunk_id"))
+# 1.0
+```
+
+{py:meth}`ds.ml.batched_nearest_neighbors <batcher.api.dataset.ml.DatasetML.batched_nearest_neighbors>` retrieves the top `k` for every question in one exact query, and {py:meth}`ds.ml.recall_at_k <batcher.api.dataset.ml.DatasetML.recall_at_k>` reports the fraction of each question's relevant chunks that came back, averaged over questions. A recall below 1.0 here is a retrieval problem, and no prompt or model change downstream can recover a chunk that never reached the context. With a few dozen labelled questions this becomes the regression test for a chunking or embedding change.
+
+The generation step takes a stub engine the same way. This one answers with the first retrieved chunk, which makes the groundedness score easy to predict:
+
+```python
+stub_engine = lambda: lambda prompts: [p.split("Context: ")[1].split(" | ")[0] for p in prompts]
+contexts = (
+    hits.join(chunks, on="chunk_id")
+    .group_by("qid")
+    .agg(context=col("chunk").array_agg())
+    .with_columns(context=col("context").list.join(" | "))
+)
+answers = (
+    questions.join(contexts, on="qid")
+    .ml.generate(
+        stub_engine,
+        prompt_column="question",
+        template="Question: {question}\nContext: {context}",
+        output_column="answer",
+    )
+    .with_columns(grounded=bt.answer_groundedness("answer", "context"))
+)
+print(answers.sort("qid").to_pydict()["grounded"])
+# [1.0, 1.0]
+```
+
+For a real run, replace `toy_encoder(...)` with a model id and `column=`, and `stub_engine` with `vllm_engine("<model-id>", chat=True)`. Nothing else in the chain changes.
+
 ## Measure the pipeline
 
 The failures in the next section are easier to fix than to notice. Each metric here is an aggregate over a column, so a whole eval set is one scan, and any of them breaks down by index version, tenant or day with {py:meth}`group_by <batcher.Dataset.group_by>`.

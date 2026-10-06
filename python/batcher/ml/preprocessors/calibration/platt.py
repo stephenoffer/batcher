@@ -115,6 +115,9 @@ class PlattCalibrator(Preprocessor):
     def fit(self, ds: Dataset) -> PlattCalibrator:
         """Fit the sigmoid's slope and intercept against the labels.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 

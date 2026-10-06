@@ -14,9 +14,9 @@ The following diagram splits that work into what happens once and what happens p
 
 Three consequences follow.
 
-The feature order is the contract. A tabular model scores by *position*, so the right columns in the wrong order produce confident nonsense with no error. Where the model records its own feature names, Batcher compares them and raises at plan time.
+The feature order is the contract. A tabular model scores by *position*, so the right columns in the wrong order produce confident nonsense with no error. Where the model records its own feature names, Batcher compares them and raises at plan time. A model trained on a bare array records none, so pass a {py:class}`FeatureSpec <batcher.ml.FeatureSpec>` as `features=` to pin the order and dtypes once: the matrix follows the spec's order whatever the frame's column order, and a feature whose dtype drifted raises when the query is built.
 
-A null feature becomes NaN. XGBoost and LightGBM treat NaN as missing and learned a default direction for it during training. Pass `missing=` when your model was trained with a different sentinel.
+A null feature becomes NaN, and a NaN in the data stays NaN. XGBoost and LightGBM treat NaN as missing and learned a default direction for it during training. Pass `missing=` when your model was trained with a different sentinel, or `on_null="error"` to refuse a batch holding a null or NaN feature with a `DataQualityError` that names each column and count.
 
 The output schema is resolved before the query runs. Batcher reads the model's class count or tree count to decide how many columns the prediction produces. A model given as a path is opened once, and cached, to be measured.
 
@@ -54,11 +54,16 @@ print(high_risk.count())
 | `"leaf"` | The leaf index each tree routed the row to. | boosters |
 | `"contrib"` | Per-feature SHAP contributions plus a bias term. | boosters |
 
-Class probabilities become one column per class, named `prediction_0`, `prediction_1`, and so on:
+Class probabilities become one column per class, named `prediction_0`, `prediction_1`, and so on. `prediction_i` is the probability of `model.classes_[i]`, which scikit-learn, XGBoost and LightGBM all sort in ascending label order, so a binary model's `prediction_0` is the negative class. Name the columns by class with `output_columns`, and a list of the wrong length raises rather than mislabelling:
 
 ```python
-probabilities = ds.ml.predict(model, features=["a", "b"], method="predict_proba")
+from batcher.ml import FeatureSpec
+
+spec = FeatureSpec(["a", "b"], {"a": "double", "b": "double"})
+names = [f"p_{c}" for c in model.classes_]
+probabilities = ds.ml.predict(model, features=spec, method="predict_proba", output_columns=names)
 print(sorted(probabilities.columns))
+# ['a', 'b', 'p_0', 'p_1']
 ```
 
 Set `as_list=True` to get a single `List<Float64>` column instead, which is usually what you want before writing the result out.
@@ -473,7 +478,7 @@ print(len(LinearRegression(["flag", "z"], "y").fit(numeric).coef_))
 
 A string, boolean, date, or all-null feature raises an error naming the column, the type, and the fix. A regressor's target must also be a number. A classifier's target is unrestricted, because a class label can be a string.
 
-The feature-order guard needs the model's training feature names. Where the model recorded them, `features=` must list them in training order: a reordering, or a trained name placed in a different slot, raises. A model fitted from a bare NumPy matrix records no names, or generic `f0` to `fN` that match no real column. For those, only the feature count is checked, against the width the model recorded, and generic names also raise a `UserWarning` that the order can't be verified. Fit from a DataFrame, or keep the feature list beside the model.
+The feature-order guard needs the model's training feature names. Where the model recorded them, `features=` must list them in training order: a reordering, or a trained name placed in a different slot, raises. A model fitted from a bare NumPy matrix records no names, or generic `f0` to `fN` that match no real column. For those, only the feature count is checked, against the width the model recorded, and generic names also raise a `UserWarning` that the order can't be verified. Fit from a DataFrame, or pass a `FeatureSpec` saved beside the model as `features=`.
 
 Under `distributed=True` a preempted worker's partition is recomputed, so scoring must be idempotent. A pure prediction is. A model wrapper that also writes to an external store is not.
 

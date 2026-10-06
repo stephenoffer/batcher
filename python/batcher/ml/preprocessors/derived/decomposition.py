@@ -121,6 +121,9 @@ class PCA(Preprocessor):
     def fit(self, ds: Dataset) -> PCA:
         """Learn the mean, the principal components, and the variance each explains.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -263,6 +266,9 @@ class TruncatedSVD(Preprocessor):
 
     def fit(self, ds: Dataset) -> TruncatedSVD:
         """Learn the top singular components from the data's second-moment matrix.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::

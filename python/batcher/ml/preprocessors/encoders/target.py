@@ -81,6 +81,8 @@ class TargetEncoder(Preprocessor):
         max_categories: the ceiling on each column's fitted cardinality — one CASE arm each.
     """
 
+    _irreversible = "categories with the same target statistic encode to the same number"
+
     __slots__ = ("columns", "cv", "mapping_", "max_categories", "prior_", "smoothing", "target")
 
     def __init__(
@@ -115,6 +117,9 @@ class TargetEncoder(Preprocessor):
 
     def fit(self, ds: Dataset) -> TargetEncoder:
         """Learn each category's smoothed target mean and the global prior.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Stored in `mapping_[col][category]` with the global mean in `prior_`; each is one
         mergeable ``group_by(col).agg(count, sum)`` pass over `ds`.

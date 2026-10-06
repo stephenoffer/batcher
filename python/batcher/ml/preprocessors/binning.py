@@ -111,6 +111,8 @@ class KBinsDiscretizer(Preprocessor):
 
     numeric_only = True
 
+    _irreversible = "every value in a bin maps to the same bin index"
+
     __slots__ = ("columns", "duplicates", "edges_", "n_bins", "output_columns", "right", "strategy")
 
     def __init__(
@@ -150,6 +152,9 @@ class KBinsDiscretizer(Preprocessor):
 
     def fit(self, ds: Dataset) -> KBinsDiscretizer:
         """Learn each column's ``n_bins - 1`` inner bin edges into `edges_`.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         For ``"uniform"`` the edges are equally spaced between min and max; for
         ``"quantile"`` they are the approximate quantiles — both one mergeable pass.

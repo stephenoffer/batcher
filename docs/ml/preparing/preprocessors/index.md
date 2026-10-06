@@ -81,6 +81,20 @@ print(StandardScaler("x", output_columns="x_std").fit_transform(ds).to_pydict())
 # {'x': [1.0, 3.0], 'x_std': [-1.0, 1.0]}
 ```
 
+## Map a result back
+
+`inverse_transform(ds)` reads each output column and writes the original value back to the source column. It exists only where the fitted state determines the original exactly: the affine scalers {py:class}`StandardScaler <batcher.ml.preprocessors.StandardScaler>`, {py:class}`MinMaxScaler <batcher.ml.preprocessors.MinMaxScaler>`, {py:class}`MaxAbsScaler <batcher.ml.preprocessors.MaxAbsScaler>` and {py:class}`RobustScaler <batcher.ml.preprocessors.RobustScaler>`, and the code-to-category encoders `OrdinalEncoder` and `LabelEncoder`. The encoders map their `unknown_value` code back to null, because unseen values and nulls share it. Decoding a classifier's predicted class indices is the usual use:
+
+```python
+from batcher.ml.preprocessors import LabelEncoder
+
+enc = LabelEncoder("y").fit(bt.from_pydict({"y": ["cat", "dog", "emu"]}))
+print(enc.inverse_transform(bt.from_pydict({"y": [2, 0, -1]})).to_pydict())
+# {'y': ['emu', 'cat', None]}
+```
+
+Every other preprocessor raises {py:exc}`PlanError <batcher.PlanError>` and says why rather than approximating. A binner sends a whole range to one bin, an imputer's fills can't be told from real values, and a hashing encoder collides categories, so none of them can recover its input. Keep the input with `output_columns` when you'll need it back.
+
 ## Available preprocessors
 
 These are the ones you reach for most, with what each `fit` learns and what its

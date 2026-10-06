@@ -419,13 +419,16 @@ def vector_search(
     filter: str | None = None,
     nprobes: int | None = None,
     refine_factor: int | None = None,
+    exact: bool = False,
 ) -> Dataset:
-    """Approximate-nearest-neighbor search over a Lance vector store → a `Dataset`.
+    """Nearest-neighbor search over a Lance vector store → a `Dataset`.
 
     Returns the `k` rows nearest to `query` (a 1-D embedding), with a ``_distance``
-    column — the retrieval step for RAG / similarity lookup. Uses the column's ANN
-    index when one exists (build it with `build_vector_index`), else a brute-force
-    scan. Needs ``batcher-engine[lance]``.
+    column — the retrieval step for RAG / similarity lookup. By default it uses the
+    column's ANN index when one exists (build it with `build_vector_index`), which is
+    approximate, and a brute-force scan otherwise. Pass ``exact=True`` to demand the
+    brute-force answer even on an indexed column, so an exact request can never quietly
+    become an approximate one. Needs ``batcher-engine[lance]``.
 
     Examples:
         .. doctest::
@@ -443,9 +446,15 @@ def vector_search(
         filter: optional SQL predicate applied with the search.
         nprobes: index partitions to probe — higher is more recall, more latency.
         refine_factor: re-rank ``k * refine_factor`` candidates with exact distances.
+        exact: skip the ANN index and scan every vector, so the result is the true `k`
+            nearest. Cannot be combined with `nprobes` or `refine_factor`, which tune the
+            index.
 
     Returns:
         A `Dataset` of the `k` nearest rows, with a ``_distance`` column appended.
+
+    Raises:
+        PlanError: If `exact` is combined with `nprobes` or `refine_factor`.
     """
     import batcher as bt
     from batcher.io.formats.structured.lance import lance_vector_search
@@ -459,6 +468,7 @@ def vector_search(
         filter=filter,
         nprobes=nprobes,
         refine_factor=refine_factor,
+        exact=exact,
     )
     return bt.from_arrow(table)
 

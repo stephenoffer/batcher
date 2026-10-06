@@ -196,6 +196,8 @@ def evaluate(
     threshold: float = 0.5,
     by: str | list[str] | None = None,
     max_classes: int = 100,
+    weight: str | None = None,
+    support: bool = False,
 ) -> dict[str, float] | Dataset:
     """Score a set of predictions, returning every metric for the task in one call.
 
@@ -212,8 +214,7 @@ def evaluate(
     the denominator is the rows where both are present. That is the usual convention, but it
     is worth knowing which way it cuts — a model that predicts null on the half of the data
     it finds hard scores on the easy half alone, and reports a clean number for it. Nothing
-    here says how many rows survived, so check that yourself when nulls are possible:
-    ``ds.filter(bt.col(y_pred).is_null()).count()``.
+    here says how many rows survived unless you pass ``support=True``, which reports them.
 
     A metric that is undefined for the data returns a value rather than raising, following
     scikit-learn: `precision`/`recall`/`f1` are 0.0 when their denominator is empty (its
@@ -244,13 +245,24 @@ def evaluate(
         threshold: The cutoff turning `y_score` into a hard prediction.
         by: Column(s) to report a separate row of metrics for.
         max_classes: The ceiling on the discovered class set, for a multi-class task.
+        weight: A per-row sample-weight column, as scikit-learn's ``sample_weight``. Each
+            metric becomes a weighted sum over weighted sum, so only the metrics with that
+            form accept it: accuracy, precision, recall, f1, balanced_accuracy (binary),
+            mse, rmse, mae and r2. Omitted `metrics` default to the task's set restricted
+            to those; naming any other metric raises rather than ignoring the weight. A
+            row with a null weight is left out like a row with a null label.
+        support: Also report ``n``, the rows the metrics were computed over (label and
+            prediction both present), and for a binary task ``n_positive``, the positive
+            rows among them. A slice reporting ``precision=0.0`` with ``n=0`` measured
+            nothing, where one with ``n=500`` measured a zero.
 
     Returns:
         A ``{metric: value}`` dict, or a `Dataset` of one row per group when `by` is given.
 
     Raises:
-        PlanError: On an unknown task or metric name, or when neither `y_pred` nor
-            `y_score` is given.
+        PlanError: On an unknown task or metric name, when neither `y_pred` nor
+            `y_score` is given, or when `weight` is combined with a metric that has no
+            weighted form.
         ColumnNotFoundError: If a named column is not in `ds`.
 
     Examples:
@@ -261,6 +273,11 @@ def evaluate(
             >>> ds = bt.from_pydict({"y": [1.0, 2.0, 3.0], "p": [1.0, 2.0, 4.0]})
             >>> round(evaluate(ds, "y", y_pred="p", task="regression")["mae"], 6)
             0.333333
+            >>> w = bt.from_pydict({"y": [1.0, 2.0], "p": [1.0, 4.0], "w": [3.0, 1.0]})
+            >>> evaluate(w, "y", y_pred="p", task="regression", metrics=["mae"], weight="w")
+            {'mae': 0.5}
+            >>> evaluate(ds, "y", y_pred="p", task="regression", metrics=["mae"], support=True)["n"]
+            3
     """
     resolved = _resolve_task(task, y_pred, y_score, ds, y_true, max_classes)
     if metrics is not None:
@@ -270,11 +287,16 @@ def evaluate(
         # actionable. But the task's **default** set is not a request, and four of the ten
         # binary defaults need a probability: with hard predictions alone, the canonical
         # `evaluate("y", y_pred="p", task="binary")` raised instead of reporting the six
-        # metrics it had everything for.
+        # metrics it had everything for. The same holds for the metrics with no weighted form.
         requested = [
-            name for name in METRIC_SETS[resolved] if y_score is not None or not _needs_score(name)
+            name
+            for name in METRIC_SETS[resolved]
+            if (y_score is not None or not _needs_score(name))
+            and (weight is None or name in _WEIGHTED)
         ]
     _validate_metrics(requested)
+    if weight is not None:
+        _validate_weighted(requested, resolved)
     groups = ranked._group_keys(by)
 
     frame = ds
@@ -293,7 +315,17 @@ def evaluate(
             }
         )
 
-    aggregates = _aggregate_exprs(requested, y_true, prediction, y_score, positive)
+    if weight is not None and prediction is not None:
+        aggregates = _weighted_exprs(requested, y_true, prediction, weight, positive)
+    else:
+        aggregates = _aggregate_exprs(requested, y_true, prediction, y_score, positive)
+    order = list(requested)
+    if support:
+        counts = _support_exprs(
+            y_true, prediction or y_score, weight, positive if resolved == "binary" else None
+        )
+        aggregates.update(counts)
+        order += list(counts)
     results: dict[str, Any] = {}
     if aggregates:
         reduced = frame.group_by(*groups).agg(**aggregates) if groups else frame.agg(**aggregates)
@@ -320,16 +352,16 @@ def evaluate(
                     frame, y_true, prediction, groups, averages_requested, max_classes
                 )
             )
-        return _join_group_results(results.get("__aggregates"), rank_frames, groups, requested)
+        return _join_group_results(results.get("__aggregates"), rank_frames, groups, order)
     averages = (
         multiclass_averages(frame, y_true, prediction, max_classes=max_classes)
         if averages_requested and prediction is not None
         else {}
     )
 
-    scalars = _scalar_results(results.get("__aggregates"), rank_requested, rank_frames, requested)
+    scalars = _scalar_results(results.get("__aggregates"), rank_requested, rank_frames, order)
     scalars.update({k: v for k, v in averages.items() if k in requested})
-    return {name: scalars[name] for name in requested if name in scalars}
+    return {name: scalars[name] for name in order if name in scalars}
 
 
 def _rank_metric_names() -> frozenset[str]:
@@ -416,6 +448,106 @@ def multiclass_averages(
             else float("nan")
         )
     return averages
+
+
+#: The metrics with a weighted form (a weighted sum over a weighted sum), for `weight=`.
+_WEIGHTED = frozenset(
+    {"accuracy", "precision", "recall", "f1", "balanced_accuracy", "mse", "rmse", "mae", "r2"}
+)
+
+
+def _validate_weighted(names: list[str], task: str) -> None:
+    """Refuse a weighted request for a metric with no weighted form, rather than ignore `weight`."""
+    unweighted = [n for n in names if n not in _WEIGHTED]
+    if task == "multiclass" and "balanced_accuracy" in names:
+        unweighted.append("balanced_accuracy")  # the weighted form here is the binary one
+    if unweighted:
+        raise PlanError(
+            f"metric(s) {unweighted} have no weighted form, so weight= cannot apply to them. "
+            f"Weighted metrics: {sorted(_WEIGHTED)}; drop weight= or the metric."
+        )
+    if not names:
+        raise PlanError(
+            f"no requested metric supports weight=; weighted metrics are {sorted(_WEIGHTED)}"
+        )
+
+
+def _weighted_exprs(
+    names: list[str], y_true: str, y_pred: str, weight: str, positive: Any
+) -> dict[str, Any]:
+    """The `agg` mapping for the weighted metrics: each a weighted sum over a weighted sum.
+
+    The same definitions scikit-learn uses with ``sample_weight``, and the same conventions
+    as the unweighted builders: a rate with an empty denominator is 0.0, balanced accuracy
+    averages only the classes present, and r2 of a constant target is 1.0 or 0.0.
+    """
+    from batcher.plan.expr_ir.constructors import col, lit, when
+    from batcher.plan.functions.metrics.model.classification import _rate, positive_mask
+    from batcher.plan.functions.metrics.model.errors import _variance_ratio
+
+    y, p, w = col(y_true), col(y_pred), col(weight).cast("float64")
+    kept = y.is_not_null() & p.is_not_null() & w.is_not_null()
+
+    def wsum(value: Any, where: Any = None) -> Any:
+        keep = kept if where is None else kept & where
+        return when(keep).then(value).otherwise(lit(0.0)).sum()
+
+    total = wsum(w)
+    out: dict[str, Any] = {}
+    if {"mse", "rmse", "mae", "r2"} & set(names):
+        error = y.cast("float64") - p.cast("float64")
+        mse = wsum(w * error * error) / total
+        # sum(w (y - ybar_w)^2), expanded so it is one pass: sum(w y^2) - sum(w y)^2 / sum(w).
+        yf = y.cast("float64")
+        ss_tot = wsum(w * yf * yf) - wsum(w * yf) * wsum(w * yf) / total
+        regression = {
+            "mse": mse,
+            "rmse": mse.sqrt(),
+            "mae": wsum(w * error.abs()) / total,
+            "r2": _variance_ratio(wsum(w * error * error), ss_tot),
+        }
+        out.update({n: regression[n] for n in names if n in regression})
+    is_pos, said_pos = positive_mask(y, positive), positive_mask(p, positive)
+    tp, fp = wsum(w, is_pos & said_pos), wsum(w, ~is_pos & said_pos)
+    fn, tn = wsum(w, is_pos & ~said_pos), wsum(w, ~is_pos & ~said_pos)
+    sensitivity, selectivity = _rate(tp, tp + fn), _rate(tn, tn + fp)
+    has_pos, has_neg = (tp + fn) > lit(0.0), (tn + fp) > lit(0.0)
+    classification = {
+        "accuracy": when(total == lit(0.0))
+        .then(lit(float("nan")))
+        .otherwise(wsum(w, y == p) / total),
+        "precision": _rate(tp, tp + fp),
+        "recall": sensitivity,
+        "f1": _rate(lit(2.0) * tp, lit(2.0) * tp + fp + fn),
+        "balanced_accuracy": when(has_pos & has_neg)
+        .then((sensitivity + selectivity) / lit(2.0))
+        .when(has_pos)
+        .then(sensitivity)
+        .when(has_neg)
+        .then(selectivity)
+        .otherwise(lit(float("nan"))),
+    }
+    out.update({n: classification[n] for n in names if n in classification})
+    return out
+
+
+def _support_exprs(
+    y_true: str, prediction: str | None, weight: str | None, positive: Any
+) -> dict[str, Any]:
+    """``n`` (rows the metrics saw) and, for a binary task, ``n_positive`` among them."""
+    from batcher.plan.expr_ir.constructors import col
+    from batcher.plan.functions.aggregate import count_if
+    from batcher.plan.functions.metrics.model.classification import positive_mask
+
+    kept = col(y_true).is_not_null()
+    if prediction is not None:
+        kept = kept & col(prediction).is_not_null()
+    if weight is not None:
+        kept = kept & col(weight).is_not_null()
+    out = {"n": count_if(kept)}
+    if positive is not None:
+        out["n_positive"] = count_if(kept & positive_mask(y_true, positive))
+    return out
 
 
 def _validate_metrics(names: list[str]) -> None:

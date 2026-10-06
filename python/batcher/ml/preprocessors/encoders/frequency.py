@@ -104,6 +104,9 @@ class FrequencyEncoder(Preprocessor):
     def fit(self, ds: Dataset) -> FrequencyEncoder:
         """Learn each column's category frequencies with one grouped count.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -215,6 +218,9 @@ class RareCategoryEncoder(Preprocessor):
     def fit(self, ds: Dataset) -> RareCategoryEncoder:
         """Learn which categories clear `min_frequency` (and fit within `max_categories`).
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -323,6 +329,8 @@ class HashingEncoder(Preprocessor):
         columns: The categorical columns to hash (replaced in place).
         n_buckets: How many buckets to hash into; larger means fewer collisions.
     """
+
+    _irreversible = "distinct categories collide in one hashed bucket"
 
     __slots__ = ("columns", "n_buckets")
 

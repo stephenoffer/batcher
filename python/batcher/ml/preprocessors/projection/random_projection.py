@@ -125,6 +125,9 @@ class _RandomProjection(Preprocessor):
     def fit(self, ds: Dataset) -> _RandomProjection:
         """Draw the projection matrix. No data is read — only the column count matters.
 
+        Unlike most preprocessors' `fit`, this one runs no query: it reads only the
+        schema of `ds`, so it is as cheap as building a plan.
+
         Examples:
             .. doctest::
 
