@@ -2091,7 +2091,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `autoloader.py` | 440 | Incremental file discovery — the Auto Loader analog (Databricks ``cloudFiles``). |
 | `dev.py` | 372 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
 | `eventhubs.py` | 370 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
-| `kafka.py` | 720 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
+| `kafka.py` | 765 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
 | `kafka_sink.py` | 323 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
 | `kinesis.py` | 516 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 244 | Google Cloud Pub/Sub broker source — subscription pull batches. |
