@@ -703,15 +703,26 @@ pub(crate) fn broadcast_join(
         .map(|idx| ops::gather_join_output(probe, build, idx, &out))
         .collect::<Result<Vec<_>, InterpError>>()?;
     if full {
-        let mut seen = vec![false; build.num_rows()];
-        for idx in &idxs {
-            for r in idx.right.iter().flatten() {
-                seen[r as usize] = true;
-            }
-        }
-        let unmatched: arrow::array::UInt32Array = (0..build.num_rows() as u32)
-            .filter(|&r| !seen[r as usize])
+        // Marked and collected across the pool: done serially this pass walked every probe
+        // row's match once more and was as long as the parallel probe itself (13 ms of a
+        // 3M x 500K full join on 16 cores). A mark is idempotent, so the chunks race on
+        // nothing but setting the same `true`; the collect keeps build-row order.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let seen: Vec<AtomicBool> = (0..build.num_rows())
+            .into_par_iter()
+            .map(|_| AtomicBool::new(false))
             .collect();
+        idxs.par_iter().for_each(|idx| {
+            for r in idx.right.iter().flatten() {
+                seen[r as usize].store(true, Ordering::Relaxed);
+            }
+        });
+        let unmatched: arrow::array::UInt32Array = arrow::array::UInt32Array::from(
+            (0..build.num_rows() as u32)
+                .into_par_iter()
+                .filter(|&r| !seen[r as usize].load(Ordering::Relaxed))
+                .collect::<Vec<u32>>(),
+        );
         if !unmatched.is_empty() {
             let rest = join::JoinIndices {
                 left: arrow::array::UInt32Array::new_null(unmatched.len()),
