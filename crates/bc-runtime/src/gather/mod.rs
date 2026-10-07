@@ -45,9 +45,11 @@ use arrow::datatypes::{
 use rayon::prelude::*;
 use std::sync::Arc;
 
+mod concat_fixed;
 mod fixed;
 mod spans;
 
+use concat_fixed::{concat_fixed, PAR_CONCAT_MIN_ROWS};
 use fixed::{take_chunked, take_fixed_width_parallel};
 use spans::{SpanAppender, SpanCopier};
 
@@ -107,7 +109,14 @@ pub fn concat_columns(arrays: &[&dyn Array]) -> Result<ArrayRef, RuntimeError> {
                         }
                         byte_span_fits::<LargeBinaryType>(arrays)?;
                     }
-                    _ => {}
+                    _ => {
+                        if let Some(width) = dt.primitive_width() {
+                            if arrays.iter().map(|a| a.len()).sum::<usize>() >= PAR_CONCAT_MIN_ROWS
+                            {
+                                return concat_fixed(arrays, width);
+                            }
+                        }
+                    }
                 }
             }
             Ok(arrow::compute::concat(arrays)?)
