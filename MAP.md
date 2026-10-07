@@ -186,7 +186,7 @@ Adaptive (intra-query) execution: stage-boundary re-optimization — package fa�
 
 | module | lines | what it is |
 |---|---|---|
-| `gating.py` | 599 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
+| `gating.py` | 597 | Whether to run adaptively, and how far to trust an estimate (control plane, `api`). |
 | `plan_surgery.py` | 88 | Plan-tree traversal and rewriting for the adaptive loop (control plane, `api`). |
 | `staging.py` | 608 | The adaptive stage loop: execute one breaker, re-optimize the rest (control plane, `api`). |
 
@@ -511,7 +511,7 @@ Conductor adaptive-tuning: activate the learned decisions and close the feedback
 
 | module | lines | what it is |
 |---|---|---|
-| `decisions.py` | 390 | Conductor-level adaptive-tuning decisions — activate the learned choices, close the loops. |
+| `decisions.py` | 391 | Conductor-level adaptive-tuning decisions — activate the learned choices, close the loops. |
 
 ### `batcher/ml/` — 6 · front-end
 
@@ -1344,7 +1344,7 @@ Aggregate-through-join pushdown: pre-aggregate a join side to shrink its input.
 |---|---|---|
 | `conditional.py` | 74 | A dimension-conditional aggregate input, split so its measure can be pre-aggregated. |
 | `gates.py` | 342 | The cost gates the aggregate-through-join pushdown rules consult. |
-| `reassociate.py` | 544 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
+| `reassociate.py` | 549 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
 | `rules.py` | 597 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
