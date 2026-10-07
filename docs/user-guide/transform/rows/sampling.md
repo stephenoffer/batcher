@@ -60,6 +60,30 @@ print(a == b, len(a))
 
 With `seed=None`, the default, a fresh seed is baked in when the plan is *built*, not when it runs, so the two {py:meth}`collect() <batcher.Dataset.collect>` calls on one sampled dataset still agree with each other. Pass a seed explicitly if the sample has to reproduce across processes.
 
+## Weighted and keyed samples
+
+`weights=` turns a count sample into a weighted one, without replacement: a row is chosen with probability proportional to its weight. Each row draws a uniform `u` from the same seeded hash, and the `n` rows with the smallest `-ln(u) / weight` are kept. That is the Efraimidis-Spirakis method, computed as an expression and a top-n, so it is as reproducible and as distributable as `sample(n=...)`.
+
+```python
+weighted = ds.with_columns(w=bt.when(bt.col("bucket") == 3).then(bt.lit(9.0)).otherwise(bt.lit(1.0)))
+picked = weighted.sample(n=100, weights="w", seed=5)
+print(picked.filter(bt.col("bucket") == 3).count() > 50)
+# True
+```
+
+Bucket 3 holds a quarter of the rows but three quarters of the weight, so it supplies most of the sample. A null or zero weight is never chosen. Before building the plan, `sample` runs one aggregate over the weights and raises `PlanError` on a negative weight, or on weights that total zero, so `weights=` needs a bounded input. It takes `n` only, because a weighted fraction has no defined size.
+
+`key=` makes a fraction sample hash only the named columns. Every row sharing a key is then kept or dropped together, which samples users or sessions rather than events, and the choice does not move when a non-key column changes.
+
+```python
+events = bt.range(0, 1000).with_columns(user=bt.col("value") % 50)
+kept = events.sample(0.2, key="user", seed=3)
+print(set(kept.group_by("user").agg(n=bt.count()).to_pydict()["n"]))
+# {20}
+```
+
+Every user kept contributes all 20 of its events. `key=` takes a fraction only, since keeping whole keys cannot promise a row count.
+
 ## Sampling is not a shuffle
 
 `sample(n=10)` gives you ten rows chosen by hash, which means the choice is stable but the *order* is arbitrary. It is not "ten random rows re-drawn each call", and it is not a permutation. If what you want is a random ordering, add a random column and sort by it. {py:meth}`with_random(name, seed=) <batcher.Dataset.with_random>` is a deterministic per-row uniform draw.
@@ -95,6 +119,8 @@ print(tr.count(), val.count(), te.count())
 ```
 
 Sizes are binomial around the requested fractions, for the same reason `sample(0.5)` was not exactly 500. Disjointness and coverage are exact. The sizes are not.
+
+A `key` that is not unique keeps every row sharing it in the same part, which makes either split a group split: with `key="patient_id"` no patient's rows reach both train and test. The parts are then sized in groups rather than rows.
 
 ## Positional splits
 
@@ -151,6 +177,8 @@ print(test.group_by("bucket").agg(n=bt.count()).sort("bucket").to_pydict())
 
 Each bucket holds 250 rows, and each gives exactly 50 of them to the test side, where a hash-sampled split lands near 20% per group rather than on it.
 
+The count per group follows a fixed rounding rule. A row goes to test when its percent rank within the group is below `test_size`, so a group of `n` rows sends `ceil(test_size * (n - 1))` rows to test, and a group of one row always goes to test, leaving that class out of train. On tiny classes, check each side with `group_by(by).len()` before training. `ds.ml.train_test_split(stratify=...)` rounds the other way and keeps a single-row class in train.
+
 {py:meth}`sample_per_group(by, n, order_by=) <batcher.Dataset.sample_per_group>` caps each group at `n` rows instead, which balances a skewed corpus without dropping its rare groups.
 
 ```python
@@ -178,6 +206,8 @@ Sample when you want *rows*. Sketch when you want a *number*. The decision table
 | --- | --- | --- |
 | Rows to eyeball, or a dev fixture | `sample(fraction)` | streams, no breaker |
 | An exact row count out | `sample(n=...)` | ranks by hash, so it breaks |
+| Rows chosen in proportion to a weight | `sample(n=..., weights=...)` | a top-n over a weighted hash draw |
+| Whole users or sessions, not events | `sample(fraction, key=...)` | hashes only the key, streams |
 | Disjoint modeling splits | `ml.train_test_split` / `ml.random_split` | row-wise filters, both stay lazy |
 | A split that keeps class proportions | `stratified_split` | hashed within each group |
 | Consecutive ranges with exact sizes | `split_at_indices` / `split_proportionately` | cuts by position, so sort first |

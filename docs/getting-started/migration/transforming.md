@@ -33,6 +33,7 @@ The tables below map pandas. Polars, PySpark, Daft, and Ray Data have a generate
 | Filter rows | `df[df.a > 1]` | {py:meth}`ds.filter(col("a") > 1) <batcher.Dataset.filter>` |
 | Group + aggregate | `df.groupby("k").agg(...)` | {py:meth}`ds.group_by("k").agg(...) <batcher.Dataset.group_by>` |
 | Group + sum all | `df.groupby("k").sum()` | `ds.group_by("k").sum()` |
+| Group, null keys dropped (pandas' default) | `df.groupby("k")` | `ds.drop_nulls(subset=["k"]).group_by("k")` |
 | Group + Python function | `df.groupby("k").apply(fn)` | `ds.group_by("k").map_groups(fn)` |
 | Mean aggregate | `df.a.mean()` | `col("a").mean()` |
 | Sort | `df.sort_values("a")` | {py:meth}`ds.sort("a") <batcher.Dataset.sort>` |
@@ -51,9 +52,21 @@ The tables below map pandas. Polars, PySpark, Daft, and Ray Data have a generate
 | Explode list | `df.explode("c")` | {py:meth}`ds.explode("c") <batcher.Dataset.explode>` |
 | Unpivot / melt | `df.melt(...)` | {py:meth}`ds.unpivot(index=..., on=...) <batcher.Dataset.unpivot>` |
 | Sample rows | `df.sample(frac=f)` | {py:meth}`ds.sample(f, seed=...) <batcher.Dataset.sample>` |
+| Weighted sample | `df.sample(n, weights="w")` | `ds.sample(n=n, weights="w", seed=...)` |
+| Fill a time grid | `df.resample("1h").asfreq()` | {py:meth}`ds.upsample("t", "1h") <batcher.Dataset.upsample>` |
 | Pivot / wide | `df.pivot_table(...)` | {py:meth}`ds.pivot(index=..., on=..., values=...) <batcher.Dataset.pivot>` |
 
 :::
+
+One grouping default differs. A null `group_by` key forms a group of its own, as in SQL and Polars, while pandas' `groupby` drops null keys unless you pass `dropna=False`. Drop the nulls first to reproduce the pandas result.
+
+```python
+scores = bt.from_pydict({"team": ["a", None, "a"], "pts": [1, 2, 3]})
+print(scores.group_by("team").agg(pts=bt.col("pts").sum()).sort("team").to_pydict())
+# {'team': ['a', None], 'pts': [4, 2]}
+print(scores.drop_nulls(subset=["team"]).group_by("team").agg(pts=bt.col("pts").sum()).to_pydict())
+# {'team': ['a'], 'pts': [4]}
+```
 
 The verbs you reach for most, in action:
 
