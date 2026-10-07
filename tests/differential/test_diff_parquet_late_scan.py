@@ -143,6 +143,14 @@ _QUERIES = [
     "SELECT count(*) AS n, sum(dec) AS s, max(d) AS hi FROM t "
     "WHERE id >= 17000 AND d >= DATE '2020-07-01'",
     "SELECT id, ts FROM t WHERE d < DATE '2020-01-15' AND id > 700 ORDER BY id",
+    # TPC-H q12's shape: a date range, column-to-column comparisons and a low-cardinality
+    # string IN, grouped into one stage for the rest and a dictionary stage for the string;
+    # then the same split across a subquery's filter and the outer one, which can reach the
+    # scan as two stacked filters.
+    "SELECT mode, count(*) AS n, sum(dec) AS s FROM t WHERE mode IN ('MAIL', 'SHIP') "
+    "AND id < k * 4000 AND d >= DATE '2020-02-01' AND d < DATE '2020-06-01' GROUP BY mode",
+    "SELECT count(*) AS n, sum(f) AS s FROM (SELECT * FROM t WHERE d >= DATE '2020-03-01') s "
+    "WHERE mode IN ('AIR', 'SHIP') AND k < id % 7",
     # A top-N over the scan: the narrow sort columns are read and sorted first, and only the
     # winners are fetched whole -- descending keys, an offset, deferred nested and decimal
     # columns, and a filter that keeps every row. (Ties the sort breaks by input order are

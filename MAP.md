@@ -3227,7 +3227,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `agg.rs` | 76 | The distributed aggregate's map and reduce steps: `partial_aggregate`, `combine` and `combine_finalize`, the mergeable folds the shuffle composes across… |
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
+| `chunked/late.rs` | 353 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
 | `chunked/mod.rs` | 695 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `chunked/resident.rs` | 85 | The plan's other Parquet scans, read by the engine before it runs instead of by the control plane. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
