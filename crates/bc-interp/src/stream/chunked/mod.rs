@@ -42,7 +42,7 @@ use bc_runtime::agg;
 use rayon::prelude::*;
 
 use super::parallel::{effective_shard_count, shard};
-use super::{build_with, combine_and_finalize, fold_partial, prebuild_joins_for_chunks, Ctx};
+use super::{build_with, combine_and_finalize, fold_partials, prebuild_joins_for_chunks, Ctx};
 use crate::error::InterpError;
 use crate::ops;
 use crate::par::ExecOptions;
@@ -471,7 +471,7 @@ impl Run<'_> {
                     .par_iter()
                     .map(|view| {
                         let ctx = Ctx::new(view, &cache, meter, self.budget);
-                        Ok(fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)?.0)
+                        Ok(fold_partials(build_with(input, ctx)?, group_keys, aggregates, &jit)?.0)
                     })
                     .collect::<Result<Vec<_>, InterpError>>()
             })?;
@@ -670,10 +670,10 @@ impl Run<'_> {
                     .par_iter()
                     .map(|lazy| {
                         let ctx = Ctx::new(srcs, &cache, meter, self.budget).with_lazy(lazy);
-                        let (partial, n) =
-                            fold_partial(build_with(input, ctx)?, group_keys, aggregates, &jit)?;
+                        let (partials, n) =
+                            fold_partials(build_with(input, ctx)?, group_keys, aggregates, &jit)?;
                         rows_in.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                        Ok(partial)
+                        Ok(partials)
                     })
                     .collect::<Result<Vec<_>, InterpError>>()
             })?

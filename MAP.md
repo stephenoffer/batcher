@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1646 Python modules across 236 packages and 345 Rust files across 14 crates.
+Covering 1646 Python modules across 236 packages and 346 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -350,7 +350,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 129 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `chunked.py` | 470 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
+| `chunked.py` | 508 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
 | `chunked_sideways.py` | 647 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
@@ -1777,7 +1777,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 |---|---|---|
 | `base.py` | 87 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
 | `energy.py` | 328 | Measuring what a stage drew — Core's half of the energy loop. |
-| `executor.py` | 468 | The Core local executor. |
+| `executor.py` | 476 | The Core local executor. |
 | `gpu_transform.py` | 312 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 191 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 489 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
@@ -3227,8 +3227,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `agg.rs` | 76 | The distributed aggregate's map and reduce steps: `partial_aggregate`, `combine` and `combine_finalize`, the mergeable folds the shuffle composes across… |
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
-| `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
-| `chunked/mod.rs` | 690 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/late.rs` | 441 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
+| `chunked/mod.rs` | 703 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/resident.rs` | 128 | The plan's other Parquet scans, read by the engine before it runs instead of by the control plane. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 728 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 342 | What the engine's own process knows about its hardware and its allocator. |
@@ -3250,7 +3251,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
-| `agg_par.rs` | 794 | The high-cardinality parallel aggregate: partition first, aggregate once. |
+| `agg_par.rs` | 800 | The high-cardinality parallel aggregate: partition first, aggregate once. |
 | `coalesce.rs` | 172 | Merge a result's small batches before it leaves the engine. |
 | `dist.rs` | 627 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
@@ -3294,7 +3295,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
 | `stream/chunked/units.rs` | 83 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
-| `stream/folds.rs` | 654 | The mergeable folds a streaming breaker reduces its input with. |
+| `stream/folds.rs` | 709 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 429 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 786 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
@@ -3610,13 +3611,13 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `avro.rs` | 31 | Native Avro (object-container-file) decode to Arrow, via `arrow-avro`. |
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
-| `late.rs` | 388 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
-| `lib.rs` | 783 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `late.rs` | 404 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
+| `lib.rs` | 795 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `mapped.rs` | 130 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 109 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns, and put a decoded batch's columns back in the order they were requested. |
-| `row_filter.rs` | 524 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
+| `row_filter.rs` | 536 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
 | `row_groups.rs` | 323 | Reading a Parquet relation one row group at a time, for a caller that schedules the row groups itself. |
 | `split_read/block_cache.rs` | 334 | A process-wide cache of remote object bytes, kept in fixed-size blocks: the warm path. |
 | `split_read/mod.rs` | 403 | Split an oversized object-store read into several concurrent range GETs. |

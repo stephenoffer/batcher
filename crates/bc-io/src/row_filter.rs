@@ -49,11 +49,11 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Datum, Float64Array, Int64Array, RecordBatch, Scalar,
-    StringArray,
+    Array, ArrayRef, BooleanArray, Datum, DictionaryArray, Float64Array, Int64Array, RecordBatch,
+    Scalar, StringArray,
 };
 use arrow::compute::kernels::{boolean, cmp};
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Int32Type, Schema};
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
 use parquet::file::metadata::RowGroupMetaData;
 use parquet::file::statistics::Statistics;
@@ -162,21 +162,15 @@ fn eval(pred: &Pred, batch: &RecordBatch) -> Option<BooleanArray> {
     match pred {
         Pred::Cmp { col, op, lit } => {
             let arr = batch.column_by_name(col)?;
-            let lit_arr = lit_array(lit, arr.data_type())?;
-            let scalar = Scalar::new(lit_arr);
-            let arr_dyn: &dyn Array = arr.as_ref();
-            let lhs: &dyn Datum = &arr_dyn;
-            let rhs: &dyn Datum = &scalar;
-            let mask = match op {
-                CmpOp::Eq => cmp::eq(lhs, rhs),
-                CmpOp::Ne => cmp::neq(lhs, rhs),
-                CmpOp::Lt => cmp::lt(lhs, rhs),
-                CmpOp::Le => cmp::lt_eq(lhs, rhs),
-                CmpOp::Gt => cmp::gt(lhs, rhs),
-                CmpOp::Ge => cmp::gt_eq(lhs, rhs),
+            // A string column the read decoded as a `Dictionary` (`late::dictionary_read`):
+            // compare each distinct value once and give every row its key's answer. A null key
+            // takes a null answer, which is what comparing the decoded null would give.
+            if let Some(dict) = arr.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+                let per_value = cmp_mask(*op, lit, dict.values().as_ref())?;
+                let mask = arrow::compute::take(&per_value, dict.keys(), None).ok()?;
+                return mask.as_any().downcast_ref::<BooleanArray>().cloned();
             }
-            .ok()?;
-            float_superset(mask, arr.as_ref(), lit)
+            cmp_mask(*op, lit, arr.as_ref())
         }
         Pred::IsNull { col, negated } => {
             let arr = batch.column_by_name(col)?;
@@ -197,6 +191,24 @@ fn eval(pred: &Pred, batch: &RecordBatch) -> Option<BooleanArray> {
             boolean::or_kleene(&eval(left, batch)?, &eval(right, batch)?).ok()
         }
     }
+}
+
+/// `arr <op> lit`, element-wise, with the float widening of [`float_superset`].
+fn cmp_mask(op: CmpOp, lit: &Lit, arr: &dyn Array) -> Option<BooleanArray> {
+    let lit_arr = lit_array(lit, arr.data_type())?;
+    let scalar = Scalar::new(lit_arr);
+    let lhs: &dyn Datum = &arr;
+    let rhs: &dyn Datum = &scalar;
+    let mask = match op {
+        CmpOp::Eq => cmp::eq(lhs, rhs),
+        CmpOp::Ne => cmp::neq(lhs, rhs),
+        CmpOp::Lt => cmp::lt(lhs, rhs),
+        CmpOp::Le => cmp::lt_eq(lhs, rhs),
+        CmpOp::Gt => cmp::gt(lhs, rhs),
+        CmpOp::Ge => cmp::gt_eq(lhs, rhs),
+    }
+    .ok()?;
+    float_superset(mask, arr, lit)
 }
 
 /// Widen a float comparison's mask to every row whose answer the engine could decide otherwise.
@@ -739,5 +751,62 @@ mod tests {
         let m = eval(&p, &batch).unwrap();
         assert!(m.value(0));
         assert!(m.value(1));
+    }
+
+    #[test]
+    fn a_dictionary_column_evaluates_exactly_as_its_plain_strings() {
+        // The read decodes a dictionary-encoded string column as a `Dictionary` under the native
+        // filter, so every comparison must give each row the answer its plain value gets --
+        // nulls included, and a dictionary value no row uses must not leak into the mask.
+        use arrow::array::DictionaryArray;
+        let plain: Vec<Option<&str>> = vec![
+            Some("AIR"),
+            None,
+            Some("MAIL"),
+            Some("AIR REG"),
+            Some("AIR"),
+            None,
+            Some(""),
+        ];
+        let dict: DictionaryArray<Int32Type> = plain.iter().copied().collect();
+        let field = |dt: DataType| Arc::new(Schema::new(vec![Field::new("s", dt, true)]));
+        let plain_batch = RecordBatch::try_new(
+            field(DataType::Utf8),
+            vec![Arc::new(StringArray::from(plain.clone())) as ArrayRef],
+        )
+        .unwrap();
+        let dict_batch = RecordBatch::try_new(
+            field(dict.data_type().clone()),
+            vec![Arc::new(dict) as ArrayRef],
+        )
+        .unwrap();
+        let s = |v: &str| Lit::Str(v.to_string());
+        let preds = [
+            cmp_pred("s", CmpOp::Eq, s("AIR")),
+            cmp_pred("s", CmpOp::Ne, s("AIR")),
+            cmp_pred("s", CmpOp::Lt, s("AIR REG")),
+            cmp_pred("s", CmpOp::Ge, s("B")),
+            cmp_pred("s", CmpOp::Eq, s("TRUCK")),
+            Pred::Or {
+                left: Box::new(cmp_pred("s", CmpOp::Eq, s("AIR"))),
+                right: Box::new(Pred::IsNull {
+                    col: "s".to_string(),
+                    negated: false,
+                }),
+            },
+            Pred::IsNull {
+                col: "s".to_string(),
+                negated: true,
+            },
+        ];
+        for p in &preds {
+            let want = eval(p, &plain_batch).unwrap();
+            let got = eval(p, &dict_batch).unwrap();
+            assert_eq!(got, want);
+            assert_eq!(mask_of(p, &dict_batch), mask_of(p, &plain_batch));
+        }
+        // The positive control: the comparison does select something and reject something.
+        let m = mask_of(&preds[0], &dict_batch);
+        assert_eq!(m.true_count(), 2);
     }
 }

@@ -300,51 +300,20 @@ impl LateFilter {
 
     /// How row group `rg` reads its dictionary-capable stages' string columns, if any qualifies.
     ///
-    /// A column qualifies when every stage reading it accepts a `Dictionary`, it is a top-level
-    /// `Utf8`/`LargeUtf8` column of `schema` (the file's Arrow schema), and its chunk is
-    /// dictionary-encoded throughout and small per row (see [`DICTIONARY_MAX_BYTES_PER_ROW`]).
+    /// A column qualifies when every stage reading it accepts a `Dictionary` and it qualifies
+    /// for [`dictionary_read`] on `rg`.
     pub(crate) fn dictionary_read(
         &self,
         schema: &Schema,
         rg: &parquet::file::metadata::RowGroupMetaData,
     ) -> Option<DictionaryRead> {
-        let rows = rg.num_rows().max(1);
-        let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
-        let mut restore = Vec::new();
-        for (i, field) in schema.fields().iter().enumerate() {
-            let name = field.name();
-            let mut readers = self.predicates.iter().filter(|p| p.columns.contains(name));
-            let first = readers.next();
-            let accepts = first.is_some_and(|p| p.dictionary) && readers.all(|p| p.dictionary);
-            if !accepts || !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-                continue;
-            }
-            let Some(chunk) = rg
-                .columns()
+        dictionary_read(schema, rg, |name| {
+            let mut readers = self
+                .predicates
                 .iter()
-                .find(|c| c.column_path().parts() == std::slice::from_ref(name))
-            else {
-                continue;
-            };
-            let all_dictionary = chunk.page_encoding_stats_mask().is_none_or(|m| {
-                m.is_only(Encoding::RLE_DICTIONARY) || m.is_only(Encoding::PLAIN_DICTIONARY)
-            });
-            if chunk.dictionary_page_offset().is_none()
-                || !all_dictionary
-                || chunk.uncompressed_size() > DICTIONARY_MAX_BYTES_PER_ROW * rows
-            {
-                continue;
-            }
-            let dict = DataType::Dictionary(
-                Box::new(DataType::Int32),
-                Box::new(field.data_type().clone()),
-            );
-            fields[i] = Arc::new(field.as_ref().clone().with_data_type(dict));
-            restore.push((name.clone(), field.data_type().clone()));
-        }
-        (!restore.is_empty()).then(|| DictionaryRead {
-            schema: Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
-            restore,
+                .filter(|p| p.columns.iter().any(|c| c == name));
+            let first = readers.next();
+            first.is_some_and(|p| p.dictionary) && readers.all(|p| p.dictionary)
         })
     }
 
@@ -374,6 +343,53 @@ impl LateFilter {
             .collect();
         RowFilter::new(stages)
     }
+}
+
+/// How row group `rg` reads the string columns `accepts` admits as `Dictionary`, if any.
+///
+/// A column qualifies when `accepts` admits it, it is a top-level `Utf8`/`LargeUtf8` column of
+/// `schema` (the file's Arrow schema), and its chunk is dictionary-encoded throughout and small
+/// per row (see [`DICTIONARY_MAX_BYTES_PER_ROW`]). `None` when no column qualifies.
+pub(crate) fn dictionary_read(
+    schema: &Schema,
+    rg: &parquet::file::metadata::RowGroupMetaData,
+    accepts: impl Fn(&str) -> bool,
+) -> Option<DictionaryRead> {
+    let rows = rg.num_rows().max(1);
+    let mut fields: Vec<FieldRef> = schema.fields().iter().cloned().collect();
+    let mut restore = Vec::new();
+    for (i, field) in schema.fields().iter().enumerate() {
+        let name = field.name();
+        if !accepts(name) || !matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+            continue;
+        }
+        let Some(chunk) = rg
+            .columns()
+            .iter()
+            .find(|c| c.column_path().parts() == std::slice::from_ref(name))
+        else {
+            continue;
+        };
+        let all_dictionary = chunk.page_encoding_stats_mask().is_none_or(|m| {
+            m.is_only(Encoding::RLE_DICTIONARY) || m.is_only(Encoding::PLAIN_DICTIONARY)
+        });
+        if chunk.dictionary_page_offset().is_none()
+            || !all_dictionary
+            || chunk.uncompressed_size() > DICTIONARY_MAX_BYTES_PER_ROW * rows
+        {
+            continue;
+        }
+        let dict = DataType::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(field.data_type().clone()),
+        );
+        fields[i] = Arc::new(field.as_ref().clone().with_data_type(dict));
+        restore.push((name.clone(), field.data_type().clone()));
+    }
+    (!restore.is_empty()).then(|| DictionaryRead {
+        schema: Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        restore,
+    })
 }
 
 /// Whether late materialization is enabled (`BATCHER_PARQUET_LATE_FILTER=0` disables it).

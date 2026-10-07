@@ -84,7 +84,7 @@ use breaker::{drain, exec_breaker};
 pub(crate) use builds::{
     node_key, prebuild_joins, prebuild_joins_for_chunks, BuildCache, MatCache,
 };
-pub(crate) use folds::{combine_and_finalize, finalize_partial, fold_partial};
+pub(crate) use folds::{combine_and_finalize, finalize_partial, fold_partial, fold_partials};
 pub(crate) use meter::Meter;
 pub(crate) use pipeline::limit_stream;
 use pipeline::{scan_stream, unit_stream};

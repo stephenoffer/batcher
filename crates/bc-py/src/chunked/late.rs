@@ -9,16 +9,31 @@ use arrow::datatypes::{DataType, Int32Type, Schema};
 
 use crate::normalize::normalize_batch;
 
-/// The predicate of the plan's `Filter` directly over `Scan(driving)`, if it has one.
-fn scan_filter(plan: &bc_ir::RelOp, driving: usize) -> Option<&bc_expr::Expr> {
-    if let bc_ir::RelOp::Filter { input, predicate } = plan {
-        if matches!(**input, bc_ir::RelOp::Scan { source_id } if source_id == driving) {
-            return Some(predicate);
-        }
+/// The predicates of the stack of `Filter`s directly over `Scan(driving)`, innermost first, or
+/// none.
+///
+/// Kyber can leave a scan under two stacked filters -- the part of a `WHERE` it pushed toward
+/// the scan, and the rest above it. TPC-H q12 is the shape: a `l_receiptdate` range under
+/// `l_shipmode IN (..) AND l_commitdate < l_receiptdate AND ...`, and with only the range as its
+/// stage the late read kept a seventh of `lineitem` where the whole clause keeps 0.5%.
+pub(super) fn scan_filters(plan: &bc_ir::RelOp, driving: usize) -> Vec<&bc_expr::Expr> {
+    let mut stack = Vec::new();
+    let mut node = plan;
+    while let bc_ir::RelOp::Filter { input, predicate } = node {
+        stack.push(predicate);
+        node = input;
+    }
+    if !stack.is_empty()
+        && matches!(node, bc_ir::RelOp::Scan { source_id } if *source_id == driving)
+    {
+        stack.reverse();
+        return stack;
     }
     plan.children()
         .into_iter()
-        .find_map(|child| scan_filter(child, driving))
+        .map(|child| scan_filters(child, driving))
+        .find(|found| !found.is_empty())
+        .unwrap_or_default()
 }
 
 /// The plan's `Filter` over the driving scan, as the late-materialization stages of its reads.
@@ -42,22 +57,90 @@ pub(super) fn plan_stages(
     driving: usize,
     carrier: &[RecordBatch],
 ) -> Vec<bc_io::RowPredicate> {
-    let (Some(predicate), Some(first)) = (scan_filter(plan, driving), carrier.first()) else {
+    let filters = scan_filters(plan, driving);
+    let (Some(&innermost), Some(first)) = (filters.first(), carrier.first()) else {
         return Vec::new();
     };
     let schema = first.schema();
-    let conjuncts = predicate.and_conjuncts();
+    // Every filter of the stack, as one conjunction: a row the stack keeps passes them all. An
+    // outer filter's conjuncts would otherwise be evaluated over rows an inner one removes, so
+    // they are only added when every conjunct is infallible -- the condition splitting needs
+    // anyway -- and the innermost filter alone is staged otherwise, as before.
+    let conjuncts: Vec<&bc_expr::Expr> = filters.iter().flat_map(|p| p.and_conjuncts()).collect();
     let split = conjuncts.len() > 1
         && conjuncts
             .iter()
             .all(|c| c.is_infallible_predicate(&schema) && evaluates_on_a_null_row(c, &schema));
     if split {
-        let mut ordered = conjuncts;
-        ordered.sort_by_key(|c| c.eval_cost());
-        ordered.into_iter().map(|c| stage(c, &schema)).collect()
+        grouped_stages(conjuncts, &schema)
     } else {
-        vec![stage(predicate, &schema)]
+        vec![stage(innermost, &schema)]
     }
+}
+
+/// Infallible `conjuncts` as few stages as keep their dictionary reads: one per string column
+/// whose conjuncts read only it (that stage takes the column as a `Dictionary`), and one for all
+/// the rest, each stage's conjuncts cheapest first.
+///
+/// One stage per conjunct made the decode a chain of row filters, each narrowing the selection
+/// the next decodes under: TPC-H q12's six conjuncts (a date range, three column-to-column date
+/// comparisons, `l_shipmode IN (..)`) measured 86 ns a row against 74 ns for no filter at all,
+/// though they keep 0.5% of `lineitem`. A stage evaluates its own conjunction by short circuit
+/// (`Expr::short_circuit_filter_mask`), so grouping loses none of the narrowing within a stage.
+/// The rest stage runs first: it holds the conjuncts that need no dictionary to be cheap.
+fn grouped_stages(conjuncts: Vec<&bc_expr::Expr>, schema: &Schema) -> Vec<bc_io::RowPredicate> {
+    let mut rest: Vec<&bc_expr::Expr> = Vec::new();
+    let mut by_column: Vec<(String, Vec<&bc_expr::Expr>)> = Vec::new();
+    for c in conjuncts {
+        match lone_string_column(c, schema) {
+            Some(name) => match by_column.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, group)) => group.push(c),
+                None => by_column.push((name, vec![c])),
+            },
+            None => rest.push(c),
+        }
+    }
+    let mut groups: Vec<Vec<&bc_expr::Expr>> = Vec::new();
+    if !rest.is_empty() {
+        groups.push(rest);
+    }
+    groups.extend(by_column.into_iter().map(|(_, group)| group));
+    groups
+        .into_iter()
+        .map(|mut group| {
+            group.sort_by_key(|c| c.eval_cost());
+            stage(&conjunction(&group), schema)
+        })
+        .collect()
+}
+
+/// The one string column `expr` reads, when that is all it reads.
+fn lone_string_column(expr: &bc_expr::Expr, schema: &Schema) -> Option<String> {
+    let mut names: Vec<&str> = Vec::new();
+    expr.collect_columns(&mut names);
+    names.sort_unstable();
+    names.dedup();
+    match names.as_slice() {
+        [only]
+            if schema
+                .field_with_name(only)
+                .is_ok_and(|f| matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8)) =>
+        {
+            Some((*only).to_string())
+        }
+        _ => None,
+    }
+}
+
+/// `parts` joined with `AND`, left to right.
+fn conjunction(parts: &[&bc_expr::Expr]) -> bc_expr::Expr {
+    let mut iter = parts.iter();
+    let first = (*iter.next().expect("a group holds a conjunct")).clone();
+    iter.fold(first, |acc, &next| bc_expr::Expr::Binary {
+        op: bc_expr::BinaryOp::And,
+        left: Box::new(acc),
+        right: Box::new(next.clone()),
+    })
 }
 
 /// The columns a read of the driving scan decodes: `columns`, or every column it carries.
@@ -222,6 +305,94 @@ fn dictionary_mask(predicate: &bc_expr::Expr, batch: &RecordBatch) -> Option<Boo
         answers.value(slot)
     });
     Some(BooleanArray::new(mask, None))
+}
+
+/// `batch` with the rows `filters` remove, applied in order exactly as the stacked `Filter`s
+/// apply them (each over the rows the ones before it kept), by the engine's own mask
+/// ([`filter_mask`]), which keeps every row of a batch it cannot evaluate so the `Filter` above
+/// raises whatever it raises.
+pub(super) fn apply_filters(
+    filters: &[&bc_expr::Expr],
+    mut batch: RecordBatch,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
+    for predicate in filters {
+        if batch.num_rows() == 0 {
+            break;
+        }
+        let mask = filter_mask(predicate, &batch);
+        if mask.true_count() < batch.num_rows() {
+            batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+        }
+    }
+    Ok(batch)
+}
+
+/// Restate the measured counts of `Scan(source)` and the `Filter`s stacked on it when the read
+/// removed rows before the scan emitted them, so the learning loop is taught the relation's
+/// size and the filters' selectivity rather than what the read left.
+///
+/// A read filtered while decoding (the late stages, or the stack applied as a resident scan is
+/// read) hands the scan only the rows the filters keep, so the scan reported the filtered count
+/// and the filter above it a selectivity of one. Kyber learned exactly that: on TPC-H q5 the
+/// `orders` date range was relearned as keeping all 150M rows, and the plan it chose next ran
+/// 1.6x slower. `rows` is what the scan read before any of it -- its surviving row groups'
+/// rows. One filter gets that as its input, which with its own output is its true selectivity;
+/// a stack of several has no measured count between its filters, so each is marked the way an
+/// operator under a runtime join filter is (`ExecMetrics::runtime_filtered`), and its counts
+/// stay out of the corrections.
+pub(super) fn restate_prefiltered(
+    metrics: &mut bc_interp::ExecMetrics,
+    plan: &bc_ir::RelOp,
+    source: usize,
+    rows: u64,
+) {
+    let mut nodes: Vec<&bc_ir::RelOp> = Vec::new();
+    preorder(plan, &mut nodes);
+    let is_scan =
+        |n: &bc_ir::RelOp| matches!(n, bc_ir::RelOp::Scan { source_id } if *source_id == source);
+    if nodes.iter().filter(|n| is_scan(n)).count() != 1 {
+        return;
+    }
+    // Each filter whose chain of filter inputs ends at the scan, with the scan itself.
+    let mut stack: Vec<u32> = Vec::new();
+    let mut scan_id = None;
+    for (id, node) in nodes.iter().enumerate() {
+        let mut cur = *node;
+        while let bc_ir::RelOp::Filter { input, .. } = cur {
+            cur = input;
+        }
+        if is_scan(cur) {
+            let id = u32::try_from(id).unwrap_or(u32::MAX);
+            if matches!(node, bc_ir::RelOp::Filter { .. }) {
+                stack.push(id);
+            } else {
+                scan_id = Some(id);
+            }
+        }
+    }
+    for op in &mut metrics.ops {
+        if Some(op.op_id) == scan_id {
+            op.rows_in = rows;
+            op.rows_out = rows;
+        } else if stack.len() == 1 && op.op_id == stack[0] {
+            op.rows_in = rows;
+        }
+    }
+    if stack.len() > 1 {
+        for id in stack {
+            if !metrics.runtime_filtered.contains(&id) {
+                metrics.runtime_filtered.push(id);
+            }
+        }
+    }
+}
+
+/// `plan`'s nodes in pre-order, the order `op_id`s number them.
+fn preorder<'a>(plan: &'a bc_ir::RelOp, out: &mut Vec<&'a bc_ir::RelOp>) {
+    out.push(plan);
+    for child in plan.children() {
+        preorder(child, out);
+    }
 }
 
 /// Whether `expr` evaluates to a boolean over one all-null row of `schema`'s columns.

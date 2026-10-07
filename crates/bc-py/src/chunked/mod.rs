@@ -19,6 +19,7 @@ use pyo3::prelude::*;
 use crate::normalize::{narrow_output, normalize_batch, rebase_nested_offsets};
 
 mod late;
+mod resident;
 use crate::{errors, prepare_exec, ExecSetup};
 
 /// Whether `plan_json` can run with source `driving` streamed in chunks.
@@ -509,7 +510,7 @@ fn fetch_located(
 /// driving row passes through exactly once here, so the counts are the query's own and the
 /// learning loop records them (`bc_interp::execute_units_metered`).
 #[pyfunction]
-#[pyo3(signature = (plan_json, sources, driving, uris, columns=None, predicate=None, batch_size=65536, engine_config="", query_id=None, memory_budget=0))]
+#[pyo3(signature = (plan_json, sources, driving, uris, columns=None, predicate=None, batch_size=65536, engine_config="", query_id=None, memory_budget=0, resident=Vec::new()))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_plan_parquet(
     py: Python<'_>,
@@ -523,10 +524,11 @@ pub(crate) fn execute_plan_parquet(
     engine_config: &str,
     query_id: Option<&str>,
     memory_budget: usize,
+    resident: Vec<resident::ResidentRead>,
 ) -> PyResult<(Vec<PyArrowType<RecordBatch>>, String)> {
     let ExecSetup {
         plan,
-        sources,
+        mut sources,
         opts,
         narrow,
         budget,
@@ -549,6 +551,9 @@ pub(crate) fn execute_plan_parquet(
         bc_arrow::usable_cores().max(1)
     };
     let out = py.detach(|| {
+        // The plan's other Parquet scans, which the control plane handed over as schema
+        // carriers plus how to read them (`resident`).
+        let prefiltered = resident::read_into(&plan, &resident, &mut sources, workers)?;
         // Pruned before the units are ranged across the workers, so a clustered predicate's
         // survivors are spread over them rather than left in the few ranges they fall in.
         let groups = bc_io::parquet_row_groups_surviving(&uris, predicate.as_deref())
@@ -565,7 +570,15 @@ pub(crate) fn execute_plan_parquet(
             driving,
             &sources[driving],
         );
-        bc_interp::execute_units_metered(&plan, &sources, driving, &src, workers, budget, &opts)
+        let late = src.late.is_some();
+        let (out, mut metrics) = bc_interp::execute_units_metered(
+            &plan, &sources, driving, &src, workers, budget, &opts,
+        )?;
+        let driving_read = late.then_some((driving, rows as u64));
+        for (id, read) in prefiltered.into_iter().chain(driving_read) {
+            late::restate_prefiltered(&mut metrics, &plan, id, read);
+        }
+        Ok((out, metrics))
     });
     let (out, metrics) = out.map_err(errors::interp_to_pyerr)?;
     let metrics = metrics.with_query(query_watch);

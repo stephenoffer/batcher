@@ -443,7 +443,36 @@ pub(crate) fn fold_partial(
     aggregates: &[bc_ir::AggregateItem],
     jit: &std::sync::OnceLock<ops::AggJit>,
 ) -> Result<(Option<agg::Partial>, u64), InterpError> {
+    let (mut partials, rows_in) = fold_partials(input, group_keys, aggregates, jit)?;
+    let merged = match partials.len() {
+        0 => None,
+        1 => partials.pop(),
+        _ => Some(agg::combine(&partials, &ops::agg_funcs(aggregates))?),
+    };
+    Ok((merged, rows_in))
+}
+
+/// [`fold_partial`], leaving the partials of a key that does not reduce uncombined.
+///
+/// A caller that combines several shards' partials anyway (`stream::parallel`, the chunked
+/// executors) gains nothing from a shard merging its own first when the merge keeps nearly every
+/// row: it is one more hash pass over the shard's whole state, and the combine across shards
+/// re-hashes all of it again. TPC-H q13's `count(*) ... GROUP BY o_custkey` over sf100 `orders`
+/// (142M rows, 10M groups, ~0.4M rows per shard) paid exactly that: per-morsel partials, a
+/// per-shard combine and the global combine, three passes where two give the same partial
+/// states. A key that reduces is folded and merged exactly as before, so its state stays at
+/// `O(groups)`; the returned partials are in fold order either way, and combine to what
+/// [`fold_partial`] returns.
+pub(crate) fn fold_partials(
+    input: Morsels<'_>,
+    group_keys: &[bc_ir::ProjectionItem],
+    aggregates: &[bc_ir::AggregateItem],
+    jit: &std::sync::OnceLock<ops::AggJit>,
+) -> Result<(Vec<agg::Partial>, u64), InterpError> {
     let funcs = ops::agg_funcs(aggregates);
+    // What the first morsel kept, and whether a fold has shown the key not to reduce.
+    let mut first: Option<(usize, usize)> = None;
+    let mut non_reducing = false;
     let mut partials: Vec<agg::Partial> = Vec::new();
     let mut folded: Option<agg::Partial> = None;
     let mut rows_in: u64 = 0;
@@ -505,6 +534,7 @@ pub(crate) fn fold_partial(
             // own measurement below can send the fold back to the morsel.
             if !asked {
                 asked = true;
+                first = Some((morsel.num_rows(), kept_rows(&partial)));
                 if chunk_would_reduce(&partial, morsel.num_rows()) {
                     unit = Unit::Chunk;
                 }
@@ -514,11 +544,19 @@ pub(crate) fn fold_partial(
         // Bounded: without this the "streaming" aggregate quietly re-materializes its input as a
         // heap of per-morsel partials. Combining on *every* morsel would instead re-hash the
         // whole running state once per morsel; batching the fold keeps state at O(groups).
-        if partials.len() >= AGG_FOLD_EVERY && fold_pays(&partials, folded.as_ref()) {
+        // Once a fold has kept most of what it merged, the key does not reduce over this shard
+        // and folding again only re-hashes state the caller's combine re-hashes anyway.
+        if !non_reducing
+            && partials.len() >= AGG_FOLD_EVERY
+            && fold_pays(&partials, folded.as_ref())
+        {
             if let Some(prev) = folded.take() {
                 partials.push(prev);
             }
-            folded = Some(agg::combine(&partials, &funcs)?);
+            let before: usize = partials.iter().map(kept_rows).sum();
+            let merged = agg::combine(&partials, &funcs)?;
+            non_reducing = kept_rows(&merged).saturating_mul(2) > before;
+            folded = Some(merged);
             partials.clear();
         }
     }
@@ -532,10 +570,27 @@ pub(crate) fn fold_partial(
     if let Some(prev) = folded.take() {
         partials.push(prev);
     }
-    if partials.is_empty() {
-        return Ok((None, rows_in));
+    if partials.len() <= 1 || non_reducing || !shard_would_reduce(first, rows_in) {
+        return Ok((partials, rows_in));
     }
-    Ok((Some(agg::combine(&partials, &funcs)?), rows_in))
+    Ok((vec![agg::combine(&partials, &funcs)?], rows_in))
+}
+
+/// Whether merging a shard's partials is worth a pass: whether a key whose first morsel kept
+/// `first` reduces, projected over the shard's `rows`, to under half of them. A key that
+/// already reduces within a morsel (or a chunk, which is entered only on a projected reduction)
+/// says yes; a near-unique key says no. No measurement (an empty shard) says yes, which is the
+/// old behaviour.
+fn shard_would_reduce(first: Option<(usize, usize)>, rows: u64) -> bool {
+    let Some((sample, kept)) = first else {
+        return true;
+    };
+    let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+    if rows == 0 || (kept as f64) < MORSEL_REDUCTION_CEILING * sample as f64 {
+        return true;
+    }
+    let groups = crate::agg_par::estimated_groups(sample, kept, 1, rows);
+    groups.saturating_mul(2) <= rows
 }
 
 /// How much input [`fold_partial`] groups at a time.

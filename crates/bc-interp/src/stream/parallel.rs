@@ -42,7 +42,7 @@ use rayon::prelude::*;
 use bc_runtime::agg;
 
 use super::{
-    build_with, combine_and_finalize, fold_partial, limit_stream, node_key, strip_empties,
+    build_with, combine_and_finalize, fold_partials, limit_stream, node_key, strip_empties,
     BuildCache, Ctx, MatCache, Meter,
 };
 use crate::ops;
@@ -673,11 +673,11 @@ fn run_with_cache(
             // schema is identical across shards, so `compile_agg` runs exactly once (the first
             // shard to see a row) rather than once per core.
             let jit: std::sync::OnceLock<ops::AggJit> = std::sync::OnceLock::new();
-            let folded: Vec<(Option<agg::Partial>, u64)> = shard_sources
+            let folded: Vec<(Vec<agg::Partial>, u64)> = shard_sources
                 .par_iter()
                 .map(|sh| {
                     let ctx = sh.ctx(cache, meter, budget, mats);
-                    fold_partial(
+                    fold_partials(
                         with_cancellation(build_with(input, ctx)?, cancel, budget),
                         group_keys,
                         aggregates,
@@ -687,7 +687,7 @@ fn run_with_cache(
                 .collect::<Result<Vec<_>, InterpError>>()?;
 
             let rows_in: u64 = folded.iter().map(|(_, n)| *n).sum();
-            let partials: Vec<agg::Partial> = folded.into_iter().filter_map(|(p, _)| p).collect();
+            let partials: Vec<agg::Partial> = folded.into_iter().flat_map(|(p, _)| p).collect();
             if partials.is_empty() {
                 // No shard saw a row. A global aggregate over nothing still yields one row
                 // (`COUNT` 0, `SUM` NULL) — the oracle owns that, over an empty input.
