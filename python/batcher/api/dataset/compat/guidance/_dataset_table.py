@@ -462,8 +462,8 @@ _PANDAS_ONLY: dict[str, str] = {
         "bt.col('t').cast('timestamp(us)'), or bt.col('t').dt.timestamp() from an epoch."
     ),
     "to_gbq": (
-        "No BigQuery sink. Land Parquet with ds.write.parquet(path) and load it into "
-        "BigQuery from there."
+        "Spelled ds.write.bigquery('dataset.table', project=...) here: one Parquet load "
+        "job per shard, appending unless mode='overwrite'."
     ),
 }
 

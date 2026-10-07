@@ -483,7 +483,9 @@ database or warehouse, where the interesting part is not the call but the connec
 serves your scheme, where the credentials come from, and how to split one extract into parallel
 queries. {doc}`/integrations/apis/index` covers web APIs: `read.http_json` for any paginated JSON
 API, with `read.graphql`, `read.github`, `read.salesforce`, `read.google_sheets`, `read.sharepoint`,
-and `read.airbyte` built on it.
+and `read.airbyte` built on it. {doc}`/integrations/databases/vendor-matrix` says which write modes and vendor types each
+database's route covers. An Amazon Athena query reads through `bt.read.athena(query, region=...,
+workgroup=...)`, a thin profile over the DB-API reader described on {doc}`/integrations/warehouses/athena`.
 
 ## What you get back
 

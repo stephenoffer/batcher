@@ -48,7 +48,18 @@ __all__ = [
 #: orphan a table's accumulated stats every rotation, silently returning the optimizer to
 #: cold estimates on a schedule.
 _NON_IDENTIFYING = frozenset(
-    {"password", "passwd", "token", "access_token", "secret", "api_key", "passphrase", "pwd"}
+    {
+        "password",
+        "passwd",
+        "token",
+        "access_token",
+        "secret",
+        "api_key",
+        "passphrase",
+        "pwd",
+        "private_key",
+        "private_key_file_pwd",
+    }
 )
 
 

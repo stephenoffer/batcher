@@ -2448,15 +2448,24 @@ class Writer:
         return writer(table, write_backend(mode, opts), mode=mode, **opts)
 
     def snowflake(self, table: str, **opts: Any) -> WriteManifest:
-        """Write to a Snowflake table.
+        """Write to a Snowflake table as a staged bulk load.
+
+        Each shard is staged and loaded with ``COPY INTO`` through the connector's
+        ``write_pandas``; the load results (chunks, rows loaded, the ``COPY INTO`` result
+        rows) come back in each `WrittenFile`'s ``job``. Authentication takes the same
+        ``auth=``/``account=``/``user=``/``role=``/``warehouse=``/``database=``/``schema=``
+        keywords as `bt.read.snowflake`, folded into the ``connection_kwargs`` every worker
+        connects with; ``auth="externalbrowser"`` is refused for a distributed write,
+        because a worker cannot open a browser. Not yet verified against a live Snowflake;
+        see tests/PENDING_VERIFICATION.md.
 
         Requires the ``snowflake`` extra: ``pip install 'batcher-engine[snowflake]'``.
 
         Args:
             table: Destination Snowflake table name.
-            opts: ``connection_kwargs=`` — a dict passed to the Snowflake connector
-                (``account``, ``user``, ``warehouse``, ``database``, …) — plus
-                ``mode=`` (``"overwrite"``, the default, or ``"append"``).
+            opts: The auth and session keywords above, or ``connection_kwargs=`` — a dict
+                passed to the Snowflake connector — plus ``mode=`` (``"overwrite"``, the
+                default, or ``"append"``).
 
         Returns:
             A `WriteManifest` describing the written rows.
@@ -2475,7 +2484,109 @@ class Writer:
                 ...     },
                 ... )
         """
-        return self(table, "snowflake", **opts)
+        from batcher.io.formats.sql.vendors import snowflake_options
+
+        return self(table, "snowflake", **snowflake_options(opts))
+
+    def bigquery(
+        self,
+        table: str,
+        *,
+        project: str | None = None,
+        mode: str = "append",
+        location: str | None = None,
+        **opts: Any,
+    ) -> WriteManifest:
+        """Load into a BigQuery table through Parquet load jobs, keeping nested fields.
+
+        Each shard is serialized to Parquet and submitted as one ``load_table_from_file``
+        job with list inference on, so an Arrow list becomes a ``REPEATED`` field and a
+        struct a ``RECORD``. An array of arrays, or a NULL element inside an array, has no
+        BigQuery spelling and is refused before any job is submitted, naming the column.
+        Each `WrittenFile`'s ``job`` holds the load job's ``job_id``, ``location`` and
+        destination. ``mode="overwrite"`` truncates the table in its one job and is refused
+        on a distributed write. Credentials come from the ambient ``google.auth``
+        environment. Needs ``batcher-engine[bigquery]``. Not yet verified against a live
+        BigQuery; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            table: Destination table, ``dataset.table`` or ``project.dataset.table``.
+            project: The project the load jobs run and bill in.
+            mode: ``"append"`` (default) or ``"overwrite"``.
+            location: The job location, when it is not the dataset's default.
+            opts: Further write options.
+
+        Returns:
+            A `WriteManifest` whose files carry the load jobs' identities.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2], "tags": [["a"], ["b", "c"]]})
+                >>> manifest = ds.write.bigquery(  # doctest: +SKIP
+                ...     "my-project.analytics.events", project="my-project"
+                ... )
+                >>> manifest.files[0].job["job_id"]  # doctest: +SKIP
+                'job_...'
+        """
+        return self(table, "bigquery", mode=mode, project=project, location=location, **opts)
+
+    def databricks(
+        self,
+        table: str,
+        *,
+        volume_path: str,
+        server_hostname: str,
+        http_path: str,
+        access_token: str,
+        **opts: Any,
+    ) -> WriteManifest:
+        """Bulk-load into an existing Databricks table through a Unity Catalog volume.
+
+        Each shard is written to Parquet, uploaded into `volume_path` with ``PUT``, loaded
+        with ``COPY INTO``, and removed. Every staged file has a fresh name, because
+        ``COPY INTO`` skips a path it has loaded before. Only ``mode="append"`` is offered.
+        Each `WrittenFile`'s ``job`` holds the ``COPY INTO`` statement's ``query_id`` and
+        the row counts the warehouse reported. Needs ``batcher-engine[databricks]``. Not
+        yet verified against a live Databricks; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            table: Destination table, optionally ``catalog.schema.table``.
+            volume_path: A ``/Volumes/...`` directory to stage files in.
+            server_hostname: The SQL warehouse hostname.
+            http_path: The SQL warehouse HTTP path.
+            access_token: A token, or an ``env:``/``file:`` reference to one.
+            opts: ``catalog=``, ``schema=`` (session defaults) and further write options.
+
+        Returns:
+            A `WriteManifest` whose files carry the ``COPY INTO`` query ids.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                >>> ds.write.databricks(  # doctest: +SKIP
+                ...     "main.sales.orders",
+                ...     volume_path="/Volumes/main/staging/loads",
+                ...     server_hostname="adb-1.azuredatabricks.net",
+                ...     http_path="/sql/1.0/warehouses/abc",
+                ...     access_token="env:DATABRICKS_TOKEN",
+                ... )
+        """
+        if "schema" in opts:
+            opts["db_schema"] = opts.pop("schema")
+        opts.setdefault("mode", "append")
+        return self(
+            table,
+            "databricks",
+            volume_path=volume_path,
+            server_hostname=server_hostname,
+            http_path=http_path,
+            access_token=access_token,
+            **opts,
+        )
 
     def clickhouse(self, table: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
         """Insert into an existing ClickHouse table over the Arrow insert interface.

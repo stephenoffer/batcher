@@ -214,6 +214,11 @@ STRUCTURE_ALLOW: dict[str, str] = {
     "python/batcher/api/io_namespace/writer.py": (
         "ds.write façade; per-format examples push it over"
     ),
+    # The `bt.read` façade: one thin delegating method per connector. Splitting it means a
+    # mixin (banned) or a second namespace (`bt.read.vector.qdrant`), a second spelling.
+    "python/batcher/api/io_namespace/reader.py": (
+        "bt.read façade; one thin method per connector, the writer.py precedent"
+    ),
     # The `ds.ml` accessor: one bound ML/multimodal namespace (map_batches, infer,
     # embed, the torch loaders, download/upload) whose every public method now carries
     # a Google-style docstring — runnable for the in-memory transforms, illustrative

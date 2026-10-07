@@ -65,12 +65,36 @@ _EXTRA = "sql"
 _MODULE = "adbc_driver_manager.dbapi"
 
 
+def _require_driver(driver: str) -> None:
+    """Refuse a named ``adbc_driver_*`` module that is absent, saying what installs it.
+
+    The driver manager's own error for a missing driver names a shared library search, not
+    a package. A driver given as a module name is checkable before connecting, and the
+    package is the module name with dashes, so the fix can be stated exactly.
+    """
+    from batcher._internal.errors import MissingDependencyError
+    from batcher.io.formats.sql.dbapi._dsn import module_available
+    from batcher.io.formats.sql.uri import scheme_for_adbc_driver
+    from batcher.io.formats.sql.vendors import install_hint
+
+    if not driver.startswith("adbc_driver_") or module_available(driver):
+        return
+    package = driver.replace("_", "-")
+    scheme = scheme_for_adbc_driver(driver)
+    advice = (install_hint(scheme) if scheme else None) or ""
+    raise MissingDependencyError(
+        f"the ADBC driver {driver!r} is not installed. {advice}".rstrip(),
+        install=f"pip install {package}",
+    )
+
+
 def _connect(driver: str, db_kwargs: dict[str, Any], conn_kwargs: dict[str, Any] | None) -> Any:
     """Open a fresh DBAPI connection for `driver` (rebuilt per worker).
 
     `db_kwargs` carries the DSN/URI and any credentials, so each string value is resolved
     here — on the worker — and the split ships only the reference."""
     dbapi = require_module(_MODULE, extra=_EXTRA)
+    _require_driver(driver)
     db_kwargs = {
         k: (resolve_secret(v, what=f"ADBC {k}") if isinstance(v, str) else v)
         for k, v in db_kwargs.items()

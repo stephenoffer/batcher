@@ -11,7 +11,7 @@ The following table summarizes the connector:
 | Extra | `pip install 'batcher-engine[snowflake]'` |
 | Parallelism | One split per result chunk from `get_result_batches()` |
 | Pushdown | Predicates, as a `WHERE` around your query. Projection isn't pushed. |
-| Credentials | Everything in the `connection_kwargs` dict, which accepts secret references |
+| Credentials | One declared `auth=` strategy with `account=`, `user=`, `role=`, `warehouse=`, `database=` and `schema=`, or everything in a `connection_kwargs` dict. Both accept secret references. |
 
 ## Read a query
 
@@ -39,7 +39,7 @@ orders = bt.read.snowflake(
 recent = orders.filter(col("amount") > 100).collect()
 ```
 
-Anything the connector accepts works in that dict, including key-pair auth, `authenticator="externalbrowser"`, and a `session_parameters` dict. Loose keywords such as `account=` or `user=` raise a `TypeError`, because they belong inside `connection_kwargs`.
+Anything the connector accepts works in that dict, including key-pair auth, `authenticator="externalbrowser"`, and a `session_parameters` dict.
 
 Any string value in the dict can be a secret reference instead of the secret itself: `env:NAME`, `file:PATH`, `cmd:NAME`, or a key store such as `vault:`, `aws-sm:`, `gcp-sm:`, or `azure-kv:`. The reference is resolved on the worker when the connection opens, so the password never appears in the plan or in a pickled split. {doc}`/user-guide/trust/secrets` covers the schemes.
 
@@ -52,6 +52,41 @@ conn = {
     "warehouse": "ETL_WH",
 }
 ```
+
+## Declare one authentication strategy
+
+:::{warning}
+The `auth=` keywords and the load results below are not yet verified against a live Snowflake account. See `tests/PENDING_VERIFICATION.md`.
+:::
+
+Instead of assembling the connector's keywords yourself, name the strategy with `auth=` and pass its credentials beside the session settings. Batcher checks the combination once, before any connection opens, and folds it into the `connection_kwargs` every worker connects with. A local run and a distributed one therefore authenticate the same way.
+
+The following table lists the strategies and what each needs besides `account=`:
+
+| `auth=` | Needs | Sent to the connector as |
+| --- | --- | --- |
+| `"password"` | `user=`, `password=` | `user`, `password` |
+| `"key_pair"` | `user=`, `private_key_file=`, optionally `private_key_file_pwd=` | `authenticator="SNOWFLAKE_JWT"` plus the key file and passphrase |
+| `"oauth"` | `token=` | `authenticator="oauth"`, `token` |
+| `"externalbrowser"` | `user=` | `authenticator="externalbrowser"` |
+
+When you leave `auth=` out, the credential you pass picks it: a key file means `key_pair`, a token means `oauth`, and a password means `password`. A credential that belongs to a different strategy, or a keyword that contradicts the same key in an explicit `connection_kwargs`, is refused rather than guessed at.
+
+```python
+# docs: skip
+orders = bt.read.snowflake(
+    "SELECT order_id, amount FROM sales.orders",
+    account="acme-prod",
+    user="svc_batcher",
+    auth="key_pair",
+    private_key_file="/etc/secrets/batcher_rsa.p8",
+    private_key_file_pwd="env:SNOWFLAKE_KEY_PASSPHRASE",
+    role="BATCHER_ETL",
+    warehouse="ETL_WH",
+)
+```
+
+The key file path must exist on every machine that connects. Browser single sign-on works for a read, distributed or not, because only the driver connects and workers fetch result chunks through pre-signed URLs. A distributed write is different: every shard connects from its own worker, which has no browser, so `auth="externalbrowser"` is refused there.
 
 ## How it parallelizes
 
@@ -104,6 +139,8 @@ manifest = shaped.write.snowflake("ORDERS", connection_kwargs=conn, mode="append
 print(manifest)
 ```
 
+Each shard is a staged bulk load: `write_pandas` uploads the shard as Parquet to a temporary stage and runs `COPY INTO`. Its load results come back in every written file's `job`: the chunk count, the rows loaded, and the `COPY INTO` result rows, so `manifest.files[0].job["copy_into"]` shows each staged file's status.
+
 The sink loads through `write_pandas` with `auto_create_table=True`, which quotes what it's given. Lowercase Arrow names produce a table whose columns can only be referenced as `"order_id"`, quotes included, for the life of the table.
 
 :::{warning}
@@ -114,7 +151,7 @@ Each shard commits its own rows as it finishes, and there's no transaction acros
 
 ## Requirements and limitations
 
-The write converts each shard to pandas and stages it through `write_pandas`, a full copy in worker memory. That suits millions of rows. For billions, write Parquet to a stage and run `COPY INTO`.
+The write converts each shard to pandas and stages it through `write_pandas`, a full copy in worker memory. That suits millions of rows. For billions, write Parquet to a stage and run `COPY INTO` yourself.
 
 Every split opens its own connection, so a hundred splits means a hundred connections. Watch the account's concurrency limits. Splits also carry `connection_kwargs` to every worker. The values are never logged, but on a shared cluster use secret references or a service account rather than a personal credential.
 

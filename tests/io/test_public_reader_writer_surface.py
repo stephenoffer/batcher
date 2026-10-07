@@ -101,6 +101,7 @@ def test_read_sql_names_the_argument_it_could_not_parse():
 #: being checked is that the method is reachable and that a failure is actionable.
 READERS = [
     ("airbyte", lambda: bt.read.airbyte("users", image="airbyte/source-faker:6")),
+    ("athena", lambda: bt.read.athena("SELECT 1", region="us-east-1", workgroup="primary")),
     ("cassandra", lambda: bt.read.cassandra(keyspace="k", table="t")),
     ("github", lambda: bt.read.github("octo/repo")),
     ("google_sheets", lambda: bt.read.google_sheets("sheet-id", "A1:B2")),

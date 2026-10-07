@@ -14,6 +14,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import BackendError
 from batcher._internal.logging import note_suppressed
+from batcher.io.formats.sql.vendors.types import explain_failure, null_zero_dates
 
 __all__ = ["arrow_type", "reconcile", "rows_to_batch"]
 
@@ -55,7 +56,13 @@ def arrow_type(module: Any, type_code: Any) -> pa.DataType | None:
     return None
 
 
-def rows_to_batch(rows: list[tuple], names: list[str], schema: pa.Schema | None) -> pa.RecordBatch:
+def rows_to_batch(
+    rows: list[tuple],
+    names: list[str],
+    schema: pa.Schema | None,
+    *,
+    zero_dates: str = "refuse",
+) -> pa.RecordBatch:
     """Transpose a block of DB-API rows into one Arrow `RecordBatch`.
 
     `zip(*rows)` is the whole row-to-column step, and it runs once per *batch*, not once
@@ -64,16 +71,37 @@ def rows_to_batch(rows: list[tuple], names: list[str], schema: pa.Schema | None)
     When `schema` is known the batch is built against it so every batch of a multi-batch
     read has identical types; without it Arrow infers, which is only safe for the first
     batch (the caller then reuses that inferred schema for the rest).
+
+    A column Arrow refuses is re-raised by `vendors.types.explain_failure`, which names the
+    column and the vendor value at fault (a MySQL zero date, a NUMERIC NaN, a driver LOB
+    handle). With ``zero_dates="null"`` a MySQL ``'0000-00-00'`` string reads as NULL.
     """
     if not rows:
         if schema is not None:
             return pa.RecordBatch.from_pylist([], schema=schema)
         return pa.RecordBatch.from_pylist([])
     columns = [list(col) for col in zip(*rows, strict=False)]
+    if zero_dates == "null":
+        columns = [null_zero_dates(col) for col in columns]
+    types = [schema.field(i).type for i in range(len(columns))] if schema is not None else None
+    arrays = [
+        _to_array(names[i] if i < len(names) else str(i), col, types[i] if types else None)
+        for i, col in enumerate(columns)
+    ]
     if schema is not None:
-        arrays = [pa.array(col, type=schema.field(i).type) for i, col in enumerate(columns)]
         return pa.RecordBatch.from_arrays(arrays, schema=schema)
-    return pa.RecordBatch.from_arrays([pa.array(col) for col in columns], names=names)
+    return pa.RecordBatch.from_arrays(arrays, names=names)
+
+
+def _to_array(name: str, values: list[Any], dtype: pa.DataType | None) -> pa.Array:
+    """One column to Arrow, with a refusal that names the column when Arrow cannot."""
+    try:
+        return pa.array(values, type=dtype)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError) as exc:
+        explained = explain_failure(name, values, exc)
+        if explained is None:
+            raise
+        raise explained from exc
 
 
 def reconcile(running: pa.Schema | None, batch: pa.RecordBatch) -> tuple[pa.Schema, pa.RecordBatch]:

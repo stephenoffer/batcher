@@ -1,13 +1,13 @@
 # Databricks
 
-This page covers reading Databricks tables. A Unity Catalog managed table is a Delta table in your own cloud storage, so {py:meth}`bt.read.databricks(table) <batcher.api.io_namespace.reader.Reader.databricks>` skips the SQL warehouse entirely: Unity vends short-lived, table-scoped storage credentials, and Batcher reads the Delta files directly, in parallel, with file skipping. No cluster spins up and nothing waits in a warehouse queue. For SQL that must run on Databricks, a warehouse path streams the result back as Arrow.
+This page covers reading Databricks tables and bulk-loading results back into one. A Unity Catalog managed table is a Delta table in your own cloud storage, so {py:meth}`bt.read.databricks(table) <batcher.api.io_namespace.reader.Reader.databricks>` skips the SQL warehouse entirely: Unity vends short-lived, table-scoped storage credentials, and Batcher reads the Delta files directly, in parallel, with file skipping. No cluster spins up and nothing waits in a warehouse queue. For SQL that must run on Databricks, a warehouse path streams the result back as Arrow.
 
 The following table summarizes the connector:
 
 | | |
 | --- | --- |
-| Read | `bt.read.databricks(table, workspace=..., token=...)` direct, or {py:meth}`bt.read.table("databricks", query=...) <batcher.api.io_namespace.reader.Reader.table>` through a SQL warehouse |
-| Write | No sink. Write Delta to an external location, or land files for `COPY INTO`. |
+| Read | `bt.read.databricks(table, workspace=..., token=...)` direct, or `bt.read.databricks(query=..., server_hostname=..., ...)` through a SQL warehouse |
+| Write | {py:meth}`ds.write.databricks(table, volume_path=..., ...) <batcher.api.io_namespace.writer.Writer.databricks>`, staged through a Unity Catalog volume and loaded with `COPY INTO`. Append only. |
 | Extra | `pip install 'batcher-engine[databricks]'` |
 | Parallelism | Direct: Delta's splits, one per data file. Warehouse: a single split. |
 | Pushdown | Direct: predicates prune files, columns are pruned per file. Warehouse: predicates and projection fold into the SQL. |
@@ -51,14 +51,24 @@ Use the warehouse path for SQL the direct path can't express: a view, a join you
 
 ```python
 # docs: skip
-report = bt.read.table(
-    "databricks",
-    query="SELECT region, SUM(amount) AS total FROM main.sales.orders GROUP BY region",
+report = bt.read.databricks(
+    query="SELECT region, SUM(amount) AS total FROM orders GROUP BY region",
     server_hostname="acme.cloud.databricks.com",
     http_path="/sql/1.0/warehouses/abc123",
     access_token="env:DATABRICKS_TOKEN",
+    catalog="main",
+    schema="sales",
+    statement_timeout_s=600,
 )
 ```
+
+:::{warning}
+The session options, cancellation and query ids on this path, and the sink below, are not yet verified against a live Databricks workspace. See `tests/PENDING_VERIFICATION.md`.
+:::
+
+`catalog=` and `schema=` set the session's defaults, so an unqualified table name resolves the way it does in the SQL editor. `session_configuration=` passes further warehouse settings, and `statement_timeout_s=` sets the session's `STATEMENT_TIMEOUT`. The options travel with the split, so a worker's session matches the driver's.
+
+A warehouse keeps running, and billing, a statement whose client has gone away. When a read stops early, through an exception, an interrupt, or a consumer that closes the stream after the rows it needed, Batcher cancels the statement on the warehouse before closing the connection. A failed statement's error names the warehouse query id, which is what the query history is keyed on, and each statement's id is logged at INFO on the `batcher.io.sql` logger.
 
 `access_token` accepts a secret reference such as `env:NAME` or `file:PATH`, resolved on the worker when the connection opens. The schema comes from a zero-row `WHERE 1 = 0` probe, so building the dataset doesn't run your query. Pushed predicates and the projected columns fold into the SQL the split carries, so the warehouse filters and prunes before Cloud Fetch returns anything. The result streams back in Arrow chunks of 65,536 rows through `fetchmany_arrow`.
 
@@ -75,7 +85,23 @@ The following table compares the two paths:
 
 ## Write results back
 
-There's no Databricks sink, and credential vending requests `READ` access only. Get results back into the lakehouse in either of the following ways:
+{py:meth}`ds.write.databricks <batcher.api.io_namespace.writer.Writer.databricks>` bulk-loads through a SQL warehouse. Each shard is written as a Parquet file, uploaded into a Unity Catalog volume with `PUT`, loaded with `COPY INTO`, and removed:
+
+```python
+# docs: skip
+manifest = report.write.databricks(
+    "main.reporting.region_totals",
+    volume_path="/Volumes/main/staging/batcher",
+    server_hostname="acme.cloud.databricks.com",
+    http_path="/sql/1.0/warehouses/abc123",
+    access_token="env:DATABRICKS_TOKEN",
+)
+print(manifest.files[0].job["query_id"])
+```
+
+The destination table must already exist. Every staged file has a fresh name, because `COPY INTO` skips a file path it has loaded before. Each written file's `job` carries the `COPY INTO` statement's `query_id` and the row counts the warehouse reported. Only `mode="append"` is offered: an overwrite would truncate and load in two separate commits, and could leave the table empty on a failure.
+
+Credential vending requests `READ` access only, so the direct path cannot write. Other ways to get results back into the lakehouse are the following:
 
 1. Write Delta to an external location. If the target is an external table whose storage you can reach with your own credentials, {py:meth}`ds.write.delta("s3://.../orders") <batcher.api.io_namespace.writer.Writer.delta>` is a normal transactional Delta commit, and Unity sees the new data on its next read. Don't do this for a managed table, whose storage belongs to Unity.
 1. Write Parquet or Delta to a landing path and let a `COPY INTO` or Auto Loader job ingest it. The catalog stays the single writer, which is the arrangement Unity is designed for.

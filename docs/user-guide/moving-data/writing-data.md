@@ -104,6 +104,8 @@ and the generic `write(path, format=...)` reaches them all, each returning a
 | `write.tfrecord(path)` | TFRecord, one `tf.train.Example` per row | `google-crc32c` |
 | `write.sql(table, uri=..., mode=...)` | A SQL table: append, or upsert/update/delete by key | a driver + reachable DB |
 | `write.snowflake(table, connection_kwargs=...)` | A Snowflake table | Snowflake account |
+| `write.bigquery(table, project=...)` | A BigQuery table, one Parquet load job per shard, nested fields kept | `[bigquery]` + a project |
+| `write.databricks(table, volume_path=..., ...)` | An existing Databricks table, staged in a volume and loaded with `COPY INTO` | `[databricks]` + a SQL warehouse |
 | `write.clickhouse(table, host=...)` | An existing ClickHouse table, via `insert_arrow` | `[clickhouse]` + a server |
 | `write.mongo(collection, uri=..., mode=...)` | A MongoDB collection | a running MongoDB |
 | `write.dynamodb(table, region_name=...)` | A DynamoDB table via `BatchWriteItem` | AWS DynamoDB |

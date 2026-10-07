@@ -35,6 +35,8 @@ A SQLAlchemy `+driver` suffix is accepted and ignored, so `postgresql+psycopg2:/
 
 `sqlite` and `duckdb` address a local file, so their path is a locator and not a database name. Write them with three slashes, `sqlite:///local.db`.
 
+A route reaching a database is not a statement about which of its types and write modes work. {doc}`vendor-matrix` states that for PostgreSQL, MySQL and MariaDB, SQL Server, Oracle, Trino and Redshift: the package each route needs, the write modes it carries, and how values such as a MySQL `BIGINT UNSIGNED` above 2^63 or a zero date convert or are refused. With no ConnectorX installed, a `mssql://`, `trino://` or `redshift://` URI reads through `pymssql`, `trino` or `redshift_connector` instead, and a `trino://user@host:443/catalog/schema` URI sets the session's catalog and schema.
+
 ```python
 # docs: skip
 import batcher as bt
