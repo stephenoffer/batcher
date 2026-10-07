@@ -794,6 +794,39 @@ def test_a_broadcast_too_large_to_hold_is_cut_to_the_keys_another_broadcast_admi
     assert not held_in_a_cut(choose_plan(ds._plan, ds._sources, strict=False))
 
 
+def test_a_by_file_cut_is_charged_for_every_unit_building_a_large_broadcast(tables, monkeypatch):
+    """TPC-H q14's shape: `lineitem` split by file, every unit hashing all of `part`.
+
+    Held whole, a broadcast past `_CHEAP_BUILD_BYTES` is built once per unit, so a by-file cut
+    holding one is weighed with that cost and, here, declined; below it the same plan runs
+    aligned and matches DuckDB.
+    """
+    from batcher.dist.executors.aligned import route
+
+    li, custflag = _read(tables, "lineitem"), _read(tables, "custflag")
+    ds = (
+        li.join(custflag, left_on="l_flag", right_on="x_flag")
+        .group_by("l_flag")
+        .agg(n=bt.count(), s=col("l_price").sum())
+    )
+    query = (
+        "SELECT l_flag, count(*) AS n, sum(l_price) AS s FROM lineitem "
+        "JOIN custflag ON l_flag = x_flag GROUP BY l_flag"
+    )
+    opt = kyber.optimize_logical(ds._plan, sources=ds._sources)
+    found = choose_plan(opt, ds._sources, strict=False)
+    assert found is not None and all(cut.key.keyless for cut in found.cuts)
+    assert_same_for_query(
+        aligned_run.run_plan(found, ds._sources, workers=2), _duck(tables, query), query
+    )
+    # A held input this small is not charged per unit however many units there are ...
+    monkeypatch.setattr(route, "_UNIT_BUILDS", 1 << 20)
+    assert choose_plan(opt, ds._sources, strict=False) is not None
+    # ... and counted as large, the units' builds outweigh what the cut spreads.
+    monkeypatch.setattr(route, "_CHEAP_BUILD_BYTES", 0)
+    assert choose_plan(opt, ds._sources, strict=False) is None
+
+
 @pytest.mark.parametrize("how", ["anti", "semi"])
 def test_a_membership_side_is_cut_to_the_keys_a_filtered_side_holds(tables, monkeypatch, how):
     """TPC-H q22's shape at SF1000: filtered customers with (or without) an order, `orders`

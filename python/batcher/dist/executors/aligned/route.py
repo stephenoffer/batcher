@@ -249,6 +249,23 @@ def _identity(source: Source) -> object:
 #: Copies of a broadcast input the fleet holds: one per node, on a typical cluster.
 _BROADCAST_COPIES = 8
 
+#: Hash builds of an unfiltered broadcast input: every unit's engine call prepares its own
+#: build sides, and a large cut runs several units per slot -- 77 on 8 x 16-core nodes at
+#: SF1000. Measured there on TPC-H q14, which holds all 200M rows of `part` for a by-file cut
+#: of `lineitem`: 27.8 s aligned (7 s of unpacking per task, 3.8 s of compute per unit)
+#: against 20.2 s for the shuffle join. A filtered input is charged as it is read (once),
+#: since what each unit builds is the filter's result.
+#:
+#: Charged only to a cut split by file: a keyed cut's large broadcasts are cut down before its
+#: units run, to the keys another broadcast admits (`reduce.reduce_broadcasts`) or to each
+#: unit's own key range (`reduce.sliceable_broadcasts`) -- TPC-H q5 holds `customer` (2.4 GB
+#: projected, 30M rows once its region is known) and runs aligned in 24 s against 37 s staged.
+_UNIT_BUILDS = 64
+#: Held bytes below which a unit's build of a broadcast is noise against its own work: TPC-H
+#: `supplier` (10M rows, ~0.2 GB projected) is held by most SF1000 cuts and costs each unit
+#: well under a second to hash.
+_CHEAP_BUILD_BYTES = 1 << 30
+
 
 def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | None:
     """The projected bytes `found` spreads across the fleet, or None when it should not run.
@@ -267,7 +284,7 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
     # does in one. Summed, TPC-H q21 at SF100 took the three-cut plan for 28 GB spread over
     # the one-cut plan's 22 GB, and ran 132 s against 4.8 s.
     spread_by: dict[object, int] = {}
-    held = driver = 0
+    held = driver = rebuilt = 0
     for cut in found.cuts:
         # A placeholder is an earlier cut's result, which has no size until it has run; an id
         # past the sources is one of an enclosing plan's (a residual being planned itself).
@@ -289,6 +306,8 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
                 driver += size
             else:
                 held += size
+                if cut.key.keyless and size > _CHEAP_BUILD_BYTES:
+                    rebuilt += size
                 if strict and size > BROADCAST_BYTES:
                     return None
     residual_sources = {s for s in scanned_source_ids(found.residual) if s < len(sources)}
@@ -302,11 +321,12 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
             return None
         driver += size
     # A broadcast input is held by every node and joined by every unit, so it costs about
-    # its size once per node; charge it that way. Split by file, TPC-H q18 would read
+    # its size once per node, and a large one once per unit too; charge it that way. Split by
+    # file, TPC-H q18 would read
     # `lineitem` in place (96 GB spread) but hold all of `orders` on every node, where
     # aligned on `orderkey` it spreads 120 GB and broadcasts only `customer`. A residual input
     # is read once, by the driver or by a residual that aligns itself, and is charged once.
-    weight = sum(spread_by.values()) - _BROADCAST_COPIES * held - driver
+    weight = sum(spread_by.values()) - _BROADCAST_COPIES * held - _UNIT_BUILDS * rebuilt - driver
     return weight if weight > 0 else None
 
 
