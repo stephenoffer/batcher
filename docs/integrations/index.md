@@ -120,6 +120,12 @@ Delta Lake, Apache Iceberg, and Apache Hudi tables.
 SQL databases, key-value stores, MongoDB, and Elasticsearch, with writes back into them.
 :::
 
+:::{grid-item-card} {octicon}`globe;1.1em` HTTP APIs and SaaS
+:link: /integrations/apis/index
+:link-type: doc
+Paginated JSON APIs, GraphQL, GitHub, Salesforce, Google Sheets, SharePoint, and Airbyte connectors.
+:::
+
 :::{grid-item-card} {octicon}`cpu;1.1em` ML and compute
 :link: /integrations/compute/index
 :link-type: doc
@@ -153,6 +159,7 @@ The following table maps each group to what it covers in full:
 | {doc}`/integrations/warehouses/index` | Snowflake, BigQuery, and Databricks |
 | {doc}`/integrations/lakehouse/index` | Delta Lake, Apache Iceberg, and Apache Hudi |
 | {doc}`/integrations/databases/index` | SQL databases over one connection URI, writing back to a database, DynamoDB, Cassandra, ScyllaDB, Redis, HBase, MongoDB, and Elasticsearch |
+| {doc}`/integrations/apis/index` | Paginated HTTP JSON APIs, GraphQL, GitHub, Salesforce, Google Sheets, SharePoint and OneDrive, and Airbyte source connectors |
 | {doc}`/integrations/compute/index` | Ray, batch schedulers, PyTorch, Hugging Face, and MLflow |
 | {doc}`/integrations/observability/index` | Prometheus and Grafana, OpenTelemetry traces, and OpenLineage |
 | {doc}`/integrations/dataframes/index` | Polars, pandas, DuckDB, PyArrow, and NumPy, in the same process and over the same Arrow |
@@ -177,6 +184,7 @@ streams/index
 warehouses/index
 lakehouse/index
 databases/index
+apis/index
 compute/index
 observability/index
 dataframes/index

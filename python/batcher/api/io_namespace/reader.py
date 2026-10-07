@@ -26,7 +26,11 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from datetime import datetime
 
+    import pyarrow as pa
+
     from batcher.api.dataset import Dataset
+    from batcher.io.formats.http.options import Pagination
+    from batcher.io.formats.http.state import Incremental
 
 __all__ = ["Reader", "read"]
 
@@ -1602,6 +1606,274 @@ class Reader:
                 >>> ds = bt.read.hbase(host="thrift", table="events")  # doctest: +SKIP
         """
         return _read_table("hbase", **opts)
+
+    # --- APIs and SaaS (HTTP) ---------------------------------------------
+    def http_json(
+        self,
+        url: str,
+        *,
+        pagination: Pagination | None = None,
+        records_path: str | tuple[str, ...] | None = None,
+        schema: pa.Schema | None = None,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        auth: Any = None,
+        incremental: Incremental | None = None,
+        **opts: Any,
+    ) -> Dataset:
+        """Read a paginated HTTP JSON API, one Arrow batch per page.
+
+        Pick the paging style with a typed option: `CursorPagination` (a cursor in the
+        body), `NextLinkPagination` (a ``Link: rel="next"`` header or a next-URL field),
+        `OffsetPagination`, or `PagePagination`. The schema is `schema` when given, else
+        inferred from the first page, and every later page is held to it: a page that
+        does not fit fails the read rather than changing or dropping a column.
+        ``bt.io.Incremental`` makes the read resumable from a durable watermark or page
+        cursor, with a lookback and dedup by key. Requests retry 429 and 5xx answers with
+        backoff, honoring ``Retry-After``.
+
+        Args:
+            url: The first page's URL.
+            pagination: The paging style, or None to read the single page at `url`.
+            records_path: Where each page holds its records (``"data.items"``); None when
+                the body is itself the list.
+            schema: The declared Arrow schema; inferred from the first page when None.
+            headers: Headers for every request. A value may be a secret reference
+                (``"env:API_KEY"``), resolved per request and never logged.
+            params: Query parameters for the first request.
+            auth: A ``bt.io.BearerToken`` or ``bt.io.OAuth2ClientCredentials``.
+            incremental: A ``bt.io.Incremental`` resume policy.
+            opts: ``retry=`` (a ``bt.io.RetryPolicy``), ``timeout=``,
+                ``max_concurrency=`` (requests in flight from this process to the host;
+                there is no cluster-wide quota), ``max_pages=``, ``method=`` and ``body=``
+                for a POST search API.
+
+        Returns:
+            A lazy `Dataset` over the API's records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.http_json(  # doctest: +SKIP
+                ...     "https://api.example.com/v1/orders",
+                ...     pagination=bt.io.CursorPagination(cursor_path="next_cursor"),
+                ...     records_path="data",
+                ...     auth=bt.io.BearerToken("env:API_TOKEN"),
+                ... )
+        """
+        return _read_table(
+            "http_json",
+            url,
+            pagination=pagination,
+            records_path=records_path,
+            schema=schema,
+            headers=headers,
+            params=params,
+            auth=auth,
+            incremental=incremental,
+            **opts,
+        )
+
+    def graphql(
+        self,
+        url: str,
+        query: str,
+        *,
+        records_path: str | tuple[str, ...],
+        variables: dict[str, Any] | None = None,
+        page_info_path: str | tuple[str, ...] | None = None,
+        **opts: Any,
+    ) -> Dataset:
+        """Read a GraphQL query's results, paging a Relay-style cursor variable.
+
+        Any entry in the response's ``errors`` fails the read, even when partial ``data``
+        came with it, so a failed field can never pass as a complete table. Not yet
+        verified against a live GraphQL service; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            url: The GraphQL endpoint.
+            query: The query document, declaring the cursor variable when it pages.
+            records_path: Where the records sit, relative to ``data``.
+            variables: Variables sent with every page.
+            page_info_path: The ``pageInfo`` object (``endCursor``/``hasNextPage``),
+                relative to ``data``; None reads one page.
+            opts: ``cursor_variable=`` (default ``"after"``), ``schema=``, ``headers=``,
+                ``auth=``, ``retry=``, ``timeout=``, ``max_pages=``, ``incremental=``.
+
+        Returns:
+            A lazy `Dataset` over the query's records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.graphql(  # doctest: +SKIP
+                ...     "https://api.github.com/graphql",
+                ...     "query($after: String) { viewer { repositories(first: 50, after: $after)"
+                ...     " { nodes { name } pageInfo { endCursor hasNextPage } } } }",
+                ...     records_path="viewer.repositories.nodes",
+                ...     page_info_path="viewer.repositories.pageInfo",
+                ...     auth=bt.io.BearerToken("env:GITHUB_TOKEN"),
+                ... )
+        """
+        return _read_table(
+            "graphql",
+            url,
+            query,
+            records_path=records_path,
+            variables=variables,
+            page_info_path=page_info_path,
+            **opts,
+        )
+
+    def github(self, repo: str, resource: str = "issues", **opts: Any) -> Dataset:
+        """Read a GitHub repository's issues, pull requests or releases through the REST API.
+
+        Pages follow the ``Link`` header, a spent rate limit waits for
+        ``x-ratelimit-reset``, and the token is a secret reference that never reaches a
+        log. ``since=`` (issues only) or ``incremental=`` makes the read incremental. Not
+        yet verified against a live GitHub API; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            repo: ``"owner/name"``.
+            resource: ``"issues"``, ``"pulls"`` or ``"releases"``.
+            opts: ``token=`` (a secret reference such as ``"env:GITHUB_TOKEN"``),
+                ``state=``, ``since=``, ``incremental=``, ``base_url=`` for GitHub
+                Enterprise, ``max_pages=``.
+
+        Returns:
+            A lazy `Dataset` with one row per issue, pull request or release.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.github(  # doctest: +SKIP
+                ...     "apache/arrow", "issues", token="env:GITHUB_TOKEN"
+                ... )
+        """
+        return _read_table("github", repo, resource, **opts)
+
+    def salesforce(
+        self, sobject: str, *, instance_url: str, schema: pa.Schema, **opts: Any
+    ) -> Dataset:
+        """Read a Salesforce object with a Bulk API 2.0 query job.
+
+        The declared `schema` is the field list and the column types, so the read never
+        guesses a type from CSV text. ``include_deleted=True`` runs ``queryAll`` and adds
+        ``IsDeleted``, and ``incremental=`` resumes by ``SystemModstamp``. Not yet
+        verified against a live Salesforce org; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            sobject: The sObject name, such as ``"Account"``.
+            instance_url: The org's instance URL (``https://<domain>.my.salesforce.com``).
+            schema: The fields to read and their Arrow types.
+            opts: ``auth=`` (a ``bt.io.BearerToken`` or
+                ``bt.io.OAuth2ClientCredentials``), ``where=``, ``include_deleted=``,
+                ``incremental=``, ``api_version=``, ``max_records=``.
+
+        Returns:
+            A lazy `Dataset` over the object's records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, pyarrow as pa
+                >>> ds = bt.read.salesforce(  # doctest: +SKIP
+                ...     "Account",
+                ...     instance_url="https://acme.my.salesforce.com",
+                ...     schema=pa.schema([("Id", pa.string()), ("Name", pa.string())]),
+                ...     auth=bt.io.BearerToken("env:SF_TOKEN"),
+                ... )
+        """
+        return _read_table("salesforce", sobject, instance_url=instance_url, schema=schema, **opts)
+
+    def google_sheets(self, spreadsheet_id: str, range: str, **opts: Any) -> Dataset:
+        """Read a range of a Google Sheet as a table.
+
+        The first row is the header unless ``header=False`` (columns ``c0``, ``c1``, ...)
+        or ``header=[names]``. Values are read unformatted by default, so numbers arrive as
+        numbers; an empty cell is null. Not yet verified against a live Google Sheets API;
+        see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            spreadsheet_id: The spreadsheet's id, from its URL.
+            range: An A1 range such as ``"Sheet1!A1:D"``.
+            opts: ``header=``, ``value_render=`` (``"UNFORMATTED_VALUE"``,
+                ``"FORMATTED_VALUE"`` or ``"FORMULA"``), ``schema=``, and ``auth=``
+                (a ``bt.io.BearerToken``; Application Default Credentials when omitted).
+
+        Returns:
+            A lazy `Dataset` over the range.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.google_sheets("1AbC...", "Sheet1!A1:D")  # doctest: +SKIP
+        """
+        return _read_table("google_sheets", spreadsheet_id, range, **opts)
+
+    def sharepoint(self, **opts: Any) -> Dataset:
+        """List a SharePoint or OneDrive document library through Microsoft Graph delta.
+
+        One row per drive item with its metadata, a ``deleted`` flag, and the file bytes
+        with ``include_content=True``. With ``state=`` the delta link is kept, so the next
+        read returns only what was added, changed, renamed or deleted since. Not yet
+        verified against a live Microsoft Graph tenant; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            opts: ``drive_id=`` or ``site_id=``, ``auth=`` (a
+                ``bt.io.OAuth2ClientCredentials`` for the tenant), ``state=``,
+                ``folder=``, ``include_content=``.
+
+        Returns:
+            A lazy `Dataset` of drive items.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.sharepoint(  # doctest: +SKIP
+                ...     site_id="contoso.sharepoint.com,1111,2222",
+                ...     auth=bt.io.OAuth2ClientCredentials(
+                ...         token_url="https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token",
+                ...         client_id="<app-id>",
+                ...         client_secret="env:GRAPH_SECRET",
+                ...         scope="https://graph.microsoft.com/.default",
+                ...     ),
+                ...     state="s3://bucket/state/docs.json",
+                ... )
+        """
+        return _read_table("sharepoint", **opts)
+
+    def airbyte(self, stream: str, **opts: Any) -> Dataset:
+        """Read one stream of an Airbyte source connector, keeping its STATE checkpoints.
+
+        The connector runs as a Docker image (``image=``) or a local executable
+        (``command=``) speaking the Airbyte protocol. Records keep their order, and a STATE
+        message is committed to ``state=`` only once every record before it was consumed,
+        so the next read resumes exactly where Airbyte says it may. Not yet verified
+        against a live Airbyte connector; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            stream: The stream to read.
+            opts: ``image=`` or ``command=``, ``config=`` (values may be secret
+                references), ``state=``, ``sync_mode=``, ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the stream's records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.airbyte(  # doctest: +SKIP
+                ...     "users", image="airbyte/source-faker:6", config={"count": 100}
+                ... )
+        """
+        return _read_table("airbyte", stream, **opts)
 
     # --- Streaming ---------------------------------------------------------
     def kafka(

@@ -2280,3 +2280,34 @@ class Writer:
                 >>> ds.write.hbase("events", host="thrift")  # doctest: +SKIP
         """
         return self(table, "hbase", mode=mode, **opts)
+
+    # --- APIs and SaaS (HTTP) ---------------------------------------------
+    def google_sheets(
+        self, spreadsheet_id: str, range: str, *, mode: str = "overwrite", **opts: Any
+    ) -> WriteManifest:
+        """Write the result into a range of a Google Sheet, in bounded batches.
+
+        ``mode="overwrite"`` clears exactly `range` and writes the header and rows into it;
+        nothing outside the range is touched. ``mode="append"`` adds the rows (no header)
+        after the table the range holds. Rows go out ``batch_rows`` per request. Not yet
+        verified against a live Google Sheets API; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            spreadsheet_id: The spreadsheet's id, from its URL.
+            range: The A1 range written into, such as ``"Report!A1"``.
+            mode: ``"overwrite"`` (default) or ``"append"``.
+            opts: ``header=``, ``batch_rows=`` (default 500), ``value_input=``
+                (``"RAW"`` or ``"USER_ENTERED"``), and ``auth=`` (a ``bt.io.BearerToken``;
+                Application Default Credentials when omitted).
+
+        Returns:
+            A `WriteManifest` naming the range and the rows written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"region": ["east"], "sales": [10]})
+                >>> ds.write.google_sheets("1AbC...", "Report!A1")  # doctest: +SKIP
+        """
+        return self(spreadsheet_id, "google_sheets", mode=mode, range=range, **opts)

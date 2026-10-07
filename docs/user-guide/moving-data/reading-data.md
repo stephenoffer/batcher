@@ -446,7 +446,9 @@ The same {py:obj}`bt.read <batcher.read>` namespace reaches everything else, on 
 Zarr, HDF5, WARC, PDF, LiDAR, and robot logs. {doc}`/integrations/databases/databases` covers a SQL
 database or warehouse, where the interesting part is not the call but the connection: which backend
 serves your scheme, where the credentials come from, and how to split one extract into parallel
-queries.
+queries. {doc}`/integrations/apis/index` covers web APIs: `read.http_json` for any paginated JSON
+API, with `read.graphql`, `read.github`, `read.salesforce`, `read.google_sheets`, `read.sharepoint`,
+and `read.airbyte` built on it.
 
 ## What you get back
 

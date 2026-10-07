@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1568 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1582 Python modules across 223 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -319,9 +319,9 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | module | lines | what it is |
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
-| `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1872 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2282 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `_write_opts.py` | 340 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
+| `reader.py` | 2144 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `writer.py` | 2313 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -1915,6 +1915,20 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `gff.py` | 129 | GFF3 and GTF format — genome annotations, nine tab-separated columns. |
 | `vcf.py` | 202 | VCF format — variant calls, the output every variant caller agrees to write. |
 
+### `batcher/io/formats/http/` — 2 · neutral IO
+
+`io.formats.http` — paginated HTTP JSON APIs as sources.
+
+| module | lines | what it is |
+|---|---|---|
+| `auth.py` | 242 | Auth providers for the HTTP sources: a static bearer token and OAuth2 client credentials. |
+| `graphql.py` | 171 | `graphql`: a GraphQL query, paged by a cursor variable, read as a lazy relation. |
+| `options.py` | 354 | Typed options for the HTTP JSON source: pagination styles and the retry policy. |
+| `records.py` | 157 | From a decoded API page to one Arrow batch, holding every page to one schema. |
+| `source.py` | 312 | `http_json`: a paginated HTTP JSON API read as a lazy relation. |
+| `state.py` | 433 | Resumable incremental API ingestion: a durable watermark, a lookback, and dedup by key. |
+| `transport.py` | 314 | The HTTP request loop every API source shares: auth, retries, backoff and a concurrency cap. |
+
 ### `batcher/io/formats/lakehouse/` — 2 · neutral IO
 
 `io.formats.lakehouse` — table-format connectors behind the format registry.
@@ -2024,6 +2038,18 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `_pushdown.py` | 141 | Translate a pushed predicate into the message-index filters a robot log supports. |
 | `mcap.py` | 372 | MCAP — the container robotics and ADAS logs are recorded in. |
 | `mdf.py` | 244 | ASAM MDF4 (``.mf4``) — the measurement format vehicle data is logged in. |
+
+### `batcher/io/formats/saas/` — 2 · neutral IO
+
+`io.formats.saas` — SaaS connectors built on the HTTP source foundation.
+
+| module | lines | what it is |
+|---|---|---|
+| `airbyte.py` | 417 | `airbyte`: one stream of an Airbyte source connector, read through the Airbyte protocol. |
+| `github.py` | 176 | `github`: a repository's issues, pull requests or releases through the GitHub REST API. |
+| `msgraph.py` | 256 | `sharepoint`: a SharePoint or OneDrive document library through Microsoft Graph delta. |
+| `salesforce.py` | 304 | `salesforce`: an sObject read with a Salesforce Bulk API 2.0 query job. |
+| `sheets.py` | 387 | `google_sheets`: read a range of a Google Sheet, and write a table into one. |
 
 ### `batcher/io/formats/semistructured/` — 2 · neutral IO
 

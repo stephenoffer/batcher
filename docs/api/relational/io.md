@@ -77,6 +77,20 @@ Each of these splits the keyspace so the store reads in parallel:
 
 A parallel scan is the right shape for reading a *table* and the wrong shape for reading one row. When a filter pins the partition key to a single value, DynamoDB and Cassandra skip the fan-out entirely and read the one partition that can hold a match. See {doc}`Key-value stores </integrations/databases/key-value-stores>`.
 
+### HTTP APIs and SaaS
+
+Each of these walks an API page by page, so it reads as one split. See {doc}`/integrations/apis/index`:
+
+| Reader | Reads |
+| --- | --- |
+| {py:meth}`bt.read.http_json(url, pagination=) <batcher.api.io_namespace.reader.Reader.http_json>` | any paginated JSON API, one Arrow batch per page |
+| {py:meth}`bt.read.graphql(url, query, records_path=) <batcher.api.io_namespace.reader.Reader.graphql>` | a GraphQL query, paging a Relay cursor; any `errors` entry fails the read |
+| {py:meth}`bt.read.github(repo, resource) <batcher.api.io_namespace.reader.Reader.github>` | GitHub issues, pull requests or releases |
+| {py:meth}`bt.read.salesforce(sobject, instance_url=, schema=) <batcher.api.io_namespace.reader.Reader.salesforce>` | a Salesforce object via a Bulk API 2.0 query job |
+| {py:meth}`bt.read.google_sheets(spreadsheet_id, range) <batcher.api.io_namespace.reader.Reader.google_sheets>` | a range of a Google Sheet |
+| {py:meth}`bt.read.sharepoint(drive_id=) <batcher.api.io_namespace.reader.Reader.sharepoint>` | a SharePoint or OneDrive library through Microsoft Graph delta |
+| {py:meth}`bt.read.airbyte(stream, image=) <batcher.api.io_namespace.reader.Reader.airbyte>` | one stream of an Airbyte source connector |
+
 ### Streaming
 
 These return an unbounded `Dataset`. See {doc}`streaming </user-guide/moving-data/streaming/index>` for triggers and checkpoints.
@@ -173,6 +187,7 @@ These load the result into an external system. `mode` says what the write does t
 | {py:meth}`ds.write.redis(key_prefix, host=) <batcher.api.io_namespace.writer.Writer.redis>` | a Redis keyspace, one pipeline per batch | `upsert` / `delete` |
 | {py:meth}`ds.write.elasticsearch(index, hosts=) <batcher.api.io_namespace.writer.Writer.elasticsearch>` | an Elasticsearch index, via `_bulk` | `upsert` / `append` / `overwrite` / `delete` |
 | {py:meth}`ds.write.hbase(table, host=) <batcher.api.io_namespace.writer.Writer.hbase>` | an HBase table, one happybase batch per Arrow batch | `upsert` / `delete` |
+| {py:meth}`ds.write.google_sheets(spreadsheet_id, range) <batcher.api.io_namespace.writer.Writer.google_sheets>` | a Google Sheet range, in bounded batches | `overwrite` (clears exactly the range) / `append` |
 
 A mode a store cannot express is refused by name rather than approximated. DynamoDB has no `append`, because `PutItem` replaces the item holding the same key and no batch operation inserts only when the key is absent; Cassandra and HBase have none for the same reason, since a CQL `INSERT` and an HBase `Put` are both upserts. None of the four has `overwrite`, because emptying those stores is a scan-and-delete, a `TRUNCATE`, a `FLUSHDB`, or a disable-and-truncate through an admin API rather than a write.
 
@@ -221,6 +236,27 @@ degenerate case for a source that can't be divided.
    RowGroupSplit
    FileSplit
    WholeSourceSplit
+```
+
+### HTTP source options
+
+The typed options `bt.read.http_json` and the SaaS readers take: a pagination style, an auth provider holding a secret reference, a retry policy, and a resumable incremental state.
+
+```{eval-rst}
+.. currentmodule:: batcher.io
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   CursorPagination
+   NextLinkPagination
+   OffsetPagination
+   PagePagination
+   BearerToken
+   OAuth2ClientCredentials
+   RetryPolicy
+   Incremental
 ```
 
 ### Built-in sources and sinks
