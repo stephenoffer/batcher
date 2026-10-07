@@ -123,7 +123,11 @@ from batcher.config.option_types import (
 from batcher.io.source import Source
 from batcher.plan.expr_ir import AggExpr, Aliased, CaseBuilder, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector, has_selector, resolve_names
-from batcher.plan.expr_ir.walk import referenced_columns
+from batcher.plan.expr_ir.walk import (
+    broadcast_aggregate_leaves,
+    contains_aggregate,
+    referenced_columns,
+)
 from batcher.plan.expr_rewrite import is_bare_window
 from batcher.plan.expr_rewrite.naming import output_name
 from batcher.plan.logical import (
@@ -1427,7 +1431,12 @@ class Dataset:
         except ColumnNotFoundError as err:
             defined = {p.alias for p in items} - set(self._plan.available_columns())
             for item in items:
-                siblings = sorted(referenced_columns(item.expr) & (defined - {item.alias}))
+                # An aggregate is not a scalar, so read its columns through the broadcast
+                # form `windowed_project` gives it; the raw node would raise here instead.
+                expr = item.expr
+                if contains_aggregate(expr):
+                    expr = broadcast_aggregate_leaves(expr)
+                siblings = sorted(referenced_columns(expr) & (defined - {item.alias}))
                 if siblings:
                     raise ColumnNotFoundError(
                         f"{method}(): {item.alias!r} references {siblings}, which this same "
