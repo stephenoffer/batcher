@@ -425,9 +425,6 @@ STR_UNSUPPORTED: dict[str, str] = {
     "isnumeric": "Spelled .str.is_numeric() here.",
     "istitle": "There is no is_title; compare against .str.to_titlecase().",
     "isupper": "Spelled .str.is_upper() here.",
-    "normalize": (
-        "Unicode normalization is not exposed; .str.normalize_whitespace() collapses whitespace."
-    ),
     "pad": "Left/right pad with .str.lpad(width) / .str.rpad(width).",
     "partition": (
         "Split on the first delimiter with .str.split_part(sep, 1) (and part 2 for the tail)."
@@ -440,7 +437,6 @@ STR_UNSUPPORTED: dict[str, str] = {
     "swapcase": "There is no swapcase; combine .str.upper() and .str.lower() as needed.",
     "wrap": "Line wrapping is a display concern; use ds.map_batches() if you need it.",
     "get_dummies": "One-hot from a delimited column: split it, then ds.get_dummies(...).",
-    "casefold": "Spelled .str.lower() here.",
 }
 
 # Polars/Daft list (``.arr``/``.list``) methods a migrant types that Batcher spells

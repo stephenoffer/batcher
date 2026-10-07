@@ -17,8 +17,6 @@ silently-wrong alias is worse than a missing one:
   with no cased characters (``"123"``), where Python's are false.
 * ``str.count`` — pandas' ``count`` is regex; `count_matches` is literal. The
   regex spelling already exists as ``str.regexp_count``.
-* ``str.casefold`` — Python's casefold is not `to_lowercase` for non-ASCII
-  (``"ß"`` folds to ``"ss"``).
 """
 
 from __future__ import annotations

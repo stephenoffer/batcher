@@ -14,6 +14,7 @@ mod chunk;
 mod compress;
 mod dialect;
 mod dynamic;
+mod groups;
 mod html;
 mod jaro;
 mod json;
@@ -22,6 +23,7 @@ mod minhash;
 mod numfmt;
 mod quality;
 mod regex_cache;
+mod unicode;
 mod uri_path;
 
 pub(crate) use dynamic::eval_str_dynamic;
@@ -94,7 +96,7 @@ pub(crate) fn eval_str(
     // dropped every non-UTF-8 row. DuckDB's `hex(BLOB)`/`md5(BLOB)`/… operate on the
     // bytes regardless of textual validity; do the same here.
     if matches!(arr.data_type(), DataType::Binary | DataType::LargeBinary) {
-        if let Some(out) = eval_bytes(func, arr, pattern, start)? {
+        if let Some(out) = eval_bytes(func, arr, pattern, start, length)? {
             return Ok(out);
         }
     }
@@ -696,7 +698,17 @@ pub(crate) fn eval_str(
             }
             Arc::new(builder.finish())
         }
-        StrFunc::Chunk => chunk::eval_chunk(s, start, length, pattern)?,
+        StrFunc::Chunk => chunk::eval_chunk(s, start, length, pattern, false)?,
+        StrFunc::ChunkOffsets => chunk::eval_chunk(s, start, length, pattern, true)?,
+        StrFunc::Normalize => unicode::normalize(s, pattern)?,
+        StrFunc::Casefold => unicode::casefold(s),
+        StrFunc::LengthGrapheme => unicode::grapheme_len(s),
+        StrFunc::SubstringGrapheme => unicode::grapheme_substr(s, start.unwrap_or(1), length),
+        StrFunc::RegexpExtractGroups | StrFunc::RegexpExtractGroupsOrNull => {
+            let re = compile_regex(pattern, func)?;
+            let null_missing = matches!(func, StrFunc::RegexpExtractGroupsOrNull);
+            groups::extract_groups(s, &re, func, null_missing)?
+        }
         StrFunc::SquadNormalize => case::eval_squad_normalize(s),
         // Per-document quality measures. `length` carries `n` for the two n-gram ratios and
         // is unused by the rest, so they ride the existing `Expr::Str` wire shape — no new
@@ -867,9 +879,18 @@ pub(crate) fn eval_str(
         StrFunc::UrlEncodeForm => Arc::new(map_str(s, dialect::url_encode_form)),
         StrFunc::UrlDecodeForm => Arc::new(map_str(s, dialect::url_decode_form)),
         StrFunc::RegexpEscape => Arc::new(map_str(s, uri_path::regexp_escape)),
-        StrFunc::ParseFilename => Arc::new(map_str_borrow(s, uri_path::parse_filename)),
-        StrFunc::ParseDirname => Arc::new(map_str_borrow(s, uri_path::parse_dirname)),
-        StrFunc::ParseDirpath => Arc::new(map_str_borrow(s, uri_path::parse_dirpath)),
+        StrFunc::ParseFilename => {
+            let sep = uri_path::Separator::parse(pattern, func)?;
+            Arc::new(map_str_borrow(s, |v| uri_path::parse_filename(v, sep)))
+        }
+        StrFunc::ParseDirname => {
+            let sep = uri_path::Separator::parse(pattern, func)?;
+            Arc::new(map_str_borrow(s, |v| uri_path::parse_dirname(v, sep)))
+        }
+        StrFunc::ParseDirpath => {
+            let sep = uri_path::Separator::parse(pattern, func)?;
+            Arc::new(map_str_borrow(s, |v| uri_path::parse_dirpath(v, sep)))
+        }
         StrFunc::ParsePath => {
             use arrow::array::{Array, ListBuilder, StringBuilder};
             // Components are borrowed slices of the input, so the value buffer needs at
@@ -878,10 +899,11 @@ pub(crate) fn eval_str(
                 StringBuilder::with_capacity(s.len(), s.value_data().len()),
                 s.len(),
             );
+            let sep = uri_path::Separator::parse(pattern, func)?;
             for o in s {
                 match o {
                     Some(v) => {
-                        for part in uri_path::parse_path(v) {
+                        for part in uri_path::parse_path(v, sep) {
                             builder.values().append_value(part);
                         }
                         builder.append(true);
@@ -978,7 +1000,7 @@ pub(crate) fn eval_str(
             let rows: Vec<Option<&[u8]>> = (0..s.len())
                 .map(|i| (!s.is_null(i)).then(|| s.value(i).as_bytes()))
                 .collect();
-            compress_rows(func, &rows, pattern)?
+            compress_rows(func, &rows, pattern, length)?
         }
         StrFunc::ToCase => {
             let style = pattern.ok_or_else(|| ExprError::MissingArgument {
@@ -1006,6 +1028,7 @@ fn compress_rows(
     func: StrFunc,
     rows: &[Option<&[u8]>],
     pattern: Option<&str>,
+    length: Option<i64>,
 ) -> Result<ArrayRef, ExprError> {
     use arrow::array::BinaryBuilder;
 
@@ -1016,6 +1039,9 @@ fn compress_rows(
     if !compress::CODECS.contains(&codec) {
         return Err(compress::unknown_codec(&format!("{func:?}"), codec));
     }
+    // `length` carries `decompress`'s output cap in bytes; a negative cap admits nothing
+    // but an empty payload, which is what "at most -1 bytes" can mean.
+    let limit = length.map(|n| usize::try_from(n).unwrap_or(0));
     let mut b = BinaryBuilder::with_capacity(rows.len(), rows.len() * 16);
     for row in rows {
         match row {
@@ -1025,7 +1051,7 @@ fn compress_rows(
                     b.append_value(compress::compress(v, codec).expect("codec validated above")?);
                 }
                 // A frame that will not decode is a null row, not a failed batch.
-                _ => match compress::decompress(v, codec).expect("codec validated above") {
+                _ => match compress::decompress(v, codec, limit).expect("codec validated above") {
                     Some(out) => b.append_value(out),
                     None => b.append_null(),
                 },
@@ -1297,6 +1323,7 @@ fn eval_bytes(
     arr: &ArrayRef,
     pattern: Option<&str>,
     start: Option<i64>,
+    length: Option<i64>,
 ) -> Result<Option<ArrayRef>, ExprError> {
     use arrow::array::{BinaryArray, LargeBinaryArray};
     // Iterate the rows as `Option<&[u8]>` for either binary offset width.
@@ -1317,7 +1344,7 @@ fn eval_bytes(
     };
     let out: ArrayRef = match func {
         StrFunc::Compress | StrFunc::Decompress => {
-            return compress_rows(func, &bytes, pattern).map(Some)
+            return compress_rows(func, &bytes, pattern, length).map(Some)
         }
         StrFunc::OctetLength => Arc::new(
             bytes

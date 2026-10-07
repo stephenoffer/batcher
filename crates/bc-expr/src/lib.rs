@@ -2414,7 +2414,9 @@ pub enum StrFunc {
     /// Inverse of `Compress` under the codec named by `pattern`. Input that is not a valid
     /// frame for that codec yields **null** rather than erroring, matching `from_base64`
     /// and `unhex` — one corrupt blob in a scan is a bad row, not a bad query, which is
-    /// why there is no separate `try_decompress`. → Binary (nullable).
+    /// why there is no separate `try_decompress`. `length`, when present, caps the
+    /// decompressed size in bytes: a payload that would exceed it is null, detected without
+    /// being materialized (the decompression-bomb bound). → Binary (nullable).
     Decompress,
     /// Re-case an identifier into the style named by `pattern`: `snake`, `upper_snake`,
     /// `camel`, `pascal`, `kebab`, `upper_kebab`, `title`, `sentence`, `dot`, or `train`.
@@ -2445,7 +2447,9 @@ pub enum StrFunc {
     /// be embedded in a pattern as a literal. Null → null. → Utf8.
     RegexpEscape,
     /// The final component of a path (DuckDB `parse_filename`): everything after the
-    /// last separator. → Utf8.
+    /// last separator. For all four `Parse*` functions `pattern` names the separators —
+    /// `both` (absent; `/` or `\`), `forward` or `backslash`, DuckDB's `both_slash`,
+    /// `forward_slash` and `backslash`. → Utf8.
     ParseFilename,
     /// The directory part of a path (DuckDB `parse_dirname`) — the *first* component,
     /// which is `/` for an absolute POSIX path. Not the same as `ParseDirpath`, which is
@@ -2472,6 +2476,37 @@ pub enum StrFunc {
     /// 8 `0`/`1` characters, or does not decode as UTF-8, yields **null**, matching
     /// `unhex`. → Utf8 (nullable).
     FromBinary,
+    /// Unicode normalization into the form named by `pattern` — `NFC` (absent means
+    /// `NFC`, DuckDB `nfc_normalize`), `NFD`, `NFKC` or `NFKD`. A Utf8 value always holds
+    /// valid UTF-8, so the only non-value is a null, which stays null; an unknown form is
+    /// an error. → Utf8. See `eval::str::unicode`.
+    Normalize,
+    /// Full Unicode case folding (CaseFolding.txt, statuses C and F), the caseless key
+    /// Python's `str.casefold` computes: `"Straße"` folds to `"strasse"` where `Lower`
+    /// keeps the `ß`. Locale-independent. → Utf8.
+    Casefold,
+    /// Number of extended grapheme clusters (DuckDB `length_grapheme`): a ZWJ family emoji
+    /// or a letter with a combining accent counts once. → Int64.
+    LengthGrapheme,
+    /// `substring_grapheme(s, start, length)` (DuckDB): [`StrFunc::Substr`] counted in
+    /// extended grapheme clusters. Differs from `Substr` in one place, as DuckDB does: a
+    /// negative `start` reaching before the first grapheme clamps to the first one rather
+    /// than shortening the window. → Utf8.
+    SubstringGrapheme,
+    /// Every capture group of the first match of regex `pattern`, as a struct with one
+    /// Utf8 field per group, in group order: a named group keeps its name and an unnamed
+    /// one is called by its 1-based index (Polars `extract_groups`). One regex evaluation
+    /// per row. No match, or a group that sat out the match, gives `''` (DuckDB
+    /// `regexp_extract(s, p, [names])`); a null input is a null struct. → Struct<Utf8...>.
+    RegexpExtractGroups,
+    /// [`StrFunc::RegexpExtractGroups`] answering a **null field** where it answers `''`,
+    /// which is Polars `extract_groups`. → Struct<Utf8...>.
+    RegexpExtractGroupsOrNull,
+    /// [`StrFunc::Chunk`] keeping where each chunk starts: a `List<Struct<text: Utf8,
+    /// start: Int64>>` whose `start` is the chunk's 0-based **character** offset into the
+    /// source, so `source[start..start + len(text)]` (in characters) is the chunk. Same
+    /// `start`/`length`/`pattern` slots and the same chunks as `Chunk`.
+    ChunkOffsets,
 }
 
 /// Temporal *constructors* carried by [`Expr::MakeTemporal`] — the inverse direction of

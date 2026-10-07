@@ -45,6 +45,18 @@ flate2 = "1"
 zstd = "0.14"
 brotli = "9"
 lz4_flex = "0.14"
+# Unicode normalization (NFC/NFD/NFKC/NFKD) for `.str.normalize`, and full case folding
+# for `.str.casefold`. Two small pure-Rust crates from the `unicode-rs` project (MIT OR
+# Apache-2.0, and MIT), with no dependencies beyond `tinyvec`. Normalizing is a per-row
+# kernel over the UCD tables, so the alternative was a Python UDF per row; `caseless`
+# implements the CaseFolding.txt C+F mapping Python's `str.casefold` uses, which
+# `to_lowercase` is not (`"Straße".to_lowercase()` keeps the ß).
+unicode-normalization = "0.1"
+caseless = "0.2"
+# Extended grapheme clusters for `length_grapheme`/`substring_grapheme` (`unit="grapheme"`).
+# Already in the lock file through `comfy-table`, so the direct edge adds no new
+# third-party code.
+unicode-segmentation = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # IANA timezone database for `convert_timezone` (DST-aware tz conversion).
 chrono-tz = { version = "0.10", default-features = false }

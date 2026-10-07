@@ -8,10 +8,11 @@ them used to be refused with *"requires a constant string pattern"*.
 
 `StrFuncDyn` is the same function with its parameters as sub-expressions; the engine
 groups rows by their distinct parameter tuple and calls the *same* kernel per group, so
-there is one definition of each function's semantics. This module is the translator's side
-of that: :func:`str_call` builds the constant node when every parameter is a literal and
-the per-row node when any is not, so a call site states the function once and does not
-have to know which form it will get.
+there is one definition of each function's semantics. Which of the two nodes to build is
+decided in one neutral place, `batcher.plan.expr_ir.namespaces.dynamic.str_call`, which the
+`.str` namespace builds through too. This module is only the translator's side of that:
+:func:`str_call` reads a sqlglot literal as a constant and lowers anything else, then
+hands the parameters over.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from typing import Any
 from sqlglot import expressions as exp
 
 from batcher.plan.expr_ir import Expr, StrFunc, StrFuncDyn, lit, when
+from batcher.plan.expr_ir.namespaces import dynamic
 
 __all__ = ["const_bool", "const_float", "const_int", "const_str", "str_call"]
 
@@ -84,37 +86,23 @@ def str_call(tr, fn: str, value, **params: Any) -> Expr:
         fn: The engine's string-function tag (`STR_FNS`).
         value: The string argument — a sqlglot node or an already-built `Expr`.
         **params: Any of ``pattern``/``replacement``/``start``/``length``, each a sqlglot
-            node, an already-constant Python value, or None (absent).
+            node, an already-constant Python value, an already-lowered `Expr`, or None.
 
     Returns:
         A `StrFunc` when every supplied parameter is a plan-time constant, else a
         `StrFuncDyn` carrying each parameter as an expression.
     """
     subject = value if isinstance(value, Expr) else tr._scalar(value)
-    consts: dict[str, Any] = {}
-    dynamic: dict[str, Expr] = {}
+    lowered: dict[str, dynamic.StrParam] = {}
     for slot, node in params.items():
-        if node is None:
-            continue
-        if isinstance(node, Expr):
-            # An already-lowered parameter (a caller that had to build it itself, such as
-            # a regex pattern carrying an inline flag prefix).
-            dynamic[slot] = node
-            continue
-        if isinstance(node, (str, int)) and not isinstance(node, bool):
-            consts[slot] = node
+        # Absent, already a constant, or already lowered (a caller that had to build the
+        # parameter itself, such as a regex pattern carrying an inline flag prefix).
+        if node is None or (isinstance(node, (str, int, Expr)) and not isinstance(node, bool)):
+            lowered[slot] = node
             continue
         constant = const_str(node) if slot in _TEXT_SLOTS else const_int(node)
-        if constant is not None:
-            consts[slot] = constant
-        else:
-            dynamic[slot] = tr._scalar(node)
-    if not dynamic:
-        return StrFunc(fn, subject, **consts)
-    # A mixed call lifts its constants to literals so every slot is an expression.
-    args: dict[str, Expr] = {k: lit(v) for k, v in consts.items()}
-    args.update(dynamic)
-    return StrFuncDyn(fn, subject, **args)
+        lowered[slot] = constant if constant is not None else tr._scalar(node)
+    return dynamic.str_call(fn, subject, **lowered)
 
 
 def dynamic_left(tr, value, count) -> Expr:

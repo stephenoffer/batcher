@@ -155,6 +155,10 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "damerau_levenshtein_osa", "from_base64_binary", "initcap_space", "mask_by_class",
         "regexp_extract_all_or_empty", "regexp_extract_or_null", "regexp_replace_all_dollar",
         "regexp_replace_dollar", "unhex_binary", "url_decode_form", "url_encode_form",
+        # Unicode-aware kernels (`eval::str::unicode`), the struct-valued group extract
+        # (`eval::str::groups`) and the offset-keeping chunker.
+        "casefold", "chunk_offsets", "length_grapheme", "normalize", "regexp_extract_groups",
+        "regexp_extract_groups_or_null", "substring_grapheme",
     }
 )  # fmt: skip
 
