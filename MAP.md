@@ -178,7 +178,7 @@ The public, fluent, lazy, expression-first API surface.
 | `multi_group.py` | 473 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
 | `stats.py` | 543 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
-| `subplan_reuse.py` | 669 | Compute a repeated subplan once and read it back (control plane, `api`). |
+| `subplan_reuse.py` | 703 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
 ### `batcher/api/adaptive/` — 5 · conductor
 
