@@ -126,3 +126,48 @@ def window_topk(ctx: Context):
         "daft",
         _DAFT_ORDERED_WINDOW_OOM,
     )
+
+
+@window.case("op-window-ntile-percent-rank")
+def window_ntile_percent_rank(ctx: Context):
+    """Price quartile (`NTILE(4)`) and `PERCENT_RANK` within each supplier, then summed.
+
+    `NTILE` needs the partition's size before it can place a row, and `PERCENT_RANK` its rank
+    against that size, so both are the two-pass window shapes the running ones never exercise.
+    The order `(l_extendedprice, l_orderkey, l_linenumber)` is unique, so every row's tile is
+    defined; `PERCENT_RANK` gives price ties one value by definition either way.
+    """
+    return cannot_run(
+        sql_fanout(
+            ctx,
+            "SELECT SUM(q) AS q, SUM(pr) AS pr, COUNT(*) AS n FROM (SELECT "
+            "NTILE(4) OVER (PARTITION BY l_suppkey ORDER BY l_extendedprice, l_orderkey, "
+            "l_linenumber) AS q, PERCENT_RANK() OVER (PARTITION BY l_suppkey ORDER BY "
+            "l_extendedprice) AS pr FROM lineitem) t",
+        ),
+        "daft",
+        _DAFT_ORDERED_WINDOW_OOM,
+    )
+
+
+@window.case("op-window-first-last-lead")
+def window_first_last_lead(ctx: Context):
+    """First and last price of each order and the next line's price (`FIRST/LAST_VALUE`, `LEAD`).
+
+    `LAST_VALUE` is taken over the whole partition (`ROWS BETWEEN UNBOUNDED PRECEDING AND
+    UNBOUNDED FOLLOWING`); under the default frame it would be the current row, the classic
+    SQL surprise, and engines would still agree on a much less interesting answer.
+    """
+    return cannot_run(
+        sql_fanout(
+            ctx,
+            "SELECT SUM(f) AS f, SUM(l) AS l, SUM(nx) AS nx, COUNT(nx) AS n FROM (SELECT "
+            "FIRST_VALUE(l_extendedprice) OVER (PARTITION BY l_orderkey ORDER BY l_linenumber) "
+            "AS f, LAST_VALUE(l_extendedprice) OVER (PARTITION BY l_orderkey ORDER BY "
+            "l_linenumber ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS l, "
+            "LEAD(l_extendedprice) OVER (PARTITION BY l_orderkey ORDER BY l_linenumber) AS nx "
+            "FROM lineitem) t",
+        ),
+        "daft",
+        _DAFT_ORDERED_WINDOW_OOM,
+    )

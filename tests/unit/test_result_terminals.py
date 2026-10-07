@@ -222,12 +222,37 @@ def twenty_files(tmp_path):
 
 
 def _settled(values: list[int]) -> int:
+    """The rows `values` has recorded once it stops growing (or after five seconds)."""
     seen = -1
     deadline = time.monotonic() + 5
     while len(values) != seen and time.monotonic() < deadline:
         seen = len(values)
         time.sleep(0.3)
-    return len(values)
+    return sum(values)
+
+
+@contextlib.contextmanager
+def _one_file_windows():
+    """Cut the `map_batches` stream into ~one-file (1,000-row) windows.
+
+    A streamed `map_batches` reads its source a *window* at a time, sized to
+    `max(num_workers * morsel_rows, target_rows_per_task)` rows (4M by default; an unset
+    `num_workers` resolved to 15 on a 16-core worker), so the whole 20,000-row fixture is one
+    window and is read in full before the first batch is yielded, on every machine. Counting
+    `fn` *calls* hid that: on 16 cores the window was coalesced into two calls, so the old
+    `< 20` assertion passed while all 20 files were read, and on 64 cores it was split into 20
+    and failed. Pinning the window (with `num_workers=1` on the stage) is what lets "closing
+    stops the read" be observed at all, and counting rows keeps coalescing out of it.
+    """
+    from batcher.config import active_config, config_context
+
+    cfg = active_config()
+    small = cfg.replace(
+        execution=dataclasses.replace(cfg.execution, morsel_rows=1_000),
+        optimizer=dataclasses.replace(cfg.optimizer, target_rows_per_task=1_000),
+    )
+    with config_context(small):
+        yield
 
 
 @pytest.mark.parametrize(
@@ -236,17 +261,33 @@ def _settled(values: list[int]) -> int:
     ids=["plain", "rebatched", "prefetch"],
 )
 def test_closing_the_iterator_stops_the_source_read(twenty_files, options):
-    """Closing after one batch stops reading: far fewer than the 20 files are processed."""
-    calls: list[int] = []
+    """Closing after one batch stops reading: far fewer than the 20,000 rows are processed."""
 
-    def seen(batch):
-        calls.append(batch.num_rows)
-        return batch
+    def counting(rows: list[int]):
+        def seen(batch):
+            rows.append(batch.num_rows)
+            return batch
 
-    batches = bt.read(twenty_files).map_batches(seen).iter_batches(**options)
-    next(batches)
-    batches.close()
-    assert _settled(calls) < 20
+        return seen
+
+    with _one_file_windows():
+        # Positive control: under the same windows, draining the iterator maps every row,
+        # so a small count below is the close taking effect and not a counter that misses.
+        drained: list[int] = []
+        for _ in (
+            bt.read(twenty_files)
+            .map_batches(counting(drained), num_workers=1)
+            .iter_batches(**options)
+        ):
+            pass
+        assert sum(drained) == 20_000
+        rows: list[int] = []
+        batches = (
+            bt.read(twenty_files).map_batches(counting(rows), num_workers=1).iter_batches(**options)
+        )
+        next(batches)
+        batches.close()
+        assert _settled(rows) <= 5_000
     with contextlib.closing(bt.read(twenty_files).iter_batches(**options)) as again:
         first = next(again)
     assert first.num_rows > 0

@@ -255,6 +255,25 @@ KNOWN_DIVERGENCES: tuple[Divergence, ...] = _validate(
             ),
             citation="Chan, Golub & LeVeque (1983); measured on this tree, 2026-08-26",
         ),
+        Divergence(
+            case="op-window-first-last-lead",
+            engine="polars",
+            versus=None,
+            signature="column 'l'",
+            verdict="reference",
+            reason=(
+                "`LAST_VALUE(x) OVER (PARTITION BY ... ORDER BY ... ROWS BETWEEN UNBOUNDED "
+                "PRECEDING AND UNBOUNDED FOLLOWING)` is the partition's last row. Polars' SQL "
+                "front-end ignores the frame clause and returns the current row's value, so "
+                "its sum is the plain sum of `l_extendedprice` (229,577,310,901.2 at sf1) "
+                "where DuckDB and Batcher both return 229,571,638,914.6. Polars is the side "
+                "that is wrong; the other columns of the case agree."
+            ),
+            citation=(
+                "ISO/IEC 9075-2:2016 7.11 <window clause> (window frame extent); measured "
+                "on polars 1.40.0, sf1, 2026-10-07"
+            ),
+        ),
     )
 )
 

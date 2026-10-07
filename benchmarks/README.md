@@ -433,6 +433,21 @@ One family per module under `suites/operators/`, each over the real TPC-H tables
 | `ops-strings` | `LIKE` (substring and prefix), `length`, `upper`, `substring`, concatenation into a `DISTINCT`, `replace` |
 | `ops-window` | `rank`, running sum, `lag`, partitioned aggregate |
 
+Every family above runs Batcher through `bt.Session().sql(...)`. The `ops-frame-*` families
+under `suites/operators/frame/` time the DataFrame API itself instead, each case written in
+Batcher's `Dataset`/`Expr` spelling, Polars' lazy expressions, DuckDB SQL on its native storage,
+and PyArrow compute where it has the function:
+
+| Family | Covers |
+|---|---|
+| `ops-frame-temporal` | `dt.truncate`, `dt.strftime`, `dt.weekday`, `dt.days_between`, each feeding a group-by |
+| `ops-frame-text` | `str.split_part`, a regex `replace_all`, a regex `extract` capture group, `str.md5` |
+| `ops-frame-timeseries` | `cum_sum`, `diff`, `rolling_mean`, a forward fill and `ewm_mean`, per order by line number |
+| `ops-frame-joins` | `join_where` (inequality only) and `cross_join` |
+| `ops-frame-reshape` | `pivot`, `top_k`, `value_counts` |
+| `ops-frame-grouping` | `rollup`, `cube`, `max_by`, `corr` |
+| `ops-frame-lists` | `list.len`/`sum`/`max`, `list.contains`, `list.sort` + `get`, `list.unique` |
+
 Run one with `--family`, e.g. `python3 benchmarks/run.py --benchmark operators --family ops-strings`.
 
 `ops-strings`, `ops-setops`, `ops-expressions` and the six join shapes beyond `op-join-agg`

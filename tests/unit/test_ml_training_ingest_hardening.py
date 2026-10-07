@@ -143,6 +143,32 @@ def test_device_mover_without_pin_memory_stages_nothing():
     assert _FakeTensor.staged == []
 
 
+def test_cuda_means_the_callers_device_not_the_prefetch_threads(monkeypatch):
+    """`device="cuda"` binds to the device current on the thread that built the loader.
+
+    The current CUDA device is per thread, and the move runs on the prefetch thread, where it
+    is 0. A Ray Train rank on a four-GPU node (`prepare_model` set ``cuda:<rank>``) got every
+    batch on ``cuda:0`` and failed its first loss: "Expected all tensors to be on the same
+    device, but got target is on cuda:0, different from other tensors on cuda:1".
+    """
+    import threading
+
+    main = threading.main_thread()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "current_device", lambda: 2 if threading.current_thread() is main else 0
+    )
+    mover = DeviceMover("cuda", pin_memory=False)  # built where the caller set cuda:2
+    moved: dict = {}
+    worker = threading.Thread(target=lambda: moved.update(mover({"x": _FakeTensor("x")})))
+    worker.start()
+    worker.join()
+    assert moved["x"].tag == "x:on-cuda:2"
+    # An explicit index is the caller's own choice and is left alone.
+    explicit = DeviceMover("cuda:3", pin_memory=False)({"x": _FakeTensor("x")})
+    assert explicit["x"].tag == "x:on-cuda:3"
+
+
 # --------------------------------------------------------------------------------------
 # 2 + 8. Non-tensorizable columns vanished silently, with no way to keep them.
 # --------------------------------------------------------------------------------------

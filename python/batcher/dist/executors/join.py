@@ -688,8 +688,8 @@ def _stream_broadcast_join(
     # `IpcWriter`, not a bare `pa.ipc.new_stream`: this output lands in the shuffle scratch
     # dir, which is a shared cluster mount whenever the cluster can span nodes, so it needs
     # the owner-only open and the codec that path implies like every other artifact there.
-    writer = IpcWriter(out_path)
-    try:
+    # A `with` block, so a failure part-way aborts the file rather than publishing a short one.
+    with IpcWriter(out_path) as writer:
         for chunk in _byte_chunks(left_batches, chunk_bytes):
             left_rows = nat.execute_plan(left_ir, [chunk], engine_config)
             joined, metrics_json = execute_metered(join_ir, [left_rows, right_full], engine_config)
@@ -698,8 +698,6 @@ def _stream_broadcast_join(
             for b in joined:
                 if b.num_rows:
                     writer.write(b)
-    finally:
-        writer.close()
     if rows_sink is not None:
         rows_sink.append(writer.num_rows)
     return out_path if writer.num_rows else None
@@ -837,8 +835,7 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
         # pair's output at once, which is the larger half of a join and the half this branch
         # exists to bound — the inputs were already streamed one pair at a time. Peak here is
         # one pair's output, and the file that gets written is byte-identical either way.
-        writer = IpcWriter(path)
-        try:
+        with IpcWriter(path) as writer:
             for batch in iter_join_paths_spilling(
                 join_ir,
                 list(jd["left_keys"]),
@@ -850,8 +847,6 @@ def _join_reduce_task(join_ir, left_paths, right_paths, work_dir, reducer_id, en
                 engine_config,
             ):
                 writer.write(batch)
-        finally:
-            writer.close()
         # The out-of-core branch joins sub-bucket pairs internally; it reports no metrics.
         return (path, writer.num_rows, "") if writer.num_rows else (None, 0, "")
     else:

@@ -113,6 +113,7 @@ class DeviceMover:
 
     def __init__(self, device: Any, *, pin_memory: bool = False, depth: int = 2) -> None:
         """Bind to a target device; `depth` staging batches stay referenced in flight."""
+        device = _bind_current_cuda(device)
         self._device = device
         self._pin = pin_memory
         # Apple MPS has no 64-bit tensors; downcast so `device="auto"` works on Apple silicon.
@@ -132,8 +133,9 @@ class DeviceMover:
                 moved = self._move_all(out, staging)
             event = torch.cuda.Event()
             event.record(self._stream)
-            # Order the consumer's compute after the copy without blocking this thread.
-            torch.cuda.current_stream().wait_event(event)
+            # Order the consumer's compute after the copy without blocking this thread. On the
+            # bound device: this runs on the prefetch thread, whose own current device is 0.
+            torch.cuda.current_stream(self._device).wait_event(event)
         else:
             moved = self._move_all(out, staging)
         if staging:
@@ -172,7 +174,29 @@ def _copy_stream(device: Any) -> Any:
         return None
     if not str(device).startswith("cuda") or not torch.cuda.is_available():
         return None
-    return torch.cuda.Stream()
+    return torch.cuda.Stream(device=device)
+
+
+def _bind_current_cuda(device: Any) -> Any:
+    """An index-less CUDA device pinned to the *calling* thread's current device.
+
+    ``"cuda"`` means "the current device", and the current device is per thread. The mover
+    runs on the prefetch thread, where it is device 0, while the caller -- a Ray Train worker
+    whose `prepare_model` set its rank's device, or any code that called
+    `torch.cuda.set_device` -- meant its own. On a four-GPU node every rank but 0 then got
+    its batches on ``cuda:0`` beside a model on ``cuda:<rank>`` (`gpu_ray_train.py` on 4x
+    A10G: "Expected all tensors to be on the same device, but got target is on cuda:0,
+    different from other tensors on cuda:1"). Bound here, on the thread that asked.
+    """
+    if str(device) != "cuda":
+        return device
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is checked by the caller
+        return device
+    if not torch.cuda.is_available():
+        return device
+    return torch.device("cuda", torch.cuda.current_device())
 
 
 def _mps_safe_dtype(tensor: Any, name: str) -> Any:

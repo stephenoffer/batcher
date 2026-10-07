@@ -80,26 +80,47 @@ def _max_stall(call: Callable[[], object]) -> tuple[float, float]:
     return longest, took[0]
 
 
-def _cases() -> dict[str, Callable[[], object]]:
+def _cases() -> dict[str, Callable[[int], Callable[[], object]]]:
+    """Each call as a factory over `reps`, the number of times its input is repeated."""
     nat = _nat()
     gk, ag = _agg_json()
     rows = _batches(4_000_000, 1_000_000)
     partials = [nat.partial_aggregate(gk, ag, [b]) for b in rows]
+    # A repeated list repeats references, not data: `rows * r` costs nothing to build.
     return {
-        "partial_aggregate": lambda: nat.partial_aggregate(gk, ag, rows),
-        "combine_finalize": lambda: nat.combine_finalize(gk, ag, partials),
-        "combine": lambda: nat.combine(gk, ag, partials),
-        "estimate_distinct": lambda: nat.estimate_distinct("v", rows),
-        "tail_quantiles": lambda: nat.tail_quantiles(["v", "k"], rows, [0.5, 0.99]),
-        "tdigest_partial": lambda: nat.tdigest_partial("k", rows),
-        "heavy_hitters": lambda: nat.heavy_hitters(["k", "v"], rows, 0.01),
+        "partial_aggregate": lambda r: lambda: nat.partial_aggregate(gk, ag, rows * r),
+        "combine_finalize": lambda r: lambda: nat.combine_finalize(gk, ag, partials * r),
+        "combine": lambda r: lambda: nat.combine(gk, ag, partials * r),
+        "estimate_distinct": lambda r: lambda: nat.estimate_distinct("v", rows * r),
+        "tail_quantiles": lambda r: lambda: nat.tail_quantiles(["v", "k"], rows * r, [0.5, 0.99]),
+        "tdigest_partial": lambda r: lambda: nat.tdigest_partial("k", rows * r),
+        "heavy_hitters": lambda r: lambda: nat.heavy_hitters(["k", "v"], rows * r, 0.01),
         # The cheapest per row of these, so it gets more rows to outlast scheduler noise.
-        "reservoir_sample": lambda: nat.reservoir_sample(rows * 6, 1000),
+        "reservoir_sample": lambda r: lambda: nat.reservoir_sample(rows * 6 * r, 1000),
     }
 
 
+def _long_enough(make: Callable[[int], Callable[[], object]]) -> Callable[[], object]:
+    """The call with its input repeated until one run outlasts `_MIN_CALL_S` twice over.
+
+    A fixed input cannot be sized for every machine: the 4M-row fold that takes several
+    hundred milliseconds on a laptop took 33-81 ms on a 64-core gate node, failing the
+    control below rather than measuring anything. Growing the input keeps the control's
+    meaning -- the call must still run long enough to tell a stall from descheduling.
+    """
+    reps = 1
+    while True:
+        call = make(reps)
+        start = time.perf_counter()
+        call()
+        took = time.perf_counter() - start
+        if took >= 2 * _MIN_CALL_S or reps >= 64:
+            return call
+        reps = min(64, reps * max(2, int(2 * _MIN_CALL_S / max(took, 1e-3)) + 1))
+
+
 @pytest.fixture(scope="module")
-def cases() -> dict[str, Callable[[], object]]:
+def cases() -> dict[str, Callable[[int], Callable[[], object]]]:
     return _cases()
 
 
@@ -117,7 +138,7 @@ def cases() -> dict[str, Callable[[], object]]:
     ],
 )
 def test_the_call_does_not_freeze_other_python_threads(cases, name: str) -> None:
-    call = cases[name]
+    call = _long_enough(cases[name])
     longest, took = _max_stall(call)
     # The control: a call too quick to outlast the switch interval proves nothing either way.
     assert took >= _MIN_CALL_S, (
