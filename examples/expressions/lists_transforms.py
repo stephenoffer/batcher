@@ -78,6 +78,28 @@ def main() -> None:
     assert sorted(tidy["unique_tags"][0]) == ["a", "b", "c"]
     assert tidy["joined"][0] == "a|b|c"
 
+    # Inside a lambda, `element_index()` is the element's position, and any other column is
+    # the enclosing row's value: here each row keeps the readings above its own threshold
+    # and weights each kept reading by its position.
+    readings = bt.from_pydict({"r": [[3, 9, 4, 12], [1, 2]], "threshold": [4, 0]})
+    scoped = readings.with_columns(
+        above=col("r").list.filter(bt.element() > col("threshold")),
+        weighted=col("r").list.transform(bt.element() * (bt.element_index() + 1)),
+    ).to_pydict()
+    assert scoped["above"] == [[9, 12], [1, 2]]
+    assert scoped["weighted"] == [[3, 18, 12, 48], [1, 4]]
+
+    # `get` takes a per-row index as well as a constant one.
+    picked = readings.select(
+        last=col("r").list.get(-1), nth=col("r").list.get(col("threshold") - 4)
+    ).to_pydict()
+    assert picked == {"last": [12, 2], "nth": [3, None]}
+
+    # `zip` pairs two lists into structs; unequal lengths raise unless `pad=True`.
+    pairs = bt.from_pydict({"k": [["a", "b"]], "v": [[1, 2]]})
+    zipped = pairs.select(z=col("k").list.zip(col("v"))).to_pydict()
+    assert zipped["z"][0] == [{"left": "a", "right": 1}, {"left": "b", "right": 2}]
+
 
 if __name__ == "__main__":
     main()

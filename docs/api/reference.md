@@ -208,6 +208,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | {py:func}`bt.struct(**fields) <batcher.struct>` / {py:func}`bt.named_struct(name, value, ...) <batcher.named_struct>` | build a struct column |
 | {py:func}`bt.sequence(start, stop, step=1) <batcher.sequence>` | per-row integer list `[start..stop]` inclusive (DuckDB `generate_series`) |
 | {py:func}`bt.element() <batcher.element>` | the current element inside `list.transform` / `list.filter` (Polars) |
+| {py:func}`bt.element_index() <batcher.element_index>` | the current element's 0-based position inside `list.transform` / `list.filter` |
 | {py:func}`bt.sum_horizontal(*exprs) <batcher.sum_horizontal>` / {py:func}`bt.mean_horizontal(*exprs) <batcher.mean_horizontal>` | row-wise sum / mean across columns, ignoring nulls (Polars) |
 | {py:func}`bt.all_horizontal(*exprs) <batcher.all_horizontal>` / {py:func}`bt.any_horizontal(*exprs) <batcher.any_horizontal>` | row-wise boolean AND / OR across columns (Polars) |
 | {py:func}`bt.hash_rows(*exprs, seed=0) <batcher.hash_rows>` | deterministic 64-bit row digest (also `expr.hash(seed=0)`) |
