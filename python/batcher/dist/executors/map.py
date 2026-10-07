@@ -375,14 +375,41 @@ def _shutdown_pools(registry: dict[tuple, list]) -> None:
     # imported the module: importing `ray` first printed a traceback on installs without it.
     if not registry:
         return
-    import ray
-
     for actors in registry.values():
-        for actor in actors:
-            with contextlib.suppress(Exception):
-                ray.kill(actor)
+        _release_and_kill(actors)
     _unpin_pool_keys(registry)
     registry.clear()
+
+
+#: How long a pool shutdown waits for its actors' `release()` before killing them anyway. A
+#: model's `close()` frees a GPU allocation or an HTTP session; one that hangs must not wedge
+#: the driver, so the wait is bounded and the kill follows regardless.
+_RELEASE_TIMEOUT_S = 10.0
+
+
+def _release_and_kill(actors: list) -> None:
+    """Give each `_MapActor` the chance to `close()` its models, then kill it.
+
+    `ray.kill` ends the process without running anything in it, so a class UDF's `close()`
+    -- which the local paths always call -- never ran on a cluster, though the user guide
+    says Batcher calls it. Asking first (`_MapActor.release`) and killing second keeps the
+    kill as the guarantee and makes the teardown the normal case. Best-effort throughout:
+    a dead actor or a failing release must not fail the query whose rows are already made.
+    """
+    if not actors:
+        return
+    import ray
+
+    refs = []
+    for actor in actors:
+        with contextlib.suppress(Exception):
+            refs.append(actor.release.remote())
+    if refs:
+        with contextlib.suppress(Exception):
+            ray.wait(refs, num_returns=len(refs), timeout=_RELEASE_TIMEOUT_S)
+    for actor in actors:
+        with contextlib.suppress(Exception):
+            ray.kill(actor)
 
 
 def _pipeline_functions(plan0: LogicalPlan) -> tuple:
@@ -488,12 +515,8 @@ def _kill_pool_keys(keys: list[tuple], registry: dict) -> None:
     key list, never the teardown. The copy that had drifted omitted `_unpin_pool_keys`, so it
     left a `_POOL_KEEPALIVE` entry pinning the callables of every pool it removed.
     """
-    import ray
-
     for key in keys:
-        for actor in registry.pop(key, []):
-            with contextlib.suppress(Exception):
-                ray.kill(actor)
+        _release_and_kill(registry.pop(key, []))
     _unpin_pool_keys(keys)
 
 
@@ -2462,7 +2485,7 @@ def _drive_actor_pool(
                 actors.remove(victim)
                 slots.pop(victim, None)
                 _release_bundle(victim)
-                ray.kill(victim)
+                _release_and_kill([victim])
             if not inflight:
                 continue
             ready, _ = ray.wait(list(inflight), num_returns=1)
@@ -2519,8 +2542,7 @@ def _drive_actor_pool(
             peak_vram = _max_opt(peak_vram, _drain_gpu_vram(a))
         return results, peak_util, peak_vram
     finally:
-        for a in actors:
-            ray.kill(a)
+        _release_and_kill(actors)
         # The placement group is a cluster-wide reservation; leaking it strands the pool's
         # GPUs for the life of the job.
         release_placement(pg)
@@ -2646,6 +2668,22 @@ class _MapActor:
         # whose true sustained figure was 13%, and that is above every threshold the packing
         # and submit-depth levers trigger on. The measurement held its own fix shut.
         self._util = _sustained_utilization()
+        self._released = False
+
+    def release(self) -> None:
+        """Close every class-UDF model this actor built, once (`core.udf.release_prebuilt`).
+
+        Called by the pool shutdown before it kills the actor (`_release_and_kill`), so a
+        model's `close()` runs under `distributed=True` as it does on the local paths.
+        Idempotent: an actor asked twice -- a scale-down racing a pool shutdown -- closes
+        its models once.
+        """
+        if self._released:
+            return
+        self._released = True
+        from batcher.core.udf import release_prebuilt
+
+        release_prebuilt(self._plan)
 
     def run(self, partition: dict, idx: int = 0):
         from batcher import core
