@@ -32,6 +32,8 @@ from harness import (  # noqa: E402
     emit_result,
     run_isolated,
 )
+from harness.compare import ENGINE_MARK  # noqa: E402
+from harness.report import cell_status  # noqa: E402
 
 pytestmark = pytest.mark.unit
 
@@ -147,3 +149,57 @@ def test_the_child_command_line_is_the_parents_minus_isolate(monkeypatch):
     assert argv[-2:] == ["--isolate-case", "job-q1a"]
     assert "--benchmark" in argv and "job" in argv
     assert "batcher,duckdb" in argv
+
+
+def _ok_payload(case: str, engines: list[str]) -> str:
+    payload = {
+        "name": case,
+        "status": "OK",
+        "note": "",
+        "engines": {e: {"ms": 1.0, "error": None, "correct": True} for e in engines},
+    }
+    return RESULT_PREFIX + json.dumps(payload) + "\n"
+
+
+def test_an_engine_over_budget_is_dropped_and_the_case_still_reports(monkeypatch):
+    """The scan suite's failure: one competitor never finished a case, and the per-suite
+    budget killed the run with no board. The child names each engine as it starts it, so the
+    one it was inside when killed is dropped and the case runs again without it."""
+    monkeypatch.setenv("BENCH_CASE_TIMEOUT_S", "5")
+    monkeypatch.setattr(sys, "argv", ["run.py", "--benchmark", "scan", "--isolate"])
+    lineups: list[list[str] | None] = []
+
+    def fake_run(argv, **kwargs):
+        assert kwargs["timeout"] == 5.0
+        assert kwargs["env"]["BENCH_ENGINE_MARKS"] == "1"
+        engines = argv[argv.index("--engines") + 1].split(",") if "--engines" in argv else None
+        lineups.append(engines)
+        if engines is None or "pyarrow" in engines:
+            raise subprocess.TimeoutExpired(
+                argv, 5, output=f"{ENGINE_MARK}batcher\n{ENGINE_MARK}pyarrow\n"
+            )
+        return _completed(_ok_payload("scan-groupby-many_small", engines))
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    (result,) = run_isolated(["scan-groupby-many_small"], ["batcher", "duckdb", "pyarrow"])
+
+    assert lineups == [None, ["batcher", "duckdb"]]
+    assert result.status == "PARTIAL"
+    assert result.engines["batcher"].ms == 1.0
+    assert result.engines["pyarrow"].error.startswith("timed out")
+    assert cell_status(result.engines["pyarrow"]) == "T/O"
+    assert "pyarrow" in result.note
+
+
+def test_a_child_killed_before_naming_an_engine_is_one_killed_row(monkeypatch):
+    """With nothing to attribute the overrun to, the case is killed whole, as before."""
+    monkeypatch.setenv("BENCH_CASE_TIMEOUT_S", "5")
+
+    def fake_run(argv, **_kwargs):
+        raise subprocess.TimeoutExpired(argv, 5, output="loading\n")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    (result,) = run_isolated(["q1"], ["batcher", "duckdb"])
+
+    assert result.status == "KILLED"
+    assert "timed out" in result.note

@@ -14,6 +14,7 @@ vectorized over Arrow, because a row-wise one costs more than the queries it is 
 
 from __future__ import annotations
 
+import os
 import traceback
 import zlib
 from collections.abc import Callable, Sequence
@@ -490,6 +491,17 @@ def timing_order(case: str, engines: list[str]) -> list[str]:
     return engines[k:] + engines[:k]
 
 
+#: Printed by an isolated child (``BENCH_ENGINE_MARKS``) as each engine starts running, so a
+#: parent that has to kill the child for overrunning its budget knows which engine it was in.
+ENGINE_MARK = "__BENCH_ENGINE__ "
+
+
+def _mark(engine: str) -> None:
+    """Announce `engine` to an isolating parent (see ``report.run_isolated``), if one asked."""
+    if os.environ.get("BENCH_ENGINE_MARKS"):
+        print(f"{ENGINE_MARK}{engine}", flush=True)
+
+
 def compare(
     name: str,
     fns: dict[str, Callable[[], pa.Table] | None],
@@ -516,6 +528,7 @@ def compare(
     # First, execute each engine once to obtain a result (and catch failures).
     for engine in engines:
         fn = fns.get(engine)
+        _mark(engine)
         er = EngineResult()
         if fn is None:
             er.error = "n/a"
@@ -609,6 +622,7 @@ def compare(
     # FAILURE we time them (useful signal), but the row stays marked FAILED.
     for engine in timing_order(name, list(outputs)):
         fn = fns[engine]
+        _mark(engine)
         try:
             timing = bench_samples(fn, runs=runs)
         except Exception as exc:
