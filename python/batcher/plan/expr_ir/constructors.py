@@ -7,6 +7,7 @@ free functions users call directly (e.g. `col("x")`, `when(c).then(v)`).
 
 from __future__ import annotations
 
+import decimal
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, Final
 
@@ -18,6 +19,7 @@ from batcher.plan.expr_ir.core import (
     IntoExpr,
     Lit,
     _col_or_expr,
+    _is_null_literal,
     _wrap,
 )
 from batcher.plan.expr_ir.nodes import (
@@ -27,9 +29,10 @@ from batcher.plan.expr_ir.nodes import (
     Greatest,
     HashRows,
     Least,
+    MakeStruct,
     NullIf,
 )
-from batcher.plan.types.registry import dtype_name
+from batcher.plan.types.registry import dtype_name, resolve_dtype
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -45,6 +48,14 @@ def when(cond: Expr) -> CaseBuilder:
     Without ``.otherwise`` (or with ``.otherwise(None)``) a row no branch matches is
     NULL, as SQL's ``CASE WHEN ... END`` is. The NULL takes the type of the first
     non-null branch value.
+
+    **Every branch is evaluated on every row**, and the condition only picks which
+    result each row keeps. So a ``when`` cannot guard a branch that would *fail* on the
+    rows it excludes: ``when(col("s") != "x").then(col("s").cast("int64"))`` still raises
+    on ``"x"``, where DuckDB, which evaluates lazily, returns NULL. Make the branch itself
+    safe instead, with `Expr.try_cast` (null on a failed cast) or `Expr.safe_divide`. A
+    branch that merely produces a value you discard, such as ``sqrt`` of a negative, is
+    fine.
 
     Args:
         cond: A boolean expression selecting the rows this branch applies to.
@@ -63,6 +74,11 @@ def when(cond: Expr) -> CaseBuilder:
 
             >>> ds.select(pos=bt.when(bt.col("x") > 0).then(bt.col("x"))).to_pydict()
             {'pos': [None, None, 5]}
+
+            >>> s = bt.from_pydict({"s": ["1", "x"]})
+            >>> safe = bt.when(bt.col("s") != "x").then(bt.col("s").try_cast("int64"))
+            >>> s.select(n=safe).to_pydict()
+            {'n': [1, None]}
     """
     return CaseBuilder().when(cond)
 
@@ -117,7 +133,9 @@ def coalesce(*exprs: IntoExpr) -> Coalesce:
     ``coalesce(col("discount"), lit(0))`` to treat a missing discount as zero.
 
     A bare string names a **column**, as it does in Polars. Spell a string constant
-    ``bt.lit("...")``.
+    ``bt.lit("...")``. A ``None`` argument (or an untyped ``bt.lit(None)``) is dropped,
+    because ``COALESCE(x, NULL)`` is ``x``: keeping it would only give the result an Int64
+    NULL to reconcile with a string or date column.
 
     Args:
         *exprs: One or more expressions or column names, tested in order.
@@ -135,7 +153,10 @@ def coalesce(*exprs: IntoExpr) -> Coalesce:
     """
     if not exprs:
         raise PlanError("coalesce() requires at least one argument")
-    return Coalesce([_col_or_expr(e) for e in exprs])
+    kept = [e for e in exprs if not _is_null_literal(e)]
+    if not kept:
+        return Coalesce([null()])
+    return Coalesce([_col_or_expr(e) for e in kept])
 
 
 def nullif(left: IntoExpr, right: IntoExpr) -> NullIf:
@@ -400,15 +421,48 @@ def count() -> AggExpr:
     return AggExpr("count_star", None)
 
 
-#: Arrow type names a NULL literal may be given. `lit(None, dtype=...)` validates against
-#: this before building, so a typo raises here rather than deep inside `Cast`.
+#: Arrow type names a literal may be given. `lit(..., dtype=...)` validates against this,
+#: plus any ``decimal(p,s)``, before building, so a typo raises here rather than deep
+#: inside `Cast`.
 _NULL_DTYPES: Final = (
     "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
     "float32", "float64", "bool", "string", "date", "time", "timestamp",
 )  # fmt: skip
 
 
-def lit(value: int | float | bool | str | None, dtype: str | None = None) -> Expr:
+def _literal_dtype(dtype: str | None, func: str) -> str | None:
+    """`dtype` checked against the names a literal may take, or a `PlanError` naming them.
+
+    A ``decimal(p,s)`` is accepted alongside the fixed names, because a decimal literal is
+    the one way to put an *exact* fractional constant into a query: a Python float is
+    already inexact before Batcher sees it.
+    """
+    if dtype is None or dtype in _NULL_DTYPES:
+        return dtype
+    import pyarrow as pa
+
+    spec = dtype.replace(" ", "").lower()
+    resolved = resolve_dtype(spec) if spec.startswith("decimal(") else None
+    if resolved is None or not pa.types.is_decimal(resolved):
+        raise PlanError(
+            f"{func}: unknown dtype {dtype!r}; expected one of {', '.join(_NULL_DTYPES)}, "
+            "or 'decimal(p,s)'"
+        )
+    return spec
+
+
+def lit(
+    value: int
+    | float
+    | bool
+    | str
+    | decimal.Decimal
+    | list[Any]
+    | tuple[Any, ...]
+    | dict[str, Any]
+    | None,
+    dtype: str | None = None,
+) -> Expr:
     """A constant literal expression, or a typed NULL when `value` is None.
 
     Wraps a Python scalar so it can be combined with column expressions — a default
@@ -419,42 +473,82 @@ def lit(value: int | float | bool | str | None, dtype: str | None = None) -> Exp
     ``lit(None)`` is the NULL literal. The JSON IR has no untyped null — `bc_expr::Literal`
     carries Int/Float/Bool/Str/Timestamp/Date and nothing else — so a null has to be given
     a type here, and it is built as ``nullif(1, 1)`` (null on every row, Int64) cast to
-    `dtype`. Without this, ``lit(None)`` raised ``TypeError: unsupported literal type:
-    NoneType`` from inside `to_ir`, so the one spelling every DataFrame user reaches for
-    failed at the point of `collect()` rather than where it was written, while the SQL
-    front-end answered the same ``NULL`` perfectly well through its own private copy of
-    this construction.
+    `dtype`. Comparisons, `eq_missing`, `fill_null` and `coalesce` recognise the untyped
+    form and answer without needing its type, so ``col("s") == bt.lit(None)`` is NULL on a
+    string column too; elsewhere, give it a `dtype`.
+
+    A list or tuple is a list literal (``bt.array`` of its elements) and a dict is a struct
+    literal (``bt.struct`` of its items), each element a literal in turn. A
+    `decimal.Decimal` is a double unless `dtype` is ``"decimal(p,s)"``, in which case it is
+    exact: the value travels as its decimal text and is cast, never through a float. Any
+    other value raises here, where it was written, rather than at `collect()`.
 
     Args:
-        value: The constant value (int, float, bool, str), or None for a NULL.
-        dtype: Arrow type name for the literal. Required only to type a NULL as
-            something other than Int64; on a non-null value it is an explicit cast.
+        value: The constant value (int, float, bool, str, date/time/datetime,
+            ``Decimal``, list, tuple or dict), or None for a NULL.
+        dtype: Arrow type name for the literal, or ``"decimal(p,s)"``. Required only to
+            type a NULL as something other than Int64; on a non-null value it is an
+            explicit cast. Not accepted with a list or dict.
 
     Returns:
         An expression that evaluates to `value` on every row.
 
     Raises:
-        PlanError: If `dtype` is not an Arrow type name a literal can take.
+        PlanError: If `dtype` is not a type name a literal can take, or `value` has no
+            literal form.
 
     Examples:
         .. doctest::
 
             >>> import batcher as bt
+            >>> from decimal import Decimal
             >>> ds = bt.from_pydict({"x": [1, 2]})
             >>> ds.select(y=bt.col("x") + bt.lit(100)).to_pydict()
             {'y': [101, 102]}
 
             >>> ds.select(y=bt.lit(None, dtype="string")).to_pydict()
             {'y': [None, None]}
+
+            >>> ds.limit(1).select(v=bt.lit([1, 2]), s=bt.lit({"a": 1})).to_pydict()
+            {'v': [[1, 2]], 's': [{'a': 1}]}
+
+            >>> ds.limit(1).select(d=bt.lit(Decimal("1.25"), dtype="decimal(10,2)")).to_pydict()
+            {'d': [Decimal('1.25')]}
     """
-    if dtype is not None and dtype not in _NULL_DTYPES:
-        raise PlanError(
-            f"lit(): unknown dtype {dtype!r}; expected one of {', '.join(_NULL_DTYPES)}"
-        )
+    func = "lit()"
+    if isinstance(value, (list, tuple, dict)):
+        if dtype is not None:
+            raise PlanError(
+                f"{func}: dtype= applies to a scalar literal, not a {type(value).__name__}; "
+                "give each element its own lit(..., dtype=...)"
+            )
+        return _nested_literal(value)
+    dtype = _literal_dtype(dtype, func)
     if value is None:
         return null(dtype)
+    if isinstance(value, decimal.Decimal) and dtype is not None and dtype.startswith("decimal("):
+        if not value.is_finite():
+            raise PlanError(f"{func}: {value!r} has no decimal representation")
+        return Lit(format(value, "f"))._cast(dtype, try_cast=False)
     typed = Lit(value)
+    typed.to_ir()  # validate now: an unsupported value raises here, not at collect()
     return typed._cast(dtype, try_cast=False) if dtype is not None else typed
+
+
+def _nested_literal(value: list[Any] | tuple[Any, ...] | dict[str, Any]) -> Expr:
+    """A list literal as `array(...)` and a dict literal as `struct(...)`, recursively."""
+    if isinstance(value, dict):
+        if not value:
+            raise PlanError("lit(): an empty dict has no struct type; give it at least one field")
+        bad = [k for k in value if not isinstance(k, str)]
+        if bad:
+            raise PlanError(f"lit(): a struct literal's keys must be strings, got {bad[0]!r}")
+        return MakeStruct([(k, lit(v)) for k, v in value.items()])
+    if not value:
+        raise PlanError(
+            "lit(): an empty list has no element type; build it from a typed column instead"
+        )
+    return Array([lit(v) for v in value])
 
 
 def null(dtype: str | None = None) -> Expr:
@@ -465,7 +559,7 @@ def null(dtype: str | None = None) -> Expr:
     only inside the SQL translator, which is why ``bt.lit(None)`` had no answer at all.
 
     Args:
-        dtype: Arrow type name for the null. Int64 when omitted.
+        dtype: Arrow type name for the null, or ``"decimal(p,s)"``. Int64 when omitted.
 
     Returns:
         An expression that is NULL on every row, typed as `dtype`.
@@ -479,10 +573,7 @@ def null(dtype: str | None = None) -> Expr:
             >>> ds.select(y=null("float64")).to_pydict()
             {'y': [None, None]}
     """
-    if dtype is not None and dtype not in _NULL_DTYPES:
-        raise PlanError(
-            f"null(): unknown dtype {dtype!r}; expected one of {', '.join(_NULL_DTYPES)}"
-        )
+    dtype = _literal_dtype(dtype, "null()")
     one = Lit(1)
     untyped: Expr = NullIf(one, one)
     return untyped if dtype in (None, "int64") else untyped._cast(dtype, try_cast=False)

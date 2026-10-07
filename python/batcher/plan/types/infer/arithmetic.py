@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher._internal.errors import PlanError
 from batcher.plan.types.lattice import promote, widen
 
 if TYPE_CHECKING:
@@ -344,10 +345,66 @@ def _arith_type(op: str, left: pa.DataType, right: pa.DataType) -> pa.DataType |
     return widen(common) if common is not None else None
 
 
+#: The arithmetic operators the engine refuses on a text or binary operand, with the symbol
+#: the error names. `floor_div` is deliberately absent: the engine casts a string operand of
+#: `//` to Float64 and answers, so refusing it here would claim more than the engine does.
+_TEXT_REFUSING_OPS = {"add": "+", "sub": "-", "mul": "*", "mod": "%", "div": "/"}
+
+
+def _is_text(dtype: pa.DataType) -> bool:
+    """Whether `dtype` is a string or binary type of any offset width."""
+    t = pa.types
+    return (
+        t.is_string(dtype)
+        or t.is_large_string(dtype)
+        or t.is_binary(dtype)
+        or (t.is_large_binary(dtype))
+    )
+
+
+def _is_scalar_operand(dtype: pa.DataType) -> bool:
+    """Whether `dtype` is a numeric, Boolean or text type -- the operands checked below."""
+    t = pa.types
+    return (
+        t.is_integer(dtype)
+        or t.is_floating(dtype)
+        or t.is_decimal(dtype)
+        or (t.is_boolean(dtype) or _is_text(dtype))
+    )
+
+
+def _refuse_text_arithmetic(op: str, left: pa.DataType, right: pa.DataType) -> None:
+    """Raise `PlanError` for arithmetic the engine always rejects on a text operand.
+
+    Without this, `Dataset.schema` reported ``null`` for ``col("s") + 1`` -- a wrong type
+    rather than an error -- and the mistake surfaced only at execution, as
+    ``Invalid arithmetic operation: Utf8 + Int64``. Over an *empty* relation the engine never
+    evaluates the kernel at all, so the query quietly returned a ``null`` column.
+
+    Only pairs the engine refuses on every input are named, and both operands have to be
+    numeric, Boolean or text: a date minus a string parses the string as a date in the
+    engine, so a temporal operand is left to it. `tests/unit/test_text_arithmetic_refusal.py`
+    executes every refused pair to prove the engine rejects it too.
+    """
+    symbol = _TEXT_REFUSING_OPS.get(op)
+    if symbol is None or not (_is_text(left) or _is_text(right)):
+        return
+    if not (_is_scalar_operand(left) and _is_scalar_operand(right)):
+        return
+    raise PlanError(
+        f"cannot apply {symbol!r} to {left} and {right}: arithmetic is not defined on text. "
+        "Cast the text first (col('s').cast('int64'), or try_cast to null out bad values); "
+        "to join strings use bt.concat(...)."
+    )
+
+
 def binary_type(expr: Binary, schema: SchemaRef, infer: InferFn) -> pa.DataType | None:
     """The result type of a `Binary` node, or ``None`` if not certain.
 
     The name-only arms answer first so a comparison never descends into its operands.
+
+    Raises:
+        PlanError: For arithmetic on a text operand the engine always rejects.
     """
     op = expr.op
     if op in _BINARY_BOOL:
@@ -373,6 +430,7 @@ def binary_type(expr: Binary, schema: SchemaRef, infer: InferFn) -> pa.DataType 
     right = infer(expr.right, schema)
     if left is None or right is None:
         return None
+    _refuse_text_arithmetic(op, left, right)
     if op in _BINARY_ARITH:
         return _arith_type(op, left, right)
     # `div` coerces a Boolean operand the way the other arithmetic does; `floor_div` does

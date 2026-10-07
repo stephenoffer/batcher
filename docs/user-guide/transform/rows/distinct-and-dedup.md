@@ -98,7 +98,7 @@ If you want the rank itself rather than one row per key, write the window descri
 
 ## Float keys: NaN and -0.0 collapse
 
-A dedup key is a hash key, and Batcher hashes floats from their *canonicalized* IEEE bits. So `0.0` and `-0.0` are one key, and every NaN is one key, even though `NaN == NaN` is false in an expression.
+A dedup key is a hash key, and Batcher hashes floats from their *canonicalized* IEEE bits. So `0.0` and `-0.0` are one key, and every NaN is one key. That agrees with expressions, where `NaN == NaN` is true and NaN sorts above every number, as in DuckDB and PostgreSQL, although IEEE 754 says `NaN == NaN` is false. {doc}`Nulls and NaN </user-guide/transform/columns/null-semantics>` has the full matrix.
 
 ```python
 floats = bt.from_pydict({"x": [0.0, -0.0, float("nan"), float("nan")]})

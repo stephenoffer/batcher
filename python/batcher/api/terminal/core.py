@@ -34,6 +34,7 @@ from batcher.plan.types import logical_bytes
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from typing import TextIO
 
 __all__ = [
     "_collect",
@@ -720,18 +721,21 @@ def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.
 
 
 @with_auto_config
-def _stats(plan: LogicalPlan, sources: list[Source], columns: list[str]):
+def _stats(
+    plan: LogicalPlan, sources: list[Source], columns: list[str], *, keep_result: bool = False
+):
     """Execute through the real path (single-node/spill/distributed) and return `RunStats`.
 
     Raises `PlanError` for an unbounded source. A `map_batches`/ML pipeline is measured per
     stage against its logical tree (see `run_profiled`), so it reports rows and time per
-    stage rather than refusing.
+    stage rather than refusing. With `keep_result` the run's own table rides along on
+    `RunStats.result`, so measuring a query does not mean running it a second time.
     """
     from batcher.api.stats import RunStats
-    from batcher.api.terminal.profile import run_profiled
+    from batcher.api.terminal.profile import run_profiled_with_result
 
-    profile = run_profiled(plan, sources, columns)
-    return RunStats.from_profile(profile)
+    table, profile = run_profiled_with_result(plan, sources, columns)
+    return RunStats.from_profile(profile, result=table if keep_result else None)
 
 
 def _sink_owns_its_layout(sink: object, path: str) -> bool:
@@ -1437,10 +1441,23 @@ def _to_pandas(
     sources: list[Source],
     columns: list[str],
     cache: StorageLevel | None = None,
+    *,
+    dtype_backend: str = "numpy",
 ) -> Any:
-    """Execute and return the result as a pandas `DataFrame` (via Arrow)."""
+    """Execute and return the result as a pandas `DataFrame` (via Arrow).
+
+    `dtype_backend` is checked before the query runs, so a typo costs nothing.
+    """
+    from batcher.interop.arrays import DTYPE_BACKENDS, pandas_types_mapper
+
+    if dtype_backend not in DTYPE_BACKENDS:
+        raise PlanError(
+            f"to_pandas(dtype_backend=...) must be one of {DTYPE_BACKENDS}, got {dtype_backend!r}"
+        )
     require("pandas", feature="Dataset.to_pandas()", provides="pandas", extra="pandas")
-    return _collect(plan, sources, columns, cache=cache).to_pandas()
+    mapper = pandas_types_mapper(dtype_backend)
+    table = _collect(plan, sources, columns, cache=cache)
+    return table.to_pandas() if mapper is None else table.to_pandas(types_mapper=mapper)
 
 
 def _to_polars(
@@ -1454,20 +1471,32 @@ def _to_polars(
     return polars.from_arrow(_collect(plan, sources, columns, cache=cache))
 
 
-def _show(plan: LogicalPlan, sources: list[Source], columns: list[str], limit: int) -> None:
-    """Print a preview of the result.
+def _show(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    limit: int,
+    *,
+    max_width: int,
+    max_cell_width: int,
+    file: TextIO | None = None,
+) -> None:
+    """Print a preview of the result to `file` (stdout when ``None``).
 
     The `limit` is pushed into the PLAN, not applied to a materialized table: `show()`
     on a billion-row dataset must read only enough of the source to produce `limit`
     rows (the streaming early-stop / distributed top-N paths), never collect the whole
-    result to the driver just to slice ten rows off it.
+    result to the driver just to slice ten rows off it. One row past the limit is
+    fetched, so the footer can say whether the preview is the whole result.
 
     What gets printed is a row-oriented table (`terminal.preview`), not pyarrow's own
     column-oriented `Table` repr — see that module for why.
     """
     from batcher.api.terminal.preview import render
 
-    print(render(_collect(_narrowed_limit(plan, limit), sources, columns), limit=limit))
+    table = _collect(_narrowed_limit(plan, limit + 1), sources, columns)
+    text = render(table, limit=limit, max_width=max_width, max_cell_width=max_cell_width)
+    print(text, file=file)
 
 
 def _narrowed_limit(plan: LogicalPlan, limit: int) -> LogicalPlan:

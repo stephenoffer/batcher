@@ -125,7 +125,11 @@ def to_jax(ds: Dataset, columns: list[str] | None) -> dict[str, Any]:
     return {name: jnp.asarray(arr) for name, arr in to_numpy(ds, columns).items()}
 
 
-def to_numpy(ds: Dataset, columns: list[str] | None) -> dict[str, Any]:
+#: `Dataset.to_numpy(nulls=...)`'s values; ``"nan"`` is the conversion it always made.
+NULL_MODES = ("nan", "raise", "mask")
+
+
+def to_numpy(ds: Dataset, columns: list[str] | None, nulls: str = "nan") -> dict[str, Any]:
     """The full result as a ``{column: numpy.ndarray}`` dict.
 
     Streams the output batches and concatenates each column, so a fixed-shape-tensor or
@@ -133,19 +137,49 @@ def to_numpy(ds: Dataset, columns: list[str] | None) -> dict[str, Any]:
     ``(n, *shape)`` array — not an opaque per-row object array — feeding NumPy / scikit-learn
     directly. Reuses `batcher.ml.to_numpy_batches` so the per-column conversion (tensor
     reshape, null→NaN, zero-copy where possible) matches the training-loader path exactly.
+
+    `nulls` is ``"nan"`` (that conversion), ``"raise"`` (a `PlanError` naming the first
+    column holding a null, checked per batch from Arrow's null count before converting), or
+    ``"mask"`` (a ``numpy.ma.MaskedArray`` per column; see `interop.arrays.column_to_masked`).
+
+    Runs ``iter_batches()`` with its default ``distributed=False``. That is a recorded
+    decision, not an oversight: see the routing table in ``docs/api/relational/dataset.md``.
     """
     import numpy as np
 
+    from batcher._internal.errors import PlanError
+    from batcher.interop.arrays import column_to_masked
     from batcher.ml.converters import to_numpy_batches
 
+    if nulls not in NULL_MODES:
+        raise PlanError(f"to_numpy(nulls=...) must be one of {NULL_MODES}, got {nulls!r}")
     names = list(ds.columns) if columns is None else list(columns)
     parts: dict[str, list[Any]] = {name: [] for name in names}
-    for batch in to_numpy_batches(ds.iter_batches(), columns=names):
+    for batch in ds.iter_batches():
+        if nulls == "raise":
+            _refuse_nulls(batch, names)
+        if nulls == "mask":
+            converted = {name: column_to_masked(batch.column(name)) for name in names}
+        else:
+            converted = next(to_numpy_batches([batch], columns=names))
         for name in names:
-            parts[name].append(batch[name])
-    return {
-        name: (np.concatenate(chunks) if chunks else np.array([])) for name, chunks in parts.items()
-    }
+            parts[name].append(converted[name])
+    stack = np.ma.concatenate if nulls == "mask" else np.concatenate
+    empty = np.ma.masked_array([]) if nulls == "mask" else np.array([])
+    return {name: (stack(chunks) if chunks else empty) for name, chunks in parts.items()}
+
+
+def _refuse_nulls(batch: pa.RecordBatch, names: list[str]) -> None:
+    """Raise `PlanError` naming the first of `names` that holds a null in `batch`."""
+    from batcher._internal.errors import PlanError
+
+    for name in names:
+        if batch.column(name).null_count:
+            raise PlanError(
+                f"to_numpy(nulls='raise'): column {name!r} holds a null, which NumPy has no "
+                "value for. Fill it first (fill_null), drop the rows (drop_nulls), or pass "
+                "nulls='mask' to keep the nulls as a mask."
+            )
 
 
 #: Fallback target size for one Ray Data block, used when Ray's own

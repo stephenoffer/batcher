@@ -72,6 +72,30 @@ print({name: (array.dtype.str, array.tolist()) for name, array in arrays.items()
 
 Pass `columns=` to take a subset, which also prunes the scan: a column you don't ask for is never read.
 
+### Nulls on the way to NumPy
+
+NumPy has no null, so `to_numpy` has to decide what to put where one was. `nulls=` makes the decision yours. The default, `"nan"`, writes NaN: an integer or Boolean column with a null widens to `float64` and a `UserWarning` says so, a float column's nulls become indistinguishable from its genuine NaNs, and a string column keeps `None` in an object array. `"raise"` raises a `PlanError` naming the first column that holds a null. `"mask"` returns a `numpy.ma.MaskedArray` per column, so an integer column stays integer and a NaN stays distinct from a null:
+
+```python
+gappy = bt.from_pydict({"n": [1, None, 3], "f": [float("nan"), None, 2.0]})
+masked = gappy.to_numpy(nulls="mask")
+print(masked["n"].dtype, masked["n"].mask.tolist())
+# int64 [False, True, False]
+print(masked["f"].mask.tolist(), np.isnan(masked["f"].data[0]))
+# [False, True, False] True
+```
+
+### A 2-D array, and when the conversions run
+
+`np.asarray(ds)` stacks the result into one `(rows, columns)` array through the same conversion, so every column has to share a dtype. The result is always a new array, so `np.asarray(ds, copy=False)` raises a `ValueError`, as NumPy 2's protocol requires of an object that cannot avoid a copy:
+
+```python
+print(np.asarray(bt.from_pydict({"a": [1, 2], "b": [3, 4]})).tolist())
+# [[1, 3], [2, 4]]
+```
+
+`to_numpy`, `to_jax` and `np.asarray(ds)` run single-node, as `iter_batches()` does by default, while `to_arrow()`, `pa.table(ds)` and `to_polars()` route as `collect()` does. {doc}`/api/relational/dataset` has the full table of which conversion executes, routes and copies how.
+
 ## Narrow types widen at the boundary
 
 Batcher normalizes narrow numeric types once, at the FFI boundary: `Int8`, `Int16` and `Int32` become `Int64`, and `Float16` and `Float32` become `Float64`. An `int32` NumPy array therefore arrives as an `Int64` column, and that is the type every later step and every result sees.

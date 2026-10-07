@@ -112,6 +112,7 @@ def test_the_only_accessor_methods_without_a_sql_name_are_introspection() -> Non
         "has_multiple_outputs",
         "is_column",
         "output_name",
+        "output_type",
         "root_names",
         "tree_format",
     ], excluded

@@ -71,7 +71,52 @@ def _wrap(value: IntoExpr) -> Expr:
     # `nodes` (which imports this module).
     if type(value).__name__ == "CaseBuilder":
         return value._finish()  # type: ignore[attr-defined]
+    # A bare ``None`` is SQL NULL. The IR has no untyped null, so where the operator gives
+    # it no type -- ``col("x") + None`` -- it is the same Int64 NULL ``bt.lit(None)`` is.
+    # The operators that *can* type it by context (the comparisons, `eq_missing`,
+    # `fill_null`, `coalesce`) intercept it before it gets here; see `_is_null_literal`.
+    # Lifting it to `Lit(None)` instead deferred a "a literal must be ... None" error to
+    # `to_ir`, which rejected the very value the message listed as allowed.
+    if value is None:
+        from batcher.plan.expr_ir.constructors import null
+
+        return null()
     return Lit(value)
+
+
+def _is_null_literal(value: object) -> bool:
+    """Whether `value` is a NULL with no type of its own: ``None`` or ``bt.lit(None)``.
+
+    ``bt.lit(None)`` is built as ``nullif(1, 1)`` over one shared `Lit` -- an Int64 NULL,
+    because the IR has no untyped one. Compared with a string or a date column that Int64
+    is a type error in the engine (``Utf8 == Int64``), although SQL's answer is simply NULL
+    whatever the other side's type. The operators whose answer does not depend on that type
+    recognise this shape and answer without it. A *typed* null (``lit(None, dtype=...)``)
+    is a `Cast` and is not matched: it already has a type, and comparing with it is exact.
+    Matched by name because `nodes` imports this module.
+    """
+    if value is None:
+        return True
+    if type(value).__name__ != "NullIf":
+        return False
+    left, right = value.left, value.right  # type: ignore[attr-defined]
+    return left is right and isinstance(left, Lit) and type(left.value) is int
+
+
+def _compare(op: str, left: Expr, other: IntoExpr | None) -> Expr:
+    """``left <op> other`` for a comparison operator, with a NULL operand typed by context.
+
+    A comparison with NULL is NULL in SQL, whatever the other operand's type, so
+    ``col("s") == None`` is a Boolean NULL on every row rather than a type error. It is
+    spelled ``is_null(left) <op> NULL::bool`` -- not a bare NULL constant -- so the result
+    still reads `left` and keeps the output name ``select(col("s") == None)`` would give.
+    Use `Expr.is_null` or `Expr.eq_missing` to *test* for null.
+    """
+    if _is_null_literal(other):
+        from batcher.plan.expr_ir.constructors import null
+
+        return Binary(op, IsNull(left), null("bool"))
+    return Binary(op, left, _wrap(other))  # type: ignore[arg-type]
 
 
 # `constructors` imports this module, so `col` is resolved on first use rather than at
@@ -229,27 +274,34 @@ class Expr:
     # --- comparison operators (yield boolean expressions) ------------------
     def __gt__(self, other: IntoExpr) -> Expr:
         """Element-wise greater-than (``a > b``), yielding a boolean expression."""
-        return Binary("gt", self, _wrap(other))
+        return _compare("gt", self, other)
 
     def __ge__(self, other: IntoExpr) -> Expr:
         """Element-wise greater-than-or-equal (``a >= b``), yielding a boolean expression."""
-        return Binary("ge", self, _wrap(other))
+        return _compare("ge", self, other)
 
     def __lt__(self, other: IntoExpr) -> Expr:
         """Element-wise less-than (``a < b``), yielding a boolean expression."""
-        return Binary("lt", self, _wrap(other))
+        return _compare("lt", self, other)
 
     def __le__(self, other: IntoExpr) -> Expr:
         """Element-wise less-than-or-equal (``a <= b``), yielding a boolean expression."""
-        return Binary("le", self, _wrap(other))
+        return _compare("le", self, other)
 
-    def __eq__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
-        """Element-wise equality (``a == b``), yielding a boolean expression (not a Python bool)."""
-        return Binary("eq", self, _wrap(other))
+    def __eq__(self, other: IntoExpr | None) -> Expr:  # type: ignore[override]
+        """Element-wise equality (``a == b``), yielding a boolean expression (not a Python bool).
 
-    def __ne__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
-        """Element-wise inequality (``a != b``), yielding a boolean expression."""
-        return Binary("ne", self, _wrap(other))
+        Comparing with ``None`` follows SQL: ``col("x") == None`` is NULL on every row, of
+        any column type. Test for null with `is_null`, or use `eq_missing`.
+        """
+        return _compare("eq", self, other)
+
+    def __ne__(self, other: IntoExpr | None) -> Expr:  # type: ignore[override]
+        """Element-wise inequality (``a != b``), yielding a boolean expression.
+
+        As with ``==``, comparing with ``None`` is NULL on every row (SQL ``x <> NULL``).
+        """
+        return _compare("ne", self, other)
 
     # `Expr` stays unhashable (see `__hash__` below, which raises with the reason).
 
@@ -955,12 +1007,24 @@ class Expr:
         upper = self <= hi if closed in ("both", "right") else self < hi
         return lower & upper
 
-    def eq_missing(self, other: IntoExpr) -> Expr:
+    def eq_missing(self, other: IntoExpr | None) -> Expr:
         """Null-safe equality (SQL ``IS NOT DISTINCT FROM``) where two nulls compare equal.
 
         A null compared with a non-null is **false** (never null). The reliable way
         to compare possibly-null keys — used for change detection
         in slowly-changing dimensions. Desugars to existing ops (no new IR).
+        ``eq_missing(None)`` is `is_null`, for a column of any type.
+
+        How it differs from ``==`` (NaN is a value, equal to itself, in both):
+
+        ==============  ==========  ==============
+        left, right     ``==``      ``eq_missing``
+        ==============  ==========  ==============
+        null, null      null        true
+        null, 1         null        false
+        NaN, NaN        true        true
+        NaN, 1.0        false       false
+        ==============  ==========  ==============
 
         Args:
             other: The expression or scalar to compare against.
@@ -975,8 +1039,14 @@ class Expr:
                 >>> ds = bt.from_pydict({"a": [1, None], "b": [1, None]})
                 >>> ds.select(r=bt.col("a").eq_missing(bt.col("b"))).to_pydict()
                 {'r': [True, True]}
+                >>> bt.from_pydict({"s": ["x", None]}).select(
+                ...     r=bt.col("s").eq_missing(None)
+                ... ).to_pydict()
+                {'r': [False, True]}
         """
-        o = _wrap(other)
+        if _is_null_literal(other):
+            return IsNull(self)
+        o = _wrap(other)  # type: ignore[arg-type]
         both_null = self.is_null() & o.is_null()
         return Coalesce([self == o, Lit(False)]) | both_null
 
@@ -2909,7 +2979,7 @@ class Expr:
 
         return hash_rows(self, seed=seed, algorithm=algorithm)
 
-    def fill_null(self, value: IntoExpr) -> Coalesce:
+    def fill_null(self, value: IntoExpr | None) -> Coalesce:
         """Replace nulls with `value`, leaving non-null values unchanged (SQL ``COALESCE``).
 
         `value` may be a scalar or another expression (e.g. a column to fall back to).
@@ -2930,6 +3000,10 @@ class Expr:
                 >>> ds.select(r=bt.col("x").fill_null(0)).to_pydict()
                 {'r': [1, 0, 3]}
         """
+        if _is_null_literal(value):
+            # ``COALESCE(x, NULL)`` is ``x``; an Int64 NULL here would only be a type error
+            # against a non-integer column.
+            return Coalesce([self])
         return Coalesce([self, _wrap(value)])
 
     # --- NaN handling / clamping -------------------------------------------
@@ -6291,9 +6365,9 @@ class Lit(Expr):
             # the reader to work out both which argument and what to do instead.
             raise PlanError(
                 f"cannot use {type(v).__name__} {v!r} as a literal value: a literal must "
-                "be a string, number, boolean, None, or a date/time/datetime/Decimal. "
-                "To reference a column use col('name'); to pass a Python object to your "
-                "own code use map_batches()."
+                "be a string, number, boolean, or a date/time/datetime/Decimal; a NULL is "
+                "bt.lit(None, dtype=...). To reference a column use col('name'); to pass a "
+                "Python object to your own code use map_batches()."
             )
         out = {"e": ExprTag.LIT, "value": tagged}
         self._ir_cache = out

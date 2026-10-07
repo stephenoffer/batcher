@@ -29,6 +29,23 @@ print(totals.to_pandas())
 
 The blocks on this page are shown rather than executed, because the test suite that runs the documentation installs the extras CI needs and pandas is not one of them. Everything here works the same way as the Polars and Arrow pages, which are executed on every run.
 
+## Nullable columns on the way out
+
+`to_pandas()` uses pyarrow's plain conversion by default, and pandas' NumPy-backed dtypes have no null for an integer. An `int64` column holding a null therefore arrives as `float64` with NaN, which also rounds any value above 2**53. Pass `dtype_backend`, with pandas' own values, to keep the type:
+
+```python
+# docs: skip
+ids = bt.from_pydict({"id": [2**62 + 1, None]})
+print(ids.to_pandas()["id"].dtype)
+# float64
+print(ids.to_pandas(dtype_backend="numpy_nullable")["id"].tolist())
+# [4611686018427387905, <NA>]
+print(ids.to_pandas(dtype_backend="pyarrow")["id"].dtype)
+# int64[pyarrow]
+```
+
+`"numpy_nullable"` gives integer, float, Boolean and string columns pandas' nullable extension dtypes (`Int64`, `Float64`, `boolean`, `string`), and `"pyarrow"` keeps every column Arrow-backed through `pd.ArrowDtype`. The result has a fresh `RangeIndex` either way, because a `Dataset` has no index to restore.
+
 ## Where the conversion cost goes
 
 Object-dtype columns are the expensive case. A pandas column of Python strings is an array of pointers, and Arrow needs one contiguous buffer plus offsets, so the conversion walks every value. Numeric columns are close to a memcpy, and a pandas frame already backed by Arrow (`dtype_backend="pyarrow"`) is close to free.

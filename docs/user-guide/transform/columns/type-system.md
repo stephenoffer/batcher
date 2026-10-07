@@ -255,6 +255,8 @@ print(mixed.isna().to_pydict(), mixed.isna(nan=True).to_pydict())
 
 Where NaN and `-0.0` do get canonicalized is in a hash key: grouping, `distinct`, joins, and shuffles all treat every NaN as one key and `-0.0` as `0.0`, so a group cannot split across partitions. See {doc}`distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`.
 
+{doc}`Nulls and NaN <null-semantics>` has the whole matrix, one executed example per row, for comparisons, Boolean logic, membership, aggregates, sorting, and keys.
+
 ## Integer division and mixed arithmetic
 
 Arithmetic between an integer and a float promotes to float, as it does in SQL and NumPy. Integer-by-integer division promotes too, so `7 / 2` is `3.5` and not `3`.
@@ -271,7 +273,73 @@ print(
 # {'div': [3.5, 2.6666666666666665], 'mod': [1, 2], 'mixed': [7.5, 8.5]}
 ```
 
-If you want floor division, be explicit: `(bt.col("a") / bt.col("b")).floor()`.
+`/` is only one of three division operators, and the other two follow different conventions. The following table lists each one:
+
+| Operator | Meaning | `-7 op 2` | Zero divisor | Convention |
+|---|---|---|---|---|
+| `a / b` | true division, always `double` | `-3.5` | `inf`, or NaN for `0 / 0` | Python, Polars, DuckDB |
+| `a // b` | floor division, rounds toward negative infinity; integers stay integers | `-4` | null | Python, Polars |
+| `a % b` | truncated remainder, takes the sign of the dividend | `-1` | null | SQL, DuckDB, Rust |
+| `bt.pmod(a, b)` | Spark's positive remainder | `1` | null | Spark |
+
+`//` and `%` come from different traditions, so Python's identity `a == (a // b) * b + a % b` does not hold when exactly one operand is negative: `(-7 // 2) * 2 + (-7 % 2)` is `-9`. DuckDB's integer `//` truncates, giving `-3`, so a query ported from DuckDB SQL gets a different quotient from `//` on negative operands. Batcher does not change either operator, because both are documented and either change would silently move results. Spell the other convention when you need it. The truncated quotient is `(a - a % b) // b`, which stays exact on integers, and Python's floor remainder is `a - (a // b) * b`:
+
+```python
+signed = bt.from_pydict({"a": [-7, 7, -7, 7], "b": [2, -2, -2, 2]})
+print(
+    signed.select(
+        floor_div=bt.col("a") // bt.col("b"),
+        trunc_rem=bt.col("a") % bt.col("b"),
+        trunc_div=(bt.col("a") - bt.col("a") % bt.col("b")) // bt.col("b"),
+        floor_rem=bt.col("a") - (bt.col("a") // bt.col("b")) * bt.col("b"),
+        pmod=bt.pmod(bt.col("a"), bt.col("b")),
+    ).to_pydict()
+)
+# {'floor_div': [-4, -4, 3, 3], 'trunc_rem': [-1, 1, -1, 1],
+#  'trunc_div': [-3, -3, 3, 3], 'floor_rem': [1, -1, -1, 1], 'pmod': [1, 1, -1, 1]}
+```
+
+## Python values in an expression
+
+A Python value written into an expression becomes a literal with a fixed type. An `int` is `int64`, a `float` is `double`, a `bool` is `bool`, a `str` is `string`, and a `date`, `datetime`, or `time` is the matching temporal type. A `decimal.Decimal` is a `double` unless you ask for a decimal: `bt.lit(Decimal("1.25"), dtype="decimal(10,2)")` is exact, because the value never passes through a float. A list or tuple given to {py:func}`bt.lit <batcher.lit>` is a list literal, and a dict is a struct literal. A value with no literal form, such as `bytes` or a `timedelta`, raises where you wrote it.
+
+The literal then meets the column through the promotion lattice in the next section, so `bt.col("i") + 0.5` is a `double`. `None` is the one value with no type of its own, and SQL NULL has none either. Batcher gives it the type the operator needs, and the operators that do not need one do not ask:
+
+- A comparison with `None` (`==`, `!=`, `<`, and the rest) is a `bool` null on every row, as SQL's `x = NULL` is, for a column of any type. It is never a null test: use `is_null()`.
+- `x.eq_missing(None)` is `x.is_null()`.
+- `coalesce(x, None)` and `x.fill_null(None)` are `x`, because a null fallback changes nothing.
+- `when(...).then(None)` and `.otherwise(None)` take the type of the other branches.
+- Anywhere else, such as `bt.col("x") + None`, a bare `None` is an `int64` null. Give it a type with `bt.lit(None, dtype="string")` when the other side is not a number.
+
+```python
+from decimal import Decimal
+
+events = bt.from_pydict({"tag": ["a", None], "n": [1, 2]})
+print(
+    events.select(
+        same=bt.col("tag") == None,  # noqa: E711
+        missing=bt.col("tag").eq_missing(None),
+        kept=bt.coalesce(bt.col("tag"), None),
+        price=bt.lit(Decimal("1.25"), dtype="decimal(10,2)"),
+        pair=bt.lit([1, 2]),
+    ).to_pydict()
+)
+# {'same': [None, None], 'missing': [False, True], 'kept': ['a', None],
+#  'price': [Decimal('1.25'), Decimal('1.25')], 'pair': [[1, 2], [1, 2]]}
+```
+
+## Conditionals evaluate every branch
+
+`when(...).then(...).otherwise(...)` computes every branch on every row and then keeps, per row, the value its condition selects. The condition decides which result survives. It does not stop a branch from running. That only matters for a branch that can *fail*. A cast that cannot parse a value raises even on the rows the condition excludes, where DuckDB, which evaluates a `CASE` lazily, returns NULL.
+
+Make the branch safe instead of guarding it. A branch that only produces a value you discard, such as `sqrt` of a negative, is harmless. {py:meth}`try_cast <batcher.plan.expr_ir.core.Expr.try_cast>` returns null where a cast fails, and {py:meth}`safe_divide <batcher.plan.expr_ir.core.Expr.safe_divide>` returns null for a zero divisor:
+
+```python
+raw = bt.from_pydict({"s": ["1", "x"]})
+parsed = bt.when(bt.col("s") != "x").then(bt.col("s").try_cast("int64"))
+print(raw.select(n=parsed).to_pydict())
+# {'n': [1, None]}
+```
 
 ## When two columns must become one
 
@@ -347,7 +415,24 @@ print(ds.dtypes[:3])
 # [DataType(int64), DataType(int64), DataType(double)]
 ```
 
-Because these are plan-derived, they are also the fastest way to catch a schema mistake: a bad `select` or a missing `output_columns` on a UDF fails here, before a single row is read.
+Because these are plan-derived, they are also the fastest way to catch a schema mistake: a bad `select` or a missing `output_columns` on a UDF fails here, before a single row is read. Arithmetic on a string column is one such mistake, and it raises a {py:exc}`PlanError <batcher.PlanError>` naming both types rather than reporting a `null` column:
+
+```python
+try:
+    ds.select(bad=bt.col("name") + 1).schema
+except bt.PlanError as exc:
+    print(str(exc).split(":")[0])
+# cannot apply '+' to string and int64
+```
+
+The same analysis is available for a single expression, with no `Dataset` at all. {py:meth}`meta.output_type(schema) <batcher.plan.expr_ir.namespaces.meta._MetaNamespace.output_type>` returns the type the expression would produce over that schema, or `None` when only running it could tell:
+
+```python
+print((bt.col("i32") * 2).meta.output_type(ds.schema))
+# int64
+print((bt.col("i32") / 2).meta.output_type(ds.schema))
+# double
+```
 
 ### The declared schema is what an empty result is made of
 

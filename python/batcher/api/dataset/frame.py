@@ -126,6 +126,11 @@ from batcher.plan.schema import column_name, suggest_columns
 from batcher.plan.streaming import Watermark
 
 if TYPE_CHECKING:
+    from typing import TextIO
+
+    import pandas as pd
+    import polars as pl
+
     from batcher.api.dataset.dq import DatasetDQ
     from batcher.api.dataset.meta import DatasetMeta
     from batcher.api.dataset.ml import DatasetML
@@ -134,6 +139,9 @@ if TYPE_CHECKING:
     from batcher.api.stats import RunStats
 
 __all__ = ["Dataset", "GroupBy"]
+
+#: The most columns the notebook repr draws before summarizing the rest in one cell.
+_HTML_MAX_COLUMNS = 50
 
 # The return of a user function passed to `Dataset.pipe` — `pipe` is transparent.
 _T = TypeVar("_T")
@@ -491,13 +499,21 @@ class Dataset:
         Every name is HTML-escaped. Column names are *data* — they come out of a CSV header,
         a JSON key, or a database catalog — and a notebook renders this string as markup, so
         an unescaped name is a document written by whoever produced the file.
+
+        At most `_HTML_MAX_COLUMNS` columns are drawn, then one cell counting the rest: a
+        10,000-column schema is otherwise 10,000 table cells for the notebook to lay out,
+        to show a header nobody can read.
         """
         import html
 
         names = self.columns
-        types = self._html_types(names)
-        head = "".join(f"<th>{html.escape(str(c))}</th>" for c in names)
+        shown = names[:_HTML_MAX_COLUMNS]
+        types = self._html_types(shown)
+        head = "".join(f"<th>{html.escape(str(c))}</th>" for c in shown)
         row = "".join(f"<td><code>{html.escape(t)}</code></td>" for t in types)
+        if len(names) > len(shown):
+            more = f"<th>… {len(names) - len(shown)} more columns</th>"
+            head, row = head + more, row + "<td></td>"
         return (
             "<div><strong>Dataset</strong> "
             f"<em>(lazy, {len(names)} columns — call .show() to preview)</em>"
@@ -660,13 +676,15 @@ class Dataset:
         **Routed like `collect()`, not like `iter_batches()`.** The protocol takes no
         execution arguments, so the export has to pick a routing policy, and the two
         available defaults disagree: `collect()` resolves ``distributed="auto"`` while
-        `iter_batches()` defaults to ``False``. Taking the latter meant that on a
-        multi-node cluster ``pl.DataFrame(ds)`` silently ran single-node while
-        ``pl.DataFrame(ds.collect())`` distributed — the same query, the same cluster, one
-        of them not using it. A caller who wants a specific mode has `iter_batches`; an
-        export that cannot be told has to match the terminal op it stands in for. On one
-        node ``"auto"`` resolves to single-node, so nothing changes there, and it never
-        starts a cluster that was not already connected.
+        `iter_batches()` defaults to ``False``. ``pl.DataFrame(ds)`` and
+        ``pa.table(ds)`` stand in for ``ds.collect()``, so they route as it does: the same
+        query on the same cluster should not run single-node through one spelling and
+        distributed through the other. On one node ``"auto"`` resolves to single-node, so
+        nothing changes there, and it never starts a cluster that was not already
+        connected. The NumPy conversions (`to_numpy`, ``np.asarray(ds)``) and
+        ``for batch in ds`` keep `iter_batches()`'s single-node default instead; that is a
+        recorded decision rather than an oversight, and the "Interoperability" table in
+        the `Dataset` API reference lists how every conversion routes.
 
         Args:
             requested_schema: A schema capsule the consumer would prefer, per the
@@ -4151,7 +4169,15 @@ class Dataset:
         """
         return build_memory_usage(self)
 
-    def equals(self, other: Dataset, *, ordered: bool = False) -> bool:
+    def equals(
+        self,
+        other: Dataset,
+        *,
+        ordered: bool = False,
+        rtol: float = 0.0,
+        atol: float = 0.0,
+        check_dtypes: bool = True,
+    ) -> bool:
         """Whether `other` computes the same result as this dataset.
 
         Compares *results*, not plans: both sides execute and their rows are
@@ -4166,9 +4192,21 @@ class Dataset:
         that `b` lacks, repeated as often as `a` has more copies, and
         ``b.except_(a, distinct=False)`` lists the extra rows on the other side.
 
+        The default comparison is exact. A float computed two ways (a ported query, or
+        one aggregated in a different order) can differ in its last bits, so `rtol` and
+        `atol` compare float columns to a tolerance the way ``numpy.isclose`` does, with
+        two NaNs equal and nulls required in the same places. Other columns stay exact.
+        Without `ordered`, rows are lined up by sorting both sides, exact columns first,
+        so a tolerance can only absorb differences the sort does not reorder.
+        ``check_dtypes=False`` compares values only, casting `other`'s result to this
+        one's column types first.
+
         Args:
             other: The dataset to compare against.
             ordered: Compare row order as well as row content.
+            rtol: Relative tolerance for float columns.
+            atol: Absolute tolerance for float columns.
+            check_dtypes: Require identical column types.
 
         Returns:
             ``True`` if both sides produce the same result.
@@ -4191,10 +4229,24 @@ class Dataset:
                 {'x': [2]}
                 >>> b.except_(a, distinct=False).to_pydict()  # rows only b has
                 {'x': [3]}
+                >>> a, b = bt.from_pydict({"x": [0.1 + 0.2]}), bt.from_pydict({"x": [0.3]})
+                >>> a.equals(b), a.equals(b, rtol=1e-12)
+                (False, True)
         """
+        tolerances = [
+            require_float(t, func="equals", arg=a) for t, a in ((rtol, "rtol"), (atol, "atol"))
+        ]
+        if not all(t >= 0 for t in tolerances):  # also refuses NaN
+            raise PlanError(f"equals(): rtol and atol must be >= 0, got {rtol!r} and {atol!r}")
         if self.columns != other.columns:
             return False
         left, right = self.collect(), other.collect()
+        if rtol or atol or not check_dtypes:
+            from batcher.api.dataset._compare import tolerant_equals
+
+            return tolerant_equals(
+                left, right, ordered=ordered, rtol=rtol, atol=atol, check_dtypes=check_dtypes
+            )
         if left.schema != right.schema:
             return False
         if ordered:
@@ -4220,15 +4272,20 @@ class Dataset:
 
         A terminal operation. Every column must share a common dtype for the result
         to be meaningful, which is NumPy's constraint, not Batcher's; use
-        `to_numpy` for a per-column ``{name: array}`` mapping instead.
+        `to_numpy` for a per-column ``{name: array}`` mapping instead. It runs through
+        `to_numpy`, so it executes single-node (see `to_numpy` for why).
 
         Args:
             dtype: The NumPy dtype to coerce to; inferred when ``None``.
-            copy: Accepted for NumPy 2 compatibility. The result is always a fresh
-                array (it is computed), so ``copy=False`` cannot be honoured.
+            copy: NumPy 2's copy request. ``None`` and ``True`` are honoured, since the
+                result is always a fresh array. ``False`` asks for a view without a copy,
+                which a computed result cannot be, so it raises as the protocol requires.
 
         Returns:
             A ``(rows, columns)`` NumPy array of the result.
+
+        Raises:
+            ValueError: If `copy` is ``False``.
 
         Examples:
             .. doctest::
@@ -4240,6 +4297,14 @@ class Dataset:
         """
         import numpy as np
 
+        if copy is False:
+            # NumPy 2's protocol: `copy=False` must raise rather than silently copy, so a
+            # caller relying on a shared buffer learns there is none. Checked before
+            # executing, because the answer does not depend on the data.
+            raise ValueError(
+                "Dataset.__array__ always materializes a new array, so copy=False cannot be "
+                "honoured; call np.asarray(ds) without copy=False"
+            )
         columns = self.to_numpy()
         stacked = np.column_stack([columns[name] for name in self.columns])
         return stacked.astype(dtype) if dtype is not None else stacked
@@ -5769,7 +5834,7 @@ class Dataset:
 
         return annotate_explain(rendered, self._plan, self._sources, fmt)
 
-    def stats(self) -> RunStats:
+    def stats(self, *, keep_result: bool = False) -> RunStats:
         """Execute the query and return its measured per-operator `RunStats`.
 
         Where `explain()` shows the *planned* shape with estimates, `stats()` runs
@@ -5778,6 +5843,15 @@ class Dataset:
         answer to "where is my time going"). It runs through the path `collect()`
         would take (single-node, spilling, or distributed under ``"auto"``), and a
         `map_batches`/ML pipeline is measured per stage rather than refused.
+
+        By default the result rows are discarded. ``keep_result=True`` keeps them on
+        `RunStats.result`, so one run gives you both the data and its measurements. It
+        is not a full `collect()` substitute: `stats()` takes no execution arguments, so
+        the run always routes as ``collect()`` with its defaults would.
+
+        Args:
+            keep_result: Keep the result table on `RunStats.result` instead of
+                discarding it.
 
         Returns:
             The measured per-operator run statistics.
@@ -5788,8 +5862,11 @@ class Dataset:
                 >>> import batcher as bt
                 >>> ds = bt.from_pydict({"k": ["a", "a", "b"], "v": [1, 2, 3]})
                 >>> print(ds.group_by("k").agg(s=bt.col("v").sum()).stats())  # doctest: +SKIP
+                >>> run = ds.filter(bt.col("v") > 1).stats(keep_result=True)
+                >>> run.rows, run.result.num_rows
+                (2, 2)
         """
-        return _stats(self._plan, self._sources, self.columns)
+        return _stats(self._plan, self._sources, self.columns, keep_result=keep_result)
 
     def count(self) -> int:
         """Return the number of result rows.
@@ -6746,6 +6823,13 @@ class Dataset:
         `iter_batches` has asked not to happen. Call a materializing terminal once to warm
         the cache, and every later stream is served from it.
 
+        The iterator is a generator, and stopping early is safe. Closing it stops the
+        source read, any `prefetch_batches` thread, and any `map_batches` stage. A
+        ``break`` out of a ``for`` loop closes it when the generator is garbage-collected,
+        which in CPython is as soon as the last reference goes. To release it at a point
+        you choose, call ``.close()``, or wrap it:
+        ``with contextlib.closing(ds.iter_batches()) as batches:``.
+
         Args:
             batch_size: Rebatch the output to this many rows; ``None`` keeps engine batches.
             batch_format: The yielded batch type — ``"pyarrow"`` (a `RecordBatch`),
@@ -6862,12 +6946,28 @@ class Dataset:
         """
         return _collect(self._plan, self._sources, self.columns, cache=self._cache)
 
-    def to_pandas(self):
+    def to_pandas(self, *, dtype_backend: str = "numpy") -> pd.DataFrame:
         """Execute the plan and return the result as a pandas `DataFrame`.
 
         A terminal operation. Materializes the Arrow result and converts it via
         pyarrow's pandas bridge, so it needs pandas installed
         (``pip install 'batcher-engine[pandas]'``); otherwise raises `BackendError`.
+
+        `dtype_backend` uses pandas' own names. The default ``"numpy"`` is pyarrow's
+        plain conversion: an integer column holding a null becomes ``float64`` with NaN,
+        which also loses exactness above 2**53. ``"numpy_nullable"`` keeps it ``Int64``
+        (and gives Boolean, Float and string columns pandas' nullable dtypes), and
+        ``"pyarrow"`` keeps every column Arrow-backed (``pd.ArrowDtype``). A Batcher
+        `Dataset` has no index, so the result always carries a fresh ``RangeIndex``.
+
+        Args:
+            dtype_backend: ``"numpy"`` (default), ``"numpy_nullable"`` or ``"pyarrow"``.
+
+        Returns:
+            The result as a pandas `DataFrame`.
+
+        Raises:
+            PlanError: If `dtype_backend` is not one of the three names.
 
         Examples:
             .. doctest::
@@ -6875,15 +6975,23 @@ class Dataset:
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [1, 2, 3]}).to_pandas().shape  # doctest: +SKIP
                 (3, 1)
+                >>> ds = bt.from_pydict({"x": [2**62 + 1, None]})
+                >>> ds.to_pandas(dtype_backend="numpy_nullable")["x"].dtype  # doctest: +SKIP
+                Int64Dtype()
         """
-        return _to_pandas(self._plan, self._sources, self.columns, self._cache)
+        return _to_pandas(
+            self._plan, self._sources, self.columns, self._cache, dtype_backend=dtype_backend
+        )
 
-    def to_polars(self):
+    def to_polars(self) -> pl.DataFrame:
         """Execute the plan and return the result as a Polars `DataFrame`.
 
         A terminal operation. Polars is Arrow-backed, so the materialized result is
         handed over without a row-wise copy. Needs polars installed
         (``pip install 'batcher-engine[polars]'``); otherwise raises `BackendError`.
+
+        Returns:
+            The result as a Polars `DataFrame`.
 
         Examples:
             .. doctest::
@@ -6894,7 +7002,9 @@ class Dataset:
         """
         return _to_polars(self._plan, self._sources, self.columns, self._cache)
 
-    def to_numpy(self, columns: str | list[str] | None = None) -> dict[str, Any]:
+    def to_numpy(
+        self, columns: str | list[str] | None = None, *, nulls: str = "nan"
+    ) -> dict[str, Any]:
         """Execute the plan and return the result as a ``{column: numpy.ndarray}`` dict.
 
         A terminal operation for numeric / scientific work: each column becomes a NumPy
@@ -6902,12 +7012,28 @@ class Dataset:
         or feature-vector column) comes back as a real ``(n, *shape)`` array rather than an
         opaque per-row object array — so the result feeds NumPy / scikit-learn directly.
         Streams the output batches, so it holds one materialized copy, not two.
+        ``np.asarray(ds)`` is the 2-D form of the same conversion.
+
+        NumPy has no null, so `nulls` says what happens to one. ``"nan"`` (the default)
+        writes NaN, widening an integer or Boolean column to ``float64`` and warning that
+        it did; a string column keeps ``None`` in an object array. ``"raise"`` raises
+        instead, naming the column. ``"mask"`` returns a ``numpy.ma.MaskedArray`` per
+        column with the nulls masked, so an integer column stays integer and a genuine NaN
+        stays distinct from a null.
+
+        It runs single-node (``iter_batches()``'s default), unlike `collect()`. See the
+        routing table in the `Dataset` API reference.
 
         Args:
             columns: optional subset of output columns to return (default: all).
+            nulls: ``"nan"`` (default), ``"raise"`` or ``"mask"``.
 
         Returns:
             A dict mapping each column name to its NumPy array.
+
+        Raises:
+            PlanError: If `nulls` is ``"raise"`` and a returned column holds a null, or
+                `nulls` is not one of the three names.
 
         Examples:
             .. doctest::
@@ -6916,11 +7042,14 @@ class Dataset:
                 >>> out = bt.from_pydict({"x": [1, 2, 3], "y": [4.0, 5.0, 6.0]}).to_numpy()
                 >>> out["x"].tolist(), out["y"].tolist()
                 ([1, 2, 3], [4.0, 5.0, 6.0])
+                >>> m = bt.from_pydict({"x": [1, None]}).to_numpy(nulls="mask")["x"]
+                >>> m.dtype, m.mask.tolist()
+                (dtype('int64'), [False, True])
         """
         from batcher.api.dataset._export import to_numpy
 
         cols = _require_columns(self.columns, _as_opt_str_list(columns), where="in to_numpy()")
-        return to_numpy(self, cols)
+        return to_numpy(self, cols, nulls=nulls)
 
     def to_jax(self, columns: str | list[str] | None = None) -> dict[str, Any]:
         """Execute the plan and return the result as a ``{column: jax.Array}`` dict.
@@ -7238,24 +7367,38 @@ class Dataset:
 
         return to_huggingface(self, mode=mode, class_labels=class_labels, images=images)
 
-    def show(self, limit: int = 10) -> None:
-        """Print a preview of the first `limit` result rows to stdout.
+    def show(
+        self,
+        limit: int = 10,
+        *,
+        max_width: int = 120,
+        max_cell_width: int = 32,
+        file: TextIO | None = None,
+    ) -> None:
+        """Print a preview of the first `limit` result rows.
 
         A terminal operation for interactive use: it executes the plan (capped at
         `limit` rows) and prints the result, returning nothing. For programmatic
         access to the data use `to_pydict` / `to_pylist` / `collect`.
 
         The `limit` is pushed into the *plan*, so previewing a billion-row source reads
-        only enough of it to fill the screen. The footer says "first N rows" only when the
-        preview actually filled its limit, so a complete result does not read as a partial
-        one. A value too long to fit, and a table too wide to fit, are both cut and marked
-        rather than allowed to wrap.
+        only enough of it to fill the screen. One row past the limit is fetched so the
+        footer can say "first N rows" only when the result really has more, and a result
+        of exactly `limit` rows does not read as a partial one. A value longer than
+        `max_cell_width`, and a table wider than `max_width`, are both cut and marked
+        rather than allowed to wrap. Pass `file` (any text stream, such as an
+        ``io.StringIO``) to capture the preview instead of printing it to stdout.
 
         Args:
             limit: Maximum number of rows to print; must be non-negative.
+            max_width: Total width, in characters, to fit the table in. Columns past it
+                are dropped and counted in the footer; at least one is always shown.
+            max_cell_width: Longest value printed in full; a longer one is cut to this
+                width and ends in ``...``. At least 4.
+            file: Where to write the preview; stdout when ``None``.
 
         Raises:
-            PlanError: If `limit` is negative.
+            PlanError: If `limit` is negative, or a width is too small to print.
 
         Examples:
             .. doctest::
@@ -7270,6 +7413,22 @@ class Dataset:
                 | lima   | 21.0   |
                 +--------+--------+
                 [2 rows x 2 columns]
+
+                >>> import io
+                >>> buf = io.StringIO()
+                >>> bt.from_pydict({"x": [1, 2, 3]}).show(2, file=buf)
+                >>> buf.getvalue().splitlines()[-1]
+                '[first 2 rows x 1 column]'
         """
         limit = require_int(limit, func="show", arg="limit", minimum=0)
-        _show(self._plan, self._sources, self.columns, limit)
+        max_width = require_int(max_width, func="show", arg="max_width", minimum=1)
+        max_cell_width = require_int(max_cell_width, func="show", arg="max_cell_width", minimum=4)
+        _show(
+            self._plan,
+            self._sources,
+            self.columns,
+            limit,
+            max_width=max_width,
+            max_cell_width=max_cell_width,
+            file=file,
+        )
