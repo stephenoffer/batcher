@@ -26,7 +26,12 @@ from batcher.api.catalog import SessionCatalog
 from batcher.api.dataset import Dataset
 from batcher.api.sql_session import catalog_sql, statements, views
 from batcher.api.sql_session import params as bindings
-from batcher.api.sql_session.registry import RegisteredFunction, resolve_type, validate_options
+from batcher.api.sql_session.registry import (
+    RegisteredFunction,
+    resolve_type,
+    validate_null_handling,
+    validate_options,
+)
 
 __all__ = ["Session"]
 
@@ -352,6 +357,7 @@ class Session:
         result_type: str | pa.DataType | None = None,
         output_columns: list[str] | None = None,
         batch_format: str = "pyarrow",
+        null_handling: str = "special",
         **config: Any,
     ) -> None:
         """Register a Python function callable from SQL (a DuckDB/Spark UDF).
@@ -369,6 +375,15 @@ class Session:
           `map_batches` contract (batch in, batch out) unless ``per_row=True``;
           `output_columns` declares the result schema and `batch_format`/extra
           ``config`` forward to `map_batches`.
+
+        `null_handling` is DuckDB's switch of the same name, for the scalar form. The default
+        ``"special"`` passes NULL arguments to `fn` (``None`` per row, nulls inside the
+        arrays when vectorized). ``"default"`` is NULL-in, NULL-out: a row with any NULL
+        argument gets NULL without `fn` seeing it, so `fn` need not guard against ``None``.
+
+        A registered function is callable from SQL (`sql`, `Dataset.sql`), not from
+        `bt.call_function`, which names the built-in function library. In the DataFrame API
+        apply the same callable with `Dataset.map_batches`.
 
         Scalar functions are not supported in ``GROUP BY`` keys, aggregate arguments,
         or ``ORDER BY`` — compute them in a subquery or projected alias first. There is no
@@ -389,6 +404,8 @@ class Session:
             result_type: Scalar output Arrow type (or alias).
             output_columns: Table-function result column names.
             batch_format: Batch table form only — the `map_batches` batch format.
+            null_handling: Scalar form only — ``"special"`` (NULLs reach `fn`) or
+                ``"default"`` (a NULL argument gives NULL without calling `fn`).
             **config: Extra `map_batches` (or, with `per_row`, `map`) keyword arguments,
                 forwarded by the table form. Anything the call form cannot honour raises.
 
@@ -405,6 +422,14 @@ class Session:
                 >>> s.register_function("dbl", lambda a: pc.multiply(a, 2), result_type="int64")
                 >>> s.sql("SELECT dbl(x) AS y FROM t").to_pydict()
                 {'y': [2, 4, 6]}
+
+                >>> _ = s.register("n", bt.from_pydict({"x": [1, None]}))
+                >>> s.register_function(
+                ...     "inc", lambda v: v + 1, vectorized=False, result_type="int64",
+                ...     null_handling="default",
+                ... )
+                >>> s.sql("SELECT inc(x) AS y FROM n").to_pydict()
+                {'y': [2, None]}
         """
         # `batch_format` is a named parameter rather than part of `**config`, so it bypasses
         # the check below — and both forms that cannot honour it dropped it in silence.
@@ -416,6 +441,7 @@ class Session:
                 f"time. Drop it, or register a batch table function (table=True)."
             )
         validate_options(name, config, table=table, per_row=per_row)
+        validate_null_handling(name, null_handling, table=table)
         if table and not per_row:
             # `batch_format` is a `map_batches` option; the per-row form goes through
             # `Dataset.map`, which has no such thing, so injecting it there would fail the very
@@ -430,6 +456,7 @@ class Session:
             result_type=resolve_type(result_type),
             output_columns=tuple(output_columns) if output_columns is not None else None,
             config=config,
+            null_handling=null_handling,
         )
         self._bump()
 
@@ -627,12 +654,15 @@ class Session:
 
         ``CREATE TABLE/VIEW AS`` registers a lazy `Dataset` into this session and ``DROP
         TABLE`` unregisters one; ``INSERT`` / ``DELETE`` / ``UPDATE`` rebind the target table
-        to its new state (a pure plan rewrite — union / filter / projected CASE — that runs
-        only on a later terminal op). ``CREATE VIEW`` stores the query, and every later
-        query naming the view translates it again, so a view sees the base tables as they
-        are when it is queried. Everything else is a ``SELECT``-family query. A session
-        built with ``read_only=True`` refuses every statement that writes; registered Python
-        functions still run whatever they run, so it is a statement guard and not a sandbox.
+        to its new state (a plan rewrite — union / filter / projected CASE — that runs only
+        on a later terminal op). ``INSERT`` aligns the new rows to the table's column types,
+        so over a Python callback stage with no declared output schema it probes that stage
+        on an empty batch or a single row (see `Dataset.schema`). ``CREATE VIEW`` stores the
+        query, and every later query naming the view translates it again, so a view sees the
+        base tables as they are when it is queried. Everything else is a ``SELECT``-family
+        query. A session built with ``read_only=True`` refuses every statement that writes;
+        registered Python functions still run whatever they run, so it is a statement guard
+        and not a sandbox.
 
         A ``SELECT`` returns a lazy `Dataset` and does no work until a terminal op, with
         these exceptions, each evaluated while the statement is translated: a
