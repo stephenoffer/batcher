@@ -295,7 +295,7 @@ A terminal operation executes the plan.
 
 | Method | Returns |
 | --- | --- |
-| {py:meth}`.collect(distributed=False, num_workers=None, spill=False, num_partitions=16, adaptive=False, transport="disk") <batcher.Dataset.collect>` | A pyarrow `Table`. |
+| {py:meth}`.collect(distributed="auto", num_workers=None, spill=False, num_partitions=None, adaptive="auto", transport="auto", backend="cpu") <batcher.Dataset.collect>` | A pyarrow `Table`. |
 | {py:meth}`.to_pydict() <batcher.Dataset.to_pydict>` | A `dict[str, list]`. |
 | {py:meth}`.to_pylist() <batcher.Dataset.to_pylist>` | A `list[dict]`, one dict per row. |
 | `.count()` | Row count as an `int`. |
@@ -305,9 +305,14 @@ A terminal operation executes the plan.
 | {py:meth}`.skew(column) <batcher.Dataset.skew>` / {py:meth}`.kurtosis(column) <batcher.Dataset.kurtosis>` / {py:meth}`.mad(column) <batcher.Dataset.mad>` | Shape and spread: lopsidedness, tail weight, and the outlier-tolerant mean absolute deviation. |
 | {py:meth}`.any(column) <batcher.Dataset.any>` / {py:meth}`.all(column) <batcher.Dataset.all>` | Reduce a boolean column (SQL `BOOL_OR` / `BOOL_AND`); an empty column is `None`, not `False`/`True`. |
 | `.corr(x, y)` / `.cov(x, y, ddof=1)` | Pearson correlation / covariance of two columns. |
-| {py:meth}`.iter_batches(batch_size=None) <batcher.Dataset.iter_batches>` | An iterator of pyarrow `RecordBatch`es. |
+| {py:meth}`.iter_batches(batch_size=None, *, batch_format="pyarrow", distributed=False, ...) <batcher.Dataset.iter_batches>` | An iterator of pyarrow `RecordBatch`es, or of `batch_format` batches. |
+| {py:meth}`.to_pandas(*, dtype_backend="numpy") <batcher.Dataset.to_pandas>` | A pandas `DataFrame`. |
+| {py:meth}`.to_polars() <batcher.Dataset.to_polars>` | A Polars `DataFrame`. |
+| {py:meth}`.to_numpy(columns=None, *, nulls="nan") <batcher.Dataset.to_numpy>` | A `dict[str, numpy.ndarray]`, or of masked arrays with `nulls="mask"`. |
+| {py:meth}`.equals(other, *, ordered=False, rtol=0.0, atol=0.0, check_dtypes=True) <batcher.Dataset.equals>` | A `bool`: whether both sides produce the same result. |
 | `.explain()` | The plan as a `str`. |
-| {py:meth}`.show(limit=10) <batcher.Dataset.show>` | Prints a preview; returns `None`. |
+| {py:meth}`.stats(*, keep_result=False) <batcher.Dataset.stats>` | A `RunStats`; with `keep_result=True` its `result` holds the run's table. |
+| {py:meth}`.show(limit=10, *, max_width=120, max_cell_width=32, file=None) <batcher.Dataset.show>` | Prints a preview to `file` (stdout by default); returns `None`. |
 | {py:obj}`.write(path, fmt=None, partition_by=None, distributed=False, num_workers=None, **kw) <batcher.Dataset.write>` | A {py:class}`WriteManifest <batcher.io.WriteManifest>`. |
 | `.write.parquet(path, compression="zstd", **kw)` | A `WriteManifest`. |
 | `.write.csv(path, **kw)`, `.write.json(path, **kw)` | A `WriteManifest`. |
@@ -387,6 +392,41 @@ operation like any other.
 
 {py:meth}`collect() <batcher.Dataset.collect>` returns a pyarrow `Table` when you want the whole result in hand, and
 {py:meth}`to_pandas() <batcher.Dataset.to_pandas>` / {py:meth}`to_arrow() <batcher.Dataset.to_arrow>` are there for the direct conversions.
+
+Several Python protocols run the query without a method call that says so. The following table lists every implicit and explicit conversion, whether it executes, how it routes on a multi-node cluster, and whether the result is a copy:
+
+| Spelling | Executes | Routes like | Copies |
+|---|---|---|---|
+| `len(ds)`, `ds.shape`, `ds.size` | a `count()`, often answered from metadata with no execution ({doc}`metadata shortcuts </user-guide/analyze/metadata-shortcuts>`) | `collect()` when it does run | no data is returned |
+| `bool(ds)`, `if ds:` | never, it raises | | |
+| `pa.table(ds)`, `pl.DataFrame(ds)`, `duckdb.sql(...)` (`__arrow_c_stream__`) | yes, lazily as the consumer reads | `collect()`: `distributed="auto"` | no, Arrow buffers are handed over |
+| `pandas.api.interchange.from_dataframe(ds)` (`__dataframe__`) | yes, materializes first | `collect()` | the consumer decides |
+| `for batch in ds` (`__iter__`) | yes, streaming | `iter_batches()`: single-node | no |
+| `np.asarray(ds)` (`__array__`) | yes | `to_numpy()`: single-node | yes, always; `copy=False` raises |
+| `ds.to_numpy()`, `ds.to_jax()` | yes, streaming the batches | `iter_batches()`: single-node | yes, where a column needs it |
+| `ds.to_pandas()` | yes | `collect()` | yes, per pandas' conversion |
+| `ds.to_polars()`, `ds.to_arrow()`, `ds.collect()` | yes | `collect()` | no |
+
+The split in the "Routes like" column is deliberate. The streaming and NumPy conversions keep `iter_batches()`'s explicit `distributed=False` default, and the conversions that stand in for `collect()` route as it does. On one node the two are identical. To stream with a specific mode, or with batch options, build the reader yourself:
+
+```python
+import pyarrow as pa
+
+reader = pa.RecordBatchReader.from_batches(ds.schema, ds.iter_batches(batch_size=2))
+print(reader.read_all().num_rows)
+# 6
+```
+
+A `for` loop over `iter_batches()` can stop early. Closing the iterator stops the source read and any prefetch thread. `break` closes it when the generator is garbage-collected, and `contextlib.closing` closes it at a point you choose:
+
+```python
+import contextlib
+
+with contextlib.closing(ds.iter_batches(batch_size=2)) as batches:
+    first = next(batches)
+print(first.num_rows)
+# 2
+```
 
 ## Reshaping
 

@@ -438,6 +438,7 @@ The {py:class}`.meta <batcher.plan.expr_ir.namespaces.meta._MetaNamespace>` acce
 | `.meta.root_names()` | the input columns it reads, left to right, repeats kept |
 | `.meta.is_column()` | whether it is a bare column reference |
 | `.meta.has_multiple_outputs()` | whether it holds a selector that expands to several columns |
+| `.meta.output_type(schema)` | the Arrow type the expression produces over `schema`, or `None` when undecidable without running |
 | `.meta.tree_format(return_as_string=False)` | a drawing of the engine tree, printed or returned |
 
 ## Data science toolkit and evaluation metrics
