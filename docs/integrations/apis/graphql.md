@@ -3,7 +3,7 @@
 This page covers {py:meth}`bt.read.graphql <batcher.api.io_namespace.reader.Reader.graphql>`, which reads the results of a GraphQL query as a lazy dataset, paging a cursor variable.
 
 :::{warning}
-Not yet verified against a live GraphQL service; see `tests/PENDING_VERIFICATION.md`. The request and response shapes are tested against a local fake server only.
+Not yet verified against a live GraphQL service; see [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md). The request and response shapes are tested against a local fake server only.
 :::
 
 | | |

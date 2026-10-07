@@ -169,7 +169,7 @@ print(sales.select(bt.numeric().mean()).to_pydict())
 
 `alias(...)` names one column, so an aliased aggregate over a selector that matched several columns raises a `PlanError` when the query is written, and so does a keyword such as `agg(total=bt.numeric().sum())`. A window works the same way: `bt.numeric().sum().over(partition_by=["region"]).name.suffix("_region")` adds one windowed column per numeric column.
 
-One expression may mix a selector with whole-frame aggregates over the same selector, which is how you standardize every numeric column at once. Bind the selector to a name and reuse it. Selectors match by identity, so writing `bt.numeric()` three times is three selectors and raises a `PlanError` that names this fix:
+One expression may mix a selector with whole-frame aggregates over the same selector, which is how you standardize every numeric column at once. Bind the selector to a name and reuse it. Selectors match by identity, so writing {py:obj}`bt.numeric() <batcher.numeric>` three times is three selectors and raises a `PlanError` that names this fix:
 
 ```python
 n = bt.numeric()
@@ -239,7 +239,7 @@ print(ds.pipe(with_total, tax=0.5).filter(bt.col("total") > 20).to_pydict()["tot
 
 Without `pipe` the same pipeline reads backwards. `with_total(ds).filter(...)` puts the first step in the middle. Reach for `pipe` whenever a chain grows a step that has no built-in method.
 
-Annotate a reusable step as taking a `bt.Dataset` first and returning one, with its options as further parameters, such as `def with_total(frame: bt.Dataset, tax: float = 0.0) -> bt.Dataset`. `pipe` is typed with a `ParamSpec`, so a type checker holds the arguments you pass after the function to that signature, and `ds.pipe(with_total, tax="high")` is flagged in the editor rather than failing when the query runs.
+Annotate a reusable step as taking a {py:obj}`bt.Dataset <batcher.Dataset>` first and returning one, with its options as further parameters, such as `def with_total(frame: bt.Dataset, tax: float = 0.0) -> bt.Dataset`. `pipe` is typed with a `ParamSpec`, so a type checker holds the arguments you pass after the function to that signature, and `ds.pipe(with_total, tax="high")` is flagged in the editor rather than failing when the query runs.
 
 Expressions have the same method. {py:meth}`Expr.pipe <batcher.Expr.pipe>` hands the expression to your function, so a reusable column builder chains the same way:
 

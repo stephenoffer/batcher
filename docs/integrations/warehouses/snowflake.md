@@ -56,7 +56,7 @@ conn = {
 ## Declare one authentication strategy
 
 :::{warning}
-The `auth=` keywords and the load results below are not yet verified against a live Snowflake account. See `tests/PENDING_VERIFICATION.md`.
+The `auth=` keywords and the load results below are not yet verified against a live Snowflake account. See [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md).
 :::
 
 Instead of assembling the connector's keywords yourself, name the strategy with `auth=` and pass its credentials beside the session settings. Batcher checks the combination once, before any connection opens, and folds it into the `connection_kwargs` every worker connects with. A local run and a distributed one therefore authenticate the same way.

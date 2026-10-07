@@ -3,7 +3,7 @@
 This page covers four readers and one writer built on {doc}`the HTTP JSON source </integrations/apis/http-json>`: GitHub, Salesforce, Google Sheets, and SharePoint or OneDrive through Microsoft Graph. Each inherits its retries, its secret-reference auth, and the `Incremental` state document.
 
 :::{warning}
-None of these connectors has been verified against the live service yet; see `tests/PENDING_VERIFICATION.md`. Each is implemented against the service's documented REST API and tested against a local fake that speaks those request and response shapes.
+None of these connectors has been verified against the live service yet; see [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md). Each is implemented against the service's documented REST API and tested against a local fake that speaks those request and response shapes.
 :::
 
 The following table summarizes what each one reads and how it resumes:

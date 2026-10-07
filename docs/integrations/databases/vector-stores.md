@@ -3,7 +3,7 @@
 This page covers writing embeddings into Qdrant, Pinecone, Milvus and Turbopuffer, and reading them back out. The four connectors share one contract, so a frame that writes to one of them has the shape the others expect, and each one checks your points before it sends the first request.
 
 :::{warning}
-None of these connectors has been run against a live service yet. Each one is tested against a recording stand-in for its client library, which pins the requests it sends but cannot prove a server accepts them. Live smoke tests exist under `tests/integration/live/` and are tracked in `tests/PENDING_VERIFICATION.md`. Verify a pipeline against your own deployment before you rely on it.
+None of these connectors has been run against a live service yet. Each one is tested against a recording stand-in for its client library, which pins the requests it sends but cannot prove a server accepts them. Live smoke tests exist under [`tests/integration/live/`](https://github.com/stephenoffer/batcher/tree/main/tests/integration/live) and are tracked in [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md). Verify a pipeline against your own deployment before you rely on it.
 :::
 
 The following table shows what each connector reads and writes, and the extra that installs its client:

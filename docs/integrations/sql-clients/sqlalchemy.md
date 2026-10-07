@@ -10,7 +10,7 @@ Not yet verified against a live SQLAlchemy application beyond this repository's 
 
 Install the `sqlalchemy` extra, which pulls in SQLAlchemy 2.0. The extra's entry point registers the dialect, so `create_engine` finds it by URL. `batcher://` and `batcher+dbapi://` name the same dialect.
 
-A URL can't name a session, since a session is a Python object. `create_engine("batcher://")` connects every pooled connection to `bt.current_session()`. To use another session, pass it through `connect_args`. A URL that names a host, database, user, or query option is refused rather than ignored.
+A URL can't name a session, since a session is a Python object. `create_engine("batcher://")` connects every pooled connection to {py:obj}`bt.current_session() <batcher.current_session>`. To use another session, pass it through `connect_args`. A URL that names a host, database, user, or query option is refused rather than ignored.
 
 ```python
 # docs: skip

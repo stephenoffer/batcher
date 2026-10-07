@@ -1,6 +1,6 @@
 # Nulls and NaN
 
-This page is the reference for how a null and a float NaN behave in every place a value is compared, combined, counted, ordered, or used as a key. Each answer is a block that runs, and `tests/differential/test_diff_null_nan_matrix.py` checks every one of them against DuckDB.
+This page is the reference for how a null and a float NaN behave in every place a value is compared, combined, counted, ordered, or used as a key. Each answer is a block that runs, and [`tests/differential/test_diff_null_nan_matrix.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_null_nan_matrix.py) checks every one of them against DuckDB.
 
 ## What is the difference between null and NaN?
 

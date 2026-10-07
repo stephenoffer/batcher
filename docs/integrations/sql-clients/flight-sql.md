@@ -37,7 +37,7 @@ The service answers these Flight SQL commands:
 | `CommandPreparedStatementUpdate` | `DoPut` | Runs a prepared statement once per bound row |
 | `CancelFlightInfo` | `DoAction` | Stops a result stream at its next batch |
 
-Parameters bind through `Session.sql`'s `params=`: the bound batch's first row fills the `?` placeholders by position, as typed values. A result streams from `Dataset.iter_batches`, one Arrow batch per Flight message. A cancelled stream ends with a cancellation error, never with a short result that looks complete. Each `DoGet` ticket is read once.
+Parameters bind through `Session.sql`'s `params=`: the bound batch's first row fills the `?` placeholders by position, as typed values. A result streams from {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>`, one Arrow batch per Flight message. A cancelled stream ends with a cancellation error, never with a short result that looks complete. Each `DoGet` ticket is read once.
 
 ## Requirements and limitations
 

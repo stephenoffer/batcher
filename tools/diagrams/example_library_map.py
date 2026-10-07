@@ -17,7 +17,7 @@ from _authoring import BLUE_MID, FONT, heading, note, svg, write
 SECTIONS = [
     ("Relational operations", 119),
     ("Expressions", 102),
-    ("Machine learning", 64),
+    ("Machine learning", 65),
     ("Statistics, time series, geo, graph", 49),
     ("Reading and writing", 48),
     ("Operating the engine", 41),
@@ -38,7 +38,7 @@ H = TOP + ROW * len(SECTIONS) + 52
 PEAK = max(n for _, n in SECTIONS)
 
 body = [
-    heading(40, 40, "533 RUNNABLE SCRIPTS, BY SECTION"),
+    heading(40, 40, "534 RUNNABLE SCRIPTS, BY SECTION"),
     note(40, 60, "Each script runs end to end and asserts on its own output."),
 ]
 for i, (name, n) in enumerate(SECTIONS):

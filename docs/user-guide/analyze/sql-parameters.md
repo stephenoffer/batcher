@@ -77,7 +77,7 @@ print(out.to_pydict())
 
 ## Check a query without running it
 
-`bt.sql` returns a lazy Dataset, and its schema comes from the plan rather than from running it. Reading `.schema` is therefore a way to check a query: it parses and translates the SQL, resolves every column and function, and reports the result columns, without reading a row.
+{py:obj}`bt.sql <batcher.sql>` returns a lazy Dataset, and its schema comes from the plan rather than from running it. Reading `.schema` is therefore a way to check a query: it parses and translates the SQL, resolves every column and function, and reports the result columns, without reading a row.
 
 ```python
 checked = bt.sql("SELECT customer, sum(amount) AS total FROM orders GROUP BY customer", orders=orders)

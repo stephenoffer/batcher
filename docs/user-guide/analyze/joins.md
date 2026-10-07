@@ -100,7 +100,7 @@ print(users.join(logins, left_on=key, right_on=key).sort("n").to_pydict())
 #  'email_right': ['ann@x.io', 'ann@x.io'], 'n': [3, 4]}
 ```
 
-A bare `bt.col("k")` is the column name `"k"`, and behaves exactly like the string.
+A bare {py:obj}`bt.col("k") <batcher.col>` is the column name `"k"`, and behaves exactly like the string.
 
 ### Null keys
 
@@ -253,7 +253,7 @@ print(inside.select("t", "crew").sort("t").to_pydict())
 
 A predicate names right columns by name. A right column whose name the left side already has takes the `suffix`, `_right` by default, so {py:obj}`bt.col("v_right") <batcher.col>` is the right side's `v`. One or two inequalities between the sides run as a range join rather than as a filtered cartesian product, and an equality runs as a hash join.
 
-References are by name, never by dataset. `events["t"]` is `bt.col("t")` and is not tied to `events`, so with two inputs that both have a `k`, `left["k"] == right["k"]` compares the left `k` with itself. `join_where` refuses that comparison with a `PlanError` that names the column to use, `bt.col("k_right")`, rather than return the cross product it would otherwise produce.
+References are by name, never by dataset. `events["t"]` is {py:obj}`bt.col("t") <batcher.col>` and is not tied to `events`, so with two inputs that both have a `k`, `left["k"] == right["k"]` compares the left `k` with itself. `join_where` refuses that comparison with a `PlanError` that names the column to use, {py:obj}`bt.col("k_right") <batcher.col>`, rather than return the cross product it would otherwise produce.
 
 ## Update values from another dataset
 

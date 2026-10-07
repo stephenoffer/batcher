@@ -47,7 +47,7 @@ print(rows["response"], rows["rid"][0] != rows["rid"][1])
 `http_engine` sends the id in the `X-Client-Request-Id` header, the one OpenAI documents for a client-supplied request id, and every retry of the request carries the same value. Set `request_id_header="Idempotency-Key"` for a gateway that deduplicates on one. The other engines record the id without sending it. With ids on, each request reaches the engine as a `{"prompt": ..., "request_id": ...}` dict, so a hand-written engine must accept the dict form, as it must for any per-row column.
 
 :::{warning}
-The request-id header is not yet verified against a live OpenAI-compatible provider; see `tests/PENDING_VERIFICATION.md`. It is tested against a local HTTP server, retries included.
+The request-id header is not yet verified against a live OpenAI-compatible provider; see [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md). It is tested against a local HTTP server, retries included.
 :::
 
 ## Chat models need the chat template

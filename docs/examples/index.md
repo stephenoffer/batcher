@@ -1,6 +1,6 @@
 # Example library
 
-Batcher ships 533 runnable example scripts under `examples/`, covering every part of the engine from the relational core to GPU inference. Every one executes end to end against the built engine, asserts on its own output, and exits non-zero if anything is wrong, so running the whole directory doubles as a release check. When you need a starting point for a pipeline, one of these is usually close.
+Batcher ships 534 runnable example scripts under `examples/`, covering every part of the engine from the relational core to GPU inference. Every one executes end to end against the built engine, asserts on its own output, and exits non-zero if anything is wrong, so running the whole directory doubles as a release check. When you need a starting point for a pipeline, one of these is usually close.
 
 The tables on these pages are generated from the scripts themselves by `python tools/example_library.py`, so the library cannot drift from the tree. The prose around them is written by hand.
 
@@ -76,7 +76,7 @@ For a single script that touches every subsystem at once, use [`examples/operati
 
 Each page below indexes one part of the library and shows code lifted from the scripts it covers. Blocks that need the S3 corpus are marked `# docs: skip` and are shown rather than executed; the rest run as part of the documentation build.
 
-![A bar chart of the 533 example scripts by section, sorted largest first. Relational operations has 119, expressions 102, machine learning 64, statistics, time series, geospatial and graph 49, reading and writing 48, operating the engine 41, TPC-H 30, data quality and governance 25, distributed and streaming 20, the root tour scripts 16, multimodal and text 11, and accelerators 8. The relational core and the expression language together hold 221 of the 533.](/_static/diagrams/example_library_map.svg)
+![A bar chart of the 534 example scripts by section, sorted largest first. Relational operations has 119, expressions 102, machine learning 65, statistics, time series, geospatial and graph 49, reading and writing 48, operating the engine 41, TPC-H 30, data quality and governance 25, distributed and streaming 20, the root tour scripts 16, multimodal and text 11, and accelerators 8. The relational core and the expression language together hold 221 of the 534.](/_static/diagrams/example_library_map.svg)
 
 | Page | Scripts | Covers |
 | --- | --- | --- |

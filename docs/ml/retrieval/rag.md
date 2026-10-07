@@ -283,7 +283,7 @@ Run the two rerankers in that order. The cross-encoder costs a model call and de
 
 ## Run it locally and score retrieval
 
-Every model in the pipeline is a plug-in point, so the whole chain runs on a laptop with stand-ins: an encoder that is any callable from a batch to the batch plus an `embedding` column, and an engine factory like the one `ds.ml.generate` already takes. Running it this way is how you test the data path, and it leaves room for the step most RAG pipelines skip, which is scoring retrieval against labelled relevant chunks before reading a single answer. The same steps, with assertions, are in `examples/ml/rag_local_eval.py`.
+Every model in the pipeline is a plug-in point, so the whole chain runs on a laptop with stand-ins: an encoder that is any callable from a batch to the batch plus an `embedding` column, and an engine factory like the one `ds.ml.generate` already takes. Running it this way is how you test the data path, and it leaves room for the step most RAG pipelines skip, which is scoring retrieval against labelled relevant chunks before reading a single answer. The same steps, with assertions, are in [`examples/ml/rag_local_eval.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml/rag_local_eval.py).
 
 ```python
 import numpy as np

@@ -3,7 +3,7 @@
 This page covers reading Amazon Athena query results. {py:meth}`bt.read.athena(query, region=...) <batcher.api.io_namespace.reader.Reader.athena>` is a connection profile over the DB-API reader: it translates Athena's settings into PyAthena's `connect()` keywords and reads through the same path as any `bt.read.sql` read.
 
 :::{warning}
-The Athena profile is not yet verified against a live Athena workgroup. See `tests/PENDING_VERIFICATION.md`.
+The Athena profile is not yet verified against a live Athena workgroup. See [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md).
 :::
 
 The following table summarizes the connector:

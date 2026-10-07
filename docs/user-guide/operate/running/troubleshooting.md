@@ -264,7 +264,7 @@ print(report.splitlines()[-2])
 A function from your own `models.py` shows up as `models [local: .../models.py; ship it]`. Ship it with `ray.init(runtime_env={"py_modules": [...]})` or a `working_dir`, or install it on the workers. `format="json"` gives the same report under a `"requirements"` key. Whether the workers' images actually carry the listed packages is still for the cluster to answer.
 
 :::{warning}
-The report is not yet verified against a failing run on a live Ray cluster; see `tests/PENDING_VERIFICATION.md`.
+The report is not yet verified against a failing run on a live Ray cluster; see [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md).
 :::
 
 ## See also

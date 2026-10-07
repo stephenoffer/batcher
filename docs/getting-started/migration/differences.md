@@ -63,7 +63,7 @@ An integer `sum` that overflows raises an `ExecutionError` asking you to cast to
 
 ## Nulls, NaN, and row order
 
-Batcher follows SQL semantics for missing values, so a pandas port changes answers without raising. The following table compares the cases a port most often gets wrong, row by row against pandas, Polars, and SQL as DuckDB implements it. `tests/differential/test_diff_semantic_compat.py` runs every cell against the installed libraries. Spark isn't a column because that suite has no JVM to run it on. Its name-level differences, such as ascending sorts putting nulls first, are in {doc}`spark/dataframe`.
+Batcher follows SQL semantics for missing values, so a pandas port changes answers without raising. The following table compares the cases a port most often gets wrong, row by row against pandas, Polars, and SQL as DuckDB implements it. [`tests/differential/test_diff_semantic_compat.py`](https://github.com/stephenoffer/batcher/blob/main/tests/differential/test_diff_semantic_compat.py) runs every cell against the installed libraries. Spark isn't a column because that suite has no JVM to run it on. Its name-level differences, such as ascending sorts putting nulls first, are in {doc}`spark/dataframe`.
 
 | Question | Batcher | pandas | Polars | SQL (DuckDB) |
 |---|---|---|---|---|

@@ -308,8 +308,8 @@ The three formats don't offer the same operations, and the gaps are deliberate r
 | Change feed read | `read.read_change_feed` | No | No |
 | Streaming write | Exactly-once, through the log's `txn` action | Exactly-once, through a marker in the snapshot summary | No |
 | Distributed streaming write | Yes | No: refused, so a replayed micro-batch can't duplicate rows | No |
-| Compaction | `bt.compact`, including Z-order | No: needs Spark's `rewrite_data_files` | No |
-| Vacuum | `bt.vacuum` removes unreferenced files | `bt.vacuum` expires old snapshots | No |
+| Compaction | {py:obj}`bt.compact <batcher.compact>`, including Z-order | No: needs Spark's `rewrite_data_files` | No |
+| Vacuum | {py:obj}`bt.vacuum <batcher.vacuum>` removes unreferenced files | {py:obj}`bt.vacuum <batcher.vacuum>` expires old snapshots | No |
 
 ## File skipping from the log
 
