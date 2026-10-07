@@ -1603,6 +1603,100 @@ class Reader:
         """
         return _read_table("hbase", **opts)
 
+    # --- Vector stores -----------------------------------------------------
+    def qdrant(self, collection: str, **opts: Any) -> Dataset:
+        """Read a Qdrant collection by scrolling it, one row per point.
+
+        Rows hold the point id, one ``fixed_size_list<float32>`` column per vector (an
+        unnamed vector reads into ``embedding``), and one column per payload key. Not yet
+        verified against a live Qdrant; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            collection: The collection to read.
+            opts: ``url=``, ``location=`` (``":memory:"``) or ``path=``, ``api_key=``,
+                ``id_column=``, ``vector_column=``, ``with_vectors=`` and ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the collection.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.qdrant("docs", url="http://localhost:6333")  # doctest: +SKIP
+        """
+        return _read_table("qdrant", collection=collection, **opts)
+
+    def pinecone(self, index: str, **opts: Any) -> Dataset:
+        """Read one namespace of a serverless Pinecone index, listing its ids and fetching them.
+
+        Rows hold the record id, its vector in ``embedding`` and one column per metadata
+        field. Not yet verified against a live Pinecone; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            index: The index to read.
+            opts: ``api_key=``, ``namespace=``, ``id_column=``, ``vector_column=`` and
+                ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the namespace.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.pinecone("docs", api_key="env:PINECONE_API_KEY")  # doctest: +SKIP
+        """
+        return _read_table("pinecone", index=index, **opts)
+
+    def milvus(self, collection: str, **opts: Any) -> Dataset:
+        """Read a Milvus collection, one split per partition, with ``query_iterator``.
+
+        Columns are the collection's fields; a float-vector field reads as
+        ``fixed_size_list<float32>``. Not yet verified against a live Milvus; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            collection: The collection to read.
+            opts: ``uri=`` (a server URL or a Milvus Lite file), ``token=``, ``db_name=``,
+                ``partitions=``, ``filter=`` and ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the collection.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.milvus("docs", uri="http://localhost:19530")  # doctest: +SKIP
+        """
+        return _read_table("milvus", collection=collection, **opts)
+
+    def turbopuffer(self, namespace: str, **opts: Any) -> Dataset:
+        """Read a Turbopuffer namespace, paged in id order.
+
+        Columns come from the namespace's attribute schema; ``vector`` reads into
+        ``embedding``. Not yet verified against a live Turbopuffer; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            namespace: The namespace to read.
+            opts: ``region=`` or ``base_url=``, ``api_key=``, ``id_column=``,
+                ``vector_column=`` and ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the namespace.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.turbopuffer(  # doctest: +SKIP
+                ...     "docs", region="gcp-us-central1", api_key="env:TURBOPUFFER_API_KEY"
+                ... )
+        """
+        return _read_table("turbopuffer", namespace=namespace, **opts)
+
     # --- Streaming ---------------------------------------------------------
     def kafka(
         self,

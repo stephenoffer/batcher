@@ -157,6 +157,10 @@ These submit a query or scan to an external system, and `table` reaches any regi
    Reader.elasticsearch
    Reader.redis
    Reader.hbase
+   Reader.qdrant
+   Reader.pinecone
+   Reader.milvus
+   Reader.turbopuffer
    Reader.table
 ```
 
@@ -262,6 +266,10 @@ These write rows into an external database, warehouse, or search index.
    Writer.redis
    Writer.elasticsearch
    Writer.hbase
+   Writer.qdrant
+   Writer.pinecone
+   Writer.milvus
+   Writer.turbopuffer
 ```
 
 ### Streaming sinks

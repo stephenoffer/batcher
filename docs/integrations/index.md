@@ -117,7 +117,7 @@ Delta Lake, Apache Iceberg, and Apache Hudi tables.
 :::{grid-item-card} {octicon}`server;1.1em` Databases
 :link: /integrations/databases/index
 :link-type: doc
-SQL databases, key-value stores, MongoDB, and Elasticsearch, with writes back into them.
+SQL databases, key-value stores, MongoDB, Elasticsearch, and vector stores, with writes back into them.
 :::
 
 :::{grid-item-card} {octicon}`cpu;1.1em` ML and compute
@@ -152,7 +152,7 @@ The following table maps each group to what it covers in full:
 | {doc}`/integrations/streams/index` | Kafka, Amazon Kinesis, Apache Pulsar, Google Cloud Pub/Sub, Azure Event Hubs, and the Avro, JSON, and Protobuf payloads they carry |
 | {doc}`/integrations/warehouses/index` | Snowflake, BigQuery, and Databricks |
 | {doc}`/integrations/lakehouse/index` | Delta Lake, Apache Iceberg, and Apache Hudi |
-| {doc}`/integrations/databases/index` | SQL databases over one connection URI, writing back to a database, DynamoDB, Cassandra, ScyllaDB, Redis, HBase, MongoDB, and Elasticsearch |
+| {doc}`/integrations/databases/index` | SQL databases over one connection URI, writing back to a database, DynamoDB, Cassandra, ScyllaDB, Redis, HBase, MongoDB, Elasticsearch, and the Qdrant, Pinecone, Milvus, and Turbopuffer vector stores |
 | {doc}`/integrations/compute/index` | Ray, batch schedulers, PyTorch, Hugging Face, and MLflow |
 | {doc}`/integrations/observability/index` | Prometheus and Grafana, OpenTelemetry traces, and OpenLineage |
 | {doc}`/integrations/dataframes/index` | Polars, pandas, DuckDB, PyArrow, and NumPy, in the same process and over the same Arrow |

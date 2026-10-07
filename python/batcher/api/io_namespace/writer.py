@@ -2280,3 +2280,114 @@ class Writer:
                 >>> ds.write.hbase("events", host="thrift")  # doctest: +SKIP
         """
         return self(table, "hbase", mode=mode, **opts)
+
+    def qdrant(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Upsert or delete points in an existing Qdrant collection.
+
+        Every point is validated, and the collection's vector size and distance checked,
+        before the first request; a failure names each point on `VectorWriteError`. A string
+        id that is not a UUID is sent as a stable UUID derived from it, so a retried write
+        lands on the same point. Not yet verified against a live Qdrant; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            collection: The collection to write into.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``url=``, ``location=`` or ``path=``, ``api_key=``, ``id_column=``,
+                ``vector_column=`` or ``vector_name=`` / ``vectors=`` for named vectors,
+                ``dimension=``, ``metric=``, ``batch_size=`` and ``max_retries=``.
+
+        Returns:
+            A `WriteManifest` counting the points written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "embedding": [[0.1, 0.2]]})
+                >>> ds.write.qdrant("docs", url="http://localhost:6333")  # doctest: +SKIP
+        """
+        return self(collection, "qdrant", mode=mode, **opts)
+
+    def pinecone(self, index: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Upsert or delete records in one namespace of an existing Pinecone index.
+
+        The index is described first, so a dimension or metric mismatch is refused before
+        anything is sent. Columns other than the id and the vector become metadata. Not yet
+        verified against a live Pinecone; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            index: The index to write into.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``api_key=``, ``namespace=``, ``id_column=``, ``vector_column=``,
+                ``dimension=``, ``metric=``, ``batch_size=`` and ``max_retries=``.
+
+        Returns:
+            A `WriteManifest` counting the records written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": ["a"], "embedding": [[0.1, 0.2]]})
+                >>> ds.write.pinecone(  # doctest: +SKIP
+                ...     "docs", api_key="env:PINECONE_API_KEY", namespace="prod"
+                ... )
+        """
+        return self(index, "pinecone", mode=mode, **opts)
+
+    def milvus(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Upsert, insert or delete rows in an existing Milvus collection.
+
+        The collection's schema is read first: the id column is sent as its primary key, the
+        vector column as its float-vector field, and a column the collection has no field
+        for is refused unless the dynamic field is enabled. ``"append"`` is a Milvus
+        ``insert`` and is never retried. Not yet verified against a live Milvus; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            collection: The collection to write into.
+            mode: ``"upsert"`` (default), ``"append"`` or ``"delete"``.
+            opts: ``uri=``, ``token=``, ``db_name=``, ``partition=``, ``vector_field=``,
+                ``id_column=``, ``vector_column=``, ``dimension=``, ``metric=``,
+                ``batch_size=`` and ``max_retries=``.
+
+        Returns:
+            A `WriteManifest` counting the rows written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "embedding": [[0.1, 0.2]]})
+                >>> ds.write.milvus("docs", uri="./milvus.db")  # doctest: +SKIP
+        """
+        return self(collection, "milvus", mode=mode, **opts)
+
+    def turbopuffer(self, namespace: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Upsert or delete documents in a Turbopuffer namespace.
+
+        The id column is sent as ``id``, the vector column as ``vector``, and every other
+        column as an attribute. ``metric=`` defaults to ``"cosine_distance"``. Not yet
+        verified against a live Turbopuffer; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            namespace: The namespace to write into; created by its first write.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``region=`` or ``base_url=``, ``api_key=``, ``schema=``, ``id_column=``,
+                ``vector_column=``, ``dimension=``, ``metric=``, ``batch_size=`` and
+                ``max_retries=``.
+
+        Returns:
+            A `WriteManifest` counting the documents written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "embedding": [[0.1, 0.2]]})
+                >>> ds.write.turbopuffer(  # doctest: +SKIP
+                ...     "docs", region="gcp-us-central1", api_key="env:TURBOPUFFER_API_KEY"
+                ... )
+        """
+        return self(namespace, "turbopuffer", mode=mode, **opts)
