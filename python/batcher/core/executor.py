@@ -369,6 +369,7 @@ def execute_local_parquet(
     read: ParquetUnitRead,
     memory_budget: int,
     feedback: FeedbackSink | None = None,
+    resident_reads: dict[int, ParquetUnitRead] | None = None,
 ) -> tuple[list[pa.RecordBatch], list[dict], dict]:
     """Execute `plan` in-process with `sources[driving]` read from Parquet by the engine's workers.
 
@@ -378,6 +379,9 @@ def execute_local_parquet(
     `execute_local_chunked`'s. Unlike that path every driving row passes through the operators
     once, so their measured counts are real and are recorded into `feedback` as the resident
     executor records its own. Returns ``(batches, ops, usage)`` as `execute_local_metered` does.
+
+    `resident_reads` names other sources the engine reads itself, whole, before it runs: for
+    each, `sources[i]` is its zero-row schema carrier, replaced by the rows read.
     """
     cfg = active_config()
     engine_cfg = cfg.engine_config_json_with(
@@ -398,6 +402,10 @@ def execute_local_parquet(
         engine_cfg,
         current_query_id() or None,
         memory_budget,
+        [
+            (i, r.uris, r.columns, r.predicate, r.batch_size)
+            for i, r in sorted((resident_reads or {}).items())
+        ],
     )
     ops, usage = _parse_metrics(metrics_json)
     if feedback is not None and ops:

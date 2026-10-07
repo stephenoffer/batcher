@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1646 Python modules across 236 packages and 345 Rust files across 14 crates.
+Covering 1646 Python modules across 236 packages and 346 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -350,7 +350,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 129 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `chunked.py` | 470 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
+| `chunked.py` | 508 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
 | `chunked_sideways.py` | 647 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
@@ -1777,7 +1777,7 @@ Core — the adaptive executor. **Execution and adaptation only.**
 |---|---|---|
 | `base.py` | 87 | The execution-strategy seam: one `Executor` Protocol, one `ExecutionContext`. |
 | `energy.py` | 328 | Measuring what a stage drew — Core's half of the energy loop. |
-| `executor.py` | 468 | The Core local executor. |
+| `executor.py` | 476 | The Core local executor. |
 | `gpu_transform.py` | 312 | GPU-accelerated relational transform kernels (the compute core of a GPU backend). |
 | `mergeable.py` | 191 | The one running fold over the mergeable aggregate algebra. |
 | `runtime.py` | 489 | Process-wide runtime services for Core: the default MetadataHub, and query cancellation. |
@@ -3228,7 +3228,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg.rs` | 76 | The distributed aggregate's map and reduce steps: `partial_aggregate`, `combine` and `combine_finalize`, the mergeable folds the shuffle composes across… |
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
-| `chunked/mod.rs` | 690 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/mod.rs` | 695 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/resident.rs` | 85 | The plan's other Parquet scans, read by the engine before it runs instead of by the control plane. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 728 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 342 | What the engine's own process knows about its hardware and its allocator. |

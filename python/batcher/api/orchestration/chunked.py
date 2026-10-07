@@ -21,6 +21,7 @@ import copy
 import math
 import re
 import time
+from collections import Counter
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
@@ -253,16 +254,25 @@ def execute_chunked(
     carrier = _schema_carrier(sources[driving], projection)
     if carrier is None:
         return None
-    scanned = opt.scanned_source_ids()
-    reads = read_scanned(sources, opt, set(scanned) - {driving})
+    others = set(opt.scanned_source_ids()) - {driving}
+    native = _native_reads(sources, opt, others) if units is not None else {}
+    reads = read_scanned(sources, opt, others - native.keys())
     resident: list[list[pa.RecordBatch]] = [
-        [carrier] if i == driving else reads[i][0] if i in reads else []
-        for i in range(len(sources))
+        reads[i][0] if i in reads else [] for i in range(len(sources))
     ]
+    resident[driving] = [carrier]
+    for i, (schema_carrier, _) in native.items():
+        resident[i] = [schema_carrier]
     try:
         if units is not None:
             out, ops, usage = core.execute_local_parquet(
-                opt, resident, driving, units, _held_budget(), feedback
+                opt,
+                resident,
+                driving,
+                units,
+                _held_budget(),
+                feedback,
+                {i: read for i, (_, read) in native.items()},
             )
             if profile is not None:
                 profile.metric_ops = ops
@@ -375,6 +385,34 @@ def _selective_build(
 def _pushed(opt: PhysicalPlan, i: int) -> tuple[list[str] | None, dict | None]:
     """The projection and predicate the plan pushed into source `i`'s scan."""
     return opt.source_projections.get(i), opt.source_predicates.get(i)
+
+
+def _native_reads(
+    sources: list[Source], opt: PhysicalPlan, ids: set[int]
+) -> dict[int, tuple[pa.RecordBatch, Any]]:
+    """The scans in `ids` the engine can read itself: `{id: (schema carrier, unit read)}`.
+
+    The rest of a row-group execution's scans are read here and handed over resident, which
+    exports every decoded batch to pyarrow and imports it back: on 64 cores at TPC-H sf100 that
+    left q18 ~300 ms with the cores idle before the engine started. A scan qualifies when
+    `parquet.units` says the engine's read returns the same rows, and when no other binding in
+    `ids` reads the same source object: `read_scanned` reads such bindings once for all of them,
+    which reading each here would undo. A pushed row cap or ordering keeps the resident read,
+    which applies them.
+    """
+    shared = Counter(id(sources[i]) for i in ids)
+    out: dict[int, tuple[pa.RecordBatch, Any]] = {}
+    for i in sorted(ids):
+        if shared[id(sources[i])] > 1 or opt.source_limits.get(i) is not None:
+            continue
+        if opt.source_orderings.get(i):
+            continue
+        projection, predicate = _pushed(opt, i)
+        read = _unit_read(sources[i], projection, predicate)
+        carrier = None if read is None else _schema_carrier(sources[i], projection)
+        if read is not None and carrier is not None:
+            out[i] = (carrier, read)
+    return out
 
 
 def _shared(sources: list[Source], opt: PhysicalPlan, i: int) -> bool:
