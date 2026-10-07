@@ -349,7 +349,7 @@ def _filtered(
     149999999`, which is every row. Judged as filtered, 4.2 GiB of it was broadcast, overran
     the bound at run time, and the query fell back to a path that took 205 s.
     """
-    from batcher.plan.logical import Aggregate, Filter
+    from batcher.plan.logical import Aggregate, Filter, Join
     from batcher.plan.visitor import children, scanned_source_ids, walk
 
     def subtree(n: LogicalPlan) -> LogicalPlan | None:
@@ -380,10 +380,14 @@ def _filtered(
     reduce = None if sources is None else (lambda side: unbroadcastable(side, sources))
     found = subtree(group_broadcast_joins(body, aligned, reduce=reduce))
     # A grouped aggregate reduces as surely as a filter: q22's distinct customer keys are 100M
-    # of `orders`' 1.5B rows.
+    # of `orders`' 1.5B rows. So does a semi or anti join, which can only drop rows: on a warm
+    # run of TPC-H q20 the shared subplan reuse turns `part`'s `LIKE 'forest%'` filter into an
+    # in-memory set of keys, `partsupp SEMI keys` stopped counting as filtered, the 13.5 GB
+    # source was judged unholdable, and the query ran staged (37.5 s against 20 s aligned).
     return found is not None and any(
         (isinstance(n, Filter) and real(n.predicate.to_ir()))
         or (isinstance(n, Aggregate) and n.group_keys)
+        or (isinstance(n, Join) and n.join_type in ("semi", "anti"))
         for n in walk(found)
     )
 
