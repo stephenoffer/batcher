@@ -365,8 +365,51 @@ def distinct_membership_sides(
             and not isinstance(node.right, Aggregate)
             and (worth is None or worth(node.right))
         ):
+            right = _reduced_by_left(node) if worth is not None else node.right
             keys = tuple(Projection(k, col(k)) for k in dict.fromkeys(node.right_keys))
-            return dataclasses.replace(node, right=Aggregate(node.right, keys, ()))
+            return dataclasses.replace(node, right=Aggregate(right, keys, ()))
         return node
 
     return transform_up(plan, step)
+
+
+def _reduced_by_left(node: Join) -> LogicalPlan:
+    """`node`'s right side semi-joined to the keys its filtered left side holds.
+
+    A key the left side never carries cannot change which left rows match, so dropping it
+    leaves the semi or anti join exactly as it was (a NULL key matches nothing either way).
+    TPC-H q22 at SF1000 asks which of ~21M filtered customers have no order: cut to their
+    keys first, each unit's distinct `o_custkey` is a few million rather than most of the
+    100M customers with an order, which is what outgrew the driver's 4.8 GiB budget and sent
+    the query to the staged path (~60-100 s). Only for a left side a predicate filters: an
+    unfiltered one holds every key and would only be read twice.
+    """
+    if not _really_filtered(node.left):
+        return node.right
+    aliases = [_fresh(k) for k in node.left_keys]
+    keys = Project(
+        input=node.left,
+        items=tuple(Projection(a, col(k)) for a, k in zip(aliases, node.left_keys, strict=True)),
+    )
+    return Join(
+        left=node.right,
+        right=keys,
+        left_keys=node.right_keys,
+        right_keys=tuple(aliases),
+        join_type="semi",
+        output=tuple(JoinOutputCol("left", c, c) for c in node.right.available_columns()),
+    )
+
+
+def _really_filtered(node: LogicalPlan) -> bool:
+    """Whether some filter in `node` tests more than `IS NOT NULL` (which joins add)."""
+    from batcher.plan.visitor import walk
+
+    def real(ir: dict) -> bool:
+        if ir.get("e") == "is_not_null":
+            return False
+        if ir.get("e") == "binary" and ir.get("op") == "and":
+            return real(ir["left"]) or real(ir["right"])
+        return True
+
+    return any(isinstance(n, Filter) and real(n.predicate.to_ir()) for n in walk(node))

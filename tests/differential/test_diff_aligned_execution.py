@@ -727,6 +727,44 @@ def test_a_broadcast_too_large_to_hold_is_cut_to_the_keys_another_broadcast_admi
 
 
 @pytest.mark.parametrize("how", ["anti", "semi"])
+def test_a_membership_side_is_cut_to_the_keys_a_filtered_side_holds(tables, monkeypatch, how):
+    """TPC-H q22's shape at SF1000: filtered customers with (or without) an order, `orders`
+    too large to hold. Its distinct customer keys are taken only among the filtered ones."""
+    from batcher.dist.executors.aligned import units
+    from batcher.dist.executors.aligned.rewrite import distinct_membership_sides
+    from batcher.plan.logical import Aggregate
+
+    cust, shuffled = _read(tables, "customer"), _read(tables, "shuffled")
+    ds = (
+        cust.filter(col("c_seg") == "BUILDING")
+        .join(shuffled, left_on="c_ck", right_on="o_ck", how=how)
+        .group_by("c_seg")
+        .agg(n=bt.count())
+    )
+    op = "NOT EXISTS" if how == "anti" else "EXISTS"
+    query = (
+        f"SELECT c_seg, count(*) AS n FROM customer WHERE c_seg = 'BUILDING' AND {op} "
+        "(SELECT 1 FROM shuffled WHERE o_ck = c_ck) GROUP BY c_seg"
+    )
+    o_id = next(i for i, s in enumerate(ds._sources) if "o_ck" in s.schema().names)
+    monkeypatch.setattr(
+        aligned_run, "BROADCAST_BYTES", units.projected_bytes(ds._sources[o_id], None) - 1
+    )
+    assert_same_for_query(_run_aligned(ds), _duck(tables, query), query)
+    # Positive control: the membership side reads the filtered customers' keys, and that is
+    # the plan the executor ran.
+    opt = kyber.optimize_logical(ds._plan, sources=ds._sources)
+    cut = distinct_membership_sides(opt, lambda side: True)
+    sides = [n.right for n in _walk(cut) if isinstance(n, Join) and n.join_type == how]
+    assert sides and isinstance(sides[0], Aggregate)
+    assert any(isinstance(n, Join) and n.join_type == "semi" for n in _walk(sides[0]))
+    found = choose_plan(opt, ds._sources, strict=False)
+    assert any(
+        isinstance(n, Join) and n.join_type == "semi" for c in found.cuts for n in _walk(c.body)
+    )
+
+
+@pytest.mark.parametrize("how", ["anti", "semi"])
 def test_a_membership_join_to_an_unclustered_table_slices_its_keys(tables, monkeypatch, how):
     """TPC-H q22's shape: rows of a key-ordered table with (or without) a match in a table
     that is not. The other side is held, and each unit reads only the keys of its own range.
