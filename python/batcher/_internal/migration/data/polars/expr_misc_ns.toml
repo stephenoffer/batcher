@@ -5,9 +5,9 @@
 ["Expr.struct"]
 field = { status = "param", batcher = "Expr.struct.field", need = "several names and the '*' wildcard in one call", wave = "W2" }
 json_encode = { status = "gap", need = "struct.json_encode", wave = "W3" }
-rename_fields = { status = "gap", need = "struct.rename_fields", wave = "W3" }
+rename_fields = { status = "param", batcher = "Expr.struct.rename_fields", need = "a positional list naming every field (Polars' form); Batcher takes an {old: new} mapping", wave = "W3" }
 unnest = { status = "param", batcher = "Dataset.unnest", need = "expression-level unnest (struct fields as separate output columns inside select)", wave = "W2" }
-with_fields = { status = "gap", need = "struct.with_fields", wave = "W3" }
+with_fields = { status = "param", batcher = "Expr.struct.with_fields", need = "positional expressions named by their output, built from pl.field(...); Batcher takes name=expr keywords and reads a field with struct.field", wave = "W3" }
 
 ["Expr.cat"]
 ends_with = { status = "canonical", batcher = "Expr.str.ends_with" }

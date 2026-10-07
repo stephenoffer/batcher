@@ -218,9 +218,9 @@ The following table maps the 5 names on `Expr.struct`, sorted alphabetically.
 |---|---|---|---|
 | `field` | `Expr.struct.field` | param | Missing: several names and the '\*' wildcard in one call. Wave W2. |
 | `json_encode` | n/a | gap | Not yet: struct.json\_encode. Wave W3. |
-| `rename_fields` | n/a | gap | Not yet: struct.rename\_fields. Wave W3. |
+| `rename_fields` | `Expr.struct.rename_fields` | param | Missing: a positional list naming every field (Polars' form); Batcher takes an \{old: new\} mapping. Wave W3. |
 | `unnest` | {py:obj}`Dataset.unnest <batcher.Dataset.unnest>` | param | Missing: expression-level unnest (struct fields as separate output columns inside select). Wave W2. |
-| `with_fields` | n/a | gap | Not yet: struct.with\_fields. Wave W3. |
+| `with_fields` | `Expr.struct.with_fields` | param | Missing: positional expressions named by their output, built from pl.field(...); Batcher takes name=expr keywords and reads a field with struct.field. Wave W3. |
 
 ## `Expr.cat`
 

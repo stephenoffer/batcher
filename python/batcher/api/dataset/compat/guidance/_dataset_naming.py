@@ -217,10 +217,7 @@ DATASET_RAY_DATA: dict[str, str] = {
     ),
     "write_bigquery": "Spelled ds.write.bigquery(table, project=...) here.",
     "write_clickhouse": "Spelled ds.write.clickhouse(table, host=host) here.",
-    "write_turbopuffer": (
-        "No Turbopuffer sink. Write vectors with ds.write.parquet(path), or push them with "
-        "ds.write.for_each_batch(fn)."
-    ),
+    "write_turbopuffer": "Spelled ds.write.turbopuffer(namespace, region=...) here.",
     # Foreign frameworks.
     "to_modin": "No Modin bridge. Collect first: ds.to_pandas().",
     "to_mars": "No Mars bridge. Collect first: ds.to_pandas().",
