@@ -56,6 +56,8 @@ def llm_udf(
     logprobs: bool = False,
     dedup: bool = False,
     skip_null_prompts: bool = False,
+    request_id_column: str | None = None,
+    request_id_key: str | list[str] | None = None,
 ) -> type:
     """A **load-once class UDF** that appends an LLM-generated column to each batch.
 
@@ -106,15 +108,25 @@ def llm_udf(
             turn it on to stop spending a decode slot (GPU engine) or a billed request
             (hosted engine) on a row that has no prompt. Ignored when `template` or
             `image_column` is set.
+        request_id_column: give every request a stable id, sent to an engine that accepts
+            one (`http_engine` sends it as a header) and recorded in this column. A column
+            of this name in the data supplies the ids; otherwise each is derived from the
+            row's request content (see `request_id_key`) and appended. Retries resend the
+            same id. Requests become ``{"prompt": ..., "request_id": ...}`` dicts, so a
+            custom engine must accept the dict form.
+        request_id_key: column(s) folded into a derived id, so rows sending identical
+            requests get distinct ids. Only meaningful when the ids are derived.
 
     Returns:
         A class whose instances map a `pyarrow.RecordBatch` to the batch plus the
         generated column(s).
 
     Raises:
-        PlanError: If `raw_column` is set without `parse_json`, or names `output_column`.
+        PlanError: If `raw_column` is set without `parse_json`, or names `output_column`;
+            or if `request_id_key` is set without `request_id_column`.
     """
     _check_raw_column(raw_column, parse_json=parse_json, output_column=output_column)
+    key = _check_request_id(request_id_column, request_id_key, output_column)
     spec = GenerateSpec(
         prompt_column=prompt_column,
         output_column=output_column,
@@ -131,6 +143,8 @@ def llm_udf(
         logprobs=logprobs,
         dedup=dedup,
         skip_null_prompts=skip_null_prompts,
+        request_id_column=request_id_column,
+        request_id_key=key,
     )
 
     class _LlmGenerate:
@@ -176,6 +190,8 @@ def llm_generate(
     logprobs: bool = False,
     dedup: bool = False,
     skip_null_prompts: bool = False,
+    request_id_column: str | None = None,
+    request_id_key: str | list[str] | None = None,
     num_workers: int = 1,
     target_batch_rows: int | None = None,
 ) -> Iterator[pa.RecordBatch]:
@@ -237,6 +253,9 @@ def llm_generate(
             turn it on to stop spending a decode slot (GPU engine) or a billed request
             (hosted engine) on a row that has no prompt. Ignored when `template` or
             `image_column` is set.
+        request_id_column: give every request a stable id, sent to an engine that accepts
+            one and recorded in this column (see `llm_udf`).
+        request_id_key: column(s) folded into a derived request id.
         num_workers: how many engines to build **in this process** and run batches
             across. Leave at ``1`` for a GPU-resident engine: each worker calls
             `engine_factory` again, so ``2`` loads two full copies of the weights onto
@@ -268,6 +287,8 @@ def llm_generate(
         logprobs=logprobs,
         dedup=dedup,
         skip_null_prompts=skip_null_prompts,
+        request_id_column=request_id_column,
+        request_id_key=request_id_key,
     )
     if num_workers <= 1 and target_batch_rows is None:
         # The documented default: one engine, the caller's batches, in order. No pool,
@@ -368,11 +389,17 @@ def _generate_batch(
     # Everything is already in row order (order un-applied, uniques fanned out), so the
     # column builders un-permute nothing: pass order=None.
     arrays += _reported_columns(engine, outputs, None, row_reported, spec)
+    appended = dict(zip(spec.appended_columns, arrays, strict=True))
+    if spec.request_id_column is not None and spec.request_id_column not in batch.schema.names:
+        # A derived id is recorded beside the output; a supplied one is already a column.
+        appended[spec.request_id_column] = _text_column(
+            [r.get("request_id") if isinstance(r, dict) else None for r in requests]
+        )
     # `append_columns` **replaces** a name the batch already carries. Building the batch by
     # hand appended it instead, and Arrow permits duplicate field names — so re-generating
     # into the column you read, or a second pass over the default `response`, produced two
     # columns of one name that `to_pydict()` and every expression disagree about.
-    return append_columns(batch, dict(zip(spec.appended_columns, arrays, strict=True)))
+    return append_columns(batch, appended)
 
 
 def _prompted_rows(spec: GenerateSpec, batch: pa.RecordBatch) -> list[int] | None:
@@ -435,12 +462,15 @@ def _dedup_requests(requests: list) -> tuple[list, list[int]]:
     Only plain-string requests are deduped. A dict request (per-row image, adapter, or
     sampling override) is treated as unique — two rows with the same prompt but different
     token budgets are genuinely different requests, and an image is not hashable anyway.
+    The one exception is a dict carrying a ``request_id`` and no image: every field it
+    sends, the id included, is then compared, so only rows sending the *same* request with
+    the *same* id collapse, and the id the engine sent is the id each row records.
     """
     uniques: list = []
     inverse: list[int] = []
-    seen: dict[str, int] = {}
+    seen: dict[object, int] = {}
     for request in requests:
-        key = request if isinstance(request, str) else None
+        key = _dedup_key(request)
         if key is not None and key in seen:
             inverse.append(seen[key])
             continue
@@ -450,6 +480,37 @@ def _dedup_requests(requests: list) -> tuple[list, list[int]]:
         uniques.append(request)
         inverse.append(position)
     return uniques, inverse
+
+
+def _dedup_key(request: object) -> object | None:
+    """The identity `_dedup_requests` compares, or `None` for a request never collapsed."""
+    if isinstance(request, str):
+        return request
+    if isinstance(request, dict) and "request_id" in request and "image" not in request:
+        return tuple(sorted((k, repr(v)) for k, v in request.items()))
+    return None
+
+
+def _check_request_id(
+    column: str | None, key: str | list[str] | None, output_column: str
+) -> tuple[str, ...] | None:
+    """Validate the request-id options and normalize `key` to a tuple."""
+    from batcher._internal.errors import PlanError
+
+    if column is None:
+        if key is not None:
+            raise PlanError(
+                "generate(request_id_key=...) folds columns into a derived request id, so it "
+                "needs request_id_column=... naming where the ids go"
+            )
+        return None
+    if column == output_column:
+        raise PlanError(
+            f"generate(): request_id_column and output_column are both {column!r}; name them apart"
+        )
+    if key is None:
+        return None
+    return (key,) if isinstance(key, str) else tuple(key)
 
 
 def _fan_out(values: list, inverse: list[int] | None) -> list:

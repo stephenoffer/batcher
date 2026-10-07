@@ -15,6 +15,7 @@ from __future__ import annotations
 from batcher.ml.llm.engines import (
     Engine,
     EngineFactory,
+    ProviderLimit,
     anthropic_engine,
     bedrock_engine,
     gemini_engine,
@@ -27,10 +28,13 @@ from batcher.ml.llm.judge import llm_pairwise_udf, llm_score_udf, llm_verify_udf
 from batcher.ml.llm.packing import pack_sequences
 from batcher.ml.llm.sizing import kv_cache_concurrency
 from batcher.ml.llm.structured import json_schema, llm_classify_udf, llm_extract_udf
+from batcher.ml.llm.tokens import TokenBudget
 
 __all__ = [
     "Engine",
     "EngineFactory",
+    "ProviderLimit",
+    "TokenBudget",
     "anthropic_engine",
     "bedrock_engine",
     "gemini_engine",

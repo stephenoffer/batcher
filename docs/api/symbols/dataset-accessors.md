@@ -32,6 +32,7 @@ These methods run a model over the rows: batch inference, embeddings, tabular sc
    DatasetML.embed
    DatasetML.predict
    DatasetML.generate
+   DatasetML.token_count
    DatasetML.classify
    DatasetML.extract
 ```

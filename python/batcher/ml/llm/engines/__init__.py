@@ -18,6 +18,7 @@ from __future__ import annotations
 from batcher.ml.llm.engines.anthropic import anthropic_engine
 from batcher.ml.llm.engines.base import Engine, EngineFactory
 from batcher.ml.llm.engines.hosted import bedrock_engine, gemini_engine
+from batcher.ml.llm.engines.limits import ProviderLimit
 from batcher.ml.llm.engines.openai import (
     _openai_body as _openai_body,
 )
@@ -57,6 +58,7 @@ from batcher.ml.llm.sizing import _truncate_to_window as _truncate_to_window
 __all__ = [
     "Engine",
     "EngineFactory",
+    "ProviderLimit",
     "anthropic_engine",
     "bedrock_engine",
     "gemini_engine",

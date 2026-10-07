@@ -221,6 +221,7 @@
 "reciprocal_rank_fusion" = "Dataset"
 "similarity_join" = "Dataset"
 "similarity_to" = "Dataset"
+"token_count" = "Dataset"
 "truncate_embeddings" = "Dataset"
 "upload" = "Dataset"
 

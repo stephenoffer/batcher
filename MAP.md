@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1603 Python modules across 225 packages and 337 Rust files across 14 crates.
+Covering 1611 Python modules across 227 packages and 337 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -220,8 +220,8 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 237 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7654 | `Dataset` — the lazy, immutable, fluent entry point. |
-| `ml.py` | 2883 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
+| `frame.py` | 7682 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `ml.py` | 2988 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
 ### `batcher/api/dataset/_build/` — 5 · conductor
@@ -470,6 +470,15 @@ Metadata-first terminal resolution — the façade over the answer modules.
 | `enrich.py` | 129 | Teach the source statistics the facets a source can compute but has not been asked for. |
 | `pushed_count.py` | 71 | `ds.count()` answered by the source's own ``COUNT(*)`` instead of by reading it. |
 
+### `batcher/api/terminal/requirements/` — 5 · conductor
+
+The worker-requirements preflight: what a plan's remote workers must be able to import.
+
+| module | lines | what it is |
+|---|---|---|
+| `report.py` | 187 | The worker-requirements preflight behind ``ds.explain(requirements=True)``. |
+| `scan.py` | 198 | What one UDF needs on a remote worker, read from the pickle that would ship it. |
+
 ### `batcher/api/terminal/stream/` — 5 · conductor
 
 Streaming terminal path for `Dataset.iter_batches` — package façade.
@@ -600,12 +609,13 @@ LLM batch inference — the Ray Data LLM competitor (offline text generation).
 | `channels.py` | 89 | Per-call side channels an engine uses to report token usage and finish reasons. |
 | `columns.py` | 234 | Building the columns a generation appends, from what the engine reported. |
 | `extract_schema.py` | 398 | The declared schema of an `extract` call: resolution, JSON Schema, and per-value coercion. |
-| `generate.py` | 570 | LLM batch generation — the columnar half of offline text generation. |
+| `generate.py` | 631 | LLM batch generation — the columnar half of offline text generation. |
 | `judge.py` | 384 | Model-graded evaluation — scoring generations with a judge model, as typed columns. |
 | `packing.py` | 251 | Sequence packing — concatenate tokenized documents into fixed-length training sequences. |
-| `requests.py` | 316 | Turning a `RecordBatch` into the per-row requests an engine receives. |
-| `sizing.py` | 379 | Sizing an LLM engine from the workload instead of from the model's maximum. |
+| `requests.py` | 384 | Turning a `RecordBatch` into the per-row requests an engine receives. |
+| `sizing.py` | 402 | Sizing an LLM engine from the workload instead of from the model's maximum. |
 | `structured.py` | 387 | Typed columns out of an LLM — the AI-powered-ETL primitives. |
+| `tokens.py` | 355 | Real-tokenizer token counts, shared by the token-count column and LLM request batching. |
 
 ### `batcher/ml/llm/engines/` — 6 · front-end
 
@@ -613,12 +623,12 @@ LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends.
 
 | module | lines | what it is |
 |---|---|---|
-| `anthropic.py` | 248 | The Anthropic Messages API backend — batch generation against a hosted Claude model. |
-| `base.py` | 113 | LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends. |
+| `anthropic.py` | 266 | The Anthropic Messages API backend — batch generation against a hosted Claude model. |
+| `base.py` | 149 | LLM engine adapters — the pluggable ``list[str] -> list[str]`` backends. |
 | `footprint.py` | 303 | What a model will occupy, read before the engine is built rather than discovered by it. |
-| `hosted.py` | 558 | AWS Bedrock and Google Gemini — the hosted providers whose wire shape is not OpenAI's. |
-| `limits.py` | 266 | Client-side rate limiting for a hosted LLM endpoint. |
-| `openai.py` | 350 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
+| `hosted.py` | 585 | AWS Bedrock and Google Gemini — the hosted providers whose wire shape is not OpenAI's. |
+| `limits.py` | 424 | Client-side rate limiting for a hosted LLM endpoint. |
+| `openai.py` | 374 | The OpenAI-compatible HTTP backend: a *served* model behind a REST endpoint. |
 | `parallelism.py` | 522 | How many GPUs one LLM engine replica needs, and what that choice costs. |
 | `sglang.py` | 348 | The SGLang backend: an offline, GPU-resident engine built around prefix reuse. |
 | `templates.py` | 72 | Whether a model expects its prompts wrapped in a chat template. |
@@ -1129,6 +1139,16 @@ Scheduling a GPU stage against the wires, not just the device count.
 |---|---|---|
 | `collective_env.py` | 281 | Telling the collective library which wires this node has, instead of letting it guess. |
 | `placement.py` | 122 | How a GPU fan-out's shards are sized and dealt against what the devices measured. |
+
+### `batcher/dist/limits/` — 4 · backend
+
+Shared provider quotas: one rate and concurrency limit obeyed by every worker.
+
+| module | lines | what it is |
+|---|---|---|
+| `actor.py` | 110 | The cluster half of a shared provider quota: one named Ray actor per provider. |
+| `quota.py` | 170 | The state behind one shared provider quota: a reservation token bucket plus leases. |
+| `shared.py` | 102 | Choosing where a shared quota lives, and holding one request's share of it. |
 
 ### `batcher/dist/reduction/` — 4 · backend
 
