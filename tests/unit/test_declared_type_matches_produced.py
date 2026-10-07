@@ -268,10 +268,11 @@ def test_a_string_times_one_is_refused_rather_than_answered():
 
     DuckDB rejects `s * 1` outright. Batcher answered the string back, because the identity
     fired before anything looked at the operand's type — so the query "succeeded" with a
-    column the arithmetic could never have produced.
+    column the arithmetic could never have produced. It is now refused at plan time, as a
+    `PlanError` naming both types, before the engine or the rewrite ever sees it (AP-181).
     """
     ds = bt.from_pydict({"s": ["a", "b"]})
-    with pytest.raises(RuntimeError):
+    with pytest.raises(bt.PlanError, match="arithmetic is not defined on text"):
         ds.select(r=col("s") * lit(1)).collect()
 
 
