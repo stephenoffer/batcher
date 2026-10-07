@@ -107,3 +107,53 @@ def test_the_chunked_probe_join_matches_the_per_chunk_loop_and_meters_every_chun
     )
     key = lambda bs: sorted(k for b in bs for k in b.column(0).to_pylist())  # noqa: E731
     assert key(per_chunk) == key(got)
+
+
+def test_a_small_spill_threshold_in_the_config_does_not_decline_the_chunked_join(monkeypatch):
+    """The output bound, not the shipped spill threshold, decides when the chunked join gives up.
+
+    The chunked engine call holds the tighter of its explicit budget and the config's
+    `memory_budget_bytes`. TPC-H q10 at SF1000 shipped 16 MiB there and every probe task
+    declined after 28 MB of output. The control: the same join under a bound below its output
+    still declines, so the bound is live rather than switched off.
+    """
+    import json
+
+    from batcher._internal.native import engine
+
+    nat = engine()
+    probe = [pa.record_batch({"k": pa.array(range(c, 400_000, 2), pa.int64())}) for c in range(2)]
+    build = [pa.record_batch({"bk": pa.array(range(400_000), pa.int64())})]
+    probe_ir = json.dumps({"op": "scan", "source_id": 0})
+    join_ir = json.dumps(
+        {
+            "op": "hash_join",
+            "left": {"op": "scan", "source_id": 0},
+            "right": {"op": "scan", "source_id": 1},
+            "left_keys": ["k"],
+            "right_keys": ["bk"],
+            "join_type": "inner",
+            "output": [{"side": "left", "name": "k", "alias": "k"}],
+        }
+    )
+    tiny = json.dumps({"parallelism": 2, "memory_budget_bytes": 64 << 10})
+    got = fb.stream_probe_join(
+        nat, probe_ir, join_ir, iter(probe), build, tiny, None, None, output_budget=1 << 30
+    )
+    assert sum(b.num_rows for b in got) == 400_000
+    monkeypatch.setattr(fb, "_OUTPUT_BUDGET_FRACTION", 0.0)  # no node-share floor under it
+    with pytest.raises(fb.BroadcastOutputTooLarge):
+        fb.stream_probe_join(
+            nat, probe_ir, join_ir, iter(probe), build, tiny, None, None, output_budget=64 << 10
+        )
+
+
+def test_the_holding_config_only_ever_raises_the_threshold():
+    import json
+
+    cfg = '{"memory_budget_bytes": 100, "parallelism": 3}'
+    assert json.loads(fb._holding_config(cfg, 1000))["memory_budget_bytes"] == 1000
+    assert fb._holding_config(cfg, 50) == cfg  # a tighter output bound leaves the config alone
+    unbounded = '{"memory_budget_bytes": 0}'
+    assert fb._holding_config(unbounded, 1000) == unbounded  # unbounded stays unbounded
+    assert fb._holding_config(cfg, 0) == cfg

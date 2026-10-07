@@ -588,6 +588,66 @@ def test_a_broadcast_no_node_can_hold_is_left_to_the_residual(tables, monkeypatc
     assert_same_for_query(got, _duck(tables, query), query)
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+def test_a_dimension_between_two_aligned_tables_is_moved_out_of_their_way(
+    tables, monkeypatch, grouped
+):
+    """TPC-H q10's shape at SF1000: `lineitem JOIN (customer JOIN orders)`, `customer` too
+    large to hold on every node.
+
+    The two key-ordered tables meet only above the dimension, so no cut can join them per
+    range without broadcasting it. Moved down to `orders`, `lineitem` joins it per range and
+    `customer` is left to the residual. Grouped, the facts are also pre-aggregated by the
+    customer key beneath it, which is what keeps the units' results small.
+    """
+    from batcher.dist.executors.aligned import route
+
+    monkeypatch.setattr(aligned_run, "BROADCAST_BYTES", 1)
+    li, orders, cust = _read(tables, "lineitem"), _read(tables, "orders"), _read(tables, "customer")
+    ds = li.join(
+        cust.join(orders, left_on="c_ck", right_on="o_ck"), left_on="l_ok", right_on="o_ok"
+    )
+    if grouped:
+        # A second dimension joined on top, as q10 joins `nation` to `customer`: that is what
+        # keeps the plain star re-association from pre-aggregating the facts on its own.
+        seg = _read(tables, "segment")
+        ds = (
+            ds.join(seg, left_on="c_seg", right_on="g_seg")
+            .group_by("c_ck", "c_seg", "g_region")
+            .agg(rev=col("l_price").sum(), n=bt.count())
+        )
+        query = (
+            "SELECT c_ck, c_seg, g_region, sum(l_price) AS rev, count(*) AS n FROM lineitem "
+            "JOIN (SELECT * FROM customer JOIN orders ON c_ck = o_ck) ON l_ok = o_ok "
+            "JOIN segment ON c_seg = g_seg GROUP BY c_ck, c_seg, g_region"
+        )
+    else:
+        ds = ds.select("l_ok", "l_price", "c_seg", "o_prio")
+        query = (
+            "SELECT l_ok, l_price, c_seg, o_prio FROM lineitem "
+            "JOIN (SELECT * FROM customer JOIN orders ON c_ck = o_ck) ON l_ok = o_ok"
+        )
+    li_id, o_id = (
+        next(i for i, s in enumerate(ds._sources) if c in s.schema().names)
+        for c in ("l_ok", "o_ok")
+    )
+
+    def pair_aligned(found) -> bool:
+        return found is not None and any({li_id, o_id} <= cut.aligned for cut in found.cuts)
+
+    # The plan as written: at this size Kyber would join the two facts first itself.
+    found = choose_plan(ds._plan, ds._sources, strict=False)
+    assert pair_aligned(found)
+    if grouped:
+        assert any(cut.aggregate is not None for cut in found.cuts if {li_id, o_id} <= cut.aligned)
+    # Positive control: without the move, the pair never shares a cut.
+    monkeypatch.setattr(route, "colocate_aligned_joins", lambda plan, aligned: plan)
+    assert not pair_aligned(choose_plan(ds._plan, ds._sources, strict=False))
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert got is not None
+    assert_same_for_query(got, _duck(tables, query), query)
+
+
 @pytest.mark.parametrize("how", ["anti", "semi"])
 def test_a_membership_join_to_an_unclustered_table_slices_its_keys(tables, monkeypatch, how):
     """TPC-H q22's shape: rows of a key-ordered table with (or without) a match in a table

@@ -267,7 +267,7 @@ def _join_chunked(nat, probe_ir, join_ir, probe_batches, build_side, engine_conf
             [carrier, build_side],
             0,
             itertools.chain([first], chunks),
-            engine_config,
+            _holding_config(engine_config, budget),
             budget,
         )
     except MemoryBudgetExceededError as exc:
@@ -275,6 +275,27 @@ def _join_chunked(nat, probe_ir, join_ir, probe_batches, build_side, engine_conf
             f"broadcast probe output outgrew its {budget / (1 << 30):.1f} GiB bound or the node "
             f"ran short of memory ({exc}); falling back to the co-partition shuffle"
         ) from exc
+
+
+def _holding_config(engine_config: str, budget: int) -> str:
+    """`engine_config` with its spill threshold lifted to the output bound `budget`.
+
+    The chunked engine call bounds what it holds by the *tighter* of its explicit budget and
+    the config's `memory_budget_bytes`. On this path the config's figure is the worker's spill
+    threshold -- an estimate of the plan's peak divided across tasks and calls -- and a
+    spine's collected output cannot spill, so that threshold became the hard bound `budget`
+    was chosen to replace. On TPC-H q10 at SF1000 over eight 64 GB nodes it was 16 MiB:
+    every probe task gave up after 28 MB of output (70 of them per run) and the join re-ran
+    as a co-partition shuffle of the probe side. The live headroom check in `_charge` and the
+    node-share floor in `_output_budget` are what keep this path off a node's limit.
+    """
+    if budget <= 0:
+        return engine_config
+    cfg = json.loads(engine_config) if engine_config else {}
+    if 0 < int(cfg.get("memory_budget_bytes", 0) or 0) < budget:
+        cfg["memory_budget_bytes"] = budget
+        return json.dumps(cfg)
+    return engine_config
 
 
 def _charge(held: int, budget: int, batches) -> int:

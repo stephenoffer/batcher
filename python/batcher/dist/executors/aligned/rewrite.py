@@ -27,7 +27,7 @@ from collections.abc import Callable
 from batcher.plan.expr_ir import Col, col
 from batcher.plan.logical import Filter, Join, JoinOutputCol, LogicalPlan, Project, Projection
 
-__all__ = ["distinct_membership_sides", "group_broadcast_joins"]
+__all__ = ["colocate_aligned_joins", "distinct_membership_sides", "group_broadcast_joins"]
 
 _FRESH = itertools.count()
 
@@ -71,16 +71,16 @@ def _push(
     b2: LogicalPlan,
     keys: list[str],
     b2_keys: tuple[str, ...],
-    aligned,
+    leaf: Callable[[LogicalPlan], bool],
     carry: list[str],
 ) -> tuple[LogicalPlan, dict[str, str]] | None:
-    """`node` with `b2` joined in on `keys` (names in `node`'s output) at the broadcast leaf.
+    """`node` with `b2` joined in on `keys` (names in `node`'s output) at the first `leaf`.
 
     Returns the rewritten node, whose output is `node`'s plus each `carry` column of `b2`,
     and the map from each of those names to its alias there; None when no such leaf exists
     on a path of inner joins, filters and plain projections.
     """
-    if _source_free(node, aligned):
+    if leaf(node):
         b2_out = {c: _fresh(c) for c in carry}
         output = [JoinOutputCol("left", c, c) for c in node.available_columns()]
         output += [JoinOutputCol("right", c, alias) for c, alias in b2_out.items()]
@@ -94,7 +94,7 @@ def _push(
         )
         return joined, b2_out
     if isinstance(node, Filter):
-        pushed = _push(node.input, b2, keys, b2_keys, aligned, carry)
+        pushed = _push(node.input, b2, keys, b2_keys, leaf, carry)
         if pushed is None:
             return None
         return Filter(input=pushed[0], predicate=node.predicate), pushed[1]
@@ -102,7 +102,7 @@ def _push(
         by_alias = {item.alias: item.expr for item in node.items}
         if not all(isinstance(by_alias.get(k), Col) for k in keys):
             return None
-        pushed = _push(node.input, b2, [by_alias[k].name for k in keys], b2_keys, aligned, carry)
+        pushed = _push(node.input, b2, [by_alias[k].name for k in keys], b2_keys, leaf, carry)
         if pushed is None:
             return None
         inner, colmap = pushed
@@ -119,7 +119,7 @@ def _push(
             names = _names_on(node, [origin[k] for k in keys], side)
             child = node.left if side == "left" else node.right
             if names is not None:
-                pushed = _push(child, b2, names, b2_keys, aligned, carry)
+                pushed = _push(child, b2, names, b2_keys, leaf, carry)
             if pushed is not None:
                 break
         if pushed is None:
@@ -143,48 +143,102 @@ def _push(
     return None
 
 
-def _move_down(node: Join, aligned: frozenset[int]) -> LogicalPlan | None:
-    """`node` with its broadcast side joined in further down the other side, or None."""
+def _move(
+    node: Join,
+    mover: Callable[[LogicalPlan], bool],
+    leaf: Callable[[LogicalPlan], bool],
+    *,
+    flatten: bool = False,
+) -> LogicalPlan | None:
+    """`node` with its `mover` side joined in at the first `leaf` down the other side, or None.
+
+    The other side (the spine) must not itself be a `mover`. The result is projected back to
+    `node`'s exact output, so nothing above sees a column it did not see before; `flatten`
+    does that by renaming a moved join's own output instead, so the join stays directly under
+    whatever reads it (the star rewrites above look for a join, not a projection of one).
+    """
     if node.join_type != "inner":
         return None
-    if _source_free(node.right, aligned) and not _source_free(node.left, aligned):
-        spine, b2, spine_keys, b2_keys, spine_side = (
-            node.left,
-            node.right,
-            node.left_keys,
-            node.right_keys,
-            "left",
-        )
-    elif _source_free(node.left, aligned) and not _source_free(node.right, aligned):
-        spine, b2, spine_keys, b2_keys, spine_side = (
-            node.right,
-            node.left,
-            node.right_keys,
-            node.left_keys,
-            "right",
-        )
+    for spine_side, b2_side in (("left", "right"), ("right", "left")):
+        spine, b2 = getattr(node, spine_side), getattr(node, b2_side)
+        if mover(b2) and not mover(spine):
+            break
     else:
         return None
-    if (
-        isinstance(spine, Join)
-        and _source_free(spine.left, aligned) is False
-        and (spine.right is b2 or spine.left is b2)
-    ):
-        return None
+    spine_keys, b2_keys = (
+        (node.left_keys, node.right_keys)
+        if spine_side == "left"
+        else (node.right_keys, node.left_keys)
+    )
     # Only what the old join emitted from `b2` rides up: carrying every column of a wide
     # dimension widens the broadcast each unit holds, for columns nothing above reads.
     carry = list(dict.fromkeys(o.name for o in node.output if o.side != spine_side))
-    pushed = _push(spine, b2, list(spine_keys), b2_keys, aligned, carry)
+    pushed = _push(spine, b2, list(spine_keys), b2_keys, leaf, carry)
     if pushed is None:
         return None
     moved, colmap = pushed
-    if _source_free(moved, aligned):
+    if mover(moved):
         return None
+    if flatten and isinstance(moved, Join):
+        emitted = {o.alias: o for o in moved.output}
+        renamed = []
+        for o in node.output:
+            src = emitted[o.name if o.side == spine_side else colmap[o.name]]
+            renamed.append(JoinOutputCol(src.side, src.name, o.alias))
+        return dataclasses.replace(moved, output=tuple(renamed))
     items = tuple(
         Projection(o.alias, col(o.name if o.side == spine_side else colmap[o.name]))
         for o in node.output
     )
     return Project(input=moved, items=items)
+
+
+def _move_down(node: Join, aligned: frozenset[int]) -> LogicalPlan | None:
+    """`node` with its broadcast side joined in further down the other side, or None."""
+    free = lambda n: _source_free(n, aligned)  # noqa: E731
+    for spine, b2 in ((node.left, node.right), (node.right, node.left)):
+        if free(b2) and not free(spine):
+            if (
+                isinstance(spine, Join)
+                and _source_free(spine.left, aligned) is False
+                and (spine.right is b2 or spine.left is b2)
+            ):
+                return None
+            break
+    return _move(node, free, free)
+
+
+def _aligned_only(node: LogicalPlan, aligned: frozenset[int]) -> bool:
+    from batcher.plan.visitor import scanned_source_ids
+
+    scanned = scanned_source_ids(node)
+    return bool(scanned) and scanned <= aligned
+
+
+def colocate_aligned_joins(plan: LogicalPlan, aligned: frozenset[int]) -> LogicalPlan:
+    """`plan` with each join of an aligned-only side moved down to the aligned input it keys on.
+
+    The mirror of `group_broadcast_joins`, for the join order statistics choose on one node:
+    TPC-H q10 at SF1000 is `lineitem JOIN (customer JOIN orders)`, the dimension sitting
+    between two tables stored in `orderkey` order. No per-range cut can hold that join without
+    holding all of `customer` (25 GB) on every node, so the query lost its aligned plan and ran
+    staged, three shuffles deep. Moved, `customer JOIN (orders JOIN lineitem)` puts the two
+    aligned tables in one subtree that joins on the key. Inner joins associate and commute
+    through their key-equality pairs, so the relation is unchanged; whether the moved plan
+    aligns better is the aligned planner's question, asked of both.
+    """
+    from batcher.plan.visitor import transform_up
+
+    only = lambda n: _aligned_only(n, aligned)  # noqa: E731
+
+    def step(node: LogicalPlan) -> LogicalPlan:
+        if isinstance(node, Join):
+            moved = _move(node, only, only, flatten=True)
+            if moved is not None:
+                return moved
+        return node
+
+    return transform_up(plan, step)
 
 
 def group_broadcast_joins(body: LogicalPlan, aligned: frozenset[int]) -> LogicalPlan:

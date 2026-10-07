@@ -28,6 +28,7 @@ from batcher.dist.executors.aligned.analysis import (
     key_classes,
 )
 from batcher.dist.executors.aligned.rewrite import (
+    colocate_aligned_joins,
     distinct_membership_sides,
     group_broadcast_joins,
 )
@@ -72,7 +73,19 @@ def choose_plan(
     # keys of its own slice, ~1.4M of SF100's 10M customer keys each, and the driver merges
     # them all -- q22 at SF100 took 10 s that way, and 2.8 s left to the shuffle.
     membership = distinct_membership_sides(plan, lambda side: _unbroadcastable(side, sources))
-    for rewritten in {id(p): p for p in (pre_aggregate_facts(plan), membership)}.values():
+    variants = [pre_aggregate_facts(plan), membership]
+    # A dimension the join order put between two aligned tables keeps them out of one cut:
+    # TPC-H q10's `lineitem JOIN (customer JOIN orders)`. With the aligned side moved down to
+    # the table it keys on, the pair joins per range, and pre-aggregated, the dimension leaves
+    # the cut altogether.
+    for aligned in {_aligned_on(key, sources) for key in key_classes(plan)}:
+        if len(aligned) < 2:
+            continue
+        moved = colocate_aligned_joins(plan, aligned)
+        if moved is not plan:
+            # Pre-aggregated first: on a tie it returns partial groups rather than joined rows.
+            variants += [pre_aggregate_facts(moved), moved]
+    for rewritten in {id(p): p for p in variants}.values():
         if rewritten is plan:
             continue
         other = _best_plan(rewritten, sources, strict, single_table, exclude)
@@ -108,11 +121,7 @@ def _best_plan(
     scanned = scanned_source_ids(plan)
     candidates: list[tuple[KeyClass, frozenset[int]]] = []
     for key in key_classes(plan):
-        aligned = frozenset(
-            sid
-            for sid in {s for s, _ in key.columns}
-            if sid < len(sources) and _clustered_on(sources[sid], key.column_of(sid))
-        )
+        aligned = _aligned_on(key, sources)
         if aligned:
             candidates.append((key, aligned))
     # Split by file: one table and every other scan of it (a relation the query uses twice),
@@ -365,6 +374,15 @@ def _implied_by_bounds(ir: dict, columns: dict) -> bool:
     if not all(isinstance(x, int) and not isinstance(x, bool) for x in (value, bound)):
         return False
     return passes(bound, value)
+
+
+def _aligned_on(key: KeyClass, sources: list[Source]) -> frozenset[int]:
+    """The sources of `key`'s class whose files store its column in order."""
+    return frozenset(
+        sid
+        for sid in {s for s, _ in key.columns}
+        if sid < len(sources) and _clustered_on(sources[sid], key.column_of(sid))
+    )
 
 
 def _clustered_on(source: Source, column: str | None) -> bool:
