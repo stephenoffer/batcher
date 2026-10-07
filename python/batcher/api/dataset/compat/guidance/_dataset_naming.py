@@ -222,9 +222,6 @@ DATASET_RAY_DATA: dict[str, str] = {
         "ds.write.for_each_batch(fn)."
     ),
     # Foreign frameworks.
-    "to_dask": (
-        "No Dask bridge. Collect first: ds.to_pandas(), or hand over ds.write.parquet(path)."
-    ),
     "to_modin": "No Modin bridge. Collect first: ds.to_pandas().",
     "to_mars": "No Mars bridge. Collect first: ds.to_pandas().",
     "to_random_access_dataset": (

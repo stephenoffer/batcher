@@ -164,7 +164,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `pipe` | {py:obj}`Expr.pipe <batcher.plan.expr_ir.core.Expr.pipe>` | canonical |  |
 | `pow` | `**` operator | canonical |  |
 | `product` | {py:obj}`Expr.product <batcher.plan.expr_ir.core.Expr.product>` | canonical |  |
-| `qcut` | `Expr.qcut` | param | Missing: left\_closed=, include\_breaks=, and allow\_duplicates= is spelled duplicates='drop'; without labels the result is the bin number, not an interval string. Wave W3. |
+| `qcut` | {py:obj}`Expr.qcut <batcher.plan.expr_ir.core.Expr.qcut>` | param | Missing: left\_closed=, include\_breaks=, and allow\_duplicates= is spelled duplicates='drop'; without labels the result is the bin number, not an interval string. Wave W3. |
 | `quantile` | {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | canonical |  |
 | `radians` | {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | canonical |  |
 | `rank` | {py:obj}`Expr.rank <batcher.plan.expr_ir.core.Expr.rank>` | canonical |  |

@@ -39,6 +39,7 @@ print(bt.from_pandas(df).to_numpy()["temp"])
 | {doc}`polars` | `from_polars` and `to_polars`, and which engine to reach for |
 | {doc}`pandas` | `from_pandas` and `to_pandas`, and the index Batcher does not have |
 | {doc}`duckdb` | `from_duckdb`, running Batcher SQL beside DuckDB SQL, and DuckDB as the correctness oracle |
+| {doc}`dask` | `to_dask`, a lazy Dask frame over Arrow partitions, and `from_dask` |
 | {doc}`arrow-and-numpy` | The zero-copy contract itself: `from_arrow`, `to_arrow`, `from_numpy`, `to_numpy`, and tensor columns |
 
 Three more adapters take a distributed frame rather than a local one, and they live with the system they belong to: {py:obj}`bt.from_ray_dataset <batcher.from_ray_dataset>` and {py:obj}`ds.to_ray_dataset() <batcher.Dataset.to_ray_dataset>` on {doc}`/integrations/compute/ray`, plus `from_spark`/`to_spark` and `from_daft`/`to_daft`, which {doc}`/getting-started/migration/index` covers alongside the porting tables.
@@ -69,5 +70,6 @@ print(bt.from_any({"a": [1, 2], "b": ["x", "y"]}).columns)
 polars
 pandas
 duckdb
+dask
 arrow-and-numpy
 ```

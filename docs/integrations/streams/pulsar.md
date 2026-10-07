@@ -7,7 +7,7 @@ The following table summarizes the connector:
 | | |
 | --- | --- |
 | Read | `bt.read.pulsar(topic)` |
-| Write | No sink. Write the stream to Delta or another streaming sink. |
+| Write | `ds.write.pulsar(topic)`, one message per row. At-least-once; see {doc}`sinks`. |
 | Extra | `pip install 'batcher-engine[pulsar]'` |
 | Parallelism | One split per partition, from the `num_partitions` you declare |
 | Subscription | `ConsumerType.Shared`, so no per-key ordering |
@@ -181,6 +181,24 @@ It is off by default because the nested column costs on every message of every p
 are carried as bytes whatever the client hands back, and a message that carried none reads
 as `null` rather than as an empty list.
 
+## Publish to Pulsar
+
+:::{warning}
+Not yet verified against a live Pulsar; see tests/PENDING_VERIFICATION.md.
+:::
+
+```python
+# docs: skip
+query = events.select(value=bt.col("value"), key=bt.col("key")).write.pulsar(
+    "persistent://tenant/ns/clean",
+    service_url="pulsar://broker:6650",
+    producer_name="clean-writer",
+    checkpoint="/var/lib/batcher/ckpt/clean",
+)
+```
+
+A row's `key` becomes the message's partition key, so a key keeps its order within a partition. `producer_name=` derives each record's sequence id from the micro-batch, so a namespace with Pulsar's broker-side deduplication enabled drops the records a replayed micro-batch already persisted. `auth_token=` accepts a token or a secret reference such as `env:PULSAR_TOKEN`.
+
 ## Requirements and limitations
 
 Authentication isn't wired. The source builds `pulsar.Client(service_url)` with no other parameters, so token auth, TLS, and OAuth2 have no way in, and a cluster that requires authentication can't be read without extending the source. See {doc}`custom connectors </user-guide/moving-data/custom-connectors>`.
@@ -199,6 +217,7 @@ start rejecting producers. Delete the subscription when you retire a pipeline.
 
 ## See also
 
+- {doc}`Broker sinks </integrations/streams/sinks>`: the column contract and the guarantees every broker sink states.
 - {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, output modes, checkpoints.
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: the shape most
   Pulsar pipelines end up in.

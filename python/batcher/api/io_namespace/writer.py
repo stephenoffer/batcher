@@ -1277,6 +1277,211 @@ class Writer:
             checkpoint,
         )
 
+    def pulsar(
+        self,
+        topic: str | None = None,
+        *,
+        service_url: str = "pulsar://localhost:6650",
+        producer_name: str | None = None,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to an Apache Pulsar topic.
+
+        The write side of `bt.read.pulsar`, on the column contract `write.kafka` uses: a
+        ``value`` column is required, and ``key`` (the partition key), ``topic`` and
+        ``headers`` (message properties) are optional. Each micro-batch is flushed and every
+        send acknowledged before it is reported written, so delivery is at-least-once. With
+        `producer_name` set, sequence ids are derived from the micro-batch, so a namespace
+        with Pulsar's broker-side deduplication enabled drops a replayed epoch's records.
+        Not yet verified against a live Pulsar; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            topic: Destination topic for rows with no ``topic`` column.
+            service_url: The Pulsar service URL.
+            producer_name: A stable producer name, enabling broker-side deduplication.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: ``auth_token=`` (a token or secret reference), ``flush_timeout=``,
+                ``dedup_ids=`` (a writer name stamped as a ``batcher-dedup-id`` property),
+                the ``value_format=`` codec family, and further ``create_producer``
+                arguments.
+
+        Returns:
+            A `StreamingQuery` handle for the running Pulsar write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.pulsar("raw", stream=True)  # doctest: +SKIP
+                >>> query = events.select(  # doctest: +SKIP
+                ...     value=bt.col("value"), key=bt.col("key")
+                ... ).write.pulsar("clean", service_url="pulsar://broker:6650")
+        """
+        from batcher.io.formats.streaming.broker_sinks import PulsarStreamSink
+
+        sink = PulsarStreamSink(
+            topic=topic, service_url=service_url, producer_name=producer_name, **options
+        )
+        return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
+    def kinesis(
+        self,
+        topic: str | None = None,
+        *,
+        region: str = "us-east-1",
+        ordered: bool = False,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to an Amazon Kinesis data stream.
+
+        The write side of `bt.read.kinesis`: ``value`` is the record data, ``key`` the
+        partition key, and ``topic`` an optional per-row stream name. Records go out through
+        ``PutRecords`` (500 records or 5 MiB per call), resending only the records a response
+        reports as failed. ``PutRecords`` does not guarantee order, so pass
+        ``ordered=True`` for per-partition-key order through ``PutRecord`` and
+        ``SequenceNumberForOrdering``, at one request per record. Kinesis has no producer
+        deduplication, so a replayed epoch republishes.
+        Not yet verified against a live Kinesis; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            topic: The stream name for rows with no ``topic`` column.
+            region: The AWS region.
+            ordered: Keep per-partition-key order, one ``PutRecord`` per record.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: ``max_attempts=``, ``flush_timeout=``, the ``value_format=`` codec
+                family, ``endpoint_url=`` and AWS credentials (secret references accepted).
+
+        Returns:
+            A `StreamingQuery` handle for the running Kinesis write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.kinesis("raw", stream=True)  # doctest: +SKIP
+                >>> query = events.select(  # doctest: +SKIP
+                ...     value=bt.col("value"), key=bt.col("key")
+                ... ).write.kinesis("clean", region="eu-west-1")
+        """
+        from batcher.io.formats.streaming.broker_sinks import KinesisStreamSink
+
+        sink = KinesisStreamSink(topic=topic, region=region, ordered=ordered, **options)
+        return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
+    def pubsub(
+        self,
+        topic: str | None = None,
+        *,
+        ordered: bool = False,
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to a Google Cloud Pub/Sub topic.
+
+        The write side of `bt.read.pubsub`: ``value`` is the message data, ``headers``
+        become attributes, and ``topic`` is an optional per-row topic path. Every publish
+        future is awaited before the micro-batch is reported written. Pub/Sub has no message
+        key: with ``ordered=True`` the ``key`` column is the ordering key, and without it a
+        ``key`` column is refused. A replayed epoch republishes; ``dedup_ids=`` stamps a
+        ``batcher-dedup-id`` attribute to deduplicate on downstream.
+        Not yet verified against a live Pub/Sub; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            topic: The full topic path, ``projects/<project>/topics/<topic>``.
+            ordered: Publish the ``key`` column as each message's ordering key.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: ``flush_timeout=``, ``dedup_ids=``, and the ``value_format=`` codec
+                family.
+
+        Returns:
+            A `StreamingQuery` handle for the running Pub/Sub write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.pubsub(  # doctest: +SKIP
+                ...     "projects/p/subscriptions/raw", stream=True
+                ... )
+                >>> query = events.select(value=bt.col("value")).write.pubsub(  # doctest: +SKIP
+                ...     "projects/p/topics/clean"
+                ... )
+        """
+        from batcher.io.formats.streaming.broker_sinks import PubSubStreamSink
+
+        sink = PubSubStreamSink(topic=topic, ordered=ordered, **options)
+        return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
+    def eventhubs(
+        self,
+        topic: str | None = None,
+        *,
+        connection_str: str = "",
+        trigger: Trigger | None = None,
+        output_mode: str = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to an Azure Event Hub.
+
+        The write side of `bt.read.eventhubs`: ``value`` is the event body, ``key`` the
+        partition key, ``partition`` an explicit partition id, and ``headers`` application
+        properties. Rows are packed into ``EventDataBatch`` objects per partition routing and
+        each batch is accepted by the service before the micro-batch is reported written. A
+        replayed epoch republishes; ``dedup_ids=`` stamps a ``batcher-dedup-id`` property.
+        Not yet verified against a live Event Hubs namespace; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            topic: The Event Hub name.
+            connection_str: The namespace connection string, or a secret reference.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: ``flush_timeout=``, ``dedup_ids=``, and the ``value_format=`` codec
+                family.
+
+        Returns:
+            A `StreamingQuery` handle for the running Event Hubs write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.eventhubs(  # doctest: +SKIP
+                ...     "raw", connection_str="env:EH_CONN", stream=True
+                ... )
+                >>> query = events.select(value=bt.col("value")).write.eventhubs(  # doctest: +SKIP
+                ...     "clean", connection_str="env:EH_CONN"
+                ... )
+        """
+        from batcher.io.formats.streaming.broker_sinks import EventHubsStreamSink
+
+        sink = EventHubsStreamSink(topic=topic, connection_str=connection_str, **options)
+        return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
     def for_each(
         self,
         fn: Callable[[dict[str, Any]], Any],

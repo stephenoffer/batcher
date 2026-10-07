@@ -29,7 +29,7 @@ The following table maps the 49 names on `Expr.str`, sorted alphabetically.
 | `explode` | n/a | gap | Not yet: Expr.str.explode (one row per character, length-changing). Wave W8. |
 | `extract` | `Expr.str.extract` | canonical | on no match Polars returns null; Batcher returns an empty string. |
 | `extract_all` | `Expr.str.extract_all` | canonical |  |
-| `extract_groups` | n/a | gap | Not yet: Expr.str.extract\_groups (capture groups to struct). Wave W3. |
+| `extract_groups` | `Expr.str.extract_groups` | canonical | on no match Polars returns null fields; Batcher's default returns empty strings, as DuckDB does. |
 | `extract_many` | n/a | gap | Not yet: Expr.str.extract\_many (Aho-Corasick). Wave W3. |
 | `find` | `Expr.str.position` | mismatch | Differs: Polars find is 0-based, regex by default, and returns null when absent; Batcher's position is 1-based, literal, and returns 0 when absent. Wave W0. |
 | `find_many` | n/a | gap | Not yet: Expr.str.find\_many. Wave W3. |
@@ -39,7 +39,7 @@ The following table maps the 49 names on `Expr.str`, sorted alphabetically.
 | `json_path_match` | `Expr.json.extract_string` | param | Missing: JSONPath evaluation parity (Polars json\_path\_match) verified across nested/array paths. Wave W7. |
 | `len_bytes` | `Expr.str.octet_length` | canonical |  |
 | `len_chars` | `Expr.str.len_chars` | canonical |  |
-| `normalize` | n/a | gap | Not yet: Expr.str.normalize (Unicode NFC/NFKC/NFD/NFKD). Wave W3. |
+| `normalize` | `Expr.str.normalize` | canonical |  |
 | `pad_end` | `Expr.str.rpad` | canonical |  |
 | `pad_start` | `Expr.str.lpad` | canonical |  |
 | `replace` | `Expr.str.replace` | mismatch | Differs: Polars replaces the first regex match (n=1, literal=False); Batcher replaces every literal occurrence. Params: n=, literal=. Wave W0. |

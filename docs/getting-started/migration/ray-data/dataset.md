@@ -81,7 +81,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `take_batch` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` + {py:obj}`Dataset.to_numpy <batcher.Dataset.to_numpy>` | mismatch | Differs: Ray take\_batch(batch\_size=20) returns one batch in batch\_format='default' (\{col: ndarray\}); Batcher: .limit(20).to\_numpy() returns \{col: ndarray\}; other batch\_format values need to\_arrow()/to\_pandas(). Wave W0. |
 | `to_arrow_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
 | `to_daft` | {py:obj}`Dataset.to_daft <batcher.Dataset.to_daft>` | canonical |  |
-| `to_dask` | n/a | gap | Not yet: export a Dataset to a Dask DataFrame. Wave W8. |
+| `to_dask` | {py:obj}`Dataset.to_dask <batcher.Dataset.to_dask>` | mismatch | Differs: Ray to\_dask(meta=, verify\_meta=) takes a pandas meta; Batcher derives meta from the Arrow schema and instead takes materialize= (arrow/deferred/parquet). Drop meta= and verify\_meta=. Wave W8. |
 | `to_mars` | n/a | out of scope | Declined: Mars (pymars) interop; Batcher has no Mars bridge and converts through pandas (Dataset.to\_pandas). |
 | `to_modin` | n/a | out of scope | Declined: Modin wraps pandas; convert through Dataset.to\_pandas and modin.pandas.DataFrame. |
 | `to_numpy_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |

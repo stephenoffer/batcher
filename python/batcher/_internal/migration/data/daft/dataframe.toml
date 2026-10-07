@@ -60,7 +60,7 @@ sum = { status = "mismatch", batcher = "Dataset.sum", note = "Daft returns a one
 summarize = { status = "mismatch", batcher = "Dataset.describe", note = "Daft summarize() returns one row per column (column, type, min, max, count, count_nulls, approx_count_distinct); Batcher describe() returns one row per statistic with a column per input column", wave = "W8" }
 to_arrow = { status = "canonical", batcher = "Dataset.to_arrow" }
 to_arrow_iter = { status = "canonical", batcher = "Dataset.iter_batches" }
-to_dask_dataframe = { status = "gap", need = "export to a Dask DataFrame", wave = "W13" }
+to_dask_dataframe = { status = "mismatch", batcher = "Dataset.to_dask", note = "Daft to_dask_dataframe(meta=) takes a pandas meta; Batcher derives it from the Arrow schema. Rename to to_dask() and drop meta=.", wave = "W13" }
 to_pandas = { status = "canonical", batcher = "Dataset.to_pandas" }
 to_pydict = { status = "canonical", batcher = "Dataset.to_pydict" }
 to_pylist = { status = "canonical", batcher = "Dataset.to_pylist" }

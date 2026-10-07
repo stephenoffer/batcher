@@ -118,6 +118,8 @@ Each of these executes the plan and returns a result or writes it out:
 | {py:meth}`.to_ray_dataset() <batcher.Dataset.to_ray_dataset>` | a `ray.data.Dataset`, for a Ray Train / Tune / Serve stage |
 | {py:meth}`.to_daft() <batcher.Dataset.to_daft>` | a `daft.DataFrame` |
 | {py:meth}`.to_spark(spark, max_arrow_bytes=None, staging_path=None) <batcher.Dataset.to_spark>` | a `pyspark.sql.DataFrame` in `spark`, staged as Parquet past `max_arrow_bytes` |
+| {py:meth}`.to_dask(materialize="arrow") <batcher.Dataset.to_dask>` | a lazy `dask.dataframe.DataFrame` over Arrow partitions (`"arrow"`, `"deferred"` or `"parquet"`) |
+| {py:meth}`.to_huggingface(mode="materialized") <batcher.Dataset.to_huggingface>` | a `datasets.Dataset` or `datasets.IterableDataset`, with `ClassLabel` and `Image` features |
 
 ### Introspection
 

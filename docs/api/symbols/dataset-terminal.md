@@ -28,6 +28,8 @@ These terminal operations execute the plan and hand the result to Arrow, Python,
    Dataset.to_ray_dataset
    Dataset.to_spark
    Dataset.to_daft
+   Dataset.to_dask
+   Dataset.to_huggingface
    Dataset.write
 ```
 

@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to Polars
 
-The following table maps 273 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
+The following table maps 275 Batcher spellings to the Polars names that compute the same thing, sorted by Batcher spelling. Each Polars name is prefixed with the class or module it lives on.
 
 | Batcher | Polars |
 |---|---|
@@ -253,12 +253,14 @@ The following table maps 273 Batcher spellings to the Polars names that compute 
 | `Expr.str.contains` | `Expr.bin.contains`, `Expr.str.contains` |
 | `Expr.str.ends_with` | `Expr.bin.ends_with`, `Expr.cat.ends_with`, `Expr.str.ends_with` |
 | `Expr.str.extract_all` | `Expr.str.extract_all` |
+| `Expr.str.extract_groups` | `Expr.str.extract_groups` |
 | `Expr.str.extract` | `Expr.str.extract` |
 | `Expr.str.join` | `Expr.str.concat`, `Expr.str.join` |
 | `Expr.str.left` | `Expr.str.head` |
 | `Expr.str.len_chars` | `Expr.cat.len_chars`, `Expr.str.len_chars` |
 | `Expr.str.lower` | `Expr.str.to_lowercase` |
 | `Expr.str.lpad` | `Expr.str.pad_start` |
+| `Expr.str.normalize` | `Expr.str.normalize` |
 | `Expr.str.octet_length` | `Expr.bin.size`, `Expr.cat.len_bytes`, `Expr.str.len_bytes` |
 | `Expr.str.replace_all` | `Expr.str.replace_all` |
 | `Expr.str.reverse` | `Expr.str.reverse` |
