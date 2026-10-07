@@ -31,7 +31,7 @@ The following table maps the 126 names on the `polars` module, sorted alphabetic
 | `arg_sort_by` | n/a | gap | Not yet: arg\_sort\_by. Wave W8. |
 | `arg_where` | n/a | gap | Not yet: arg\_where. Wave W8. |
 | `build_info` | {py:obj}`bt.versions <batcher.versions>` | canonical |  |
-| `business_day_count` | n/a | gap | Not yet: business\_day\_count. Wave W6. |
+| `business_day_count` | {py:obj}`bt.business_day_count <batcher.business_day_count>` | mismatch | Differs: week\_mask= is spelled weekmask=; holidays= matches and the range is the same half-open \[start, end). Wave W6. |
 | `Catalog` | {py:obj}`bt.Catalog <batcher.Catalog>` | mismatch | Differs: pl.Catalog is a Unity Catalog client; bt.Catalog has in-memory, Delta directory and pyiceberg backends and no Unity backend. Wave W9. |
 | `coalesce` | {py:obj}`bt.coalesce <batcher.coalesce>` | canonical |  |
 | `col` | {py:obj}`bt.col <batcher.col>` | canonical |  |

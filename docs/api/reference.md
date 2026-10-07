@@ -234,8 +234,9 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | {py:func}`bt.current_timestamp() <batcher.current_timestamp>` | current timestamp, bound at plan-build time |
 | {py:func}`bt.current_date() <batcher.current_date>` | today's date, bound at plan-build time |
 | {py:func}`bt.date_part(part, expr) <batcher.date_part>` | extract a calendar field such as `year`, `month`, or `dow` |
-| {py:func}`bt.date_add(expr, days) <batcher.date_add>` | add a whole number of `days` to a date/time column (Spark {py:func}`date_add <batcher.date_add>`) |
-| {py:func}`bt.date_sub(expr, days) <batcher.date_sub>` | subtract a whole number of `days` from a date/time column (Spark {py:func}`date_sub <batcher.date_sub>`) |
+| {py:func}`bt.date_add(expr, days) <batcher.date_add>` | add a whole number of `days`, a constant or a per-row column, to a date/time column (Spark {py:func}`date_add <batcher.date_add>`) |
+| {py:func}`bt.date_sub(expr, days) <batcher.date_sub>` | subtract a whole number of `days`, a constant or a per-row column, from a date/time column (Spark {py:func}`date_sub <batcher.date_sub>`) |
+| {py:func}`bt.business_day_count(start, end, holidays=(), weekmask="1111100") <batcher.business_day_count>` | business days in `[start, end)`, sharing one calendar with `.dt.add_business_days` and `.dt.is_business_day` (numpy `busday_count`) |
 | {py:func}`bt.make_date(year, month, day) <batcher.make_date>` | build a Date from integer components; an impossible date is null |
 | {py:func}`bt.make_timestamp(year, month, day, hour=0, minute=0, second=0) <batcher.make_timestamp>` | build a Timestamp from components |
 | {py:func}`bt.from_epoch(expr, unit="s") <batcher.from_epoch>` | read an integer epoch column as a Timestamp at a stated unit (`s`/`ms`/`us`/`ns`) |

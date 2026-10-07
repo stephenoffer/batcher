@@ -196,6 +196,7 @@ Each of these requires a statistic computed over the whole relation or a column 
    DatasetDQ.null_rate_below
    DatasetDQ.unique_ratio_above
    DatasetDQ.fresh_within
+   DatasetDQ.monotonic
 ```
 
 

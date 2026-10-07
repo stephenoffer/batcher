@@ -74,12 +74,12 @@ The following table maps the 47 names on `Expr.dt`, sorted alphabetically.
 
 | Polars | Batcher | Status | Notes |
 |---|---|---|---|
-| `add_business_days` | n/a | gap | Not yet: Expr.dt.add\_business\_days. Wave W6. |
+| `add_business_days` | `Expr.dt.add_business_days` | mismatch | Differs: week\_mask= is spelled weekmask= (a 7-flag sequence or a 1111100 string); holidays= and roll=raise/forward/backward match. Wave W6. |
 | `base_utc_offset` | n/a | gap | Not yet: Expr.dt.base\_utc\_offset (a time-zone-aware Datetime type). Wave W6. |
 | `cast_time_unit` | n/a | gap | Not yet: Expr.dt.cast\_time\_unit (ms/us/ns). Wave W6. |
 | `century` | `Expr.dt.century` | canonical |  |
 | `combine` | n/a | gap | Not yet: Expr.dt.combine (date + TIME). Wave W6. |
-| `convert_time_zone` | `Expr.dt.convert_timezone` | mismatch | Differs: Polars converts a tz-aware column to one target zone; Batcher's convert\_timezone takes (from, to) over naive timestamps. Wave W6. |
+| `convert_time_zone` | `Expr.dt.convert_timezone` | mismatch | Differs: Polars returns the same instant labelled with the target zone; Batcher convert\_timezone(from\_tz, to\_tz) returns the target zone's naive wall clock (DuckDB AT TIME ZONE). from\_tz must name a tz-aware column's own zone. Wave W6. |
 | `date` | `Expr.dt.date` | canonical |  |
 | `datetime` | n/a | gap | Not yet: Expr.dt.datetime (naive local datetime of a time-zone-aware Datetime type). Wave W6. |
 | `day` | `Expr.dt.day` | canonical |  |
@@ -87,7 +87,7 @@ The following table maps the 47 names on `Expr.dt`, sorted alphabetically.
 | `dst_offset` | n/a | gap | Not yet: Expr.dt.dst\_offset (a time-zone-aware Datetime type). Wave W6. |
 | `epoch` | `Expr.dt.timestamp` | mismatch | Differs: Polars epoch() defaults to microseconds. Port epoch(time\_unit=U) as dt.timestamp(U) for s, ms, us and ns; time\_unit=d is bt.partition\_days(x), Int64 where Polars returns Int32. For an instant before 1970 with a sub-millisecond part, dt.timestamp(ms) truncates toward zero where Polars floors. Wave W0. |
 | `hour` | `Expr.dt.hour` | canonical |  |
-| `is_business_day` | `Expr.dt.is_business_day` | param | Missing: week\_mask=, holidays=. Wave W2. |
+| `is_business_day` | `Expr.dt.is_business_day` | mismatch | Differs: week\_mask= is spelled weekmask=; holidays= matches. Wave W2. |
 | `is_leap_year` | `Expr.dt.is_leap_year` | canonical |  |
 | `iso_year` | `Expr.dt.iso_year` | canonical |  |
 | `microsecond` | `Expr.dt.microsecond` | canonical |  |
@@ -102,20 +102,20 @@ The following table maps the 47 names on `Expr.dt`, sorted alphabetically.
 | `ordinal_day` | `Expr.dt.dayofyear` | canonical |  |
 | `quarter` | `Expr.dt.quarter` | canonical |  |
 | `replace` | n/a | gap | Not yet: Expr.dt.replace (set year/month/.../microsecond fields). Wave W6. |
-| `replace_time_zone` | n/a | gap | Not yet: Expr.dt.replace\_time\_zone (a time-zone-aware Datetime type). Wave W6. |
+| `replace_time_zone` | `Expr.dt.replace_timezone` | mismatch | Differs: spelled replace\_timezone(tz, ambiguous=, nonexistent=); the non\_existent keyword is nonexistent here and also takes shift\_forward. Wave W6. |
 | `round` | `Expr.dt.round` | param | Missing: multiples such as '15m' and offset=. Wave W2. |
 | `second` | `Expr.dt.second` | param | Missing: fractional=. Wave W2. |
 | `strftime` | `Expr.dt.strftime` | canonical |  |
 | `time` | n/a | gap | Not yet: Expr.dt.time (needs a TIME type; time\_of\_day returns an integer). Wave W6. |
 | `timestamp` | `Expr.dt.timestamp` | canonical |  |
 | `to_string` | `Expr.dt.strftime` | mismatch | Differs: with no format Polars renders by column type: a Datetime\[us\] is strftime(%Y-%m-%d %H:%M:%S%.6f) and a Date is strftime(%Y-%m-%d). Batcher needs the format stated, so a port of an unknown column type needs review. Wave W0. |
-| `total_days` | n/a | gap | Not yet: Duration total\_days. Wave W6. |
-| `total_hours` | n/a | gap | Not yet: Duration total\_hours. Wave W6. |
-| `total_microseconds` | n/a | gap | Not yet: Duration total\_microseconds. Wave W6. |
-| `total_milliseconds` | n/a | gap | Not yet: Duration total\_milliseconds. Wave W6. |
-| `total_minutes` | n/a | gap | Not yet: Duration total\_minutes. Wave W6. |
+| `total_days` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('d'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_hours` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('h'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_microseconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('us'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_milliseconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('ms'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_minutes` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('m'); the count truncates toward zero and comes back as Int64. Wave W6. |
 | `total_nanoseconds` | n/a | gap | Not yet: Duration total\_nanoseconds. Wave W6. |
-| `total_seconds` | n/a | gap | Not yet: Duration total\_seconds. Wave W6. |
+| `total_seconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('s'); the count truncates toward zero and comes back as Int64. Wave W6. |
 | `truncate` | `Expr.dt.truncate` | param | Missing: Polars duration strings (1mo, 15m) and offset=. For a single calendar unit port as truncate(unit, preserve\_type=True), which keeps a Date a Date. Wave W2. |
 | `week` | `Expr.dt.week` | canonical |  |
 | `weekday` | `Expr.dt.weekday` | canonical |  |

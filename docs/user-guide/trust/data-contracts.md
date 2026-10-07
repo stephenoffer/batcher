@@ -128,6 +128,19 @@ as a literal, so the answer is identical single-node and distributed.
 Its counterpart is row-level: `not_in_future` flags a timestamp dated ahead of now, with a
 `tolerance` to absorb clock skew between producers.
 
+A time series can also be wrong in order rather than in value. `monotonic` flags each row
+whose timestamp steps backwards from the previous row in `order_by` order, checked within
+each `by` group, and `strict=True` also flags a repeated timestamp. It is row-level, so
+`drop` and `quarantine` act on the rows where the sequence broke.
+
+```python
+log = bt.from_pydict(
+    {"device": ["a", "a", "a", "b"], "seq": [1, 2, 3, 1], "ts": [10, 30, 20, 5]}
+)
+print(log.dq.monotonic("ts", order_by="seq", by="device").validate().violations)
+# {"monotonic(ts, increasing, by=['device'])": 1}
+```
+
 ```python
 mixed = bt.from_pydict({"ts": [dt.datetime(2020, 1, 1), dt.datetime(2999, 1, 1)]})
 print(mixed.dq.not_in_future("ts", tolerance="5m").validate().violations)
