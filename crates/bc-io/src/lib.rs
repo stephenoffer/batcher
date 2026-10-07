@@ -214,22 +214,12 @@ pub fn read_parquet_filtered(
     ))
 }
 
-/// How many whole files to read concurrently in a batched multi-file read. A
-/// many-small-files scan is latency-bound on per-file footer+chunk GETs, so overlapping
-/// files (on top of each file's own row-group concurrency) is the throughput lever.
-///
-/// **This is a latency budget, not a CPU one, and a flat 64 was leaving most of it unspent.**
-/// Each file costs about two sequential round trips (footer, then its column chunks) and
-/// almost no CPU, so the useful concurrency is set by how many requests are needed to cover
-/// the round-trip time — far more than the core count. Measured reading the 1,024-file
-/// `small-parquet/1GiB` corpus from S3 on a 96-core node, one column: **803 ms at 64, 411 ms
-/// at 256, 167 ms at 512** — 4.8x for a number, on the layout the scan benchmark measures as
-/// Batcher's largest gap.
-///
-/// **The round trip does not shrink with the host, so the floor is 256, not 64.** On a 16-core
-/// worker over the 10,240-file `small-parquet/10GiB` corpus (count / `GROUP BY`, best of 3):
-/// 6,226 / 6,428 ms at 64, 1,351 / 1,445 at 256, 1,139 / 1,359 at 512. An in-flight file holds
-/// its column chunks, and `iter_chunks` bounds a read to about a GiB of files.
+/// How many whole files a batched multi-file read keeps in flight. A file costs about two
+/// sequential round trips (footer, then column chunks) and almost no CPU, so this is a latency
+/// budget, not a CPU one, and the round trip does not shrink with the host. Measured over S3:
+/// 1,024 files on 96 cores, 803 ms at 64 / 411 at 256 / 167 at 512; 10,240 files on 16 cores
+/// (count / `GROUP BY`), 6,226 / 6,428 ms at 64, 1,351 / 1,445 at 256, 1,139 / 1,359 at 512.
+/// An in-flight file holds its column chunks; `iter_chunks` bounds a read to about a GiB.
 fn file_concurrency() -> usize {
     static C: OnceLock<usize> = OnceLock::new();
     *C.get_or_init(|| {
