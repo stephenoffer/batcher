@@ -147,6 +147,10 @@ async def _resilient_batch(
             # one, so "only one event loop touches this" was never true of the allowance.
             if not _claim_dropped_row(budget, exc):
                 raise  # the error budget is spent — a real bug on clean data still fails
+            if op.error_column is not None:
+                from batcher.core.udf.resilience import errored_row
+
+                return [errored_row(batch, exc)]  # kept, with its error (`error_column`)
             return []  # drop the one corrupt row and carry on
         mid = batch.num_rows // 2
         left, right = await asyncio.gather(

@@ -30,6 +30,13 @@ That abandonment is why the call is bounded by `_internal.concurrency.call_with_
 rather than a `ThreadPoolExecutor`: an executor's atexit hook joins every worker thread it
 ever started, so an abandoned call wedged the process at exit — see that module for the full
 account, and for why the guarded call also has to carry the caller's context.
+
+The last section is what happens to a stage's output on the way out, which is where the
+budget's opt-in quarantine and the declared output schema meet. A row the budget isolates
+leaves the bisection as a *marker* (`errored_row`): the input row plus a reserved column
+holding the error. `conform_output` turns each marker into a row of the declared output,
+casts every other batch to the declared `output_columns` schema, and adds the `error_column`.
+Both need the same thing -- the stage's output types known up front -- so they are one pass.
 """
 
 from __future__ import annotations
@@ -42,9 +49,15 @@ import pyarrow as pa
 
 from batcher._internal.concurrency.timeout import call_with_timeout
 from batcher._internal.logging import note_suppressed
+from batcher.core.udf.call import _check_declared_columns
 from batcher.plan.logical import MapBatches
 
-__all__ = ["wants_resilience", "wrap_resilient"]
+__all__ = ["conform_output", "errored_row", "wants_resilience", "wrap_resilient"]
+
+#: The reserved column a quarantined row carries out of the bisection (see `errored_row`).
+#: A column rather than schema metadata because it has to survive every result-coercion step
+#: between the bisection and `conform_output`, and those rebuild batches freely.
+_ERROR_MARKER = "__batcher_udf_error__"
 
 # Cap the exponential backoff so a large `max_retries` with a modest base cannot sleep for
 # minutes between attempts (``0.5 * 2**12`` is already 34 minutes). A retry is meant to ride
@@ -156,3 +169,136 @@ def _record_retry(
     except Exception as exc:  # pragma: no cover - observability must never break a query
         note_suppressed("core", "record a UDF retry", exc)
         return
+
+
+def errored_row(row: pa.RecordBatch, exc: BaseException) -> pa.RecordBatch:
+    """The marker a one-row failure becomes when its stage keeps errored rows.
+
+    The input row, unchanged, plus `_ERROR_MARKER` holding ``"<ExcType>: <message>"``. It
+    carries the input rather than nulls because the stage's preserved columns are reported
+    from it; `conform_output` decides which values survive.
+
+    Args:
+        row: The single input row the `fn` raised on.
+        exc: What it raised.
+
+    Returns:
+        The marker batch.
+    """
+    message = pa.array([f"{type(exc).__name__}: {exc}"], pa.string())
+    return row.append_column(_ERROR_MARKER, message)
+
+
+def conform_output(
+    batches: list[pa.RecordBatch], op: MapBatches, *, check_names: bool = True
+) -> list[pa.RecordBatch]:
+    """Hold a stage's output batches to its declared columns, schema and `error_column`.
+
+    With `check_names`, the declared `output_columns` names are checked first
+    (`_check_declared_columns`) against the batches the `fn` produced, never the quarantine
+    markers. The materializing path checks; the streaming path never has, because it sees one
+    sub-batch at a time and reconciles a column that appears or disappears across them. The
+    rest is a no-op unless the stage declared a `pyarrow.Schema` for `output_columns` or asked
+    for an `error_column`. With a schema, every batch is cast to `op.declared_output()`, so the
+    declared types are what the stage returns on every path -- including on an empty input,
+    which is answered with a zero-row batch of the declared schema instead of a column of
+    Arrow `null`. A declared column the batch lacks is filled with nulls: that only happens
+    when `input_columns` let projection pushdown prune a pass-through column nothing above
+    the stage reads.
+
+    With an `error_column`, a marker (`errored_row`) becomes one output row whose columns are
+    null except the preserved ones, and every other row gets a null error.
+
+    Args:
+        batches: The stage's output, in order.
+        op: The stage.
+        check_names: Whether to check the returned names against `output_columns`.
+
+    Returns:
+        The conformed batches, in the same order.
+
+    Raises:
+        PlanError: If the returned names do not match the declared `output_columns`.
+        SchemaError: If a returned column cannot be cast to its declared type, or a column
+            declared non-nullable comes back with nulls.
+    """
+    if check_names:
+        _check_declared_columns([b for b in batches if _ERROR_MARKER not in b.schema.names], op)
+    if op.output_schema is None and op.error_column is None:
+        return batches
+    out = [_conform_batch(b, op) for b in batches]
+    declared = op.declared_output()
+    if declared is not None and not any(b.num_rows for b in out):
+        return [pa.RecordBatch.from_pylist([], schema=declared)]
+    return out
+
+
+def _conform_batch(batch: pa.RecordBatch, op: MapBatches) -> pa.RecordBatch:
+    """One batch of the stage's output, conformed (see `conform_output`)."""
+    errored = _ERROR_MARKER in batch.schema.names
+    error = batch.column(_ERROR_MARKER) if errored else pa.nulls(batch.num_rows, pa.string())
+    body = _body_schema(op)
+    if errored:
+        batch = _quarantined(batch.drop_columns([_ERROR_MARKER]), op, body)
+    elif body is not None:
+        batch = _cast_to_declared(batch, body)
+    if op.error_column is None:
+        return batch
+    return batch.append_column(pa.field(op.error_column, pa.string()), error)
+
+
+def _body_schema(op: MapBatches) -> pa.Schema | None:
+    """`op.declared_output()` without its `error_column`: what the `fn`'s columns become."""
+    declared = op.declared_output()
+    if declared is None or op.error_column is None:
+        return declared
+    return pa.schema([f for f in declared if f.name != op.error_column], declared.metadata)
+
+
+def _quarantined(row: pa.RecordBatch, op: MapBatches, body: pa.Schema | None) -> pa.RecordBatch:
+    """The output row for an input row the `fn` raised on.
+
+    Without a declared schema the stage keeps its input's columns (the callable `filter`, the
+    only stage `validate_error_column` lets through without one), so the row is the input row.
+    With one, each declared column is null unless the stage preserves it, in which case the
+    input value is the output value by the stage's own declaration.
+    """
+    if body is None:
+        return row
+    kept = set(op.preserves_columns or ())
+    columns = [
+        row.column(f.name).cast(f.type)
+        if f.name in kept and f.name in row.schema.names
+        else pa.nulls(1, f.type)
+        for f in body
+    ]
+    return pa.RecordBatch.from_arrays(columns, schema=body)
+
+
+def _cast_to_declared(batch: pa.RecordBatch, body: pa.Schema) -> pa.RecordBatch:
+    """`batch` in `body`'s column order and types, naming the column that will not fit."""
+    from batcher._internal.errors import SchemaError
+
+    columns = []
+    for f in body:
+        idx = batch.schema.get_field_index(f.name)
+        if idx < 0:
+            columns.append(pa.nulls(batch.num_rows, f.type))
+            continue
+        column = batch.column(idx)
+        try:
+            column = column if column.type == f.type else column.cast(f.type)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as exc:
+            raise SchemaError(
+                f"map_batches output column {f.name!r} is {column.type}, which does not cast "
+                f"to the declared {f.type} ({exc}). Fix the function's output or the "
+                "output_columns schema."
+            ) from exc
+        if not f.nullable and column.null_count:
+            raise SchemaError(
+                f"map_batches output column {f.name!r} is declared non-nullable but the "
+                f"function returned {column.null_count} null(s). Declare the field nullable, "
+                "or fill the nulls in the function."
+            )
+        columns.append(column)
+    return pa.RecordBatch.from_arrays(columns, schema=body)

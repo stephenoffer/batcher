@@ -21,7 +21,11 @@ from batcher._internal.errors import ColumnNotFoundError, PlanError
 def tensor_ds() -> bt.Dataset:
     """An embedding column as `map_batches` produces it: a fixed-shape tensor."""
     return bt.from_pydict({"id": [1, 2, 3]}).map_batches(
-        lambda b: {"id": b.column("id").to_pylist(), "embedding": np.eye(3, 4, dtype="float32")},
+        # One embedding per input row (id k -> unit vector k), whatever rows the batch holds.
+        lambda b: {
+            "id": b.column("id").to_pylist(),
+            "embedding": np.eye(4, dtype="float32")[np.asarray(b.column("id")) - 1],
+        },
         output_columns=["id", "embedding"],
     )
 

@@ -21,11 +21,11 @@ from batcher.plan.expr_ir import Col, Expr, Lit
 from batcher.plan.logical.aggregate import Sort, SortKeySpec
 from batcher.plan.logical.base import LogicalPlan
 from batcher.plan.logical.join import Join
+from batcher.plan.logical.map_batches import MapBatches
 from batcher.plan.logical.relational import (
     Distinct,
     Filter,
     Limit,
-    MapBatches,
     Project,
     Projection,
     Sample,

@@ -9,12 +9,18 @@ batch, an async `fn` given knobs it ignores) are named at the call site that cau
 
 from __future__ import annotations
 
+from typing import Any
+
+import pyarrow as pa
+
 __all__ = [
     "normalize_resources",
     "normalize_retry",
     "require_number",
+    "split_output_columns",
     "validate_bindings",
     "validate_column_list",
+    "validate_error_column",
     "validate_fn",
     "validate_num_workers",
     "validate_output_columns",
@@ -152,6 +158,86 @@ def validate_output_columns(
         if name in seen:
             raise PlanError(f"{param} has a duplicate column name {name!r}")
         seen.add(name)
+
+
+def split_output_columns(output_columns: Any) -> tuple[list[str] | None, pa.Schema | None]:
+    """Read `output_columns` as ``(names, schema)``: a list declares names, a schema both.
+
+    A `pyarrow.Schema` is the complete form. Its names feed every name-only consumer exactly
+    as a list does, and its types are what `Dataset.schema` answers from without running the
+    callback and what every output batch is cast to. A tensor column is declared through
+    Arrow's own extension type (``pa.fixed_shape_tensor``), so there is no second notation.
+
+    Args:
+        output_columns: A list of names, a `pyarrow.Schema`, or `None`.
+
+    Returns:
+        The names (or `None`) and the schema (or `None` for a name-only declaration).
+
+    Raises:
+        PlanError: If `output_columns` is a string, or a schema with no fields.
+    """
+    from batcher._internal.errors import PlanError
+
+    if output_columns is None:
+        return None, None
+    if isinstance(output_columns, pa.Schema):
+        if not len(output_columns):
+            raise PlanError("output_columns cannot be an empty schema; pass None to keep the input")
+        return list(output_columns.names), output_columns
+    if isinstance(output_columns, str):
+        raise PlanError(
+            f"output_columns must be a list of names or a pyarrow.Schema, got the string "
+            f"{output_columns!r}; wrap it in a list: [{output_columns!r}]"
+        )
+    return list(output_columns), None
+
+
+def validate_error_column(
+    error_column: object,
+    max_errored_rows: int,
+    schema: pa.Schema | None,
+    keeps_input: bool,
+    names: list[str] | None,
+) -> None:
+    """Reject an `error_column` the stage could not honour, naming the fix.
+
+    The quarantined row has to be built without the `fn`'s output, so its column types must be
+    known up front: from the declared `output_columns` schema, or -- for the callable `filter`,
+    which only drops rows -- from the input itself. And the row exists only because the
+    `max_errored_rows` budget isolated it, so a zero budget would make the option a no-op.
+
+    Args:
+        error_column: The requested column name, or `None`.
+        max_errored_rows: The stage's dirty-row budget.
+        schema: The declared output schema, if any.
+        keeps_input: Whether the stage's output columns are its input's (`filter`).
+        names: The stage's output column names, when known, to refuse a collision.
+
+    Raises:
+        PlanError: If any of the above does not hold.
+    """
+    if error_column is None:
+        return
+    from batcher._internal.errors import PlanError
+
+    if not isinstance(error_column, str) or not error_column:
+        raise PlanError(f"error_column must be a non-empty string, got {error_column!r}")
+    if max_errored_rows <= 0:
+        raise PlanError(
+            "error_column keeps the rows max_errored_rows would drop, so it needs "
+            "max_errored_rows > 0; set the budget, e.g. max_errored_rows=1000"
+        )
+    if schema is None and not keeps_input:
+        raise PlanError(
+            "error_column needs the output types up front to build a failed row without the "
+            "function's result: pass output_columns as a pyarrow.Schema, e.g. "
+            "output_columns=pa.schema([('y', pa.int64())])"
+        )
+    if names and error_column in names:
+        raise PlanError(
+            f"error_column {error_column!r} is already an output column; pick another name"
+        )
 
 
 def validate_bindings(

@@ -959,6 +959,11 @@ class Dataset:
         fn_constructor_kwargs: dict | None = None,
         max_concurrency: int = 0,
         max_errored_rows: int = 0,
+        error_column: str | None = None,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
         **equals: Any,
     ) -> Dataset:
         """Keep only the rows where every predicate is true.
@@ -1021,6 +1026,13 @@ class Dataset:
             fn_constructor_kwargs: Keyword arguments for a class predicate's construction.
             max_concurrency: In-flight batches for an ``async def`` predicate; 0 = a default.
             max_errored_rows: Rows a raising predicate may drop per worker before failing.
+            error_column: Keep a row the predicate raised on instead of dropping it, with
+                ``"<ExcType>: <message>"`` in this new string column (null on every other
+                row). Needs `max_errored_rows` > 0, which the kept rows still count against.
+            timeout: Wall-clock ceiling (seconds) for one predicate call; 0 = no timeout.
+            max_retries: Times to retry a batch whose predicate raises a retryable error.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
             **equals: Column-equals-value shorthands, ANDed with `predicates`.
 
         Returns:
@@ -1063,6 +1075,11 @@ class Dataset:
             "zero_copy_batch": zero_copy_batch,
             "max_concurrency": max_concurrency,
             "max_errored_rows": max_errored_rows,
+            "error_column": error_column,
+            "timeout": timeout,
+            "max_retries": max_retries,
+            "retry_backoff": retry_backoff,
+            "retry_on": retry_on,
         }
         ray = {
             "num_cpus": num_cpus,
@@ -1471,7 +1488,7 @@ class Dataset:
         batch_format: str = "pyarrow",
         input_columns: list[str] | None = None,
         preserves_columns: list[str] | None = None,
-        output_columns: list[str] | None = None,
+        output_columns: list[str] | pa.Schema | None = None,
         num_workers: int | str = "auto",
         num_cpus: float | None = None,
         num_gpus: float = 0.0,
@@ -1490,6 +1507,7 @@ class Dataset:
         model_memory_gb: float = 0.0,
         multiprocessing: bool = False,
         max_errored_rows: int = 0,
+        error_column: str | None = None,
         timeout: float = 0.0,
         max_retries: int = 0,
         retry_backoff: float = 0.5,
@@ -1556,7 +1574,10 @@ class Dataset:
             preserves_columns: The columns `fn` returns unchanged, same name and same value in
                 every output row. A later `filter` reading only these runs *below* the UDF, so
                 the model scores fewer rows. Naming a column `fn` rewrites changes the result.
-            output_columns: The result schema when `fn` changes the columns.
+            output_columns: The result columns when `fn` changes them: a list of names, or a
+                `pyarrow.Schema` that also fixes their types. A schema lets `schema` answer
+                without calling `fn`, and every output batch is cast to it, so an empty input
+                still returns the declared types.
             num_workers: Concurrent per-batch calls within a worker (``"auto"`` sizes to the
                 stage), or an explicit int.
             num_cpus: Ray Data's per-worker CPU request; raises when set.
@@ -1583,6 +1604,9 @@ class Dataset:
             model_memory_gb: The model's footprint, for host-RAM budgeting and VRAM packing.
             multiprocessing: Run CPU-bound pure-Python calls across processes.
             max_errored_rows: Rows a raising `fn` may drop per worker before failing.
+            error_column: Keep a row `max_errored_rows` would drop, with its output columns
+                null and ``"<ExcType>: <message>"`` in this new string column (null on every
+                other row). Needs `output_columns` as a `pyarrow.Schema`.
             timeout: Wall-clock ceiling (seconds) for one `fn` call; 0 = no timeout.
             max_retries: Times to retry a batch whose `fn` raises a retryable error.
             retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
@@ -1654,6 +1678,7 @@ class Dataset:
             model_memory_gb=model_memory_gb,
             multiprocessing=multiprocessing,
             max_errored_rows=max_errored_rows,
+            error_column=error_column,
             timeout=timeout,
             max_retries=max_retries,
             retry_backoff=retry_backoff,
@@ -1765,7 +1790,7 @@ class Dataset:
         batch_size: int | None = None,
         batch_format: str = "pyarrow",
         input_columns: list[str] | None = None,
-        output_columns: list[str] | None = None,
+        output_columns: list[str] | pa.Schema | None = None,
         num_workers: int | str = "auto",
         num_cpus: float | None = None,
         num_gpus: float = 0.0,
@@ -1781,6 +1806,11 @@ class Dataset:
         fn_constructor_kwargs: dict | None = None,
         max_concurrency: int = 0,
         max_errored_rows: int = 0,
+        error_column: str | None = None,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
     ) -> Dataset:
         """Apply a per-row Python function ``fn(row) -> row`` (Ray Data ``map``).
 
@@ -1806,7 +1836,8 @@ class Dataset:
             input_columns: The columns `fn` reads, so projection pushdown can prune the scan.
                 Omitting a column the callback reads is a correctness bug: the pruned column
                 is missing from the row dict.
-            output_columns: The result schema when `fn` changes the columns.
+            output_columns: The result columns when `fn` changes them: a list of names, or a
+                `pyarrow.Schema` that also fixes their types (see `map_batches`).
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
             num_cpus: Ray Data's per-worker CPU request; raises when set.
             num_gpus: GPUs to reserve per distributed worker.
@@ -1826,6 +1857,13 @@ class Dataset:
             fn_constructor_kwargs: Keyword arguments for a class `fn`'s construction.
             max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
             max_errored_rows: Rows a raising `fn` may drop per worker before failing.
+            error_column: Keep a row `max_errored_rows` would drop, as `map_batches` does;
+                needs `output_columns` as a `pyarrow.Schema`.
+            timeout: Wall-clock ceiling (seconds) for one call over a batch of rows.
+            max_retries: Times to retry a batch whose `fn` raises a retryable error. The
+                retry re-runs every row of the batch, so `fn` should be idempotent.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
 
         Returns:
             A new lazy `Dataset` with `fn` applied to every row.
@@ -1850,7 +1888,7 @@ class Dataset:
         batch_size: int | None = None,
         batch_format: str = "pyarrow",
         input_columns: list[str] | None = None,
-        output_columns: list[str] | None = None,
+        output_columns: list[str] | pa.Schema | None = None,
         num_workers: int | str = "auto",
         num_cpus: float | None = None,
         num_gpus: float = 0.0,
@@ -1866,6 +1904,11 @@ class Dataset:
         fn_constructor_kwargs: dict | None = None,
         max_concurrency: int = 0,
         max_errored_rows: int = 0,
+        error_column: str | None = None,
+        timeout: float = 0.0,
+        max_retries: int = 0,
+        retry_backoff: float = 0.5,
+        retry_on: type[BaseException] | tuple[type[BaseException], ...] | None = None,
     ) -> Dataset:
         """Apply ``fn(row) -> iterable[row]`` per row and flatten (Ray Data ``flat_map``).
 
@@ -1877,7 +1920,8 @@ class Dataset:
             batch_size: Rows handed to each worker call.
             batch_format: The row values — ``"pyarrow"`` (Python values) or ``"numpy"``.
             input_columns: The columns `fn` reads, so projection pushdown can prune the scan.
-            output_columns: The result schema when `fn` changes the columns.
+            output_columns: The result columns when `fn` changes them: a list of names, or a
+                `pyarrow.Schema` that also fixes their types (see `map_batches`).
             num_workers: Concurrent calls within a worker (``"auto"`` sizes it).
             num_cpus: Ray Data's per-worker CPU request; raises when set.
             num_gpus: GPUs to reserve per distributed worker.
@@ -1897,6 +1941,13 @@ class Dataset:
             fn_constructor_kwargs: Keyword arguments for a class `fn`'s construction.
             max_concurrency: In-flight per-row awaits within a batch for an ``async`` `fn`.
             max_errored_rows: Rows a raising `fn` may drop per worker before failing.
+            error_column: Keep a row `max_errored_rows` would drop, as `map_batches` does;
+                needs `output_columns` as a `pyarrow.Schema`.
+            timeout: Wall-clock ceiling (seconds) for one call over a batch of rows.
+            max_retries: Times to retry a batch whose `fn` raises a retryable error. The
+                retry re-runs every row of the batch, so `fn` should be idempotent.
+            retry_backoff: Base backoff (seconds); attempt `k` waits `retry_backoff * 2**k`.
+            retry_on: Exception type(s) worth retrying; ``None`` retries any `Exception`.
 
         Returns:
             A new lazy `Dataset` of the flattened rows.
@@ -5468,11 +5519,19 @@ class Dataset:
 
     @property
     def schema(self) -> pa.Schema:
-        """The output Arrow schema (column names and types), without scanning rows.
+        """The output Arrow schema (column names and types), resolved without a full run.
 
-        A scan returns its source schema directly; other plans resolve derived
-        column types via a zero-row execution. Use `columns` for just the names
-        (always free).
+        A scan returns its source schema directly, and a relational plan infers its types
+        statically or, failing that, from a zero-row execution. Use `columns` for just the
+        names (always free).
+
+        A Python callback stage (`map_batches`, `map`, `flat_map`) is opaque: its output
+        types are whatever `fn` returns. Declare them with ``output_columns=pa.schema(...)``
+        and this answers without calling `fn`. Without a declared schema each such stage is
+        probed: a batch `fn` is called on an empty batch, and a `map`/`flat_map` `fn`, which
+        is never called on an empty batch, on one input row. Either way a class `fn` is built,
+        which for a model is a load. The callable form of `filter` keeps its input's schema
+        and is answered from it.
 
         Returns:
             The output Arrow schema.

@@ -67,7 +67,7 @@ Not every call is either free or a full run. The following table labels the comm
 | Streaming | Runs the plan incrementally as you consume it. | `iter_batches` and `iter_rows`, which start work at the first `next()`, not when called |
 | Externally mutating | Runs the plan and changes something outside the process. | every `ds.write.*` sink, and SQL `CREATE TABLE ... AS`, `INSERT`, `DELETE`, or `UPDATE` on a *catalog* table, which write immediately |
 
-Two cases need care. `len(ds)` and `shape` look like attribute reads but execute a `count`, often answered from file metadata and otherwise from a full run. And a Python callable such as `map_batches(fn)` has output types Batcher can't know without running it, so `schema`, or an `INSERT` into a session table built on it, can call `fn` on input data. A SQL `INSERT`, `DELETE`, or `UPDATE` on a session table otherwise only rebinds the name to a new lazy plan.
+Two cases need care. `len(ds)` and `shape` look like attribute reads but execute a `count`, often answered from file metadata and otherwise from a full run. And a Python callable such as `map_batches(fn)` has output types Batcher can't know without asking it, so `schema`, or an `INSERT` into a session table built on it, calls `fn` to ask: on an empty batch, or on one input row for a `map` or `flat_map` function, which is never called on an empty batch. Declare the types with `output_columns=pa.schema(...)` and neither calls `fn` at all. A SQL `INSERT`, `DELETE`, or `UPDATE` on a session table otherwise only rebinds the name to a new lazy plan.
 
 `iter_batches` doesn't start a query until you ask for the first batch:
 
