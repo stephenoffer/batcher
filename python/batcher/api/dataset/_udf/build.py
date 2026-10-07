@@ -10,7 +10,7 @@ binds its extra arguments the same way (`bind_fn`), and validates the rest here.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
@@ -71,7 +71,11 @@ ROW_OPTIONS = (
 )
 
 
-def refuse_callable_options(method: Callable, given: dict[str, Any]) -> None:
+def refuse_callable_options(
+    method: Callable,
+    given: dict[str, Any],
+    columns: Callable[[], Collection[str]] = tuple,
+) -> None:
     """Refuse the callable-only options of `method` when no callable was passed.
 
     `filter` takes an expression, a SQL string, or a callable, and its UDF options mean
@@ -79,20 +83,36 @@ def refuse_callable_options(method: Callable, given: dict[str, Any]) -> None:
     a scheduled predicate and run as an ordinary one, so any option that differs from its
     default is named and refused.
 
+    An option that is also a column of the dataset is almost always an equality shorthand
+    that collided with the parameter (``filter(num_workers=1)`` on a ``num_workers``
+    column), so the message then names the two spellings that cannot collide.
+
     Args:
         method: The method whose signature holds the defaults.
         given: The option values as the caller passed them.
+        columns: Returns the dataset's column names; called only when an option is refused.
 
     Raises:
         PlanError: If any option differs from its default.
     """
     defaults = _defaults(method)
     set_names = sorted(name for name, value in given.items() if value != defaults[name])
-    if set_names:
+    if not set_names:
+        return
+    names = set(columns())
+    clashes = [name for name in set_names if name in names]
+    if clashes:
+        name = clashes[0]
+        value = given[name]
         raise PlanError(
-            f"{method.__name__}() got {set_names}, which apply only to a callable predicate; "
-            "drop them, or pass the condition as a function of the batch"
+            f"{method.__name__}() got {clashes}, which name both a column and an option that "
+            f"applies only to a callable predicate; compare the column with "
+            f"filter(bt.col({name!r}) == {value!r}) or filter({{{name!r}: {value!r}}})"
         )
+    raise PlanError(
+        f"{method.__name__}() got {set_names}, which apply only to a callable predicate; "
+        "drop them, or pass the condition as a function of the batch"
+    )
 
 
 @functools.lru_cache(maxsize=32)

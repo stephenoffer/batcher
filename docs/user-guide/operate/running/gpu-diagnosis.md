@@ -9,6 +9,23 @@ decoding video on its shader cores instead of its decoder, and one waiting on th
 front of it. Every one of those leaves the query correct and the node a fraction as fast, and
 none of them appears in a stack trace or a query profile.
 
+## Check that the plan reaches the device
+
+A stage that never ran on the GPU is slow for a simpler reason than any below. `collect(backend="gpu")` falls back to the CPU engine for any operator or expression outside the translated subset, and it returns the same rows either way, so the fallback is silent by design. {py:meth}`Dataset.explain <batcher.Dataset.explain>` with `backend="gpu"` asks the question without a device. It optimizes the plan, matches its shape against the translated subset, and rehearses the translation on zero-row frames, which are the checks the GPU route makes before it starts a worker. The text form ends with one line naming the operator or expression that blocks the plan:
+
+```python
+import batcher as bt
+
+ds = bt.from_pydict({"g": ["a", "b", "a"], "x": [1, 2, 3]})
+print(ds.filter(bt.col("x") > 1).explain(backend="gpu").splitlines()[-1])
+# device tier (backend='gpu'): eligible
+print(ds.with_columns(h=bt.col("x").hash()).explain(backend="gpu").splitlines()[-1])
+# device tier (backend='gpu'): declined: an expression is not translated: expr hash
+#   (a specific digest (SplitMix64 + FNV-1a) that no dataframe hash reproduces)
+```
+
+`format="json"` carries the same verdict as a `"device"` object with `eligible` and `reason` keys. Eligible means the shape translates. Whether the query runs on a device still depends on a visible GPU and, under `backend="auto"`, on the cost policy.
+
 ## Why one utilization number is not enough
 
 Almost every GPU tool reports the same figure, and it answers less than it appears to.

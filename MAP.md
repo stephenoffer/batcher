@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1566 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1567 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -215,11 +215,11 @@ The `Dataset` builder package.
 | `_dedup.py` | 326 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 244 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
 | `_export.py` | 331 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
-| `_nulls.py` | 195 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
+| `_nulls.py` | 223 | Null handling behind `Dataset.fill_null` / `drop_nulls` / `isna` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 6783 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 7067 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -231,7 +231,7 @@ Plan-construction helpers behind the thinner `Dataset` methods.
 |---|---|---|
 | `combine.py` | 296 | Bodies of the `Dataset` verbs that combine two or more relations over existing operators. |
 | `conform.py` | 159 | Bodies of the `Dataset` verbs that hold a relation to a shape: `match_to_schema`, `drop_nans`. |
-| `core.py` | 563 | Plan-construction helpers behind the thinner `Dataset` methods. |
+| `core.py` | 574 | Plan-construction helpers behind the thinner `Dataset` methods. |
 | `reshape.py` | 226 | Bodies of the `Dataset` verbs that cut or turn a relation: `transpose`, `partition_by`, `split`. |
 | `sessions.py` | 136 | Session windows: grouping a partition's events into runs separated by an idle gap. |
 
@@ -241,7 +241,7 @@ The shared machinery behind the batch-UDF verbs on `Dataset`.
 
 | module | lines | what it is |
 |---|---|---|
-| `build.py` | 411 | Build the `MapBatches` stage behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
+| `build.py` | 431 | Build the `MapBatches` stage behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
 | `checks.py` | 322 | Edge validation and advisory warnings for the batch-UDF verbs. |
 | `cluster.py` | 163 | Checks a UDF stage must pass against the live Ray cluster before it is submitted. |
 | `ray_options.py` | 275 | Resolve the Ray Data resource parameters of the UDF verbs onto what the scheduler honours. |
@@ -353,7 +353,7 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | `phases.py` | 97 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 273 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
 | `run.py` | 674 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
-| `sizing.py` | 342 | What the conductor needs to know about a plan's size before it runs it. |
+| `sizing.py` | 394 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 592 | The three ways the conductor can execute an admitted plan, plus the source read. |
 | `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
 
@@ -448,6 +448,7 @@ The opt-in GPU execution backend for supported relational shapes.
 | module | lines | what it is |
 |---|---|---|
 | `audit.py` | 121 | What the device tier actually did, per process — the counterpart to the fallback contract. |
+| `eligibility.py` | 153 | Say whether a plan would translate to the device tier, and name what blocks it if not. |
 | `failure.py` | 62 | Telling a GPU backend that declined from one that is broken. |
 | `fanout.py` | 198 | Grow the cluster to the devices a plan wants, check one is free, and fan the work out. |
 | `route.py` | 326 | Decide whether a plan runs on the GPU, run it, and record what that cost. |
@@ -460,7 +461,7 @@ Metadata-first terminal resolution — the façade over the answer modules.
 
 | module | lines | what it is |
 |---|---|---|
-| `_core.py` | 414 | Metadata-first terminal resolution. |
+| `_core.py` | 417 | Metadata-first terminal resolution. |
 | `aggregate.py` | 357 | Metadata-first resolution of a *keyless aggregate* terminal. |
 | `enrich.py` | 129 | Teach the source statistics the facets a source can compute but has not been asked for. |
 | `pushed_count.py` | 71 | `ds.count()` answered by the source's own ``COUNT(*)`` instead of by reading it. |
@@ -2486,7 +2487,7 @@ Column selectors — expressions that stand for *many* columns at plan time.
 |---|---|---|
 | `build.py` | 365 | The public selector constructors — ``bt.all()``, ``bt.numeric()``, ``bt.matches(...)``. |
 | `core.py` | 451 | The `Selector` expression leaf and its `.name` rename accessor. |
-| `expand.py` | 353 | Resolving a selector-bearing expression against a schema. |
+| `expand.py` | 361 | Resolving a selector-bearing expression against a schema. |
 
 ### `batcher/plan/expr_rewrite/` — 1 · contract
 

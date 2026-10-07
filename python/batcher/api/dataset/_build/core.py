@@ -138,23 +138,32 @@ def build_window(
 _RANDOM_MODULUS = 2147483647  # 2^31 - 1 (prime): the uniform denominator.
 
 
-def build_with_random(ds: Dataset, name: str, *, seed: int, normal: bool) -> Dataset:
-    """Add a reproducible pseudo-random column keyed by ``(seed, row index)``.
+def build_with_random(
+    ds: Dataset, name: str, *, seed: int, normal: bool, key: list[str] | None = None
+) -> Dataset:
+    """Add a reproducible pseudo-random column keyed by ``(seed, row index)`` or by `key`.
 
-    Pure desugaring: a `with_row_index` provides a stable per-row key, an xxhash of
-    ``seed:salt:index`` provides a well-distributed integer, and that maps to a
-    uniform ``[0, 1)`` (or, with `normal`, a standard normal via Box-Muller from two
-    independent hashes). Keyed on the stable index, so it is reproducible and matches
-    on the single-node and parallel paths.
+    Pure desugaring: an integer per row, well distributed, maps to a uniform ``[0, 1)`` (or,
+    with `normal`, a standard normal via Box-Muller from two independent integers). Without
+    `key` the integer is an xxhash of ``seed:salt:index`` over a `with_row_index`, so it is
+    reproducible for one input order. With `key` it is a typed `hash_rows` of the salt and the
+    key columns, seeded by `seed` -- a pure row-wise expression, so the value is a function of
+    the row's key alone and does not move when the data is reordered, re-split into files or
+    batches, or partitioned differently, and a row index (`RowId`, single-node only) is never
+    built.
     """
     from batcher.plan.expr_ir import Col, lit
+    from batcher.plan.expr_ir.constructors import hash_rows
     from batcher.plan.functions.string import concat_ws
 
     rid = f"__bc_random_idx_{name}"
 
     def uniform_int(salt: str) -> Expr:
-        keyed = concat_ws(":", lit(f"{seed}:{salt}"), Col(rid).cast("string"))
-        h = keyed.str.xxhash64()  # well-distributed Int64
+        if key is not None:
+            h = hash_rows(lit(salt), *(Col(c) for c in key), seed=seed)
+        else:
+            keyed = concat_ws(":", lit(f"{seed}:{salt}"), Col(rid).cast("string"))
+            h = keyed.str.xxhash64()  # well-distributed Int64
         return ((h % _RANDOM_MODULUS) + _RANDOM_MODULUS) % _RANDOM_MODULUS  # [0, M)
 
     if normal:
@@ -165,6 +174,8 @@ def build_with_random(ds: Dataset, name: str, *, seed: int, normal: bool) -> Dat
         expr = (-2.0 * u1.ln()).sqrt() * (2.0 * math.pi * u2).cos()  # Box-Muller
     else:
         expr = uniform_int("u").cast("float64") / float(_RANDOM_MODULUS)  # [0, 1)
+    if key is not None:
+        return ds.with_columns(**{name: expr})
     return ds.with_row_index(rid).with_columns(**{name: expr}).drop(rid)
 
 

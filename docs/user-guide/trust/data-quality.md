@@ -379,6 +379,21 @@ with option_context("distributed.mode", "never"):
 
 `drop()`, `quarantine()`, and `annotate()` return lazy datasets, so you choose where they run when you collect them, such as `clean.collect(distributed=True, num_workers=4)`. The checks lower to the same relational operators as any other query, so a cluster run has no separate validation semantics.
 
+## Compare two datasets
+
+{py:meth}`Dataset.equals <batcher.Dataset.equals>` says whether two datasets compute the same rows, ignoring order unless you pass `ordered=True`. It answers only yes or no. When it returns `False`, compare the schemas first, because a type difference fails it even when every value matches. Then `except_(..., distinct=False)` in each direction lists the differing rows, each repeated as often as one side has more copies of it than the other:
+
+```python
+expected = bt.from_pydict({"id": [1, 2, 2]})
+actual = bt.from_pydict({"id": [1, 2, 3]})
+print(expected.equals(actual), expected.schema == actual.schema)
+# False True
+print(expected.except_(actual, distinct=False).to_pydict())  # missing from actual
+# {'id': [2]}
+print(actual.except_(expected, distinct=False).to_pydict())  # extra in actual
+# {'id': [3]}
+```
+
 ## See also
 
 - {doc}`Data contracts </user-guide/trust/data-contracts>`: the checks a whole table fails rather than a row, such as row counts, distributions, freshness, and schema.

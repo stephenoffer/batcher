@@ -89,7 +89,7 @@ print(
 # {'revenue': [20, 0, 150], 'missing': [False, True, False]}
 ```
 
-The {py:class}`Dataset <batcher.Dataset>` itself keeps the pandas names `isna`, `notna`, `round`, `abs`, `clip`, `shape`, `size`, `nunique`, and `select_dtypes`, plus `drop_constant_columns`. The frame methods that differ map as follows:
+The {py:class}`Dataset <batcher.Dataset>` itself keeps the pandas names `isna`, `notna`, `round`, `abs`, `clip`, `shape`, `size`, `nunique`, and `select_dtypes`, plus `drop_constant_columns`. Its `isna` and `notna` test for null only unless you pass `nan=True`, because pandas counts a float NaN as missing and Batcher doesn't by default. The frame methods that differ map as follows:
 
 | pandas | Batcher |
 |---|---|

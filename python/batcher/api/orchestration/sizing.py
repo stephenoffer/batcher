@@ -31,6 +31,7 @@ __all__ = [
     "carried_columns",
     "declared_row_count",
     "distributed_hardware",
+    "empty_result_table",
     "partitions_from_physical",
     "projected_input_bytes",
     "proven_empty_table",
@@ -251,8 +252,59 @@ def proven_empty_table(logical_opt: LogicalPlan, plan: LogicalPlan) -> pa.Table 
 
     if not is_empty_relation(logical_opt):
         return None
+    return empty_result_table(plan)
+
+
+def empty_result_table(plan: LogicalPlan) -> pa.Table | None:
+    """A zero-row table typed by `plan`'s static schema, carrying source metadata it keeps.
+
+    `available_schema` holds names and types only, so an empty result built from it alone
+    dropped the Arrow field and schema metadata that the same query returns as soon as one
+    row survives: ``limit(1)`` kept it and ``limit(0)`` did not. This restores what the
+    engine carries on the shapes where that is knowable from the plan: through nodes that
+    only remove or reorder rows (`Filter`, `Limit`, `Sort`) the output is the scan's own
+    schema, metadata included; through one `Project`, a bare column reference keeps its
+    field's metadata and the schema-level metadata is dropped, as the engine does. Any other
+    shape keeps the static schema, which claims no metadata it cannot vouch for.
+
+    Args:
+        plan: The plan whose provably empty result is wanted.
+
+    Returns:
+        The typed zero-row table, or `None` when the schema is not statically known.
+    """
+    from batcher.plan.expr_ir import Col
+    from batcher.plan.logical import Filter, Limit, Project, Scan, Sort
+
+    def below_row_only(node: LogicalPlan) -> LogicalPlan:
+        while isinstance(node, Filter | Limit | Sort):
+            node = node.input
+        return node
+
     inferred = plan.available_schema()
-    return None if inferred is None else inferred.arrow.empty_table()
+    if inferred is None:
+        return None
+    schema = inferred.arrow
+    node = below_row_only(plan)
+    project = node if isinstance(node, Project) else None
+    if project is not None:
+        node = below_row_only(project.input)
+    if not isinstance(node, Scan):
+        return schema.empty_table()
+    source = node.schema.arrow
+    if project is None:
+        if node.available_columns() != schema.names:
+            return schema.empty_table()
+        fields = [f.with_type(t) for f, t in zip(source, schema.types, strict=True)]
+        return pa.schema(fields, metadata=source.metadata).empty_table()
+    origin = {p.alias: p.expr.name for p in project.items if type(p.expr) is Col}
+    fields = [
+        f.with_metadata(source.field(origin[f.name]).metadata)
+        if f.name in origin and origin[f.name] in source.names
+        else f
+        for f in schema
+    ]
+    return pa.schema(fields).empty_table()
 
 
 #: A re-issued query hands back the *same* plan object, and this analysis walks every node's
