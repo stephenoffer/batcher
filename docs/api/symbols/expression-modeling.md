@@ -25,6 +25,7 @@ Column-wide transforms that standardize, scale, normalize, bin, encode, or flag 
    Expr.softmax
    Expr.label_encode
    Expr.cut
+   Expr.qcut
    Expr.is_outlier
 ```
 

@@ -263,6 +263,7 @@ These sit outside the `Dataset` and `Expr` surfaces:
   {py:meth}`.fill_nan(value) <batcher.plan.expr_ir.core.Expr.fill_nan>`, {py:meth}`.eq_missing(other) <batcher.plan.expr_ir.core.Expr.eq_missing>`, {py:meth}`.is_nan() <batcher.plan.expr_ir.core.Expr.is_nan>`, {py:meth}`.is_not_nan() <batcher.plan.expr_ir.core.Expr.is_not_nan>`,
   `.is_finite()`, `.is_infinite()`, `.clip(lower, upper)`, `.alias(name)`
 - Binning and gap-filling: `.cut(breaks, labels=None, left_closed=False)`,
+  {py:meth}`.qcut(q, labels=None, duplicates="raise") <batcher.plan.expr_ir.core.Expr.qcut>`,
   {py:meth}`.forward_fill() <batcher.plan.expr_ir.core.Expr.forward_fill>` and {py:meth}`.backward_fill() <batcher.plan.expr_ir.core.Expr.backward_fill>`. The two fills are window functions, so bind them with {py:meth}`.over(order_by=[...]) <batcher.AggExpr.over>`. An order is required.
 - Math: `.abs()`, `.round(digits)`, `.sqrt()`, `.floor()`, `.ceil()`,
   `.ln()`, `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.arcsin()`,

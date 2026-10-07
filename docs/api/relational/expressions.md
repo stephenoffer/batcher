@@ -112,8 +112,9 @@ replace one:
 | {py:meth}`.is_finite() <batcher.plan.expr_ir.core.Expr.is_finite>` / {py:meth}`.is_infinite() <batcher.plan.expr_ir.core.Expr.is_infinite>` | true where the float value is finite / ±infinity |
 | `.fill_null(value)` | replace nulls with a value |
 | {py:meth}`.forward_fill() <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`.backward_fill() <batcher.plan.expr_ir.core.Expr.backward_fill>` | carry the nearest non-null value along an ordered window ({py:meth}`.over(order_by=...) <batcher.AggExpr.over>` required) |
-| {py:meth}`.interpolate() <batcher.plan.expr_ir.core.Expr.interpolate>` | draw a straight line across an interior gap instead of holding the last value flat (`.over(order_by=...)` required) |
+| {py:meth}`.interpolate(max_gap=None, by=None) <batcher.plan.expr_ir.core.Expr.interpolate>` | draw a straight line across an interior gap instead of holding the last value flat; `by=` weights it by a time column's distance and becomes the order, `max_gap=` leaves a wider gap null (`.over(order_by=...)` required without `by`) |
 | `.cut(breaks, labels=None, left_closed=False)` | bin a numeric column into labeled intervals |
+| {py:meth}`.qcut(q, labels=None, duplicates="raise") <batcher.plan.expr_ir.core.Expr.qcut>` | bin a numeric column by its own quantiles, pandas-exact; the bin number, or a label per bin; `.over(partition_by=...)` bins within each group |
 
 ```python
 nulls = bt.from_pydict({"x": [1, None, 3]})
@@ -321,7 +322,7 @@ A window expression composes with ordinary arithmetic and other windows. The eng
 | `.rolling_sum(k)` / `.rolling_mean(k)` / `.rolling_min(k)` / `.rolling_max(k)` / `.rolling_count(k)` | `agg(x) OVER (ROWS BETWEEN k-1 PRECEDING AND CURRENT ROW)` |
 | {py:meth}`.rolling_var(k, ddof=1) <batcher.plan.expr_ir.core.Expr.rolling_var>` / {py:meth}`.rolling_std(k, ddof=1) <batcher.plan.expr_ir.core.Expr.rolling_std>` | sample (or population, `ddof=0`) variance / stddev over the same trailing frame |
 | {py:meth}`.rolling_sum_by(by, w) <batcher.plan.expr_ir.core.Expr.rolling_sum_by>` / {py:meth}`.rolling_mean_by <batcher.plan.expr_ir.core.Expr.rolling_mean_by>` / {py:meth}`.rolling_min_by <batcher.plan.expr_ir.core.Expr.rolling_min_by>` / {py:meth}`.rolling_max_by <batcher.plan.expr_ir.core.Expr.rolling_max_by>` / {py:meth}`.rolling_count_by <batcher.plan.expr_ir.core.Expr.rolling_count_by>` | the same aggregates over a *time* window: `RANGE BETWEEN w PRECEDING AND CURRENT ROW` ordered by `by`, where `w` may be a duration such as `"5m"` |
-| {py:meth}`.ewm_mean(...) <batcher.plan.expr_ir.core.Expr.ewm_mean>` / {py:meth}`.ewm_std(...) <batcher.plan.expr_ir.core.Expr.ewm_std>` / {py:meth}`.ewm_var(...) <batcher.plan.expr_ir.core.Expr.ewm_var>` | exponentially weighted moving statistics, decayed by `alpha` / `span` / `half_life` / `com` (`.over(order_by=...)` required) |
+| {py:meth}`.ewm_mean(...) <batcher.plan.expr_ir.core.Expr.ewm_mean>` / {py:meth}`.ewm_std(...) <batcher.plan.expr_ir.core.Expr.ewm_std>` / {py:meth}`.ewm_var(...) <batcher.plan.expr_ir.core.Expr.ewm_var>` | exponentially weighted moving statistics, decayed by `alpha` / `span` / `half_life` / `com`, with pandas' `adjust`, `ignore_nulls` and `min_periods` (`.over(order_by=...)` required) |
 | {py:meth}`.ewm_mean_by(by, half_life) <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` | the same smoother decayed by *elapsed* `by` rather than by row position, for an irregularly sampled series |
 | {py:meth}`.rle_id() <batcher.plan.expr_ir.core.Expr.rle_id>` | 0-based index of the current run of equal values (`.over(order_by=...)` required) |
 | {py:meth}`.peak_max(order_by=...) <batcher.plan.expr_ir.core.Expr.peak_max>` / {py:meth}`.peak_min(order_by=...) <batcher.plan.expr_ir.core.Expr.peak_min>` | true at a local extremum, strictly beyond both neighbours; an edge row is never one |

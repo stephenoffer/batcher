@@ -104,6 +104,22 @@ print(
 
 The trailing null shows the difference in kind. A fill has a value to carry. Interpolation has nothing on the far side to draw a line to, so the row stays null. Both take `partition_by` through `.over(...)`, which keeps one sensor's readings out of another's gaps.
 
+Interpolation by row position assumes the readings are evenly spaced. When they aren't, pass `by=` the time column and the line is weighted by elapsed time instead, which is Polars' `interpolate_by`. `max_gap=` stops it from inventing a long stretch of data: a gap wider than the bound stays null as a whole. With `by` the bound is the time between the two readings around the gap, given as a duration for a timestamp column or a number for a numeric one. Without `by` it counts null rows.
+
+```python
+uneven = bt.from_pydict({"at": [0, 1, 5, 6, 7, 8], "level": [0.0, None, 5.0, None, None, 8.0]})
+print(
+    uneven.with_columns(
+        timed=bt.col("level").interpolate(by="at"),
+        bounded=bt.col("level").interpolate(by="at", max_gap=3),
+    ).to_pydict()
+)
+# {'at': [0, 1, 5, 6, 7, 8], 'level': [0.0, None, 5.0, None, None, 8.0],
+#  'timed': [0.0, 1.0, 5.0, 6.0, 7.0, 8.0], 'bounded': [0.0, None, 5.0, 6.0, 7.0, 8.0]}
+```
+
+The first gap spans five time units, so the bounded column leaves it null. pandas' `interpolate(limit=n)` behaves differently: it fills the first `n` rows of a longer gap rather than none of them.
+
 ## Smooth over a time window
 
 {py:meth}`rolling_mean_by <batcher.plan.expr_ir.core.Expr.rolling_mean_by>` and its family aggregate the rows within a *duration* of the current one, rather than a fixed number of rows. That distinction matters as soon as the sampling rate varies: a 10-row moving average covers ten minutes when the sensor reports once a minute and three seconds when it reports two hundred times.
@@ -132,6 +148,20 @@ print(
 ```
 
 `ewm_std` and `ewm_var` give the matching spread over the same weights, which is what makes a live volatility band or control limit.
+
+All three take pandas' and Polars' tuning options. `adjust=False` switches to the recursive form `y = (1 - alpha) * y_prev + alpha * x`, `ignore_nulls=True` stops a null row from aging the weights, and `min_periods=n` leaves a row null until its series has `n` readings. Each matches those two libraries at every non-null row, so a smoother ported from either keeps its numbers.
+
+```python
+print(
+    readings.filter(bt.col("sensor") == "a")
+    .with_columns(
+        recursive=bt.col("celsius").ewm_mean(span=3, adjust=False, min_periods=2).over(order_by=["at"])
+    )
+    .sort("at")
+    .to_pydict()["recursive"]
+)
+# [None, 20.5, 21.25, 23.625]
+```
 
 `ewm_mean` decays once per *row*, which is right only when the readings are evenly spaced, and for the irregular feed above they are not: the half-hour gap costs exactly the weight one minute would. {py:meth}`ewm_mean_by <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` decays by elapsed time instead, so the smoother says the same thing whatever the sampling rate did.
 

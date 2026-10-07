@@ -7,18 +7,21 @@
 //! original row order by the caller's `ordered` index lists.
 //!
 //! * **EWM** (`ewm_mean`/`ewm_var`/`ewm_std`) — exponentially weighted moving statistics.
-//!   The weights are `(1-alpha)^(t-i)` over *absolute* positions, which is pandas'
-//!   `adjust=True, ignore_na=False` and Polars' `ewm_mean(adjust=True, ignore_nulls=False)`,
-//!   the default in both. A null input row yields a null output and contributes nothing,
-//!   but still advances the decay — again matching both.
+//!   By default the weights are `(1-alpha)^(t-i)` over *absolute* positions, which is
+//!   pandas' `adjust=True, ignore_na=False` and Polars' `ewm_mean(adjust=True,
+//!   ignore_nulls=False)`, the default in both. A null input row yields a null output and
+//!   contributes nothing, but still advances the decay — again matching both. [`Ewm`]
+//!   carries the other three variants of that pair and `min_periods`.
 //! * **EWM by elapsed time** (`ewm_mean` with a half-life instead of an alpha) — the same
 //!   smoother, decayed by how far apart two readings *are* rather than by how many rows
 //!   separate them. It is the form an irregular feed needs: a per-row decay charges an hour
 //!   of silence the same weight as a second, which smooths a gappy sensor into nonsense.
 //! * **`interpolate`** — fill an interior null run by drawing a straight line between the
-//!   bracketing non-null values, weighted by row position (Polars `interpolate`). Nulls
-//!   before the first or after the last non-null have nothing to interpolate between and
-//!   stay null; `forward_fill`/`backward_fill` are the tools for those.
+//!   bracketing non-null values, weighted by row position (Polars `interpolate`) or by the
+//!   order key's value (Polars `interpolate_by`). Nulls before the first or after the last
+//!   non-null have nothing to interpolate between and stay null; `forward_fill`/
+//!   `backward_fill` are the tools for those. [`InterpolateGap::max_gap`] leaves a gap
+//!   wider than a bound null rather than drawing a line across it.
 //! * **`rle_id`** — the 0-based index of the current run of equal values, incrementing
 //!   whenever the value changes along the order. It is the segmentation primitive behind
 //!   "how long has this sensor been in its current state", and it is type-generic because
@@ -65,15 +68,27 @@ impl EwmState {
         self.sum_w2 *= decay * decay;
     }
 
-    /// Observe `v` with weight 1 (the newest row always carries the full weight).
+    /// Observe `v` with weight `w`: 1 under `adjust=True` (the newest row carries the full
+    /// weight), and `alpha` under `adjust=False` for every row after the first.
     #[inline]
-    fn push(&mut self, v: f64) {
-        self.sum_w += 1.0;
-        self.sum_w2 += 1.0;
+    fn push(&mut self, v: f64, w: f64) {
+        self.sum_w += w;
+        self.sum_w2 += w * w;
         let delta = v - self.mean;
-        self.mean += delta / self.sum_w;
-        self.m2 += delta * (v - self.mean);
+        self.mean += delta * w / self.sum_w;
+        self.m2 += w * delta * (v - self.mean);
         self.seen = true;
+    }
+
+    /// Rescale every weight so they sum to one. The mean and the debiased variance are
+    /// unchanged by it; what changes is the scale the *next* weight is added at, which is
+    /// what `adjust=False` defines (pandas resets `old_wt` to 1 after each observation).
+    #[inline]
+    fn normalize(&mut self) {
+        let s = self.sum_w;
+        self.sum_w = 1.0;
+        self.m2 /= s;
+        self.sum_w2 /= s * s;
     }
 
     /// The *sample* (debiased) exponentially weighted variance, or `None` when the
@@ -92,31 +107,49 @@ impl EwmState {
     }
 }
 
+/// The parameters of one EWM recurrence.
+///
+/// The four `(adjust, ignore_nulls)` combinations are pandas' `ewm(adjust=, ignore_na=)` and
+/// Polars' `ewm_mean(adjust=, ignore_nulls=)`, and all four reduce to one weighted West
+/// state: every step that ages the decay multiplies each existing weight by `1 - alpha`, and
+/// an observation then joins with weight 1 (`adjust`, or the first observation) or `alpha`.
+/// `adjust=False` additionally rescales the weights to sum to one after every observation,
+/// as pandas does, so the next `alpha` is added against a unit total.
+pub(crate) struct Ewm {
+    /// The smoothing factor, in `(0, 1]`; the caller validates it.
+    pub alpha: f64,
+    /// `true` is the weighted average over every weight; `false` is the recursive form.
+    pub adjust: bool,
+    /// `true` lets a null row leave the decay alone (weights by relative position).
+    pub ignore_nulls: bool,
+    /// Non-null observations a partition needs before a row gets a value.
+    pub min_periods: u64,
+}
+
 /// Exponentially weighted `mean`/`var`/`stddev` along each ordered partition.
 ///
-/// `alpha` is the smoothing factor in `(0, 1]`; the caller validates it. Output is
-/// Float64 for every numeric input, and null wherever the input row is null.
+/// Output is Float64 for every numeric input, and null wherever the input row is null or
+/// fewer than `ewm.min_periods` observations have been seen.
 pub(crate) fn ewm_window(
     func: WindowFn,
     ordered: &[Vec<usize>],
     values: &ArrayRef,
-    alpha: f64,
+    ewm: &Ewm,
     num_rows: usize,
 ) -> Result<ArrayRef, RuntimeError> {
-    let decay = 1.0 - alpha;
     let mut out = vec![None::<f64>; num_rows];
     // One closure per input type rather than a per-row `match`: the branch is loop
     // invariant, and this kernel is the inner loop of a smoothing pipeline.
     match values.data_type() {
         DataType::Float64 => {
             let arr = values.as_primitive::<Float64Type>();
-            run_ewm(func, ordered, decay, &mut out, |row| {
+            run_ewm(func, ordered, ewm, &mut out, |row| {
                 arr.is_valid(row).then(|| arr.value(row))
             });
         }
         DataType::Int64 => {
             let arr = values.as_primitive::<Int64Type>();
-            run_ewm(func, ordered, decay, &mut out, |row| {
+            run_ewm(func, ordered, ewm, &mut out, |row| {
                 arr.is_valid(row).then(|| arr.value(row) as f64)
             });
         }
@@ -134,18 +167,37 @@ pub(crate) fn ewm_window(
 fn run_ewm(
     func: WindowFn,
     ordered: &[Vec<usize>],
-    decay: f64,
+    ewm: &Ewm,
     out: &mut [Option<f64>],
     value_at: impl Fn(usize) -> Option<f64>,
 ) {
+    let decay = 1.0 - ewm.alpha;
     for part in ordered {
         let mut st = EwmState::default();
+        let mut observed = 0u64;
         for &row in part {
-            st.decay(decay);
             let Some(v) = value_at(row) else {
-                continue; // null in → null out, but the decay above still aged the state
+                // Null in → null out. Under `ignore_nulls=false` the row still ages every
+                // weight, which is what makes the weights follow absolute positions.
+                if !ewm.ignore_nulls {
+                    st.decay(decay);
+                }
+                continue;
             };
-            st.push(v);
+            st.decay(decay);
+            let w = if ewm.adjust || !st.seen {
+                1.0
+            } else {
+                ewm.alpha
+            };
+            st.push(v, w);
+            if !ewm.adjust {
+                st.normalize();
+            }
+            observed += 1;
+            if observed < ewm.min_periods {
+                continue;
+            }
             out[row] = match func {
                 WindowFn::EwmMean => st.seen.then_some(st.mean),
                 WindowFn::EwmVar => st.variance(),
@@ -217,28 +269,40 @@ pub(crate) fn ewm_by_window(
     Ok(Arc::new(Float64Array::from(out)))
 }
 
+/// How `interpolate` measures and bounds a gap.
+pub(crate) struct InterpolateGap<'a> {
+    /// A gap wider than this stays null: counted in null rows when `by` is `None`, and as
+    /// the order-key distance between the bracketing readings when it is set.
+    pub max_gap: Option<f64>,
+    /// Weight by the order key's value distance (Polars `interpolate_by`) rather than by
+    /// row position.
+    pub by: Option<&'a RangeOrder>,
+}
+
 /// Linearly interpolate interior null runs along each ordered partition.
 ///
 /// A null at ordered position `p` bracketed by non-null values at `a < p < b` takes
-/// `x[a] + (x[b] - x[a]) · (p - a) / (b - a)`. Leading and trailing nulls have no
-/// bracket and stay null. Integer input widens to Float64, because an interpolated
-/// value between two integers is generally not one.
+/// `x[a] + (x[b] - x[a]) · t`, where `t = (p - a) / (b - a)` by position, or the same ratio
+/// of order-key distances under `gap.by`. Leading and trailing nulls have no bracket and
+/// stay null, and so does a gap wider than `gap.max_gap`. Integer input widens to Float64,
+/// because an interpolated value between two integers is generally not one.
 pub(crate) fn interpolate_window(
     ordered: &[Vec<usize>],
     values: &ArrayRef,
+    gap: &InterpolateGap<'_>,
     num_rows: usize,
 ) -> Result<ArrayRef, RuntimeError> {
     let mut out = vec![None::<f64>; num_rows];
     match values.data_type() {
         DataType::Float64 => {
             let arr = values.as_primitive::<Float64Type>();
-            run_interpolate(ordered, &mut out, |row| {
+            run_interpolate(ordered, gap, &mut out, |row| {
                 arr.is_valid(row).then(|| arr.value(row))
             });
         }
         DataType::Int64 => {
             let arr = values.as_primitive::<Int64Type>();
-            run_interpolate(ordered, &mut out, |row| {
+            run_interpolate(ordered, gap, &mut out, |row| {
                 arr.is_valid(row).then(|| arr.value(row) as f64)
             });
         }
@@ -256,6 +320,7 @@ pub(crate) fn interpolate_window(
 /// left edge exists, fill it from the straight line between the two edges.
 fn run_interpolate(
     ordered: &[Vec<usize>],
+    gap: &InterpolateGap<'_>,
     out: &mut [Option<f64>],
     value_at: impl Fn(usize) -> Option<f64>,
 ) {
@@ -267,16 +332,53 @@ fn run_interpolate(
             let Some(v) = value_at(row) else { continue };
             out[row] = Some(v);
             if let Some((p_pos, p_val)) = prev {
-                let span = (pos - p_pos) as f64;
-                for (gap, &grow) in part[p_pos + 1..pos].iter().enumerate() {
-                    let t = (gap + 1) as f64 / span;
-                    out[grow] = Some(p_val + (v - p_val) * t);
+                if pos > p_pos + 1 {
+                    fill_gap(&part[p_pos..=pos], p_val, v, gap, out);
                 }
             }
             prev = Some((pos, v));
         }
         // A trailing null run ends the partition with no right edge, so it stays null —
         // no work to undo, since `out` starts null.
+    }
+}
+
+/// Fill the interior of one bracketed null run. `run` is the rows from the left reading to
+/// the right one inclusive, in order; `left`/`right` are their values.
+fn fill_gap(
+    run: &[usize],
+    left: f64,
+    right: f64,
+    gap: &InterpolateGap<'_>,
+    out: &mut [Option<f64>],
+) {
+    let (first, last) = (run[0], run[run.len() - 1]);
+    let Some(by) = gap.by else {
+        let span = (run.len() - 1) as f64;
+        // The gap is the null rows between the readings.
+        if gap.max_gap.is_some_and(|m| span - 1.0 > m) {
+            return;
+        }
+        for (i, &row) in run[1..run.len() - 1].iter().enumerate() {
+            out[row] = Some(left + (right - left) * ((i + 1) as f64 / span));
+        }
+        return;
+    };
+    // A null order key on either reading has no distance to weight by, so the run is left
+    // null rather than guessed at.
+    let Some(span) = by.gap(first, last) else {
+        return;
+    };
+    if gap.max_gap.is_some_and(|m| span > m) {
+        return;
+    }
+    for &row in &run[1..run.len() - 1] {
+        out[row] = match by.gap(first, row) {
+            // Readings that share a key leave no room for a slope; the left one stands.
+            Some(_) if span == 0.0 => Some(left),
+            Some(d) => Some(left + (right - left) * (d / span)),
+            None => None,
+        };
     }
 }
 
@@ -313,6 +415,22 @@ pub(crate) fn rle_id_window(
 mod tests {
     use super::*;
 
+    /// The historical EWM: `adjust=True, ignore_nulls=False, min_periods=1`.
+    fn plain(alpha: f64) -> Ewm {
+        Ewm {
+            alpha,
+            adjust: true,
+            ignore_nulls: false,
+            min_periods: 1,
+        }
+    }
+
+    /// Positional interpolation with no gap bound.
+    const NO_LIMIT: InterpolateGap<'static> = InterpolateGap {
+        max_gap: None,
+        by: None,
+    };
+
     fn f64s(arr: &ArrayRef) -> Vec<Option<f64>> {
         let a = arr.as_primitive::<Float64Type>();
         (0..a.len())
@@ -346,7 +464,7 @@ mod tests {
             Some(4.0),
         ]));
         let ordered = vec![vec![0usize, 1, 2, 3]];
-        let got = ewm_window(WindowFn::EwmMean, &ordered, &values, 0.5, 4).unwrap();
+        let got = ewm_window(WindowFn::EwmMean, &ordered, &values, &plain(0.5), 4).unwrap();
         close(
             &f64s(&got),
             &[Some(1.0), None, Some(2.6), Some(3.4615384615384617)],
@@ -361,7 +479,7 @@ mod tests {
     fn ewm_std_and_var_match_the_sample_reference() {
         let values: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0]));
         let ordered = vec![vec![0usize, 1, 2, 3]];
-        let std = ewm_window(WindowFn::EwmStd, &ordered, &values, 0.5, 4).unwrap();
+        let std = ewm_window(WindowFn::EwmStd, &ordered, &values, &plain(0.5), 4).unwrap();
         let want_std = [
             None,
             // pandas' second value is 1/sqrt(2) exactly: with alpha=.5 the two-observation
@@ -374,7 +492,7 @@ mod tests {
         ];
         close(&f64s(&std), &want_std, "ewm_std");
 
-        let var = ewm_window(WindowFn::EwmVar, &ordered, &values, 0.5, 4).unwrap();
+        let var = ewm_window(WindowFn::EwmVar, &ordered, &values, &plain(0.5), 4).unwrap();
         let want_var: Vec<Option<f64>> = want_std.iter().map(|v| v.map(|s| s * s)).collect();
         close(&f64s(&var), &want_var, "ewm_var");
     }
@@ -388,7 +506,8 @@ mod tests {
         let values: ArrayRef = Arc::new(Float64Array::from(raw.clone()));
         let ordered = vec![(0..64).collect::<Vec<usize>>()];
         let alpha = 0.3;
-        let got = f64s(&ewm_window(WindowFn::EwmVar, &ordered, &values, alpha, 64).unwrap());
+        let got =
+            f64s(&ewm_window(WindowFn::EwmVar, &ordered, &values, &plain(alpha), 64).unwrap());
         for (t, slot) in got.iter().enumerate().take(64).skip(1) {
             let w: Vec<f64> = (0..=t)
                 .map(|i| (1.0 - alpha).powi((t - i) as i32))
@@ -418,7 +537,7 @@ mod tests {
         // Rows 0,2 are one partition; rows 1,3 the other (deliberately interleaved, to
         // exercise the scatter back to original row order).
         let ordered = vec![vec![0usize, 2], vec![1usize, 3]];
-        let got = f64s(&ewm_window(WindowFn::EwmMean, &ordered, &values, 0.5, 4).unwrap());
+        let got = f64s(&ewm_window(WindowFn::EwmMean, &ordered, &values, &plain(0.5), 4).unwrap());
         close(
             &got,
             &[Some(1.0), Some(100.0), Some(5.0 / 3.0), Some(500.0 / 3.0)],
@@ -432,9 +551,9 @@ mod tests {
     fn ewm_alpha_one_is_the_identity() {
         let values: ArrayRef = Arc::new(Float64Array::from(vec![3.0, 9.0, 4.0]));
         let ordered = vec![vec![0usize, 1, 2]];
-        let mean = f64s(&ewm_window(WindowFn::EwmMean, &ordered, &values, 1.0, 3).unwrap());
+        let mean = f64s(&ewm_window(WindowFn::EwmMean, &ordered, &values, &plain(1.0), 3).unwrap());
         close(&mean, &[Some(3.0), Some(9.0), Some(4.0)], "alpha=1 mean");
-        let var = f64s(&ewm_window(WindowFn::EwmVar, &ordered, &values, 1.0, 3).unwrap());
+        let var = f64s(&ewm_window(WindowFn::EwmVar, &ordered, &values, &plain(1.0), 3).unwrap());
         assert_eq!(var, vec![None, None, None]);
     }
 
@@ -451,7 +570,7 @@ mod tests {
             None,
         ]));
         let ordered = vec![vec![0usize, 1, 2, 3, 4, 5]];
-        let got = f64s(&interpolate_window(&ordered, &values, 6).unwrap());
+        let got = f64s(&interpolate_window(&ordered, &values, &NO_LIMIT, 6).unwrap());
         close(
             &got,
             &[None, Some(10.0), Some(20.0), Some(30.0), Some(40.0), None],
@@ -465,11 +584,11 @@ mod tests {
     fn interpolate_widens_integers_and_tolerates_all_null() {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(0), None, Some(1)]));
         let ordered = vec![vec![0usize, 1, 2]];
-        let got = f64s(&interpolate_window(&ordered, &values, 3).unwrap());
+        let got = f64s(&interpolate_window(&ordered, &values, &NO_LIMIT, 3).unwrap());
         close(&got, &[Some(0.0), Some(0.5), Some(1.0)], "int interpolate");
 
         let empty: ArrayRef = Arc::new(Float64Array::from(vec![None::<f64>, None, None]));
-        let got = f64s(&interpolate_window(&ordered, &empty, 3).unwrap());
+        let got = f64s(&interpolate_window(&ordered, &empty, &NO_LIMIT, 3).unwrap());
         assert_eq!(got, vec![None, None, None]);
     }
 
@@ -481,7 +600,7 @@ mod tests {
         // gap is bracketed by 30 (first in order) and 10 (last).
         let values: ArrayRef = Arc::new(Float64Array::from(vec![Some(10.0), None, Some(30.0)]));
         let ordered = vec![vec![2usize, 1, 0]];
-        let got = f64s(&interpolate_window(&ordered, &values, 3).unwrap());
+        let got = f64s(&interpolate_window(&ordered, &values, &NO_LIMIT, 3).unwrap());
         close(
             &got,
             &[Some(10.0), Some(20.0), Some(30.0)],
@@ -517,5 +636,184 @@ mod tests {
         let ordered = vec![vec![0usize, 2], vec![1usize, 3]];
         let got = rle_id_window(&ordered, &values, 4).unwrap();
         assert_eq!(got.as_primitive::<Int64Type>().values(), &[0, 0, 0, 0]);
+    }
+
+    /// The four `(adjust, ignore_nulls)` recurrences must reproduce pandas
+    /// `ewm(alpha=.5, adjust=, ignore_na=)` on `[1, null, 3, 4, null, null, 10]` -- every
+    /// constant below is pandas 2.3's output, at the non-null rows (pandas carries the last
+    /// value across a null row where this engine and Polars answer null).
+    #[test]
+    fn ewm_adjust_and_ignore_nulls_match_pandas() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            None,
+            Some(3.0),
+            Some(4.0),
+            None,
+            None,
+            Some(10.0),
+        ]));
+        let ordered = vec![(0..7).collect::<Vec<usize>>()];
+        // (adjust, ignore_nulls, mean at rows 0/2/3/6, var at rows 2/3/6)
+        let cases = [
+            (
+                true,
+                false,
+                [1.0, 2.6, 3.4615384615384617, 8.896103896103897],
+                [2.0, 1.3636363636363635, 20.707762557077626],
+            ),
+            (
+                true,
+                true,
+                [
+                    1.0,
+                    2.3333333333333335,
+                    3.2857142857142856,
+                    6.866666666666666,
+                ],
+                [2.0, 1.8571428571428568, 18.828571428571433],
+            ),
+            (
+                false,
+                false,
+                [
+                    1.0,
+                    2.3333333333333335,
+                    3.166666666666667,
+                    8.633333333333333,
+                ],
+                [2.0, 1.8636363636363633, 22.351612903225803],
+            ),
+            (
+                false,
+                true,
+                [1.0, 2.0, 3.0, 6.5],
+                [2.0, 2.4000000000000004, 19.80952380952381],
+            ),
+        ];
+        for (adjust, ignore_nulls, mean, var) in cases {
+            let ewm = Ewm {
+                alpha: 0.5,
+                adjust,
+                ignore_nulls,
+                min_periods: 1,
+            };
+            let what = format!("adjust={adjust} ignore_nulls={ignore_nulls}");
+            let got = f64s(&ewm_window(WindowFn::EwmMean, &ordered, &values, &ewm, 7).unwrap());
+            let want = [
+                Some(mean[0]),
+                None,
+                Some(mean[1]),
+                Some(mean[2]),
+                None,
+                None,
+                Some(mean[3]),
+            ];
+            close(&got, &want, &format!("mean {what}"));
+            let got = f64s(&ewm_window(WindowFn::EwmVar, &ordered, &values, &ewm, 7).unwrap());
+            let want = [
+                None,
+                None,
+                Some(var[0]),
+                Some(var[1]),
+                None,
+                None,
+                Some(var[2]),
+            ];
+            close(&got, &want, &format!("var {what}"));
+        }
+    }
+
+    /// `min_periods` nulls every row before the partition's n-th observation, counting
+    /// observations rather than rows, and restarts with each partition.
+    #[test]
+    fn ewm_min_periods_counts_observations() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            None,
+            Some(3.0),
+            Some(4.0),
+            Some(5.0),
+        ]));
+        let ordered = vec![vec![0usize, 1, 2], vec![3usize, 4]];
+        let ewm = Ewm {
+            min_periods: 2,
+            ..plain(0.5)
+        };
+        let got = f64s(&ewm_window(WindowFn::EwmMean, &ordered, &values, &ewm, 5).unwrap());
+        close(
+            &got,
+            &[None, None, Some(2.6), None, Some(14.0 / 3.0)],
+            "min_periods=2",
+        );
+    }
+
+    /// A gap of more than `max_gap` null rows stays null whole -- it is not filled part
+    /// way, which is where this differs from pandas' `limit`.
+    #[test]
+    fn interpolate_max_gap_leaves_wide_gaps_null() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(1.0),
+            None,
+            Some(3.0),
+            None,
+            None,
+            Some(6.0),
+        ]));
+        let ordered = vec![(0..6).collect::<Vec<usize>>()];
+        let gap = InterpolateGap {
+            max_gap: Some(1.0),
+            by: None,
+        };
+        let got = f64s(&interpolate_window(&ordered, &values, &gap, 6).unwrap());
+        close(
+            &got,
+            &[Some(1.0), Some(2.0), Some(3.0), None, None, Some(6.0)],
+            "max_gap=1",
+        );
+    }
+
+    /// `by` weights the line by the order key's distance (Polars `interpolate_by`), and a
+    /// `max_gap` is then a distance between the bracketing readings.
+    #[test]
+    fn interpolate_by_weights_by_key_distance() {
+        let key: ArrayRef = Arc::new(Int64Array::from(vec![0, 1, 4, 10, 30, 31]));
+        let order = RangeOrder::read(&key, false).unwrap().unwrap();
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            None,
+            Some(8.0),
+            None,
+            Some(28.0),
+            None,
+        ]));
+        let ordered = vec![(0..6).collect::<Vec<usize>>()];
+        let by = InterpolateGap {
+            max_gap: None,
+            by: Some(&order),
+        };
+        let got = f64s(&interpolate_window(&ordered, &values, &by, 6).unwrap());
+        close(
+            &got,
+            &[
+                Some(0.0),
+                Some(2.0),
+                Some(8.0),
+                Some(8.0 + 20.0 * (6.0 / 26.0)),
+                Some(28.0),
+                None,
+            ],
+            "interpolate_by",
+        );
+        let bounded = InterpolateGap {
+            max_gap: Some(10.0),
+            by: Some(&order),
+        };
+        let got = f64s(&interpolate_window(&ordered, &values, &bounded, 6).unwrap());
+        close(
+            &got,
+            &[Some(0.0), Some(2.0), Some(8.0), None, Some(28.0), None],
+            "interpolate_by max_gap",
+        );
     }
 }

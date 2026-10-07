@@ -273,10 +273,7 @@ _PREDICATES: dict[str, str] = {
     ),
     "factorize": "Dense integer codes are bt.col('x').label_encode().",
     "cut": "Binning is bt.col('x').cut(breaks=[...]) inside ds.with_columns(...).",
-    "qcut": (
-        "Quantile binning: derive breaks from bt.col('x').quantile(...), then "
-        "bt.col('x').cut(breaks=...)."
-    ),
+    "qcut": "Quantile binning is bt.col('x').qcut(4) inside ds.with_columns(...).",
     "combine_first": (
         "Fill a column's nulls from another via a join, then coalesce: "
         "ds.join(other, on='key').with_columns(x=bt.coalesce(bt.col('x'), bt.col('x_right')))."

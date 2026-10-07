@@ -1734,6 +1734,7 @@ pub(crate) fn window_batch_with(
             alpha: f.alpha,
             half_life: f.half_life,
             ignore_nulls: f.ignore_nulls,
+            opts: f.opts.clone(),
         });
     }
 
@@ -1824,6 +1825,7 @@ fn map_window_func(f: WindowFn) -> window::WindowFn {
         WindowFn::EwmStd => window::WindowFn::EwmStd,
         WindowFn::Interpolate => window::WindowFn::Interpolate,
         WindowFn::RleId => window::WindowFn::RleId,
+        WindowFn::Qcut => window::WindowFn::Qcut,
     }
 }
 

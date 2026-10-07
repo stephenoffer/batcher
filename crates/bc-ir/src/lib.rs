@@ -20,9 +20,11 @@ use serde::Deserialize;
 mod depth;
 mod engine_config;
 mod error;
+mod window_opts;
 pub use depth::{json_max_depth, MAX_PLAN_DEPTH};
 pub use engine_config::EngineConfig;
 pub use error::IrError;
+pub use window_opts::WindowOpts;
 
 /// A node in the relational plan DAG.
 ///
@@ -575,8 +577,14 @@ pub struct WindowFunc {
     pub half_life: Option<f64>,
     /// `IGNORE NULLS` for `first_value`/`last_value`/`nth_value`: pick among the frame's
     /// non-null values rather than its rows. Absent (the SQL default) is `RESPECT NULLS`.
+    /// On the EWM functions it is pandas' `ignore_na`: a null row does not age the decay.
     #[serde(default)]
     pub ignore_nulls: bool,
+    /// The series functions' options beyond `alpha` (EWM `adjust`/`min_periods`,
+    /// `interpolate`'s `max_gap`/`by_value`) and `qcut`'s probabilities. Absent is every
+    /// default.
+    #[serde(default)]
+    pub opts: WindowOpts,
     pub alias: String,
 }
 
@@ -702,6 +710,10 @@ pub enum WindowFn {
     EwmStd,
     Interpolate,
     RleId,
+    /// The 0-based bin of each row among the partition's own quantiles at
+    /// [`WindowOpts::probs`] (pandas `qcut`). Reads the whole partition and ignores any
+    /// ORDER BY. → Int64.
+    Qcut,
 }
 
 /// One output column of a `Project`: an expression and the name it is bound to.

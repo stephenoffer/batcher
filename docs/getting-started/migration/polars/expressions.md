@@ -78,10 +78,10 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `entropy` | {py:obj}`Expr.entropy <batcher.plan.expr_ir.core.Expr.entropy>` | mismatch | Differs: Polars entropy reads the values as a distribution in natural log; the template passes of=values and base e. Polars counts a null as a value. Wave W0. |
 | `eq` | `==` operator | canonical |  |
 | `eq_missing` | {py:obj}`Expr.eq_missing <batcher.plan.expr_ir.core.Expr.eq_missing>` | canonical |  |
-| `ewm_mean` | {py:obj}`Expr.ewm_mean <batcher.plan.expr_ir.core.Expr.ewm_mean>` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
+| `ewm_mean` | {py:obj}`Expr.ewm_mean <batcher.plan.expr_ir.core.Expr.ewm_mean>` | param | Missing: bias=, and min\_samples= is spelled min\_periods=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
 | `ewm_mean_by` | {py:obj}`Expr.ewm_mean_by <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` | param | Missing: half\_life as a duration string over a temporal by column. Wave W2. |
-| `ewm_std` | {py:obj}`Expr.ewm_std <batcher.plan.expr_ir.core.Expr.ewm_std>` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
-| `ewm_var` | {py:obj}`Expr.ewm_var <batcher.plan.expr_ir.core.Expr.ewm_var>` | param | Missing: adjust=, bias=, min\_samples=, ignore\_nulls=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
+| `ewm_std` | {py:obj}`Expr.ewm_std <batcher.plan.expr_ir.core.Expr.ewm_std>` | param | Missing: bias=, and min\_samples= is spelled min\_periods=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
+| `ewm_var` | {py:obj}`Expr.ewm_var <batcher.plan.expr_ir.core.Expr.ewm_var>` | param | Missing: bias=, and min\_samples= is spelled min\_periods=; Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
 | `exclude` | `Selector.exclude` | canonical |  |
 | `exp` | {py:obj}`Expr.exp <batcher.plan.expr_ir.core.Expr.exp>` | canonical |  |
 | `explode` | n/a | gap | Not yet: Expr.explode (length-changing). Wave W8. |
@@ -109,7 +109,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `index_of` | n/a | gap | Not yet: Expr.index\_of. Wave W8. |
 | `inspect` | n/a | gap | Not yet: Expr.inspect (print intermediate value). Wave W8. |
 | `interpolate` | {py:obj}`Expr.interpolate <batcher.plan.expr_ir.core.Expr.interpolate>` | param | Missing: method= ('linear','nearest'); Batcher requires an explicit order\_by (explicit-order policy). Wave W2. |
-| `interpolate_by` | n/a | gap | Not yet: Expr.interpolate\_by. Wave W5. |
+| `interpolate_by` | {py:obj}`Expr.interpolate <batcher.plan.expr_ir.core.Expr.interpolate>` | mismatch | Differs: Batcher spells it interpolate(by=col); by becomes the window order, and max\_gap= bounds the distance filled. Wave W0. |
 | `is_between` | {py:obj}`Expr.between <batcher.plan.expr_ir.core.Expr.between>` | canonical |  |
 | `is_close` | n/a | gap | Not yet: Expr.is\_close (abs\_tol/rel\_tol/nans\_equal). Wave W3. |
 | `is_duplicated` | {py:obj}`Expr.is_duplicated <batcher.plan.expr_ir.core.Expr.is_duplicated>` | canonical |  |
@@ -164,7 +164,7 @@ The following table maps the 218 names on `Expr`, sorted alphabetically.
 | `pipe` | {py:obj}`Expr.pipe <batcher.plan.expr_ir.core.Expr.pipe>` | canonical |  |
 | `pow` | `**` operator | canonical |  |
 | `product` | {py:obj}`Expr.product <batcher.plan.expr_ir.core.Expr.product>` | canonical |  |
-| `qcut` | n/a | gap | Not yet: Expr.qcut (quantile binning). Wave W3. |
+| `qcut` | `Expr.qcut` | param | Missing: left\_closed=, include\_breaks=, and allow\_duplicates= is spelled duplicates='drop'; without labels the result is the bin number, not an interval string. Wave W3. |
 | `quantile` | {py:obj}`Expr.quantile <batcher.plan.expr_ir.core.Expr.quantile>` | canonical |  |
 | `radians` | {py:obj}`Expr.radians <batcher.plan.expr_ir.core.Expr.radians>` | canonical |  |
 | `rank` | {py:obj}`Expr.rank <batcher.plan.expr_ir.core.Expr.rank>` | canonical |  |

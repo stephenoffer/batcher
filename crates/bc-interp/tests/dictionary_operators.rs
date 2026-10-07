@@ -498,6 +498,7 @@ fn windowing_over_a_dictionary_partition_agrees_with_the_decoded_oracle() {
                     alpha: None,
                     half_life: None,
                     ignore_nulls: false,
+                    opts: bc_ir::WindowOpts::default(),
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -508,6 +509,7 @@ fn windowing_over_a_dictionary_partition_agrees_with_the_decoded_oracle() {
                     alpha: None,
                     half_life: None,
                     ignore_nulls: false,
+                    opts: bc_ir::WindowOpts::default(),
                     alias: "rsum".into(),
                 },
             ],

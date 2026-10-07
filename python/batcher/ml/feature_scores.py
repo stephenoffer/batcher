@@ -87,7 +87,7 @@ def _require_categorical(ds: Dataset, features: list[str], scorer: str) -> None:
                 f"value per row ({distinct} of {rows}), which pins the score at its maximum "
                 f"however unrelated the column is to the target. For a continuous feature use "
                 f"f_classif_scores() (categorical target) or f_regression_scores() (continuous "
-                f"target), or bucket it first with .qcut()/.cut()."
+                f"target), or bucket it first with bt.col({feature!r}).qcut(10) or .cut(breaks)."
             )
 
 
