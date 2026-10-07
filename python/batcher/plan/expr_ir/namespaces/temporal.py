@@ -1481,7 +1481,7 @@ class _DtNamespace(_Bound):
                 >>> import datetime as dt
                 >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 15, 9, 0)]})
                 >>> paris = ds.select(r=bt.col("d").dt.replace_timezone("Europe/Paris"))
-                >>> paris.schema["r"]
+                >>> paris.schema.field("r").type
                 TimestampType(timestamp[us, tz=Europe/Paris])
                 >>> paris.select(h=bt.col("r").dt.hour()).to_pydict()
                 {'h': [9]}
