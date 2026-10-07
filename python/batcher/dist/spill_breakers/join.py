@@ -301,6 +301,7 @@ def _spill_paths_to_subbuckets(nat, paths, key_names, n, work_dir, tag):
     reduce pays a full write and re-read to change nothing. Both sides take the same salt, so
     equal keys still co-locate and each sub-bucket pair remains an independent join.
     """
+    import contextlib
     import os
 
     from batcher.dist.shuffle_io import IpcWriter, read_ipc
@@ -311,7 +312,11 @@ def _spill_paths_to_subbuckets(nat, paths, key_names, n, work_dir, tag):
     writers = [IpcWriter(os.path.join(work_dir, f"{tag}_{i}.arrow")) for i in range(n)]
     schema: pa.Schema | None = None
     key_idx: list[int] = []
-    try:
+    # Entered as contexts so a failure part-way aborts every sub-bucket instead of
+    # publishing the rows written so far as if they were all of them.
+    with contextlib.ExitStack() as stack:
+        for writer in writers:
+            stack.enter_context(writer)
         for p in paths:
             batches = read_ipc(p)
             if not batches:
@@ -325,9 +330,6 @@ def _spill_paths_to_subbuckets(nat, paths, key_names, n, work_dir, tag):
                 for b in bucket:
                     if b.num_rows:
                         writers[i].write(b)
-    finally:
-        for writer in writers:
-            writer.close()
     out_paths: list[str | None] = [w.path if w.is_open else None for w in writers]
     return out_paths, schema
 

@@ -980,7 +980,7 @@ Window-function translation for the SQL front-end.
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
 | `flight_worker.py` | 1953 | The shared Arrow Flight shuffle worker actor. |
-| `shuffle_io.py` | 532 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
+| `shuffle_io.py` | 573 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 312 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 446 | Learned join-skew: persist the hot join-key values measured by the detection |
 | `sort_boundaries.py` | 329 | Learned range-sort boundaries: persist the quantile grid the SAMPLE barrier measured, |
@@ -1001,7 +1001,7 @@ Per-operator distributed executor implementations.
 |---|---|---|
 | `aggregate.py` | 442 | Distributed aggregation over a disk Arrow-IPC shuffle. |
 | `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
-| `join.py` | 895 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
+| `join.py` | 890 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
 | `map.py` | 3372 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 590 | Plan-shape analysis for the distributed dispatcher. |
@@ -1184,7 +1184,7 @@ Out-of-core streaming for the binary/ordering breakers: sort, join, window.
 
 | module | lines | what it is |
 |---|---|---|
-| `join.py` | 449 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
+| `join.py` | 451 | Out-of-core join: co-partition both sides by key, join one bucket pair at a time. |
 | `sort.py` | 374 | Out-of-core sort: range-partition into ordered buckets, sort each, yield in key order. |
 | `window.py` | 176 | Out-of-core window: grace-partition by the PARTITION BY keys so each bucket holds |
 

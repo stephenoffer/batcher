@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 import tempfile
+import uuid
 from collections.abc import Iterable
 from typing import NamedTuple
 
@@ -340,6 +341,18 @@ class IpcWriter:
       there is the one shuffle sending raw bytes over the wire.
     - **Opened lazily**, because the partition phase holds every writer at once, so a
       bucket that receives no rows must cost no file descriptor.
+    - **Published whole, or not at all.** The stream is written to a private
+      ``<path>.<token>.partial`` beside the target and renamed onto `path` only by a clean
+      `close`; leaving a ``with`` block on an exception, or `abort`, deletes it instead.
+      Shuffle tasks are speculated (`carbonite.resilience.gather_with_backups`), so two
+      copies of one map task write the same deterministic path, and the barrier hands the
+      first finisher's paths to the reducers while the other copy is still running. Writing
+      in place, the late copy re-opened the path with `O_TRUNC` under a reader that had
+      already been given it: a reducer read a zero-byte bucket (`ArrowInvalid: Tried reading
+      schema message`, the skewed-sort integration tests on a loaded 64-core gate), and one
+      that caught the file half rewritten would have read a short stream -- rows lost with
+      no error. A rename swaps a complete file for a complete, identical one, and a reader
+      that has the old one open keeps reading it.
 
     Two call sites had none of the three (`pa.OSFile(path, "wb")` straight into
     `pa.ipc.new_stream`), which is exactly the drift
@@ -363,7 +376,7 @@ class IpcWriter:
             2
     """
 
-    __slots__ = ("_num_rows", "_opened", "_path", "_sink", "_writer")
+    __slots__ = ("_num_rows", "_opened", "_partial", "_path", "_sink", "_writer")
 
     def __init__(self, path: str) -> None:
         """Name the file without creating it.
@@ -372,6 +385,7 @@ class IpcWriter:
             path: Where the stream will be written, once there is something to write.
         """
         self._path = path
+        self._partial: str | None = None
         self._sink: object | None = None
         self._writer: pa.ipc.RecordBatchStreamWriter | None = None
         self._num_rows = 0
@@ -405,8 +419,11 @@ class IpcWriter:
         if self._writer is not None:
             return
         # `open_private` first, so the rows are never world-readable even briefly; the
-        # options are read from the path, so the decision costs a string comparison.
-        self._sink = pa.PythonFile(open_private(self._path), mode="w")
+        # options are read from the path, so the decision costs a string comparison. The
+        # partial file sits beside the target, so the publishing rename never crosses a
+        # filesystem and stays atomic.
+        self._partial = f"{self._path}.{uuid.uuid4().hex}.partial"
+        self._sink = pa.PythonFile(open_private(self._partial), mode="w")
         self._writer = pa.ipc.new_stream(
             self._sink, schema, options=shuffle_ipc_options(self._path)
         )
@@ -424,13 +441,36 @@ class IpcWriter:
         self._num_rows += batch.num_rows
 
     def close(self) -> str | None:
-        """Finalize the stream. Idempotent.
+        """Finalize the stream and publish it at `path`. Idempotent.
 
         Returns:
             The path when a file was created, `None` when this writer never opened one —
             which is what a caller collecting per-bucket paths records for an empty
-            bucket.
+            bucket, or one that was aborted.
         """
+        self._finish()
+        partial, self._partial = self._partial, None
+        if partial is not None:
+            os.replace(partial, self._path)
+        return self._path if self._opened else None
+
+    def abort(self) -> None:
+        """Discard what was written: nothing is published at `path`. Idempotent.
+
+        For a write that failed part-way. Publishing it would hand a reader a stream that
+        ends early, which reads as a complete, shorter bucket rather than as an error.
+        """
+        try:
+            self._finish()
+        finally:
+            partial, self._partial = self._partial, None
+            self._opened = False
+            if partial is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(partial)
+
+    def _finish(self) -> None:
+        """Close the stream writer and its file handle, once."""
         writer, sink = self._writer, self._sink
         self._writer = None
         try:
@@ -440,13 +480,15 @@ class IpcWriter:
             self._sink = None
             if sink is not None:
                 sink.close()
-        return self._path if self._opened else None
 
     def __enter__(self) -> IpcWriter:
         return self
 
-    def __exit__(self, *exc: object) -> None:
-        self.close()
+    def __exit__(self, exc_type: type[BaseException] | None, *_exc: object) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.abort()
 
 
 def write_ipc(batches: list[pa.RecordBatch], path: str) -> str:
@@ -510,7 +552,9 @@ def write_ipc_round_robin(
     """
     writers = [IpcWriter(path) for path in paths]
     schema: pa.Schema | None = None
-    try:
+    with contextlib.ExitStack() as stack:
+        for writer in writers:
+            stack.enter_context(writer)
         for i, b in enumerate(batches):
             if schema is None:
                 schema = b.schema
@@ -521,9 +565,6 @@ def write_ipc_round_robin(
         for writer in writers:
             if not writer.is_open:
                 writer.write(empty)
-    finally:
-        for writer in writers:
-            writer.close()
 
 
 def read_ipc(path: str) -> list[pa.RecordBatch]:
