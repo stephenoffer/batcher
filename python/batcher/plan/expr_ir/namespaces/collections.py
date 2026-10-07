@@ -6,7 +6,7 @@ parameterless list reductions are generated from `_LIST_FUNCS` (data, not code).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 
@@ -39,6 +39,12 @@ from batcher.plan.expr_ir.namespaces._json_path import check_json_path
 from batcher.plan.expr_ir.nodes import Col, ListJoin, NullIf
 from batcher.plan.expr_ir.walk import referenced_columns
 from batcher.plan.types.registry import dtype_to_wire, resolve_dtype
+
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.declared import ListBound as _Bound
+else:
+    # The runtime class binds these methods with `setattr`; checkers read `declared`.
+    _Bound = object
 
 
 class _StructNamespace:
@@ -795,7 +801,7 @@ class _MapNamespace:
         return MapFunc("element_at", self._e, key=key)
 
 
-class _ListNamespace:
+class _ListNamespace(_Bound):
     """List/array reductions and transforms: ``col("a").list.len()``, ``.list.sum()``.
 
     Generated from ``_LIST_FUNCS`` (accessor name → ``bc-expr`` ``ListFunc`` tag) —

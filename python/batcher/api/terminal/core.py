@@ -52,6 +52,9 @@ __all__ = [
     "_write",
 ]
 
+#: The execution backends `collect(backend=...)` accepts.
+_BACKENDS = ("cpu", "gpu", "auto")
+
 
 def _shortcut(plan: LogicalPlan, route: str, rows: int, started: float) -> None:
     """Report a query a shortcut answered without reaching the executor.
@@ -194,7 +197,7 @@ def _collect(
     # size); `backend="auto"` lets Kyber's cost policy decide GPU vs CPU fully. Anything else — an
     # unsupported shape, a GPU-less cluster, or data Kyber routes to the CPU — silently uses the
     # CPU engine, so both are always safe. Same result, different *where*.
-    if backend not in ("cpu", "gpu", "auto"):
+    if backend not in _BACKENDS:
         raise PlanError(f"backend must be 'cpu', 'gpu', or 'auto', got {backend!r}")
     if backend in ("gpu", "auto"):
         from batcher import core

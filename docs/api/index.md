@@ -53,6 +53,8 @@ The area pages are grouped by what the call is for. Each group has its own index
 
 Tuning lives next door: {doc}`/configuration/index` covers every `Config` field with its default.
 
+Whether a call continues the chain or runs the query is in its return type, and {doc}`/api/return-types` lists that type for every public entry point, generated from the signatures.
+
 ## See also
 
 - {doc}`/user-guide/index`: the task-oriented guides these pages are the reference for.
@@ -67,6 +69,7 @@ Tuning lives next door: {doc}`/configuration/index` covers every `Config` field 
 :caption: Reference
 
 reference
+return-types
 symbols/index
 ```
 

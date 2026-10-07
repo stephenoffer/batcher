@@ -131,6 +131,9 @@ def build_window(
     return ds._derive(Window(ds._plan, part_keys, tuple(order_specs), tuple(specs)))
 
 
+#: The rows `distinct(keep=...)` can keep from a duplicate set.
+_DISTINCT_KEEPS = ("first", "last", "any")
+
 _RANDOM_MODULUS = 2147483647  # 2^31 - 1 (prime): the uniform denominator.
 
 
@@ -335,7 +338,7 @@ def build_distinct(
     unknown = set(subset) - set(ds.columns)
     if unknown:
         raise PlanError(f"distinct(): unknown subset column(s) {sorted(unknown)}")
-    if keep not in ("first", "last", "any"):
+    if keep not in _DISTINCT_KEEPS:
         raise PlanError(f"distinct(): keep must be 'first'/'last'/'any', got {keep!r}")
     # Refused here, by name, rather than at execution as a generic breaker. The generic
     # message advises "restructure to ... a single top-level aggregate / distinct", which

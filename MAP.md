@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1642 Python modules across 235 packages and 341 Rust files across 14 crates.
+Covering 1644 Python modules across 236 packages and 341 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -173,7 +173,7 @@ The public, fluent, lazy, expression-first API surface.
 | `executors.py` | 681 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 821 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 285 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
-| `groupby.py` | 1200 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
+| `groupby.py` | 1204 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 262 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `multi_group.py` | 473 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
@@ -220,8 +220,8 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 237 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7741 | `Dataset` — the lazy, immutable, fluent entry point. |
-| `ml.py` | 2988 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
+| `frame.py` | 7767 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `ml.py` | 2995 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
 ### `batcher/api/dataset/_build/` — 5 · conductor
@@ -232,7 +232,7 @@ Plan-construction helpers behind the thinner `Dataset` methods.
 |---|---|---|
 | `combine.py` | 347 | Bodies of the `Dataset` verbs that combine two or more relations over existing operators. |
 | `conform.py` | 159 | Bodies of the `Dataset` verbs that hold a relation to a shape: `match_to_schema`, `drop_nans`. |
-| `core.py` | 456 | Plan-construction helpers behind the thinner `Dataset` methods. |
+| `core.py` | 459 | Plan-construction helpers behind the thinner `Dataset` methods. |
 | `join.py` | 361 | The body of `Dataset.join`: key resolution, the opt-in keywords, and the `Join` node. |
 | `pivot.py` | 251 | Bodies of the `Dataset` verbs that turn long data wide and back: `pivot`, `unpivot`, `unnest`. |
 | `resample.py` | 244 | Bodies of `Dataset.sample` and `Dataset.upsample`: choosing rows, and adding the missing ones. |
@@ -245,7 +245,7 @@ The shared machinery behind the batch-UDF verbs on `Dataset`.
 
 | module | lines | what it is |
 |---|---|---|
-| `build.py` | 461 | Build the `MapBatches` stage behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
+| `build.py` | 463 | Build the `MapBatches` stage behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
 | `checks.py` | 408 | Edge validation and advisory warnings for the batch-UDF verbs. |
 | `cluster.py` | 163 | Checks a UDF stage must pass against the live Ray cluster before it is submitted. |
 | `ray_options.py` | 275 | Resolve the Ray Data resource parameters of the UDF verbs onto what the scheduler honours. |
@@ -324,7 +324,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 344 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 2412 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2939 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `writer.py` | 2940 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -381,7 +381,7 @@ Session entry points that create `Dataset`s.
 | `_scan.py` | 44 | The one place a `Source` becomes a `Dataset`. |
 | `admin.py` | 454 | Session-level administration: table maintenance, streaming control, cluster release. |
 | `cache.py` | 109 | Session-level control of the process result cache: what it holds, and dropping it. |
-| `combine.py` | 163 | Frame combination: the polymorphic `concat`. |
+| `combine.py` | 164 | Frame combination: the polymorphic `concat`. |
 | `frames.py` | 760 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
 | `frameworks.py` | 492 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
@@ -435,7 +435,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 736 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1603 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1606 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 829 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
@@ -2543,12 +2543,12 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 603 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 7238 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 7247 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 376 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 568 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 421 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
-| `nodes.py` | 714 | Leaf IR nodes the `Expr` base class does not construct. |
+| `nodes.py` | 721 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 278 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 385 | Structural traversals over the expression tree. |
@@ -2560,7 +2560,14 @@ Migration-error guidance for `Expr` and its typed accessors.
 | module | lines | what it is |
 |---|---|---|
 | `guidance.py` | 510 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
-| `namespaces.py` | 311 | Ecosystem-compatible spellings on the typed accessor namespaces. |
+
+### `batcher/plan/expr_ir/declared/` — 1 · contract
+
+Typing declarations for the methods bound onto expression classes at runtime.
+
+| module | lines | what it is |
+|---|---|---|
+| `bound.py` | 337 | Typing declarations for the methods bound onto expression classes at runtime. |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
 
@@ -2573,12 +2580,12 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | `_descriptions.py` | 399 | The curated per-accessor docstrings, keyed by accessor name. |
 | `_dialect.py` | 175 | Plan-time constants for the `.str` parameters that select another engine's semantics. |
 | `_json_path.py` | 170 | Plan-time check of the JSONPath subset the engine's `.json` kernels navigate. |
-| `collections.py` | 2272 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 2278 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `dynamic.py` | 77 | Build a string function whose parameters may be columns rather than constants. |
 | `meta.py` | 317 | The `.meta` accessor: questions about an expression's *shape*, answered without data. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
-| `strings.py` | 4826 | The `.str` accessor namespace. |
-| `temporal.py` | 1666 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
+| `strings.py` | 4832 | The `.str` accessor namespace. |
+| `temporal.py` | 1672 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
 
@@ -2609,12 +2616,12 @@ The expression function library, grouped by family.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 548 | Aggregate free functions that compose existing mergeable aggregates. |
+| `aggregate.py` | 549 | Aggregate free functions that compose existing mergeable aggregates. |
 | `aggregate_semantics.py` | 281 | The aggregate parameters that restore another engine's semantics by composition. |
 | `collection.py` | 201 | Collection-construction free functions (`struct`, `named_struct`, `map_from_arrays`, `sequence`). |
 | `horizontal.py` | 262 | Row-wise ("horizontal") reductions across several columns. |
 | `partitioning.py` | 204 | Lakehouse partition transforms — the derived value a partitioned table stores. |
-| `quantiles.py` | 196 | Quantile, cardinality, and histogram aggregate shorthands. |
+| `quantiles.py` | 199 | Quantile, cardinality, and histogram aggregate shorthands. |
 | `regression.py` | 263 | Linear-regression aggregate functions (DuckDB/PostgreSQL ``regr_*`` family). |
 | `scalar.py` | 562 | Scalar SQL-compat sugar — the DuckDB/Spark spellings that are free functions, not `Expr` methods. |
 | `security.py` | 333 | Data-protection functions: `mask`, `hmac_sha256`, `aes_encrypt`, `aes_decrypt`. |
@@ -2874,6 +2881,7 @@ Configuration: one frozen, typed `Config` object.
 | `env.py` | 282 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
+| `option_types.py` | 110 | `Literal` aliases for the closed option vocabularies on the public signatures. |
 | `options.py` | 357 | Dotted-string option access over the frozen `Config` tree. |
 | `profiles.py` | 299 | Named fault-tolerance profiles for the distributed engine. |
 | `serde.py` | 282 | Converting a `Config` to and from dicts, files, and environment-variable names. |

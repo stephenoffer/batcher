@@ -111,7 +111,7 @@ def test_expressions_survive_deepcopy():
 
 # --- 2. no silently-wrong ecosystem spellings ---------------------------------------
 def test_aliases_that_would_be_semantically_wrong_are_absent():
-    """Guard the deliberate omissions in `expr_ir.compat.namespaces`.
+    """Guard the deliberate omissions from the `.str` accessor.
 
     `position`/`substr` are 1-based SQL and `is_lower` is true for uncased strings,
     so these ecosystem names would each be a silently-wrong alias. If someone adds

@@ -72,7 +72,3 @@ __all__ = [
     "_StructNamespace",
     "parse_offset",
 ]
-
-# The ecosystem spellings (``str.isdigit``, ``dt.day_of_week``, ``list.element_at``)
-# are attached once the accessor classes above exist. They live in `expr_ir.compat`
-# so each namespace module stays the single home of its primary surface.

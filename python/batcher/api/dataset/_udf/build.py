@@ -74,6 +74,8 @@ FAILURE_PARAMS = (
     "retry_backoff",
     "retry_on",
 )
+#: The batch formats a per-row adapter can split into rows (`map`/`flat_map`).
+_ROW_FORMATS = ("pyarrow", "numpy")
 #: The remaining options `map`/`flat_map` forward to `build_rows`.
 ROW_OPTIONS = (
     "batch_size",
@@ -279,7 +281,7 @@ def build_rows(
 
     verb = "flat_map" if flat else "map"
     validate_fn(fn)  # the adapter is itself callable, so check the user's fn before wrapping
-    _check_format(verb, batch_format, ("pyarrow", "numpy"))
+    _check_format(verb, batch_format, _ROW_FORMATS)
     writable = writable_format(verb, batch_format, zero_copy_batch) is not None
     names, _ = split_output_columns(output_columns)
     cols = tuple(names) if names is not None else None
