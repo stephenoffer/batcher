@@ -20,6 +20,11 @@ from batcher.plan.source_stats import SourceStatistics
 
 __all__ = ["InMemorySource"]
 
+#: Distinct projections `InMemorySource.read` keeps the projected batch list for. A handful of
+#: queries over one table read a handful of column sets; the bound only stops an ad-hoc
+#: workload from growing the cache without limit, oldest projection first.
+_READ_CACHE_PROJECTIONS = 32
+
 # Overflow-safe narrow → canonical widenings the engine normalizes to at the FFI
 # boundary anyway (Int8/16/32, UInt8/16/32 → Int64; Float16/32 → Float64; LargeUtf8 →
 # Utf8). Doing it once here — instead of the Rust boundary re-casting on *every* query —
@@ -168,6 +173,7 @@ class InMemorySource:
         "_identity",
         "_mean_cache",
         "_ndv_cache",
+        "_read_cache",
         "_row_count",
         "_schema",
         "_stats",
@@ -222,6 +228,7 @@ class InMemorySource:
         self._targets.update(_unimportable_targets(src_schema))
         self._schema = _widen_schema(src_schema, self._targets) if self._targets else src_schema
         self._cache: dict[tuple[int, str], pa.Array] = {}
+        self._read_cache: dict[tuple[str, ...] | None, list[pa.RecordBatch]] = {}
         self._stats: object | None = None
         self._ndv_cache: dict[str, int | None] = {}
         self._mean_cache: dict[str, float | None] = {}
@@ -601,7 +608,20 @@ class InMemorySource:
         Returns:
             The source's batches. No copy is made beyond the projection itself.
         """
-        return [self._project(i, b, projection) for i, b in enumerate(self._batches)]
+        # Memoized per projection: the batches never change, and re-projecting them is a
+        # per-*batch* Python loop -- a select, a widening lookup and a rebuild for each one.
+        # TPC-DS sf10's `inventory` registers as 1,084 batches, and that loop was ~27 ms of
+        # every query reading it, re-run identically on each execution. Only the batch
+        # wrappers are held; their columns are the source's own arrays (or the widened ones
+        # `_cache` already keeps), so a hit costs no memory beyond the list.
+        key = None if projection is None else tuple(projection)
+        hit = self._read_cache.get(key)
+        if hit is None:
+            hit = [self._project(i, b, projection) for i, b in enumerate(self._batches)]
+            if len(self._read_cache) >= _READ_CACHE_PROJECTIONS:
+                self._read_cache.pop(next(iter(self._read_cache)))
+            self._read_cache[key] = hit
+        return list(hit)
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
         """Yield the resident batches one at a time.
