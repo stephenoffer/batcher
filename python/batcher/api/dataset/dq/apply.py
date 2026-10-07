@@ -117,6 +117,7 @@ def prepared(
         The prepared dataset and the ``(name, validity)`` pairs in declaration order.
     """
     terms: list[tuple[str, Expr]] = []
+    ds = with_helpers(ds, constraints)
     for i, c in enumerate(constraints):
         if not isinstance(c, ROW_KINDS) or (enforced_only and not c.enforced):
             continue
@@ -288,8 +289,25 @@ def provably_clean(ds: Dataset, constraints: tuple[Constraint, ...]) -> bool:
     return constraints_provably_hold(ds, runtime)
 
 
+def with_helpers(ds: Dataset, constraints: tuple[Constraint, ...]) -> Dataset:
+    """`ds` with every row constraint's helper window columns added (see `RowConstraint`).
+
+    Args:
+        ds: The dataset the chain was built against.
+        constraints: The accumulated chain.
+
+    Returns:
+        `ds` itself when no constraint needs a helper column.
+    """
+    helpers = {
+        name: expr for c in constraints if isinstance(c, RowConstraint) for name, expr in c.helpers
+    }
+    return ds.with_columns(**helpers) if helpers else ds
+
+
 def _measure(ds: Dataset, constraints: tuple[Constraint, ...]) -> tuple[int, dict[int, Any]]:
     """Run the counting passes, returning the row count and each constraint's measurement."""
+    ds = with_helpers(ds, constraints)
     aggs: dict[str, Expr] = {"__dq_rows": count()}
     for i, c in enumerate(constraints):
         if isinstance(c, RowConstraint):
