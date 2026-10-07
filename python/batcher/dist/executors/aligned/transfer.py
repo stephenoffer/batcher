@@ -132,6 +132,7 @@ def pack_held(held: dict[int, object], key: str) -> dict[int, object]:
     rows = {sid: v for sid, v in held.items() if isinstance(v, list)}
     if sum(b.nbytes for batches in rows.values() for b in batches) < PACK_BYTES:
         return held
+    started = time.perf_counter()
     packed: dict[int, object] = {sid: v for sid, v in held.items() if sid not in rows}
     jobs = [
         (sid, run) for sid, batches in rows.items() for run in _contiguous(batches, _PACK_PARTS)
@@ -141,6 +142,15 @@ def pack_held(held: dict[int, object], key: str) -> dict[int, object]:
     for sid in rows:
         parts = tuple(buf for (owner, _run), buf in zip(jobs, buffers, strict=True) if owner == sid)
         packed[sid] = Packed(f"{key}:{sid}", parts)
+    get_logger("dist").info(
+        "aligned: packed %d held input(s), %d batches, %.0f MB -> %.0f MB in %d parts, %.2fs",
+        len(rows),
+        sum(len(batches) for batches in rows.values()),
+        sum(b.nbytes for batches in rows.values() for b in batches) / 1e6,
+        sum(b.size for b in buffers) / 1e6,
+        len(buffers),
+        time.perf_counter() - started,
+    )
     return packed
 
 
