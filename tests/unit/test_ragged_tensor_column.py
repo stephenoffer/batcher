@@ -117,9 +117,16 @@ def _decoded(ds, column="img"):
 
 def test_a_udf_returning_mixed_resolution_images_produces_a_ragged_column():
     out = bt.from_pydict({"id": [1, 2, 3]}).map_batches(
-        lambda b: {"id": b.column("id"), "img": _IMAGES}, output_columns=["id", "img"]
+        # One image per input row (id k -> the k-th image), whatever rows the batch holds.
+        lambda b: {
+            "id": b.column("id"),
+            "img": [_IMAGES[i - 1] for i in b.column("id").to_pylist()],
+        },
+        output_columns=["id", "img"],
     )
-    assert is_ragged_tensor_column(out.schema.field("img").type)
+    # Held against what the query returns, not `out.schema`: the column is ragged because
+    # the images differ across rows, and `schema` asks an undeclared stage about one row.
+    assert is_ragged_tensor_column(out.collect().schema.field("img").type)
     assert [a.shape for a in _decoded(out)] == [(2, 2), (3, 4), (1, 5)]
 
 

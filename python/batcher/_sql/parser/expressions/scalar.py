@@ -317,10 +317,9 @@ def _scalar(tr, node) -> Expr:
         derived = derived_function(tr, node)
         if derived is not None:
             return derived
-        raise NotImplementedError(
-            f"unknown function {node.name!r}: it is not a supported SQL function and "
-            f"is not registered (use bt.register_function to call a Python function)"
-        )
+        from batcher._sql.parser.udf import unknown_function_message
+
+        raise NotImplementedError(unknown_function_message(tr, node.name))
     typed = derived_function(tr, node)
     if typed is not None:
         return typed

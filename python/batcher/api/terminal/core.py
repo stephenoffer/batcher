@@ -696,28 +696,79 @@ def _declared_schema(plan: LogicalPlan, sources: list[Source]) -> pa.Schema | No
 
 
 def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.Schema:
-    """The output Arrow schema without scanning rows.
+    """The output Arrow schema, scanning no rows unless a callback must be asked.
 
     A bare scan returns its source schema, normalized the way the FFI boundary will
     normalize it. Otherwise the plan's type-carrying `available_schema()` analysis answers
-    without touching the engine when it can infer every output type; anything it leaves
-    uncertain falls back to a zero-row execution (`limit(0)`), which the engine answers
-    without materializing data.
+    without touching the engine when it can infer every output type -- which includes a
+    `map_batches`/`map`/`flat_map` stage whose `output_columns` is a `pyarrow.Schema`, and
+    the callable form of `filter`. Anything it leaves uncertain falls back to a probe run
+    (`_probe_schema`).
 
     The `widen` on the scan arm is what keeps all three arms agreeing. The other two
     already predict the boundary's normalization — `available_schema()` through
-    `plan.types`, and the `limit(0)` fallback by actually executing — while this one
+    `plan.types`, and the probe by actually executing — while this one
     handed back the source's own types. A dictionary-encoded column (what Parquet emits
     natively for a low-cardinality string) was therefore reported as
     `dictionary<values=string, ...>` by `Dataset.schema` when `collect()` returns plain
     `string`, so the cheapest arm was the only one that lied.
     """
-    from batcher.plan.logical import Limit
-
     declared = _declared_schema(plan, sources)
     if declared is not None:
         return declared
-    return _collect(Limit(plan, 0), sources, columns).schema
+    return _probe_schema(plan, sources, columns)
+
+
+def _probe_schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.Schema:
+    """Execute just enough of `plan` to learn its output schema.
+
+    A relational plan runs under ``LIMIT 0``, which the engine answers without materializing
+    data. That limit alone does not bound a Python stage: it sits *above* the callback, and
+    the callback ran over every input row before anything was limited -- a `map_batches`
+    over 100,000 rows was called 7 times over all of them, on the driver, for a property
+    read. So each `MapBatches` input is capped as well (`_capped_for_probe`), and a callback
+    sees an empty batch, or one row where an empty batch cannot answer. A class callback is
+    still constructed, which for a load-once model is a model load; declaring
+    `output_columns` as a schema is how to avoid the call.
+
+    Two answers from the empty batch are not answers, and both are asked again on one row
+    (still bounded -- one row per stage): a callback that refuses an empty batch, which it
+    never sees in a real run, and a column that comes back Arrow `null`, which is what a
+    column the callback built from no values is typed as.
+    """
+    from batcher._internal.logging import note_suppressed
+    from batcher.plan.logical import Limit
+
+    try:
+        schema = _collect(Limit(_capped_for_probe(plan), 0), sources, columns).schema
+    except Exception as exc:
+        note_suppressed("api", "probe a callback's output schema on an empty batch", exc)
+    else:
+        if not any(pa.types.is_null(t) for t in schema.types):
+            return schema
+    return _collect(Limit(_capped_for_probe(plan, True), 0), sources, columns).schema
+
+
+def _capped_for_probe(node: LogicalPlan, row_above: bool = False) -> LogicalPlan:
+    """`node` with every callback stage's input limited to zero rows, or one where needed.
+
+    Zero wherever it suffices: a batch callback is called on an empty batch and answers with
+    its types, and an empty batch is the one input whose types cannot depend on the values
+    in it (a NumPy round trip turns a batch of equal-length lists into a tensor). A per-row
+    stage (`map`/`flat_map`) is never called on an empty batch, so it gets one row, and so
+    does every callback beneath it -- a stage that emitted nothing would starve it.
+    """
+    import dataclasses
+
+    from batcher.plan.logical import Limit, MapBatches
+    from batcher.plan.visitor import children, with_children
+
+    if isinstance(node, MapBatches):
+        one = row_above or node.per_row
+        capped = Limit(_capped_for_probe(node.input, one), 1 if one else 0)
+        return dataclasses.replace(node, input=capped)
+    kids = children(node)
+    return with_children(node, [_capped_for_probe(k, row_above) for k in kids]) if kids else node
 
 
 @with_auto_config

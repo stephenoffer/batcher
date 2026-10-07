@@ -22,14 +22,9 @@ from batcher.config import active_config
 from batcher.core.runtime import cancellable
 from batcher.core.udf import strategy as strat
 from batcher.core.udf.async_udf import is_async_udf, run_async_batches
-from batcher.core.udf.call import (
-    _check_declared_columns,
-    _coerce_udf_result,
-    _formatted,
-    _resilient_call,
-)
+from batcher.core.udf.call import _coerce_udf_result, _formatted, _resilient_call
 from batcher.core.udf.lifecycle import build_udf_callable, teardown_udf
-from batcher.core.udf.resilience import wrap_resilient
+from batcher.core.udf.resilience import conform_output, wrap_resilient
 from batcher.plan.logical import MapBatches
 from batcher.plan.types import one_batch
 
@@ -147,10 +142,9 @@ def apply_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordBa
     converted back — the data plane stays Arrow, only the call is reframed.
 
     Every dispatch route funnels back through here, which is why the `output_columns`
-    declaration is checked at this one point rather than inside each of them."""
-    out = _dispatch_udf(current, op)
-    _check_declared_columns(out, op)
-    return out
+    declaration -- its names, its declared schema, and the `error_column` quarantine -- is
+    applied at this one point (`conform_output`) rather than inside each of them."""
+    return conform_output(_dispatch_udf(current, op), op)
 
 
 def _dispatch_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.RecordBatch]:
@@ -167,7 +161,9 @@ def _dispatch_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.Reco
         # and multiprocessing routes below — async concurrency is about overlapping awaits, not
         # filling cores or a device.
         return _apply_udf_async(op, current, build_udf_callable(op.fn))
-    if op.num_gpus > 0 and op.batch_size is None:
+    if op.num_gpus > 0 and op.batch_size is None and op.error_column is None:
+        # (An `error_column` stage skips it: the autobatch pool has no error-budget bisection
+        # to isolate the row it would keep.)
         # Auto batch sizing for a GPU inference stage with no explicit `batch_size`:
         # hill-climb the size online toward the VRAM-capped throughput plateau, so the
         # user never hand-tunes it (a hand-set or unset `batch_size` is Ray Data's #1
@@ -178,7 +174,9 @@ def _dispatch_udf(current: list[pa.RecordBatch], op: MapBatches) -> list[pa.Reco
         return _apply_udf_autobatch(op, batches)
 
     total = sum(b.num_rows for b in current)
-    use_processes = strat.wants_processes(op, total, current)
+    # A kept errored row is built in this process from the bisection's marker, which the
+    # process pool's children do not produce, so an `error_column` stage stays on threads.
+    use_processes = op.error_column is None and strat.wants_processes(op, total, current)
     morsel = max(1, active_config().execution.morsel_rows)
     if op.batch_size is not None:
         batches = rechunk(current, op.batch_size)
@@ -304,9 +302,10 @@ def _run_sync_udf(op: MapBatches, batches: list[pa.RecordBatch], strategy: str) 
             # full allowance, so the effective bound scaled with parallelism.
             budget = strat.error_budget(op)
             is_gpu = op.num_gpus > 0
+            keep = op.error_column is not None
 
             def _resilient(b: pa.RecordBatch) -> list[pa.RecordBatch]:
-                return _resilient_call(call, b, budget, is_gpu)
+                return _resilient_call(call, b, budget, is_gpu, keep)
 
             # Checked outside the bisection, so a cancellation is never charged as a bad row.
             _emit = cancellable(_resilient, "map_batches")

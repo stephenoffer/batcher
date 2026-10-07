@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1635 Python modules across 234 packages and 337 Rust files across 14 crates.
+Covering 1636 Python modules across 234 packages and 337 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -220,7 +220,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 237 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7682 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 7741 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2988 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -245,8 +245,8 @@ The shared machinery behind the batch-UDF verbs on `Dataset`.
 
 | module | lines | what it is |
 |---|---|---|
-| `build.py` | 431 | Build the `MapBatches` stage behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
-| `checks.py` | 322 | Edge validation and advisory warnings for the batch-UDF verbs. |
+| `build.py` | 461 | Build the `MapBatches` stage behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
+| `checks.py` | 408 | Edge validation and advisory warnings for the batch-UDF verbs. |
 | `cluster.py` | 163 | Checks a UDF stage must pass against the live Ray cluster before it is submitted. |
 | `ray_options.py` | 275 | Resolve the Ray Data resource parameters of the UDF verbs onto what the scheduler honours. |
 | `rows.py` | 111 | The output tables of the per-row callbacks behind `ds.map` and `ds.flat_map`. |
@@ -411,8 +411,8 @@ The SQL `Session`: a table catalog, a Python-function registry, and a read diale
 |---|---|---|
 | `catalog_sql.py` | 396 | SQL over a session's catalogs: ``USE``, ``SHOW``, schema DDL, and catalog table references. |
 | `params.py` | 258 | The per-call bindings of a SQL statement: the tables it names and the values it binds. |
-| `registry.py` | 103 | What a Python function registered for SQL looks like to the translator. |
-| `session.py` | 1036 | The SQL `Session` — a context binding named tables, Python functions, and a dialect. |
+| `registry.py` | 141 | What a Python function registered for SQL looks like to the translator. |
+| `session.py` | 1066 | The SQL `Session` — a context binding named tables, Python functions, and a dialect. |
 | `statements.py` | 288 | SQL statements that change the catalog rather than only reading it. |
 | `views.py` | 145 | Session views bound at query time, and the one case rule every session name follows. |
 
@@ -435,7 +435,7 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 736 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1552 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1603 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 829 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
@@ -891,7 +891,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `statements.py` | 328 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 331 | Built-in table functions in the FROM clause: the series generators and model scoring. |
 | `translator.py` | 671 | The `_Translator` skeleton plus the public `sql()` entry point. |
-| `udf.py` | 196 | Registered-Python-function support for the SQL translator. |
+| `udf.py` | 265 | Registered-Python-function support for the SQL translator. |
 
 ### `batcher/_sql/parser/expressions/` — 6 · front-end
 
@@ -906,7 +906,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | `json.py` | 259 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
 | `literals.py` | 556 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `maps.py` | 98 | SQL → `.map` accessor dispatch. |
-| `scalar.py` | 548 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
+| `scalar.py` | 547 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 258 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 220 | SQL string functions whose translation is more than a name lookup. |
 | `temporal.py` | 484 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
@@ -1003,7 +1003,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 874 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3321 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3359 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 590 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 643 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 531 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1840,17 +1840,17 @@ Execution of pipelines containing `map_batches` (opaque Python/ML operators).
 
 | module | lines | what it is |
 |---|---|---|
-| `apply.py` | 415 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
-| `async_udf.py` | 193 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
-| `call.py` | 473 | The per-batch `map_batches` call boundary (Core, layer 3). |
+| `apply.py` | 414 | Apply one `map_batches` stage to a set of batches (Core, layer 3). |
+| `async_udf.py` | 197 | Run an async (`async def`) `map_batches` fn: overlap I/O-bound calls across batches. |
+| `call.py` | 480 | The per-batch `map_batches` call boundary (Core, layer 3). |
 | `execute.py` | 313 | Execution of pipelines containing `map_batches` (opaque Python/ML operators). |
 | `isolation.py` | 236 | What a UDF child process is allowed to see and consume. |
 | `lifecycle.py` | 90 | Build and tear down a `map_batches` UDF instance (Core, layer 3). |
 | `processes.py` | 457 | The warm, shared process pool that runs CPU-bound `map_batches` UDFs off the GIL. |
-| `resilience.py` | 158 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
+| `resilience.py` | 304 | Retry and timeout policy wrapping a per-batch `map_batches` call (Core, layer 3). |
 | `sizing.py` | 281 | What the streaming UDF path learned last run, folded back into this run's sizing. |
 | `strategy.py` | 495 | How a `map_batches` `fn` is run: threads vs processes, and the per-batch row count. |
-| `stream.py` | 364 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
+| `stream.py` | 366 | Streaming, stage-overlapped execution of a linear `map_batches` chain. |
 
 ### `batcher/governance/` — 3 · subsystem
 
@@ -2735,7 +2735,8 @@ String free functions, in two halves: building text and reading structure out of
 | `aggregate.py` | 320 | Grouping and ordering logical nodes: `Aggregate` and `Sort` (and their specs). |
 | `base.py` | 516 | `LogicalPlan` — the base class for declarative plan nodes. |
 | `join.py` | 547 | Join logical nodes: `JoinOutputCol`, `Join`, `AsofJoin` and `RangeJoin`. |
-| `relational.py` | 667 | Row-wise and set relational logical nodes. |
+| `map_batches.py` | 210 | The opaque Python stage: `MapBatches`, behind `map_batches`, `map`, `flat_map` and `filter(fn)`. |
+| `relational.py` | 546 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
 | `transforms.py` | 743 | Plan transforms and predicates over `LogicalPlan` trees. |
 | `window.py` | 559 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
@@ -2893,7 +2894,7 @@ Config range/consistency validation, applied at every `Config` entry point.
 | `optional.py` | 82 | The one optional-dependency import guard. |
 | `paths.py` | 130 | Filesystem locations of the installed package, and how to create things there safely. |
 | `prefetch.py` | 116 | Overlap a producer generator with its consumer on a background thread. |
-| `registry.py` | 306 | Keyed lookup tables: the generic extension-point registry and the identity memo. |
+| `registry.py` | 309 | Keyed lookup tables: the generic extension-point registry and the identity memo. |
 | `sql_errors.py` | 275 | Turn a sqlglot parse failure into a Batcher `PlanError` with a plain-text message. |
 
 ### `batcher/_internal/concurrency/` — 0 · utility
@@ -3159,7 +3160,7 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 | `arrays.py` | 389 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
 | `dask_frames.py` | 73 | Arrow partitions → a lazy ``dask.dataframe.DataFrame``. |
 | `diagnostics.py` | 266 | Why a Python value cannot become an Arrow column, and what to do about it. |
-| `formats.py` | 394 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
+| `formats.py` | 400 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
 | `huggingface.py` | 229 | Arrow → Hugging Face ``datasets`` conversion, with feature translation. |
 
 ### `batcher/migrate/` — ?

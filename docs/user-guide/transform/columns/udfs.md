@@ -49,7 +49,7 @@ print(with_total.select("text", "total").to_pydict())
 # {'text': ['a,b', 'c', 'd,e,f'], 'total': [10.0, 40.0, 90.0]}
 ```
 
-`output_columns` declares the result schema when `fn` changes it. Omit it and later operations still believe the old schema, so a `select` on your new column fails at plan time. Declare it whenever the columns differ from the input.
+`output_columns` declares the result columns when `fn` changes them. Omit it and later operations still believe the old schema, so a `select` on your new column fails at plan time. Declare it whenever the columns differ from the input. A list declares names only. A `pyarrow.Schema` declares the types too, which {ref}`Declare the output types <udf-declare-output-types>` covers.
 
 `num_workers` defaults to `"auto"`, which fans the per-batch calls across local cores. That helps only if `fn` releases the GIL, which Arrow, NumPy, and torch all do. For a CPU-bound pure-Python `fn`, pass `multiprocessing=True`. Your script still needs an `if __name__ == "__main__":` guard, because a worker process starts by importing it.
 
@@ -116,7 +116,7 @@ print(
 
 Use `fn_args` and `fn_kwargs` for arguments that vary per call rather than per worker. They arrive after the batch, as `fn(batch, *fn_args, **fn_kwargs)`. `fn_args` and `fn_constructor_args` must be a tuple or list and `fn_kwargs` and `fn_constructor_kwargs` a dict with string keys. Any other shape raises a `PlanError` naming the parameter when you define the stage, not in a worker on its first batch. The same holds for `input_columns`, `preserves_columns`, `num_workers` below 1, and a non-numeric `max_concurrency`.
 
-If the class holds a resource that must be released, give it a `close` method. Batcher calls it when the worker is done with the model, which is where a GPU allocation or an HTTP session goes back.
+If the class holds a resource that must be released, give it a `close` method. Batcher calls it when the worker is done with the model, which is where a GPU allocation or an HTTP session goes back. Under `collect(distributed=True)` the model lives on a long-lived actor, and Batcher asks each actor to close its models before it shuts the actor pool down. That shutdown waits a bounded time for `close` to return and then ends the actor regardless, so a `close` that hangs can't wedge the job.
 
 ## Receive NumPy, pandas, or torch batches
 
@@ -146,8 +146,6 @@ def cap(batch):
 print(ds.select("price").map_batches(cap, batch_format="numpy", zero_copy_batch=False).to_pydict())
 # {'price': [10.0, 15.0, 15.0]}
 ```
-
-`max_concurrency` bounds how many batches an `async def` `fn` has in flight at once. `0` picks a default.
 
 ## Per-row functions, when you must
 
@@ -207,6 +205,32 @@ print(ds.filter(lambda batch: batch["text"].str.contains(","), batch_format="pan
 ```
 
 Same rows, and the expression form builds no Python object per row. Check for an expression before you write the loop.
+
+## Async functions
+
+An `async def` function suits an I/O-bound callback, such as a request to a model endpoint. Batcher awaits its calls concurrently on one event loop instead of holding a thread per request. Four verbs accept one, and `max_concurrency` bounds a different unit on each:
+
+| Verb | What `max_concurrency` bounds |
+| --- | --- |
+| `map_batches(fn)` | Batches in flight at once. |
+| `filter(fn)` | Batches in flight at once. |
+| `map(fn)` | Rows in flight at once within one batch. |
+| `flat_map(fn)` | Rows in flight at once within one batch. |
+
+`0`, the default, picks a default bound. The bound applies within one worker, so a cluster runs up to `max_concurrency` times the worker count. A quota that spans every worker, such as a provider's requests per minute, belongs on the engine making the call rather than on the stage.
+
+```python
+import asyncio
+
+
+async def lookup(batch):
+    await asyncio.sleep(0)  # stands in for a request to a remote service
+    return batch.append_column("found", pc.greater(batch.column("qty"), 1))
+
+
+print(ds.select("qty").map_batches(lookup, max_concurrency=4, output_columns=["qty", "found"]).to_pydict())
+# {'qty': [1, 2, 3], 'found': [False, True, True]}
+```
 
 ## Bundle a function with its options
 
@@ -296,6 +320,33 @@ Batcher logs a warning naming the dropped columns, because the result otherwise 
 
 Build the output columns once, outside any per-batch branching, so every return path has the same keys. A function that decides its columns inside an `if` is the shape this catches.
 
+(udf-declare-output-types)=
+### Declare the output types
+
+A list in `output_columns` names the columns and leaves their types to whatever `fn` returns. Pass a `pyarrow.Schema` instead and the types are part of the declaration. `map`, `flat_map`, and `map_batches` all accept one. Every output batch is cast to it, and a value that does not fit raises a `SchemaError` naming the column. A field declared `nullable=False` refuses a null the same way. A tensor column is declared with Arrow's own `pa.fixed_shape_tensor(...)` type.
+
+The declaration does two things a list can't. `schema` answers from it without calling `fn`. And an empty input still returns the declared types, where a list leaves a column no row reached as Arrow `null`:
+
+```python
+calls = []
+
+
+def priced(batch):
+    calls.append(batch.num_rows)
+    return {"cents": pc.cast(pc.multiply(batch.column("price"), 100), "int64")}
+
+
+cents = pa.schema([("cents", pa.int64())])
+print(ds.map_batches(priced, output_columns=cents).schema, calls)
+# cents: int64 []
+print(ds.filter(bt.col("price") > 1000).map_batches(priced, output_columns=cents).collect().schema)
+# cents: int64
+```
+
+The types come back the way the engine normalizes them for every operator above the stage. A declared `int32` reads back as `int64`, a `float32` as `float64`, and a dictionary column as its value type.
+
+Without a declared schema, `schema` has to ask `fn`. It calls a batch function on an empty batch. A `map` or `flat_map` function is never called on an empty batch, so it gets one input row, and so does any batch stage beneath it. Either way a class `fn` is still constructed, which for a model means loading it. A column that comes back Arrow `null` from the empty batch is asked about on one row as well. The probe sees at most one row, so a type that depends on the values across rows, such as a tensor column that is ragged only because its shapes differ, is certain only when you declare it. The callable form of `filter` is the exception, because dropping rows keeps the input's columns and types, so `schema` reads them from the input without calling the predicate.
+
 ## One call per group
 
 {py:meth}`map_groups <batcher.GroupBy.map_groups>` hands your function every row of one group and no row of another. It is the Batcher spelling of pandas `groupby().apply()`, Polars {py:meth}`group_by().map_groups() <batcher.Dataset.group_by>`, and Spark `applyInPandas`, and it is what per-entity work needs: a user's session sequence, a device's time series, a document's chunks.
@@ -378,6 +429,18 @@ Scalar SQL functions do not work inside `GROUP BY` keys, aggregate arguments, or
 There is no aggregate form. An aggregate has to be mergeable, built from a partial, a combine and a finalize, so that one machine and a hundred produce the same answer. A Python callable over one batch cannot supply that. Use `ds.group_by(...).agg(...)` for a built-in aggregate, or `map_groups` for arbitrary Python over each group.
 
 An option the call form cannot honor is rejected at registration rather than ignored, so a misspelled keyword fails where you wrote it.
+
+A per-row function receives `None` for a NULL argument by default, and must handle it. DuckDB's default is the opposite, NULL in and NULL out. Pass `null_handling="default"` to get DuckDB's behavior: a row with any NULL argument answers NULL and `fn` never sees it, in the vectorized form too. The parameter takes DuckDB's name and values, and the default `"special"` keeps NULLs flowing to `fn`.
+
+```python
+s = bt.Session()
+s.register("n", bt.from_pydict({"x": [1, None, 3]}))
+s.register_function("inc", lambda v: v + 1, vectorized=False, result_type="int64", null_handling="default")
+print(s.sql("SELECT inc(x) AS y FROM n").to_pydict())
+# {'y': [2, None, 4]}
+```
+
+A registered function exists only inside a SQL query, run through `bt.sql`, `Session.sql`, or `Dataset.sql`. {py:func}`bt.call_function <batcher.call_function>` names the built-in function library and raises for it, because an expression has no relation for the function's `map_batches` stage to run over. In the DataFrame API, apply the same callable with `map_batches`.
 
 ## Taking it to a cluster
 

@@ -73,6 +73,24 @@ print(out.to_pydict())
 # {'name': ['Ann', 'bob', 'CARL'], 'size': ['small', 'big', 'big']}
 ```
 
+### Replace values without dropping rows
+
+`filter` removes the rows a condition rejects. To change some values and keep every row, write the condition as a `when/then/otherwise` over the column itself and give it back under the same name with `with_columns`. The `otherwise` branch is the column, so a row the condition does not match keeps its value:
+
+```python
+capped = ds.with_columns(price=bt.when(bt.col("price") > 15).then(15.0).otherwise(bt.col("price")))
+print(capped.to_pydict())
+# {'name': ['Ann', 'bob', 'CARL'], 'price': [10.0, 15.0, 15.0], 'qty': [1, 2, 3]}
+```
+
+A NULL condition counts as not matched, the same as SQL's `CASE WHEN`, so a NULL value falls through to `otherwise` and stays NULL. A selector applies the same replacement to every column it picks, each compared and replaced on its own:
+
+```python
+numbers = bt.numeric()
+print(ds.with_columns(bt.when(numbers > 2).then(0).otherwise(numbers)).to_pydict())
+# {'name': ['Ann', 'bob', 'CARL'], 'price': [0.0, 0.0, 0.0], 'qty': [1, 2, 0]}
+```
+
 ## Null handling
 
 {py:obj}`bt.coalesce <batcher.coalesce>` returns the first non-null argument. {py:obj}`bt.nullif(a, b) <batcher.nullif>` returns null when `a == b`. {py:obj}`bt.greatest <batcher.greatest>` and {py:obj}`bt.least <batcher.least>` pick the extreme across columns. On a single expression, `.fill_null(value)`, `.is_null()`, and `.is_not_null()` apply.

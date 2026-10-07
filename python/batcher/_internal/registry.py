@@ -1,9 +1,12 @@
 """Keyed lookup tables: the generic extension-point registry and the identity memo.
 
 Sources, sinks, operators, optimization rules, and backends all register through
-an instance of `Registry[T]`. Third-party packages can also contribute via
-`importlib.metadata` entry points (wired in once the extension points stabilize),
-so plugging in a new source or backend never requires forking the engine.
+an instance of `Registry[T]`. Registration happens when the registering module is
+imported, so a third-party source or sink plugs in by subclassing the public
+`batcher.io` bases and being imported before it is named; nothing is forked. There is
+no automatic discovery: nothing reads `importlib.metadata` entry points, and a package
+that is never imported never registers. `Registry(on_miss=...)` is the seam such
+discovery would hang from.
 
 Because every extension point funnels through here, this is also where a user's typo
 in a format or backend name is caught — so `get` raises the canonical unknown-name

@@ -192,7 +192,7 @@ def _undeclared_udf_hint(source: LogicalPlan | None) -> str:
     stage is found by walking the single-input chain from `source`; only the error path
     pays for the walk.
     """
-    from batcher.plan.logical.relational import MapBatches
+    from batcher.plan.logical.map_batches import MapBatches
 
     node = source
     while node is not None:

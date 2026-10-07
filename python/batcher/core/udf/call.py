@@ -52,7 +52,7 @@ def shared_error_budget(key: str, allowance: int) -> list[int]:
 
 
 def _resilient_call(
-    call, sub: pa.RecordBatch, budget: list[int], is_gpu: bool
+    call, sub: pa.RecordBatch, budget: list[int], is_gpu: bool, keep: bool = False
 ) -> list[pa.RecordBatch]:
     """Run a per-batch `call`, isolating failures by bisection — the unified OOM-halving +
     dirty-data-tolerance path.
@@ -72,7 +72,10 @@ def _resilient_call(
     is the running drop count, appended on the first drop so existing callers keep passing a
     one-element list unchanged. Each drop also publishes to the observability bus with the
     running count and the error text, so a running job reports the loss as it happens rather
-    than at the end."""
+    than at the end.
+
+    `keep` is the stage's `error_column` opt-in: the isolated row is charged exactly as a drop
+    is, and returned as a `resilience.errored_row` marker instead of vanishing."""
     try:
         return _coerce_udf_result(call(sub), sub.schema)
     except Exception as exc:
@@ -93,10 +96,14 @@ def _resilient_call(
                         "Raise max_errored_rows, or fix the rows that fail."
                     )
                 raise  # genuine single-row over-allocation, or the error budget is spent
+            if keep:
+                from batcher.core.udf.resilience import errored_row
+
+                return [errored_row(sub, exc)]
             return []  # drop the one corrupt row and carry on
         mid = sub.num_rows // 2
-        left = _resilient_call(call, sub.slice(0, mid), budget, is_gpu)
-        return left + _resilient_call(call, sub.slice(mid), budget, is_gpu)
+        left = _resilient_call(call, sub.slice(0, mid), budget, is_gpu, keep)
+        return left + _resilient_call(call, sub.slice(mid), budget, is_gpu, keep)
 
 
 #: Guards the whole allowance. `_resilient_call` runs under a `ThreadPoolExecutor` on the
