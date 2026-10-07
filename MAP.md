@@ -3295,7 +3295,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
 | `stream/chunked/units.rs` | 83 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
-| `stream/folds.rs` | 654 | The mergeable folds a streaming breaker reduces its input with. |
+| `stream/folds.rs` | 709 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 429 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 786 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
