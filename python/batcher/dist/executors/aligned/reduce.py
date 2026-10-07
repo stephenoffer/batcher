@@ -24,6 +24,7 @@ import dataclasses
 
 import pyarrow as pa
 
+from batcher.dist.executors.aligned.analysis import AlignedPlan
 from batcher.io.source import InMemorySource
 from batcher.plan.expr_ir import Col, col
 from batcher.plan.logical import (
@@ -37,7 +38,7 @@ from batcher.plan.logical import (
 )
 from batcher.plan.schema import SchemaRef
 
-__all__ = ["prefer_hash_joins", "reduce_broadcasts", "sliceable_broadcasts"]
+__all__ = ["prefer_hash_joins", "push_top_n", "reduce_broadcasts", "sliceable_broadcasts"]
 
 #: A reduction is kept only when it removes at least this share of the broadcast's rows.
 _MIN_CUT = 0.1
@@ -214,3 +215,64 @@ def sliceable_broadcasts(body: LogicalPlan, cut, held: dict[int, pa.Table]) -> d
             if found is not None and found[1] == cut.key.column_of(found[0]):
                 sliced[b.source_id] = b_key
     return sliced
+
+
+def push_top_n(plan: AlignedPlan) -> AlignedPlan:
+    """`plan` with each row-returning cut a residual top-N reads cut to its own top N per unit.
+
+    A cut without an aggregate returns its units' rows concatenated: a disjoint union, so the
+    first N of the whole are among the first N of each unit. TPC-H q10 at SF1000 ends in
+    `ORDER BY revenue DESC LIMIT 20` over 44.5M per-customer groups, which the residual
+    aligned on `custkey` computes whole per unit; every one of them crossed to the driver to
+    be sorted there, and the driver (a 32 GB head node) was OOM-killed on the second run.
+    Each unit now keeps its own 20. The residual's sort still decides: this only drops rows
+    no unit could contribute to its answer.
+
+    Taken only for a placeholder the residual reads once, through plain-column projections,
+    under a sort with a limit; the sort keys must be columns of the cut's output.
+    """
+    from batcher.plan.logical import Sort
+    from batcher.plan.visitor import walk
+
+    scans = [n.source_id for n in walk(plan.residual) if isinstance(n, Scan)]
+    cuts = list(plan.cuts)
+    for node in walk(plan.residual):
+        if not (isinstance(node, Sort) and node.limit is not None):
+            continue
+        found = _placeholder_under(node.input, plan.placeholders)
+        if found is None or scans.count(found[0]) != 1:
+            continue
+        sid, names = found
+        i = plan.placeholders.index(sid)
+        if cuts[i].aggregate is not None:
+            continue
+        keys = []
+        for key in node.keys:
+            if not (isinstance(key.expr, Col) and key.expr.name in names):
+                break
+            keys.append(dataclasses.replace(key, expr=col(names[key.expr.name])))
+        else:
+            body = Sort(cuts[i].body, tuple(keys), limit=node.limit)
+            cuts[i] = dataclasses.replace(cuts[i], body=body)
+    return dataclasses.replace(plan, cuts=tuple(cuts))
+
+
+def _placeholder_under(node: LogicalPlan, placeholders) -> tuple[int, dict[str, str]] | None:
+    """The placeholder scan `node` reads through plain-column projections, and each of
+    `node`'s columns as that scan's column."""
+    if isinstance(node, Scan):
+        if node.source_id not in placeholders:
+            return None
+        return node.source_id, {c: c for c in node.available_columns()}
+    if isinstance(node, Project):
+        found = _placeholder_under(node.input, placeholders)
+        if found is None:
+            return None
+        sid, names = found
+        mapped = {
+            item.alias: names[item.expr.name]
+            for item in node.items
+            if isinstance(item.expr, Col) and item.expr.name in names
+        }
+        return sid, mapped
+    return None

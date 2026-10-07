@@ -206,6 +206,36 @@ def test_key_grouped_aggregate_sorted_and_limited_above(tables):
     assert_same_for_query(_run_aligned(ds), _duck(tables, query), query)
 
 
+def test_a_residual_top_n_is_kept_per_unit(tables, monkeypatch):
+    """TPC-H q10's ending: a top-N over groups each unit computes whole.
+
+    Each unit keeps its own first N, the driver's sort picks the answer among them. Ties are
+    excluded by the order (`l_ok` breaks them), so the expected rows are exact.
+    """
+    from batcher.dist.executors.aligned import reduce
+    from batcher.plan.logical import Sort
+
+    seen = []
+    real = reduce.push_top_n
+    monkeypatch.setattr(aligned_run, "push_top_n", lambda p: seen.append(real(p)) or seen[-1])
+    li, orders = _read(tables, "lineitem"), _read(tables, "orders")
+    ds = (
+        li.join(orders, left_on="l_ok", right_on="o_ok")
+        .group_by("l_ok", "o_prio")
+        .agg(s=col("l_qty").sum())
+        .sort("s", "l_ok", descending=[True, False])
+        .limit(7)
+    )
+    query = (
+        "SELECT l_ok, o_prio, sum(l_qty) AS s FROM lineitem JOIN orders ON l_ok = o_ok "
+        "GROUP BY l_ok, o_prio ORDER BY s DESC, l_ok LIMIT 7"
+    )
+    assert_same_for_query(_run_aligned(ds), _duck(tables, query), query)
+    # Positive control: the cut each unit ran was the top 7 of its own groups.
+    tops = [c.body for p in seen for c in p.cuts if isinstance(c.body, Sort)]
+    assert tops and all(t.limit == 7 for t in tops)
+
+
 def test_left_join_keeps_unmatched_rows(tables):
     """Fact keys 2900-2999 have no order, so the left join emits them null-padded."""
     li, orders = _read(tables, "lineitem"), _read(tables, "orders")
