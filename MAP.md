@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1568 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1574 Python modules across 222 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -320,8 +320,8 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1872 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2282 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `reader.py` | 1966 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `writer.py` | 2393 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -2188,6 +2188,18 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | `documents.py` | 241 | Document format — text extraction from PDF, HTML, Word, decks, EPUB and Markdown. |
 | `text.py` | 590 | Plain-text source and sink — one row per line or per whole file, one line per value. |
 | `warc.py` | 319 | WARC source — web-archive records (ISO 28500) as Arrow rows. |
+
+### `batcher/io/formats/vector/` — 2 · neutral IO
+
+`io.formats.vector` — vector-store connectors over one shared contract.
+
+| module | lines | what it is |
+|---|---|---|
+| `contract.py` | 644 | The vector-store contract: what every vector-store connector agrees on before it dials out. |
+| `milvus.py` | 337 | Milvus connector — query a collection's partitions as Arrow; upsert, insert and delete. |
+| `pinecone.py` | 270 | Pinecone connector — list and fetch a namespace as Arrow, upsert and delete records. |
+| `qdrant.py` | 328 | Qdrant connector — scroll a collection out as Arrow, upsert and delete points into it. |
+| `turbopuffer.py` | 319 | Turbopuffer connector — page a namespace out as Arrow, upsert and delete documents. |
 
 ### `batcher/io/lookup/` — 2 · neutral IO
 
