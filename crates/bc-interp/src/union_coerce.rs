@@ -67,7 +67,7 @@ pub(crate) fn union_target_schema(
         .map(|f| f.data_type().clone())
         .collect();
     let mut mismatch = false;
-    for b in batches.iter().skip(1) {
+    for (branch, b) in batches.iter().enumerate().skip(1) {
         // Same guard as `cast_to_union_schema`, and for the same reason: indexing past a
         // narrower branch's columns panics, and this crate does not panic on user data.
         if b.num_columns() != ncols {
@@ -91,13 +91,7 @@ pub(crate) fn union_target_schema(
                         *t = common;
                         mismatch = true;
                     }
-                    None => {
-                        return Err(InterpError::IncompatibleSetOpTypes {
-                            col: c,
-                            left: t.to_string(),
-                            right: bt.to_string(),
-                        })
-                    }
+                    None => return Err(incompatible(first.schema().field(c), branch, t, bt)),
                 }
             }
         }
@@ -153,6 +147,85 @@ pub(crate) fn cast_to_union_schema(
         })
         .collect::<Result<_, InterpError>>()?;
     Ok(RecordBatch::try_new(Arc::clone(schema), cols)?)
+}
+
+/// The typed error for a column whose branch types `left` and `right` have no supertype,
+/// naming the column and the first place inside it where the two disagree.
+fn incompatible(column: &Field, branch: usize, left: &DataType, right: &DataType) -> InterpError {
+    let mut path = column.name().clone();
+    let (l, r) = first_conflict(left, right, &mut path);
+    InterpError::IncompatibleSetOpTypes(Box::new(crate::error::SetOpConflict {
+        column: column.name().clone(),
+        branch,
+        path,
+        left: l,
+        right: r,
+        left_type: left.to_string(),
+        right_type: right.to_string(),
+    }))
+}
+
+/// Descend two types that have no supertype to the first place they disagree, extending
+/// `path` as it goes, and describe each side there.
+///
+/// It asks [`promote_union_type`] at every level rather than restating when two types meet:
+/// a struct and a list are walked only because the lattice unifies them through their
+/// children, and a child is named only when *it* is what the lattice refuses. A whole
+/// nested type printed twice, which is what the error used to show, leaves the reader to
+/// diff two long type strings by eye to find the one field that differs.
+fn first_conflict(left: &DataType, right: &DataType, path: &mut String) -> (String, String) {
+    use DataType::{FixedSizeList, LargeList, List, Struct};
+    match (left, right) {
+        (Struct(lf), Struct(rf)) => {
+            // A struct unifies only with an identical struct, so the first field that is
+            // missing, misplaced, or not *identical* is the conflict.
+            for (i, l) in lf.iter().enumerate() {
+                let Some((j, r)) = rf.find(l.name()) else {
+                    path.push_str(&format!(".{}", l.name()));
+                    return (l.data_type().to_string(), "no such field".into());
+                };
+                if l.data_type() != r.data_type() {
+                    path.push_str(&format!(".{}", l.name()));
+                    return first_conflict(l.data_type(), r.data_type(), path);
+                }
+                if l.is_nullable() != r.is_nullable() {
+                    path.push_str(&format!(".{}", l.name()));
+                    let null = |f: &Field| {
+                        if f.is_nullable() {
+                            "nullable"
+                        } else {
+                            "non-null"
+                        }
+                    };
+                    return (
+                        format!("{} {}", null(l), l.data_type()),
+                        format!("{} {}", null(r), r.data_type()),
+                    );
+                }
+                if i != j {
+                    return (
+                        format!("field `{}` at position {i}", l.name()),
+                        format!("at position {j}"),
+                    );
+                }
+            }
+            match rf.iter().find(|r| lf.find(r.name()).is_none()) {
+                Some(extra) => {
+                    path.push_str(&format!(".{}", extra.name()));
+                    ("no such field".into(), extra.data_type().to_string())
+                }
+                None => (left.to_string(), right.to_string()),
+            }
+        }
+        (
+            List(l) | LargeList(l) | FixedSizeList(l, _),
+            List(r) | LargeList(r) | FixedSizeList(r, _),
+        ) if promote_union_type(l.data_type(), r.data_type()).is_none() => {
+            path.push_str("[]");
+            first_conflict(l.data_type(), r.data_type(), path)
+        }
+        _ => (left.to_string(), right.to_string()),
+    }
 }
 
 /// The common type two set-operation branch columns must both widen to, so neither side is
@@ -331,7 +404,57 @@ mod union_coerce_tests {
         let b = batch("x", DataType::Utf8, Arc::new(StringArray::from(vec!["z"])));
         assert!(matches!(
             coerce_union_branches(vec![a, b]),
-            Err(InterpError::IncompatibleSetOpTypes { .. })
+            Err(InterpError::IncompatibleSetOpTypes(_))
         ));
+    }
+
+    /// A nested conflict names the column and the field path, not "column 0" and two whole
+    /// struct types to diff by eye.
+    #[test]
+    fn a_nested_conflict_names_the_column_and_the_field_path() {
+        use arrow::datatypes::Fields;
+        let inner = |t: DataType| {
+            DataType::Struct(Fields::from(vec![Field::new(
+                "x",
+                DataType::Struct(Fields::from(vec![Field::new("y", t, true)])),
+                true,
+            )]))
+        };
+        let msg = |l: &DataType, r: &DataType| {
+            let mut path = "s".to_string();
+            let (a, b) = first_conflict(l, r, &mut path);
+            format!("{path}: {a} vs {b}")
+        };
+        assert_eq!(
+            msg(&inner(DataType::Int64), &inner(DataType::Utf8)),
+            "s.x.y: Int64 vs Utf8"
+        );
+        let list = |t: DataType| DataType::List(Arc::new(Field::new("item", inner(t), true)));
+        assert_eq!(
+            msg(&list(DataType::Int64), &list(DataType::Utf8)),
+            "s[].x.y: Int64 vs Utf8"
+        );
+        let missing = DataType::Struct(Fields::from(vec![Field::new("z", DataType::Int64, true)]));
+        assert_eq!(
+            msg(&inner(DataType::Int64), &missing),
+            r#"s.x: Struct("y": Int64) vs no such field"#
+        );
+
+        let schema = |t: DataType| Arc::new(Schema::new(vec![Field::new("s", t, true)]));
+        let empty = |t: DataType| RecordBatch::new_empty(schema(t));
+        let err = coerce_union_branches(vec![
+            empty(inner(DataType::Int64)),
+            empty(inner(DataType::Utf8)),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("column `s`") && err.contains("at `s.x.y`"),
+            "{err}"
+        );
+        assert!(
+            err.contains("Int64 (earlier branches) vs Utf8 (branch 1)"),
+            "{err}"
+        );
     }
 }

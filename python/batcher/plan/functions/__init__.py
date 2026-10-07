@@ -26,6 +26,7 @@ from batcher.plan.functions.aggregate import (
 )
 from batcher.plan.functions.collection import (
     element,
+    element_index,
     map_from_arrays,
     named_struct,
     sequence,
@@ -152,6 +153,7 @@ __all__ = [
     "date_sub",
     "e",
     "element",
+    "element_index",
     "elt",
     "ends_with_role",
     "extract_after",

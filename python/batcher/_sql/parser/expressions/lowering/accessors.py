@@ -91,10 +91,13 @@ def accessor_namespaces() -> tuple[str, ...]:
 #: * ``list_filter``/``list_transform`` take a lambda (``list_filter(l, x -> x > 0)``);
 #: * ``list_unique`` is DuckDB's *count* of distinct elements, and the list itself is
 #:   ``list_distinct``;
-#: * ``.str.join`` is an aggregate, spelled ``string_agg``.
+#: * ``.str.join`` is an aggregate, spelled ``string_agg``;
+#: * ``json_decode`` (and DuckDB's ``json_transform``) takes a type *structure* document;
+#: * ``struct_rename_fields`` takes its ``{old: new}`` mapping as trailing name pairs.
 _CURATED_ELSEWHERE = frozenset(
     {
         "jsonarraylength",
+        "jsondecode",
         "jsonexists",
         "jsonextractstring",
         "jsonkeys",
@@ -103,6 +106,7 @@ _CURATED_ELSEWHERE = frozenset(
         "listtransform",
         "listunique",
         "strjoin",
+        "structrenamefields",
     }
 )
 

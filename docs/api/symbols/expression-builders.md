@@ -23,6 +23,7 @@ column reference, a literal, a conditional, and the constructors for the composi
    nullif
    iff
    element
+   element_index
    struct
    named_struct
    map_from_arrays

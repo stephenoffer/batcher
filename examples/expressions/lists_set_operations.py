@@ -31,11 +31,13 @@ def main() -> None:
         overlaps=col("before").list.has_any(col("after")),
         # Concatenation keeps duplicates; union does not.
         appended=col("before").list.concat(col("after")),
-        # Set similarity: |intersection| / |union|. Build it from the two set operators
-        # above. (`.list.jaccard` is a different thing -- a position-by-position
-        # agreement rate for `str.minhash` signatures, not a set overlap.)
+        # Set similarity: |intersection| / |union|, built from the two set operators
+        # above. `.list.jaccard(mode="set")` is the same number in one call. (Its default
+        # mode is a different thing: a position-by-position agreement rate for
+        # `str.minhash` signatures, not a set overlap.)
         shared=col("before").list.intersect(col("after")).list.len(),
         combined=col("before").list.union(col("after")).list.len(),
+        set_jaccard=col("before").list.jaccard(col("after"), mode="set"),
     )
 
     result = diffed.to_pydict()
@@ -57,6 +59,7 @@ def main() -> None:
     ]
     print(jaccard)
     assert jaccard[0] == 0.5
+    assert result["set_jaccard"][0] == 0.5
 
 
 if __name__ == "__main__":

@@ -267,24 +267,80 @@ class ListZip(IRNode):
     right: Expr = child()
 
 
+#: The names a list lambda body binds itself: the element (`bt.element()`) and its 0-based
+#: position in its list (`bt.element_index()`). Must match `eval/list_ops/list_hof.rs`.
+ELEMENT_COL = "element"
+ELEMENT_INDEX_COL = "element_index"
+LAMBDA_BOUND = frozenset({ELEMENT_COL, ELEMENT_INDEX_COL})
+
+
 @expr_node
 class ListTransform(IRNode):
-    """`list.transform(func)` — apply the element sub-expression `func` (over
-    ``element()``) to every list element, preserving lengths. → List."""
+    """`list.transform(func)` — apply the element sub-expression `func` to every list
+    element, preserving lengths. → List.
+
+    `func` is a lambda body: ``element()`` and ``element_index()`` are bound by the node,
+    and every other column it reads is a *capture* -- ``captures[i]`` is evaluated over
+    the enclosing row and bound inside the body as ``capture_names[i]``. The captures are
+    ordinary children, so a rewrite of the enclosing projection reaches them; the body
+    itself is scoped and rewrites stop at it."""
 
     tag = ExprTag.LIST_TRANSFORM
     input: Expr = child()
     func: Expr = child()
+    captures: tuple[Expr, ...] = children(omit_falsy=True, default=())
+    capture_names: tuple[str, ...] = scalar(omit_falsy=True, default=())
 
 
 @expr_node
 class ListFilter(IRNode):
     """`list.filter(pred)` — keep elements where the boolean element predicate `pred`
-    (over ``element()``) is true. → List."""
+    is true. → List. Scoped exactly as `ListTransform`'s body is."""
 
     tag = ExprTag.LIST_FILTER
     input: Expr = child()
     pred: Expr = child()
+    captures: tuple[Expr, ...] = children(omit_falsy=True, default=())
+    capture_names: tuple[str, ...] = scalar(omit_falsy=True, default=())
+
+
+@expr_node
+class ListZipStruct(IRNode):
+    """`list.zip(other, pad=)` — pair two lists element by element into
+    ``List<Struct<left, right>>``. Unequal lengths raise unless `pad`. → List."""
+
+    tag = ExprTag.LIST_ZIP_STRUCT
+    left: Expr = child()
+    right: Expr = child()
+    pad: bool = scalar(omit_falsy=True, default=False)
+
+
+@expr_node
+class StructUpdate(IRNode):
+    """Edit a struct's fields: drop `drop`, rename each ``(old, new)`` in `rename`, then
+    set ``names[i]`` to ``values[i]`` (replacing in place, else appending). The input's
+    null mask and untouched fields, metadata included, are kept. → Struct."""
+
+    tag = ExprTag.STRUCT_UPDATE
+    input: Expr = child()
+    names: tuple[str, ...] = scalar(omit_falsy=True, default=())
+    values: tuple[Expr, ...] = children(omit_falsy=True, default=())
+    drop: tuple[str, ...] = scalar(omit_falsy=True, default=())
+    rename: tuple[tuple[str, str], ...] = scalar(omit_falsy=True, default=())
+
+
+@expr_node
+class JsonDoc(IRNode):
+    """A whole-document JSON function: `decode`/`decode_strict` text into the type `dtype`
+    (the nested wire form of `plan.types.dtype_to_wire`), `encode` a value as JSON text,
+    or `merge_patch` the document with the RFC 7386 patch in `other`."""
+
+    tag = ExprTag.JSON_DOC
+    vocab = frozenset({"decode", "decode_strict", "encode", "merge_patch"})
+    fn: str = scalar()
+    input: Expr = child()
+    other: Expr | None = child(omit_none=True, default=None)
+    dtype: str | tuple | None = scalar(omit_none=True, default=None)
 
 
 @expr_node

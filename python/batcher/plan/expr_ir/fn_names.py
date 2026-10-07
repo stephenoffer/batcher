@@ -128,7 +128,8 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "json_object_keys", "json_type", "json_value", "json_contains", "json_pretty",
         "json_structure", "chr", "to_base", "bin", "format_bytes", "format_bytes_si",
         "damerau_levenshtein", "jaro_similarity", "jaro_winkler_similarity",
-        "json_extract", "json_extract_string", "l_trim",
+        "json_extract", "json_extract_all", "json_extract_string", "json_extract_string_all",
+        "l_trim",
         "len", "levenshtein", "like", "lower",
         "lpad", "mask", "md5", "minhash", "octet_length", "overlay", "position", "r_trim",
         "regexp_count", "regexp_extract", "regexp_extract_all", "regexp_matches",
@@ -197,8 +198,8 @@ LIST_FNS: Final[frozenset[str]] = frozenset(
         "l2_norm", "len", "log_softmax",
         "max", "max_abs", "mean", "median", "min", "n_unique", "n_unique_with_nulls",
         "normalize", "product", "reverse", "softmax", "sort", "sort_desc",
-        "sort_desc_nulls_first", "sort_nulls_first", "std", "sum", "unique",
-        "unique_with_nulls", "var",
+        "sort_desc_nulls_first", "sort_nulls_first", "std", "std_pop", "sum", "unique",
+        "unique_with_nulls", "var", "var_pop",
     }
 )  # fmt: skip
 

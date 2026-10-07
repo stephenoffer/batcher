@@ -90,6 +90,8 @@ _LITERAL_ARGS: tuple[tuple, ...] = (
     # whose falsy-mapping branch returns the receiver unchanged -- so the sweep checked
     # the identity, not the method. Last, so no other method's shape changes.
     ({1: 2},),
+    # A field-renaming table for `.struct.rename_fields`, after the remap above.
+    ({"x": "z"},),
 )  # fmt: skip
 
 #: Columns offered as an argument, before any literal.

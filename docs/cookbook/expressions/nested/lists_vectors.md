@@ -4,6 +4,8 @@ A list column of floats is an embedding. Keeping it in the engine means a simila
 
 The script scores three small vectors against a query with `cosine_similarity`, `cosine_distance`, `dot`, and `euclidean_distance`, and shows why a vector scaled by two has the same cosine similarity but a different L2 distance. It checks `l2_norm`, `len`, and unit norm, normalizes a vector, and finishes with the nearest-neighbor ranking these functions exist for.
 
+The distance functions need two vectors of one dimension. When both columns are fixed-size lists whose declared sizes differ, such as a 2-element and a 3-element embedding, the plan fails with a `PlanError` naming both columns before any row is read. Variable-length lists are checked per row as they are scored.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/lists_vectors.py

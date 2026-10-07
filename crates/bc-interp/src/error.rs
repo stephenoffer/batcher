@@ -54,18 +54,11 @@ pub enum InterpError {
     #[error("failed to build a thread pool with {0} workers")]
     ThreadPool(usize),
 
-    #[error(
-        "set operation (UNION/INTERSECT/EXCEPT) column {col} has incompatible branch \
-         types {left} and {right} with no common type"
-    )]
-    IncompatibleSetOpTypes {
-        /// The 0-based output column whose branch types cannot be unified.
-        col: usize,
-        /// The type accumulated from the earlier branch(es).
-        left: String,
-        /// The conflicting later-branch type.
-        right: String,
-    },
+    /// A set operation's branches disagree on a column's type with no common supertype.
+    /// Boxed: the conflict carries the path and both types, and an unboxed variant that
+    /// size would widen every `Result<_, InterpError>` in the crate.
+    #[error("{0}")]
+    IncompatibleSetOpTypes(Box<SetOpConflict>),
 
     #[error(
         "malformed partial-state batch: expected {expected} columns \
@@ -143,4 +136,42 @@ pub enum InterpError {
 
     #[error(transparent)]
     Arrow(#[from] ArrowError),
+}
+
+/// Where the branches of a set operation stop agreeing on one column's type.
+#[derive(Debug)]
+pub struct SetOpConflict {
+    /// The output column whose branch types cannot be unified, by name.
+    pub column: String,
+    /// The 0-based branch whose type first conflicted with the earlier branches'.
+    pub branch: usize,
+    /// Where inside the column the types first disagree: the column name itself for a
+    /// flat type, `s.x.y` for a struct field, `s.items[]` for a list's elements.
+    pub path: String,
+    /// What the earlier branch(es) hold at `path`.
+    pub left: String,
+    /// What the conflicting branch holds at `path`.
+    pub right: String,
+    /// The whole column type accumulated from the earlier branch(es).
+    pub left_type: String,
+    /// The conflicting branch's whole column type.
+    pub right_type: String,
+}
+
+impl std::fmt::Display for SetOpConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "set operation (UNION/INTERSECT/EXCEPT) column `{}` has no common type across its \
+             branches: at `{}`, {} (earlier branches) vs {} (branch {}); whole column types: \
+             {} and {}",
+            self.column,
+            self.path,
+            self.left,
+            self.right,
+            self.branch,
+            self.left_type,
+            self.right_type
+        )
+    }
 }

@@ -29,6 +29,8 @@ def main() -> None:
         med=col("samples").list.median(),
         spread=col("samples").list.std(),
         variance=col("samples").list.var(),
+        # `ddof=0` is the population form (DuckDB `list_var_pop`), as on `Expr.var`.
+        pop_variance=col("samples").list.var(ddof=0),
         distinct=col("samples").list.n_unique(),
         product=col("samples").list.product(),
         # Index of the smallest / largest element.
@@ -50,6 +52,8 @@ def main() -> None:
     assert result["lo"] == [1.0, 10.0]
     assert result["hi"] == [4.0, 20.0]
     assert result["avg"] == [2.25, 15.0]
+    assert result["variance"][1] == 50.0
+    assert result["pop_variance"][1] == 25.0
     assert result["distinct"] == [3, 2]
     assert result["product"] == [12.0, 200.0]
     assert result["argmin"][0] == 1

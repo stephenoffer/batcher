@@ -430,6 +430,12 @@ DECLINED_EXPRS: dict[str, str] = {
     "list_zip": "returns a list column, which the host backend cannot construct",
     "make_map": "returns a map column, which the host backend cannot construct",
     "make_struct": "returns a struct column, which the host backend cannot construct",
+    "struct_update": "returns a struct column, which the host backend cannot construct",
+    "list_zip_struct": "returns a list column, which the host backend cannot construct",
+    # Decode builds a typed nested value and encode walks one; both are a Rust kernel
+    # (`bc-expr::eval::str::json::typed`) whose lenient-cast rules a translation would
+    # have to restate, and merge-patch is a recursive document edit with no column form.
+    "json_doc": "a JSON document kernel (`bc-expr::eval::str::json`) with no dataframe form",
     "map": "reads a map column; the construction half is declined, so the pair stays together",
     "sequence": "returns a list column, which the host backend cannot construct",
     # The engine parses with chrono and, when that fails, with a *partial* parse that fills in

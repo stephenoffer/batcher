@@ -79,6 +79,10 @@ _FN_METHOD = {
 
 _MAX_DEPTH = 6
 
+# Fields a builder derives from the arguments the user typed, which a source-like repr
+# omits: a list lambda's captures are read off its body.
+_DERIVED_FIELDS = ("captures", "capture_names")
+
 
 def render_expr(expr: Any, depth: int = 0) -> str:
     """Render an `Expr` node as a source-like string (used by ``Expr.__repr__``)."""
@@ -157,7 +161,8 @@ def _render_accessor(expr: Any, depth: int) -> str:
     args = [
         render_expr(v, depth + 1) if isinstance(v, Expr) else repr(v)
         for f in node_fields
-        if f.name not in ("fn", base_field.name) and (v := getattr(expr, f.name)) is not None
+        if f.name not in ("fn", base_field.name, *_DERIVED_FIELDS)
+        and (v := getattr(expr, f.name)) is not None
     ]
     return f"{base}.{ns}.{name}({', '.join(args)})"
 

@@ -7,3 +7,5 @@
 //! and `map_from_entries` are the next two, and both are construction rather than access.
 
 pub(crate) mod make_map;
+
+pub(crate) mod struct_update;

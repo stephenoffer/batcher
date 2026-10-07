@@ -22,6 +22,7 @@ use arrow::array::{
 use serde::Deserialize;
 
 mod analyze;
+mod dtype;
 mod error;
 mod select;
 mod subset;
@@ -417,18 +418,77 @@ pub enum Expr {
         right: Box<Expr>,
     },
 
-    /// `list.transform(func)` — apply the element sub-expression `func` (which reads
-    /// the reserved `element` column) to every list element, preserving lengths.
-    ListTransform { input: Box<Expr>, func: Box<Expr> },
+    /// `list.transform(func)` — apply the element sub-expression `func` to every list
+    /// element, preserving lengths. `func` reads the reserved `element` and
+    /// `element_index` columns, plus one column per capture: `captures[i]`, evaluated
+    /// over the *enclosing* row and repeated for each of its elements, under the name
+    /// `capture_names[i]`. That is how a lambda body reads an outer column.
+    ListTransform {
+        input: Box<Expr>,
+        func: Box<Expr>,
+        #[serde(default)]
+        captures: Vec<Expr>,
+        #[serde(default)]
+        capture_names: Vec<String>,
+    },
 
     /// `list.filter(pred)` — keep the elements where the boolean element predicate
-    /// `pred` (reading the reserved `element` column) is true.
-    ListFilter { input: Box<Expr>, pred: Box<Expr> },
+    /// `pred` is true. Scoped exactly as [`Expr::ListTransform`]'s body is.
+    ListFilter {
+        input: Box<Expr>,
+        pred: Box<Expr>,
+        #[serde(default)]
+        captures: Vec<Expr>,
+        #[serde(default)]
+        capture_names: Vec<String>,
+    },
 
     /// Struct construction (SQL `struct_pack` / Spark `struct`) — each row becomes a
     /// `Struct` with the named fields, each field's value being the per-row value of
     /// its sub-expression. The read-side counterpart is `StructField`.
     MakeStruct { fields: Vec<NamedExpr> },
+
+    /// Pair two lists element by element into a `List<Struct<left, right>>`
+    /// (`list.zip`; DuckDB `list_zip`). Two lists of different lengths are an error
+    /// unless `pad`, which extends the shorter with nulls. Null if either list is null.
+    ListZipStruct {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        #[serde(default)]
+        pad: bool,
+    },
+
+    /// Edit a struct's fields in place (`struct.with_fields` / `rename_fields` /
+    /// `drop_fields`; DuckDB `struct_update`/`struct_insert`). Applied in this order:
+    /// `drop` removes fields, `rename` renames survivors (`[old, new]` pairs), then each
+    /// `values[i]` replaces the field `names[i]` where it exists and is appended where it
+    /// does not. The outer null mask and every untouched child — its data, nullability and
+    /// field metadata — are kept as they were, so a null struct stays null rather than
+    /// becoming a struct of nulls.
+    StructUpdate {
+        input: Box<Expr>,
+        #[serde(default)]
+        names: Vec<String>,
+        #[serde(default)]
+        values: Vec<Expr>,
+        #[serde(default)]
+        drop: Vec<String>,
+        #[serde(default)]
+        rename: Vec<(String, String)>,
+    },
+
+    /// A whole-document JSON function: decode text into a typed value (`dtype`, in the
+    /// nested wire form of `dtype.rs`), encode a value as JSON text, or apply an RFC 7386
+    /// merge patch taken from `other`.
+    JsonDoc {
+        #[serde(rename = "fn")]
+        func: JsonDocFunc,
+        input: Box<Expr>,
+        #[serde(default)]
+        other: Option<Box<Expr>>,
+        #[serde(default)]
+        dtype: Option<serde_json::Value>,
+    },
 
     /// Map construction (SQL `map(keys, values)` / Spark `map_from_arrays`) — each row
     /// pairs a `List` of keys with a `List` of values into one Arrow `Map` entry.
@@ -1886,6 +1946,12 @@ pub enum ListFunc {
     Std,
     /// Sample variance `Σ(x-mean)²/(n-1)` → Float64; null when n<2.
     Var,
+    /// Population standard deviation `sqrt(Σ(x-mean)²/n)` (`list.std(ddof=0)`, DuckDB
+    /// `list_stddev_pop`) → Float64; null for an empty or all-null row.
+    StdPop,
+    /// Population variance `Σ(x-mean)²/n` (`list.var(ddof=0)`, DuckDB `list_var_pop`)
+    /// → Float64; null for an empty or all-null row.
+    VarPop,
     /// Distinct elements preserving first-occurrence order → `List` (same element
     /// type); null elements are dropped.
     Unique,
@@ -2036,6 +2102,21 @@ pub enum MathFunc {
     /// and beyond that NaN. A node beside its two siblings, and more accurate near zero
     /// than `0.5 * ln((1 + x) / (1 - x))`, which loses precision to cancellation there.
     Atanh,
+}
+
+/// The whole-document JSON functions carried by [`Expr::JsonDoc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonDocFunc {
+    /// JSON text → `dtype`, as DuckDB `json_transform` reads it; a value that does not
+    /// fit, and a document that does not parse, is null.
+    Decode,
+    /// [`JsonDocFunc::Decode`] raising instead of nulling (DuckDB `json_transform_strict`).
+    DecodeStrict,
+    /// Any value → compact JSON text (DuckDB `to_json`).
+    Encode,
+    /// RFC 7386 merge of the patch in `other` into the document (DuckDB `json_merge_patch`).
+    MergePatch,
 }
 
 /// String functions. `upper`/`lower` → Utf8; `len` → Int64; `contains`/
@@ -2210,6 +2291,16 @@ pub enum StrFunc {
     /// JSON array column into a list column that `explode` and `.list` can work on.
     /// → List<Utf8>.
     JsonArrayValues,
+    /// Every element of the JSON array at `pattern` path, each rendered as
+    /// [`StrFunc::JsonExtract`] renders a leaf: DuckDB `json_extract(doc, '<path>[*]')`.
+    /// `pattern` is the path *before* the trailing `[*]`. An absent path or a non-array
+    /// is the **empty** list, as in DuckDB; a null or malformed document is null.
+    /// → List<Utf8>.
+    JsonExtractAll,
+    /// [`StrFunc::JsonExtractAll`] with each element rendered as
+    /// [`StrFunc::JsonExtractString`] renders one (unquoted, a JSON null as a null
+    /// element): DuckDB `json_extract_string(doc, '<path>[*]')`. → List<Utf8>.
+    JsonExtractStringAll,
     /// The JSON type at `pattern` path: `object`, `array`, `string`, `number`,
     /// `boolean`, or `null`; null if the path is absent. → Utf8.
     JsonType,

@@ -49,6 +49,7 @@ from batcher.plan.expr_ir.func_nodes import (
     DateOffset,
     DateTrunc,
     GeoFunc,
+    JsonDoc,
     ListBinary,
     ListContains,
     ListFilter,
@@ -61,6 +62,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListSlice,
     ListTransform,
     ListZip,
+    ListZipStruct,
     MakeTemporal,
     MapFunc,
     SpatialFunc,
@@ -69,6 +71,7 @@ from batcher.plan.expr_ir.func_nodes import (
     StrFuncDyn,
     Strptime,
     StructField,
+    StructUpdate,
     WindowBuckets,
     WindowStart,
 )
@@ -210,6 +213,10 @@ def _representatives() -> dict[str, Any]:
         "list_zip": ListZip("list_add", Col("a"), Col("b")),
         "list_transform": ListTransform(Col("a"), _ELEM),
         "list_filter": ListFilter(Col("a"), _PRED),
+        "list_filter_captures": ListFilter(Col("a"), _PRED, (Col("th"),), ("th",)),
+        "list_zip_struct": ListZipStruct(Col("a"), Col("b")),
+        "list_zip_struct_pad": ListZipStruct(Col("a"), Col("b"), pad=True),
+        "list_func_var_pop": ListFunc("var_pop", Col("a")),
         "list_get": ListGet(Col("a"), -1),
         "list_get_dyn": ListGetDyn(Col("a"), Col("i")),
         "list_contains": ListContains(Col("a"), 5),
@@ -218,6 +225,15 @@ def _representatives() -> dict[str, Any]:
         "list_slice_full": ListSlice(Col("a"), 1, 2),
         # --- struct / map -------------------------------------------------------
         "struct_field": StructField(Col("s"), "field"),
+        "struct_update_min": StructUpdate(Col("s"), drop=("a",)),
+        "struct_update_full": StructUpdate(
+            Col("s"), names=("x",), values=(Lit(1),), drop=("a",), rename=(("b", "c"),)
+        ),
+        "json_doc_decode": JsonDoc(
+            "decode", Col("j"), dtype=("struct", (("a", ("list", "int64")),))
+        ),
+        "json_doc_encode": JsonDoc("encode", Col("s")),
+        "json_doc_merge_patch": JsonDoc("merge_patch", Col("j"), other=Lit("{}")),
         "map_simple": MapFunc("map_keys", Col("m")),
         "map_element_at": MapFunc("element_at", Col("m"), key="k"),
         # --- multimodal ---------------------------------------------------------

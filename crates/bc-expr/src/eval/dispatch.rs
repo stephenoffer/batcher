@@ -20,7 +20,9 @@ use crate::eval::list::{
     eval_array, eval_list, eval_list_binary, eval_list_contains, eval_list_join,
     eval_list_position, eval_make_struct, rebuild_list, require_list,
 };
-use crate::eval::list_ops::{eval_list_filter, eval_list_set, eval_list_transform, eval_list_zip};
+use crate::eval::list_ops::{
+    eval_list_filter, eval_list_set, eval_list_transform, eval_list_zip, lambda_scope,
+};
 use crate::eval::map::{eval_map, eval_struct_field};
 use crate::eval::math::{eval_extreme, eval_is_inf, eval_is_nan, eval_math, eval_math2};
 use crate::eval::media::image::ImageArgs;
@@ -366,9 +368,60 @@ impl Expr {
                 let (l, r) = (left.eval(batch)?, right.eval(batch)?);
                 eval_list_zip(*op, &l, &r)
             }
-            Expr::ListTransform { input, func } => eval_list_transform(&input.eval(batch)?, func),
-            Expr::ListFilter { input, pred } => eval_list_filter(&input.eval(batch)?, pred),
+            Expr::ListTransform {
+                input,
+                func,
+                captures,
+                capture_names,
+            } => {
+                let scope = lambda_scope(capture_names, captures, batch)?;
+                eval_list_transform(&input.eval(batch)?, func, &scope)
+            }
+            Expr::ListFilter {
+                input,
+                pred,
+                captures,
+                capture_names,
+            } => {
+                let scope = lambda_scope(capture_names, captures, batch)?;
+                eval_list_filter(&input.eval(batch)?, pred, &scope)
+            }
             Expr::MakeStruct { fields } => eval_make_struct(fields, batch),
+            Expr::ListZipStruct { left, right, pad } => {
+                let (l, r) = (left.eval(batch)?, right.eval(batch)?);
+                crate::eval::list_ops::list_zip::eval_list_zip_struct(&l, &r, *pad)
+            }
+            Expr::StructUpdate {
+                input,
+                names,
+                values,
+                drop,
+                rename,
+            } => {
+                let set = names
+                    .iter()
+                    .zip(values)
+                    .map(|(n, v)| Ok((n.as_str(), v.eval(batch)?)))
+                    .collect::<Result<Vec<_>, ExprError>>()?;
+                crate::eval::map_ops::struct_update::eval_struct_update(
+                    &input.eval(batch)?,
+                    &set,
+                    drop,
+                    rename,
+                )
+            }
+            Expr::JsonDoc {
+                func,
+                input,
+                other,
+                dtype,
+            } => eval_json_doc(
+                *func,
+                &input.eval(batch)?,
+                other.as_deref(),
+                dtype.as_ref(),
+                batch,
+            ),
             Expr::MakeMap { keys, values } => crate::eval::map_ops::make_map::eval_make_map(
                 &keys.eval(batch)?,
                 &values.eval(batch)?,
@@ -547,6 +600,34 @@ fn is_constant_chain(expr: &Expr) -> bool {
 fn broadcast_row(one: &ArrayRef, n: usize) -> Result<ArrayRef, ExprError> {
     let zeros = arrow::array::UInt32Array::from(vec![0u32; n]);
     Ok(arrow::compute::take(one.as_ref(), &zeros, None)?)
+}
+
+/// [`Expr::JsonDoc`]: the decode target and the patch are checked here, where a plan built
+/// without the control plane would otherwise reach the kernel with neither.
+fn eval_json_doc(
+    func: crate::JsonDocFunc,
+    input: &ArrayRef,
+    other: Option<&Expr>,
+    dtype: Option<&serde_json::Value>,
+    batch: &RecordBatch,
+) -> Result<ArrayRef, ExprError> {
+    use crate::eval::str::json;
+    use crate::JsonDocFunc;
+    let missing = |arg: &'static str| ExprError::MissingArgument {
+        func: format!("json.{func:?}"),
+        arg,
+    };
+    match func {
+        JsonDocFunc::Decode | JsonDocFunc::DecodeStrict => {
+            let target = crate::dtype::dtype_from_wire(dtype.ok_or_else(|| missing("dtype"))?)?;
+            json::decode(input, &target, func == JsonDocFunc::DecodeStrict)
+        }
+        JsonDocFunc::Encode => json::encode(input),
+        JsonDocFunc::MergePatch => {
+            let patch = other.ok_or_else(|| missing("patch"))?.eval(batch)?;
+            json::merge_patch(input, &patch)
+        }
+    }
 }
 
 #[cfg(test)]

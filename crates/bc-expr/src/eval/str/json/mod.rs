@@ -9,57 +9,18 @@
 //! wide document — the semistructured common case — reaching `$.a` touches the bytes up to
 //! `a` and skips the rest, instead of materializing the entire object graph.
 //!
-//! Path syntax matches the SQL / `.json` accessor: a `$`-rooted dotted path with optional
-//! numeric array subscripts, e.g. `$.user.id`, `$.tags[0]`, `$.a.b[2].c`. A leading `$` is
-//! optional. Structural skipping is string- and escape-aware; leaf values keep exact
-//! `serde_json` semantics, so results stay bit-for-bit identical to a full parse.
+//! Path syntax is the singular-query subset of RFC 9535 that [`path`] parses: `$.user.id`,
+//! `$.tags[0]`, `$."x.y"[-1]`. Structural skipping is string- and escape-aware; leaf values
+//! keep exact `serde_json` semantics, so results stay bit-for-bit identical to a full parse.
 
+mod patch;
+mod path;
+mod typed;
+
+pub(in crate::eval) use patch::merge_patch;
+pub(super) use path::{parse_path, PathPart};
 use serde_json::Value;
-
-/// One step of a JSON path: an object key or an array index.
-///
-/// The index is signed: a non-negative index counts from the front (`[0]` is the
-/// first element), a negative index counts from the back (`[-1]` is the last),
-/// matching DuckDB's JSON path semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum PathPart {
-    Key(String),
-    Index(i64),
-}
-
-/// Parse a `$.a.b[0].c` path into its component steps.
-///
-/// The leading `$` is optional. Dots separate object keys; `[n]` selects an array
-/// element (`[-1]` the last, counting from the back — DuckDB semantics). A key that
-/// itself carries a subscript (`tags[0]`) splits into a [`PathPart::Key`] followed by
-/// a [`PathPart::Index`]. Empty segments are ignored, so `$.a`, `a`, and `.a` are
-/// equivalent.
-pub(super) fn parse_path(path: &str) -> Vec<PathPart> {
-    let mut parts = Vec::new();
-    for segment in path.trim_start_matches('$').split('.') {
-        if segment.is_empty() {
-            continue;
-        }
-        // A segment is `name`, `name[0]`, `name[0][1]`, or a bare `[0]`.
-        let (name, rest) = match segment.find('[') {
-            Some(idx) => (&segment[..idx], &segment[idx..]),
-            None => (segment, ""),
-        };
-        if !name.is_empty() {
-            parts.push(PathPart::Key(name.to_string()));
-        }
-        // Peel off each `[n]` subscript in the remainder.
-        let mut cur = rest;
-        while let Some(close) = cur.find(']') {
-            let inner = cur[1..close].trim();
-            if let Ok(idx) = inner.parse::<i64>() {
-                parts.push(PathPart::Index(idx));
-            }
-            cur = &cur[close + 1..];
-        }
-    }
-    parts
-}
+pub(in crate::eval) use typed::{decode, encode};
 
 /// The raw slice of the value at `path` within `text`, or `None` if the document is
 /// not valid enough to navigate or the path is absent.
@@ -534,6 +495,48 @@ pub(super) fn array_values(text: &str, path: &[PathPart]) -> Option<Vec<Option<S
     }
 }
 
+/// Every element of the array at `path`, for a path ending in `[*]` (DuckDB's wildcard).
+///
+/// `as_json` picks the rendering: [`extract_json`]'s (a string keeps its quotes, a JSON null
+/// is `null`) or [`render_leaf`]'s (unquoted, a JSON null is a null element), which are the
+/// two SQL spellings `json_extract` and `json_extract_string`. DuckDB answers the *empty*
+/// list where the path is absent or the value there is not an array, and so does this; only
+/// a document that does not parse is `None`, where DuckDB raises.
+pub(super) fn extract_all(
+    text: &str,
+    path: &[PathPart],
+    as_json: bool,
+) -> Option<Vec<Option<String>>> {
+    serde_json::from_str::<serde::de::IgnoredAny>(text).ok()?;
+    let Some(raw) = seek(text, path).filter(|r| r.starts_with('[')) else {
+        return Some(Vec::new());
+    };
+    let bytes = raw.as_bytes();
+    let mut out = Vec::new();
+    let mut i = skip_ws(bytes, 1);
+    if bytes.get(i) == Some(&b']') {
+        return Some(out);
+    }
+    loop {
+        let end = skip_value(bytes, i)?;
+        let element = &raw[i..end];
+        out.push(if as_json {
+            match render_leaf(element) {
+                Some(_) if element.starts_with('"') => Some(compact(element)),
+                None => Some("null".to_string()),
+                other => other,
+            }
+        } else {
+            render_leaf(element)
+        });
+        i = skip_ws(bytes, end);
+        match bytes.get(i)? {
+            b',' => i = skip_ws(bytes, i + 1),
+            _ => return Some(out),
+        }
+    }
+}
+
 /// Render one already-located JSON value as text: a string leaf verbatim, a container as
 /// `json_value(doc, path)` — the value at `path` as text, **null for a container**.
 ///
@@ -798,7 +801,7 @@ mod tests {
     use super::*;
 
     fn parts(p: &str) -> Vec<PathPart> {
-        parse_path(p)
+        parse_path(p).unwrap()
     }
 
     #[test]
@@ -882,6 +885,26 @@ mod tests {
         // `extract_string` cannot tell these apart — that is why `path_exists` exists.
         assert_eq!(extract_string(doc, &parts("$.z")), None);
         assert_eq!(extract_string(doc, &parts("$.other")), None);
+    }
+
+    #[test]
+    fn a_wildcard_tail_lists_every_element_in_both_renderings() {
+        let doc = r#"{"a": [1, "x", null, {"b": 2}]}"#;
+        let p = parts("$.a");
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            extract_all(doc, &p, true),
+            Some(vec![s("1"), s("\"x\""), s("null"), s(r#"{"b":2}"#)])
+        );
+        assert_eq!(
+            extract_all(doc, &p, false),
+            Some(vec![s("1"), s("x"), None, s(r#"{"b":2}"#)])
+        );
+        // DuckDB: an absent path and a non-array are the empty list, not null.
+        assert_eq!(extract_all(r#"{"a": 1}"#, &p, true), Some(vec![]));
+        assert_eq!(extract_all("{}", &p, false), Some(vec![]));
+        assert_eq!(extract_all(r#"{"a": []}"#, &p, false), Some(vec![]));
+        assert_eq!(extract_all("nope", &p, false), None);
     }
 
     #[test]
@@ -1280,7 +1303,7 @@ mod tests {
             "$.event.items",
         ]
         .iter()
-        .map(|p| parse_path(p))
+        .map(|p| parse_path(p).unwrap())
         .collect();
         let iters = 200_000usize;
 

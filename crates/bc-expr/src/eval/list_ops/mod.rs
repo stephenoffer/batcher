@@ -20,7 +20,7 @@ pub(crate) mod simhash;
 pub(crate) use coerce::{accumulate_pair, align_children, as_var_list};
 pub(crate) use gather::eval_list_gather;
 pub(crate) use lcs::eval_lcs_length;
-pub(crate) use list_hof::{eval_list_filter, eval_list_transform};
+pub(crate) use list_hof::{eval_list_filter, eval_list_transform, lambda_scope};
 pub(crate) use list_reshape::eval_flatten;
 pub(crate) use list_set::eval_list_set;
 pub(crate) use list_zip::eval_list_zip;
