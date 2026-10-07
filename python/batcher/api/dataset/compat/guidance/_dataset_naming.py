@@ -215,7 +215,7 @@ DATASET_RAY_DATA: dict[str, str] = {
     "write_webdataset": (
         "Spelled ds.write.webdataset(path) here; bt.read.webdataset(path) reads the shards back."
     ),
-    "write_bigquery": "No BigQuery sink. Land Parquet with ds.write.parquet(path) and load it.",
+    "write_bigquery": "Spelled ds.write.bigquery(table, project=...) here.",
     "write_clickhouse": "Spelled ds.write.clickhouse(table, host=host) here.",
     "write_turbopuffer": (
         "No Turbopuffer sink. Write vectors with ds.write.parquet(path), or push them with "

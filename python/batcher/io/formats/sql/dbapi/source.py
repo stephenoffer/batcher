@@ -136,6 +136,8 @@ def _connect(module_name: str, connect_kwargs: dict[str, Any]) -> Any:
 
     Credentials arrive as ``env:``/``file:`` references and are resolved *here* — on the
     machine that opens the connection — so the pickled split carries only the reference.
+    Trino's auth object, which a plain keyword cannot carry, is built here from the resolved
+    password; see `vendors.connect`.
     """
     module = _import_driver(module_name)
     if not hasattr(module, "connect"):
@@ -147,7 +149,9 @@ def _connect(module_name: str, connect_kwargs: dict[str, Any]) -> Any:
         k: (resolve_secret(v, what=f"{module_name} {k}") if isinstance(v, str) else v)
         for k, v in connect_kwargs.items()
     }
-    return module.connect(**resolved)
+    from batcher.io.formats.sql.vendors.connect import adapt_connect_kwargs
+
+    return module.connect(**adapt_connect_kwargs(module_name, resolved))
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +165,27 @@ class _DBAPISplit:
     declared_schema: pa.Schema | None = None
     #: A caller-owned connection to borrow instead of opening one. Never closed here.
     borrowed: Any = field(default=None, repr=False, compare=False)
+    #: The vendor type rules (`vendors.types`): see `DBAPISource`.
+    unsigned: str = "refuse"
+    zero_dates: str = "refuse"
+    oracle_numbers: str = "native"
+
+    def _open(self) -> Any:
+        """A fresh connection, configured for the split's declared vendor type rules."""
+        from batcher.io.formats.sql.vendors.connect import prepare_connection
+
+        conn = _connect(self.module_name, self.connect_kwargs)
+        prepare_connection(conn, self.module_name, oracle_numbers=self.oracle_numbers)
+        return conn
+
+    def _batch(
+        self, rows: list[tuple], names: list[str], schema: pa.Schema | None
+    ) -> pa.RecordBatch:
+        """One block of rows as Arrow, with the vendor type rules applied."""
+        from batcher.io.formats.sql.vendors.types import conform
+
+        batch = rows_to_batch(rows, names, schema, zero_dates=self.zero_dates)
+        return conform(batch, unsigned=self.unsigned)
 
     def _driver_module(self) -> Any:
         """The driver module, for its PEP 249 type objects.
@@ -186,11 +211,7 @@ class _DBAPISplit:
         that shows up far away — the user's next query fails on a connection Batcher shut
         while they were not looking.
         """
-        conn = (
-            _as_dbapi_connection(self.borrowed)
-            if self.borrowed is not None
-            else _connect(self.module_name, self.connect_kwargs)
-        )
+        conn = _as_dbapi_connection(self.borrowed) if self.borrowed is not None else self._open()
         try:
             yield conn.cursor()
         finally:
@@ -221,11 +242,7 @@ class _DBAPISplit:
         a fresh catalog.
         """
         borrowed = self.borrowed is not None
-        conn = (
-            _as_dbapi_connection(self.borrowed)
-            if borrowed
-            else _connect(self.module_name, self.connect_kwargs)
-        )
+        conn = _as_dbapi_connection(self.borrowed) if borrowed else self._open()
         memo: dict[tuple[str, bool], Any] = {}
 
         def _run(sql: str, *, many: bool) -> Any:
@@ -275,7 +292,7 @@ class _DBAPISplit:
             # the server streaming a result set nobody is going to read.
             rows = cur.fetchmany(self.batch_size)
             if rows:
-                return rows_to_batch(list(rows), names, self.declared_schema).schema
+                return self._batch(list(rows), names, self.declared_schema).schema
             # No rows anywhere: the driver told us the column *names* but nothing can
             # tell us their types. Typing them `null` says exactly that — dropping the
             # columns instead would hand the planner an empty relation for a table that
@@ -295,9 +312,9 @@ class _DBAPISplit:
                 if self.declared_schema is not None:
                     # The user stated the types; they are authoritative and every batch is
                     # built against them.
-                    batch = rows_to_batch(list(rows), names, self.declared_schema)
+                    batch = self._batch(list(rows), names, self.declared_schema)
                 else:
-                    batch = rows_to_batch(list(rows), names, None)
+                    batch = self._batch(list(rows), names, None)
                     running, batch = reconcile(running, batch)
                 yield batch.select(projection) if projection is not None else batch
 
@@ -347,6 +364,13 @@ class DBAPISource:
         lower_bound: Approximate minimum of `partition_on`.
         upper_bound: Approximate maximum of `partition_on`.
         num_partitions: How many parallel queries to issue.
+        unsigned: ``"refuse"`` (default) raises, naming the column, on an unsigned 64-bit
+            value above 2^63-1 (MySQL ``BIGINT UNSIGNED``); ``"decimal"`` reads every
+            ``uint64`` column as ``decimal128(20, 0)``.
+        zero_dates: ``"refuse"`` (default) raises on a MySQL ``'0000-00-00'`` date the
+            driver returned as a string; ``"null"`` reads it as NULL.
+        oracle_numbers: ``"native"`` (default) keeps what python-oracledb returns, a float
+            for a fractional NUMBER; ``"decimal"`` fetches every NUMBER as an exact Decimal.
 
     Raises:
         BackendError: If the driver is not installed or is not a DB-API 2.0 module,
@@ -372,6 +396,9 @@ class DBAPISource:
     lower_bound: float | None = None
     upper_bound: float | None = None
     num_partitions: int = 1
+    unsigned: str = "refuse"
+    zero_dates: str = "refuse"
+    oracle_numbers: str = "native"
     #: Memoized `schema()`. `init=False` so it is not part of the public constructor, and
     #: `compare=False` so two sources that describe the same relation stay equal whether or
     #: not either has been asked for its schema yet — which matters because `identity()` and
@@ -383,6 +410,13 @@ class DBAPISource:
     def __post_init__(self) -> None:
         if self.query is None and self.table is None:
             raise BackendError("DBAPISource requires either query= or table=")
+        from batcher.io.formats.sql.vendors import types as vendor_types
+
+        vendor_types.check_policy("unsigned", self.unsigned, vendor_types.UNSIGNED_POLICIES)
+        vendor_types.check_policy("zero_dates", self.zero_dates, vendor_types.ZERO_DATE_POLICIES)
+        vendor_types.check_policy(
+            "oracle_numbers", self.oracle_numbers, vendor_types.ORACLE_NUMBER_POLICIES
+        )
         if self.uri is not None and not self.module:
             # The same URI `bt.read.sql` takes, resolved to a driver and its connect
             # kwargs. Doing it here rather than at the call site is what lets a URI reach
@@ -493,6 +527,9 @@ class DBAPISource:
             self.batch_size,
             self.schema_override,
             self.connection,
+            self.unsigned,
+            self.zero_dates,
+            self.oracle_numbers,
         )
 
     def schema(self) -> pa.Schema:

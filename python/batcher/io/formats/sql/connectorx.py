@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import Any
 
 import pyarrow as pa
 
@@ -61,7 +62,7 @@ def _read_arrow(
     The URI embeds credentials, so an `env:`/`file:` reference is resolved here — on the
     worker that opens the connection — never on the driver that built the split."""
     conn_uri = resolve_secret(conn_uri, what="ConnectorX conn_uri") or conn_uri
-    cx = require_module(_MODULE, extra=_EXTRA)
+    cx = _connectorx(conn_uri)
     if partition_on is not None and num_partitions > 1:
         return cx.read_sql(
             conn_uri,
@@ -73,6 +74,20 @@ def _read_arrow(
     return cx.read_sql(conn_uri, query, return_type="arrow")
 
 
+def _connectorx(conn_uri: str) -> Any:
+    """Import ConnectorX, or raise naming every route that reaches this URI's vendor."""
+    from batcher._internal.errors import MissingDependencyError
+    from batcher.io.formats.sql.vendors import install_hint
+
+    try:
+        return require_module(_MODULE, extra=_EXTRA)
+    except MissingDependencyError as exc:
+        advice = install_hint(conn_uri.partition("://")[0])
+        if advice is None:
+            raise
+        raise MissingDependencyError(f"{exc} {advice}", install=exc.install) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class _ConnectorXSplit:
     """A picklable ConnectorX read: a URI + the rewritten query (no live conn)."""
@@ -81,15 +96,19 @@ class _ConnectorXSplit:
     query: str
     partition_on: str | None
     num_partitions: int
+    unsigned: str = "refuse"
 
     def _table(self, projection: list[str] | None) -> pa.Table:
+        from batcher.io.formats.sql.vendors.types import conform_table
+
         sql = apply_projection(self.query, projection)
-        return _read_arrow(
+        table = _read_arrow(
             self.conn_uri,
             sql,
             partition_on=self.partition_on,
             num_partitions=self.num_partitions,
         )
+        return conform_table(table, unsigned=self.unsigned)
 
     def schema(self) -> pa.Schema:
         """The query's column types — which ConnectorX can only report by running it.
@@ -145,6 +164,9 @@ class ConnectorXSource(SingleResultQuerySource):
             parallel reads. ``None`` reads in a single partition.
         num_partitions: Number of balanced partitions (ignored if
             `partition_on` is None).
+        unsigned: ``"refuse"`` (default) raises, naming the column, on an unsigned 64-bit
+            value above 2^63-1 (MySQL ``BIGINT UNSIGNED``); ``"decimal"`` reads every
+            ``uint64`` column as ``decimal128(20, 0)``.
 
     Raises:
         BackendError: If `connectorx` is not installed.
@@ -163,6 +185,12 @@ class ConnectorXSource(SingleResultQuerySource):
     conn_uri: str = field(repr=False)
     partition_on: str | None = None
     num_partitions: int = 1
+    unsigned: str = "refuse"
+
+    def __post_init__(self) -> None:
+        from batcher.io.formats.sql.vendors.types import UNSIGNED_POLICIES, check_policy
+
+        check_policy("unsigned", self.unsigned, UNSIGNED_POLICIES)
 
     @property
     def sql_dialect(self) -> str:
@@ -196,7 +224,9 @@ class ConnectorXSource(SingleResultQuerySource):
 
     def _split_for(self, sql: str) -> _ConnectorXSplit:
         """The split for a real read, carrying ConnectorX's own range-partitioning."""
-        return _ConnectorXSplit(self.conn_uri, sql, self.partition_on, self.num_partitions)
+        return _ConnectorXSplit(
+            self.conn_uri, sql, self.partition_on, self.num_partitions, self.unsigned
+        )
 
     def _probe_split_for(self, sql: str) -> _ConnectorXSplit:
         """Probe unpartitioned: fanning a `WHERE 1 = 0` into N sub-queries buys nothing.
@@ -204,7 +234,7 @@ class ConnectorXSource(SingleResultQuerySource):
         The only override of this hook in the tree, and the reason it exists: every other
         backend's split is already one query, so its probe is too.
         """
-        return _ConnectorXSplit(self.conn_uri, sql, None, 1)
+        return _ConnectorXSplit(self.conn_uri, sql, None, 1, self.unsigned)
 
     def identity(self) -> str:
         """The learned-statistics key: the connection *and* the query, never the query alone.

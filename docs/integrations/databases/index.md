@@ -26,6 +26,12 @@ users.write.sql("users_clean", uri="postgresql://svc@db:5432/app", mode="upsert"
 One connection URI for PostgreSQL, MySQL, SQL Server, Oracle, SQLite, Trino and the rest, 36 schemes in all. Parallel range extraction, and any PEP 249 driver besides.
 :::
 
+:::{grid-item-card} {octicon}`checklist;1.1em` Vendor capability matrix
+:link: /integrations/databases/vendor-matrix
+:link-type: doc
+Which route serves PostgreSQL, MySQL, SQL Server, Oracle, Trino and Redshift, what each can write, and how problematic vendor types convert or refuse.
+:::
+
 :::{grid-item-card} {octicon}`pencil;1.1em` Writing to a database
 :link: /integrations/databases/writing
 :link-type: doc
@@ -58,6 +64,7 @@ A few more stores have readers without a page of their own. ClickHouse reads Arr
 :hidden:
 
 databases
+vendor-matrix
 writing
 key-value-stores
 mongodb

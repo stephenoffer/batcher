@@ -1,13 +1,13 @@
 # BigQuery
 
-This page covers reading BigQuery tables and query results. {py:meth}`bt.read.bigquery(...) <batcher.api.io_namespace.reader.Reader.bigquery>` reads through the BigQuery Storage Read API, which serves a table as parallel Arrow streams, and pushes both your filters and your column selection into the read session so BigQuery scans only what the query uses.
+This page covers reading BigQuery tables and query results, and loading a dataset into a table. {py:meth}`bt.read.bigquery(...) <batcher.api.io_namespace.reader.Reader.bigquery>` reads through the BigQuery Storage Read API, which serves a table as parallel Arrow streams, and pushes both your filters and your column selection into the read session so BigQuery scans only what the query uses.
 
 The following table summarizes the connector:
 
 | | |
 | --- | --- |
 | Read | `bt.read.bigquery(query, project=...)` or `bt.read.bigquery(table=..., project=...)` |
-| Write | No sink. Write Parquet to Cloud Storage and load it with `bq load`. |
+| Write | {py:meth}`ds.write.bigquery(table, project=..., mode=...) <batcher.api.io_namespace.writer.Writer.bigquery>`, one Parquet load job per shard, `mode` `"append"` (the default) or `"overwrite"` |
 | Extra | `pip install 'batcher-engine[bigquery]'` |
 | Parallelism | One split per Storage Read API stream, `max_streams=8` by default |
 | Pushdown | Predicates become the session's `row_restriction`. Projection becomes `selected_fields`. |
@@ -83,17 +83,36 @@ narrow = bt.read.bigquery(
 
 An explicit `selected_fields` replaces the pushed projection rather than intersecting with it. An explicit `row_restriction` is combined with a pushed predicate using `AND`. Nested and repeated fields arrive as Arrow structs and lists. Use the {py:class}`.struct <batcher.plan.expr_ir.namespaces.collections._StructNamespace>` and {py:class}`.list <batcher.plan.expr_ir.namespaces.collections._ListNamespace>` accessors to reach into them.
 
+## Write a table
+
+:::{warning}
+The BigQuery sink is not yet verified against a live BigQuery project. See `tests/PENDING_VERIFICATION.md`.
+:::
+
+{py:meth}`ds.write.bigquery <batcher.api.io_namespace.writer.Writer.bigquery>` serializes each shard to Parquet in memory and submits it as one `load_table_from_file` job. Parquet is what carries the nested shape: list inference is turned on in the job's `ParquetOptions`, so an Arrow list becomes a `REPEATED` field rather than a record wrapping `list.element`, and a struct becomes a `RECORD`.
+
+```python
+# docs: skip
+events = bt.from_pydict({"user_id": [1, 2], "tags": [["new"], ["returning", "mobile"]]})
+manifest = events.write.bigquery("acme-data.analytics.events", project="acme-billing")
+print(manifest.files[0].job)
+```
+
+Every written file's `job` holds the load job's `job_id`, its `location` and the destination, so the job can be found in the console or the audit log. `mode="overwrite"` uses `WRITE_TRUNCATE` in the job and is refused on a distributed write, where each shard's job would truncate the table.
+
+Two Arrow shapes have no BigQuery spelling, and the write refuses them before any job is submitted, naming the column. An array directly inside an array has no `ARRAY<ARRAY>` equivalent, so wrap the inner array in a struct. A NULL element inside an array is not allowed either, though a NULL array is, so drop the elements first with `col(...).list.drop_nulls()`.
+
 ## Requirements and limitations
 
 The Storage Read API is metered per project, on read throughput and concurrent streams. A job that fans out to hundreds of streams across a large cluster can exhaust the quota, and the symptom is `ResourceExhausted` on `ReadRows` inside a worker partway through a scan, not a failure at planning time. Keep `max_streams` proportionate to the workers that consume the streams.
 
 Read sessions expire. Batcher creates the session at planning time, so a scan whose splits wait behind a long queue, on a busy cluster or an autoscaler still warming up, can find its streams gone. A stream that fails mid-read is re-read from its start by the retry, not resumed at the offset it reached.
 
-There's no BigQuery sink. A {py:exc}`BackendError <batcher.BackendError>` at construction means the client libraries are missing, or that neither `query` nor `table` was supplied. A governance policy matches a `table=` read by its table name. A query read has no table name to match, so declare one with `governed_as="<project.dataset.table>"`. Inside a {py:obj}`bt.security() <batcher.security>` block, an undeclared query that names a governed table is refused. See {doc}`How a table is named </user-guide/trust/table-names>`.
+A {py:exc}`BackendError <batcher.BackendError>` at construction means the client libraries are missing, or that neither `query` nor `table` was supplied. A governance policy matches a `table=` read by its table name. A query read has no table name to match, so declare one with `governed_as="<project.dataset.table>"`. Inside a {py:obj}`bt.security() <batcher.security>` block, an undeclared query that names a governed table is refused. See {doc}`How a table is named </user-guide/trust/table-names>`.
 
 ## See also
 
-- {doc}`Snowflake </integrations/warehouses/snowflake>`: the warehouse connector that also writes.
+- {doc}`Snowflake </integrations/warehouses/snowflake>`: the other warehouse with a staged bulk write.
 - {doc}`Databricks </integrations/warehouses/databricks>`: Unity Catalog tables read straight from their Delta files.
 - {doc}`Reading data </user-guide/moving-data/reading-data>`: the reader surface.
 - {doc}`Multi-source join </cookbook/data-engineering/modeling/multi-source-join>`: a BigQuery table joined against the lake without staging either side.

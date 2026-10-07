@@ -127,6 +127,8 @@ _DRIVER_DIALECTS: dict[str, str] = {
     "snowflake": "snowflake",
     "clickhouse_driver": "clickhouse",
     "trino": "trino",
+    "pymssql": "mssql",
+    "redshift_connector": "redshift",
 }
 
 

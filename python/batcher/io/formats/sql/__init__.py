@@ -21,6 +21,10 @@ Parallel reads come from one of two places, in this order of preference:
   reader. Opt-in, and the bounds come from the caller — this package still issues no
   schema or bound probes of its own.
 
+`vendors` states what Batcher knows about specific databases — routes, install packages,
+write modes and type rules — and holds the warehouse sinks (BigQuery, Databricks) and the
+Snowflake and Athena connection profiles.
+
 Two shared modules support the connectors rather than registering anything:
 `uri` maps a SQLAlchemy-style connection URI onto whichever backend can serve it, and
 `partition` builds the disjoint-and-exhaustive range predicates.
@@ -36,15 +40,18 @@ from batcher.io.formats.sql.databricks import DatabricksSource
 from batcher.io.formats.sql.dbapi import DBAPISource
 from batcher.io.formats.sql.odbc import ODBCSource
 from batcher.io.formats.sql.snowflake import SnowflakeSink, SnowflakeSource
+from batcher.io.formats.sql.vendors import BigQuerySink, DatabricksSink
 
 __all__ = [
     "ADBCSink",
     "ADBCSource",
+    "BigQuerySink",
     "BigQuerySource",
     "ClickHouseSink",
     "ClickHouseSource",
     "ConnectorXSource",
     "DBAPISource",
+    "DatabricksSink",
     "DatabricksSource",
     "ODBCSource",
     "SnowflakeSink",

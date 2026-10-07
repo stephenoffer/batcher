@@ -95,7 +95,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `unique` | {py:obj}`Dataset.select <batcher.Dataset.select>` + {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` + {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | mismatch | Differs: Ray unique(column) is eager and returns a list of the column's distinct values (ignore\_nulls=False keeps None); Batcher Dataset.distinct deduplicates rows and returns a Dataset. Port as: \[r\[c\] for r in ds.select(c).distinct().to\_pylist()\]. Wave W0. |
 | `with_column` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
 | `with_columns` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
-| `write_bigquery` | n/a | gap | Not yet: BigQuery writer (Batcher reads BigQuery via bt.read.bigquery but cannot write it). Wave W13. |
+| `write_bigquery` | `Dataset.write.bigquery` | mismatch | Differs: Ray write\_bigquery(project\_id, dataset) names the table as 'dataset.table' and replaces it per overwrite\_table=; Batcher write.bigquery(table, project=) takes the table first and appends unless mode='overwrite'. Wave W13. |
 | `write_clickhouse` | `Dataset.write.clickhouse` | param | Missing: creating the table (Ray's CREATE mode); Batcher inserts into an existing table. Wave W13. |
 | `write_csv` | `Dataset.write.csv` | mismatch | Differs: Ray write\_csv defaults mode=SaveMode.APPEND and writes a directory of CSV files; Batcher defaults mode='overwrite' (replacing existing output) and supports append only for delta/iceberg/hudi/snowflake. Pass mode explicitly; file-sink append is missing. Wave W2. |
 | `write_datasink` | n/a | gap | Not yet: write through a user Datasink implementation. Wave W11. |

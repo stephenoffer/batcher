@@ -1376,12 +1376,19 @@ class Reader:
     def snowflake(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a Snowflake SQL query, fetching result chunks in parallel as Arrow.
 
-        Connection credentials go in ``connection_kwargs``, a dict passed to
-        ``snowflake.connector.connect``.
+        Declare one authentication strategy with ``auth=`` — ``"password"``,
+        ``"key_pair"`` (``private_key_file=``, optionally ``private_key_file_pwd=``),
+        ``"oauth"`` (``token=``) or ``"externalbrowser"`` — beside ``account=``, ``user=``,
+        ``role=``, ``warehouse=``, ``database=`` and ``schema=``. They are validated once and
+        folded into ``connection_kwargs``, the dict every worker connects with, so a local
+        run and a distributed one authenticate the same way. Pass secrets as references
+        (``private_key_file_pwd="env:SF_KEY_PWD"``). An explicit ``connection_kwargs=`` dict
+        passed to ``snowflake.connector.connect`` still works on its own. Not yet verified
+        against a live Snowflake; see tests/PENDING_VERIFICATION.md.
 
         Args:
             query: SQL text to execute against Snowflake.
-            opts: ``connection_kwargs=`` (``account``, ``user``, ``warehouse``, ...),
+            opts: The auth and session keywords above, or ``connection_kwargs=``;
                 ``governed_as=`` (the table a governance policy is matched against, since
                 a query names none), plus any other source options.
 
@@ -1396,16 +1403,36 @@ class Reader:
                 ...     "SELECT * FROM sales.orders",
                 ...     connection_kwargs={"account": "acme", "user": "bob", "warehouse": "wh"},
                 ... )
+
+                >>> ds = bt.read.snowflake(  # doctest: +SKIP
+                ...     "SELECT * FROM sales.orders",
+                ...     account="acme",
+                ...     user="etl",
+                ...     auth="key_pair",
+                ...     private_key_file="/keys/etl.p8",
+                ...     role="ANALYST",
+                ...     warehouse="WH",
+                ... )
         """
-        return _read_table("snowflake", query, **opts)
+        from batcher.io.formats.sql.vendors import snowflake_options
 
-    def databricks(self, table: str, **opts: Any) -> Dataset:
-        """Read a Databricks/Unity Catalog table by name.
+        return _read_table("snowflake", query, **snowflake_options(opts))
 
-        Uses credential vending to read the underlying Delta files directly.
+    def databricks(self, table: str | None = None, **opts: Any) -> Dataset:
+        """Read a Databricks/Unity Catalog table by name, or a query through a SQL warehouse.
+
+        A table read uses credential vending to read the underlying Delta files directly.
+        A ``query=`` read runs on a SQL warehouse (``server_hostname=``, ``http_path=``,
+        ``access_token=``), where ``catalog=`` and ``schema=`` set the session defaults,
+        ``session_configuration=`` passes warehouse settings, and ``statement_timeout_s=``
+        bounds the statement. An abandoned or interrupted warehouse read cancels its
+        statement remotely, and a failure names the warehouse query id. The warehouse
+        options are not yet verified against a live Databricks; see
+        tests/PENDING_VERIFICATION.md.
 
         Args:
-            table: Fully qualified Unity Catalog table name (``catalog.schema.table``).
+            table: Fully qualified Unity Catalog table name (``catalog.schema.table``), or
+                None for a ``query=`` read.
             opts: Connection and credential options passed as keywords.
 
         Returns:
@@ -1416,7 +1443,18 @@ class Reader:
 
                 >>> import batcher as bt
                 >>> ds = bt.read.databricks("main.sales.orders")  # doctest: +SKIP
+
+                >>> ds = bt.read.databricks(  # doctest: +SKIP
+                ...     query="SELECT * FROM orders",
+                ...     server_hostname="adb-1.azuredatabricks.net",
+                ...     http_path="/sql/1.0/warehouses/abc",
+                ...     access_token="env:DATABRICKS_TOKEN",
+                ...     catalog="main",
+                ...     schema="sales",
+                ... )
         """
+        if "schema" in opts:
+            opts["db_schema"] = opts.pop("schema")
         return _read_table("databricks", table, **opts)
 
     def bigquery(self, query: str | None = None, **opts: Any) -> Dataset:
@@ -1447,6 +1485,65 @@ class Reader:
         if query is not None:
             opts["query"] = query
         return _read_table("bigquery", **opts)
+
+    def athena(
+        self,
+        query: str,
+        *,
+        region: str,
+        workgroup: str | None = None,
+        output_location: str | None = None,
+        database: str | None = None,
+        **opts: Any,
+    ) -> Dataset:
+        """Read the result of an Amazon Athena query through PyAthena.
+
+        A thin profile over the DB-API reader: the Athena settings are translated to
+        PyAthena's ``connect()`` keywords, and the read gets the same projection and
+        predicate pushdown and zero-row schema probe as any ``bt.read.sql`` read. Athena
+        writes each result to S3, so name an ``output_location`` or a ``workgroup`` that
+        enforces one. Credentials come from the ambient AWS chain, or
+        ``profile_name=``. Needs ``batcher-engine[athena]``. Not yet verified against a
+        live Athena; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            query: SQL text to run on Athena.
+            region: The AWS region, e.g. ``"us-east-1"``.
+            workgroup: The Athena workgroup to run in.
+            output_location: The ``s3://`` prefix for query results.
+            database: The default database unqualified table names resolve in.
+            opts: ``catalog=`` and ``profile_name=``, plus any `DBAPISource` option such as
+                ``batch_size=``.
+
+        Returns:
+            A lazy `Dataset` over the query result.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.athena(  # doctest: +SKIP
+                ...     "SELECT * FROM events",
+                ...     region="us-east-1",
+                ...     workgroup="analytics",
+                ...     database="web",
+                ... )
+        """
+        from batcher.io.formats.sql._common import require_module
+        from batcher.io.formats.sql.vendors import ATHENA_DRIVER, athena_connect_kwargs
+
+        require_module(ATHENA_DRIVER, extra="athena")
+        connect_kwargs = athena_connect_kwargs(
+            region=region,
+            workgroup=workgroup,
+            output_location=output_location,
+            database=database,
+            catalog=opts.pop("catalog", None),
+            profile_name=opts.pop("profile_name", None),
+        )
+        return _read_table(
+            "dbapi", query=query, module=ATHENA_DRIVER, connect_kwargs=connect_kwargs, **opts
+        )
 
     def clickhouse(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a ClickHouse SQL query over the Arrow-native interface.

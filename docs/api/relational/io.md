@@ -61,6 +61,7 @@ These submit a query to an external engine and stream the Arrow result back:
 | {py:meth}`bt.read.snowflake(query, connection_kwargs=) <batcher.api.io_namespace.reader.Reader.snowflake>` | a Snowflake query (parallel result-chunk fetch) |
 | {py:meth}`bt.read.bigquery(...) <batcher.api.io_namespace.reader.Reader.bigquery>` | BigQuery via the Storage Read API (parallel Arrow streams) |
 | {py:meth}`bt.read.clickhouse(query) <batcher.api.io_namespace.reader.Reader.clickhouse>` | a ClickHouse query (Arrow-native) |
+| {py:meth}`bt.read.athena(query, region=) <batcher.api.io_namespace.reader.Reader.athena>` | an Amazon Athena query, through PyAthena and the DB-API reader |
 
 ### NoSQL
 
@@ -165,6 +166,8 @@ These load the result into an external system. `mode` says what the write does t
 | Writer | Writes | `mode` |
 | --- | --- | --- |
 | {py:meth}`ds.write.snowflake(table, connection_kwargs=) <batcher.api.io_namespace.writer.Writer.snowflake>` | a Snowflake table | `append` / `overwrite` |
+| {py:meth}`ds.write.bigquery(table, project=) <batcher.api.io_namespace.writer.Writer.bigquery>` | a BigQuery table, one Parquet load job per shard; each file's `job` names the load job | `append` / `overwrite` |
+| {py:meth}`ds.write.databricks(table, volume_path=) <batcher.api.io_namespace.writer.Writer.databricks>` | an existing Databricks table, staged in a volume and loaded with `COPY INTO` | `append` |
 | {py:meth}`ds.write.clickhouse(table, host=) <batcher.api.io_namespace.writer.Writer.clickhouse>` | an existing ClickHouse table, via `insert_arrow` | `append` / `overwrite` (truncates first) |
 | {py:meth}`ds.write.sql(table, uri=) <batcher.api.io_namespace.writer.Writer.sql>` | a SQL table, via ADBC for a bulk append and any PEP 249 driver otherwise | `append` / `overwrite` / `upsert` / `update` / `delete` / `delete_insert` |
 | {py:meth}`ds.write.mongo(collection, uri=) <batcher.api.io_namespace.writer.Writer.mongo>` | a MongoDB collection | `upsert` / `append` / `overwrite` / `delete` |

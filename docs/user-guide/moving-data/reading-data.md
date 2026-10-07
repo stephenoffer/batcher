@@ -446,7 +446,9 @@ The same {py:obj}`bt.read <batcher.read>` namespace reaches everything else, on 
 Zarr, HDF5, WARC, PDF, LiDAR, and robot logs. {doc}`/integrations/databases/databases` covers a SQL
 database or warehouse, where the interesting part is not the call but the connection: which backend
 serves your scheme, where the credentials come from, and how to split one extract into parallel
-queries.
+queries. {doc}`/integrations/databases/vendor-matrix` says which write modes and vendor types each
+database's route covers. An Amazon Athena query reads through `bt.read.athena(query, region=...,
+workgroup=...)`, a thin profile over the DB-API reader described on {doc}`/integrations/warehouses/athena`.
 
 ## What you get back
 

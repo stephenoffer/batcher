@@ -30,6 +30,10 @@ class WrittenFile:
     the log alone (`io.stats.file_skipping`). Empty when the sink does not collect
     them; the names are format-neutral and each sink maps them to its own log format.
 
+    `job` carries the remote system's identity for the write, for a sink whose destination
+    runs its own job: a BigQuery load job's ``job_id`` and ``location``, a Databricks
+    ``query_id``, a Snowflake ``COPY INTO`` result. Empty for a sink with no remote job.
+
     Examples:
         .. doctest::
 
@@ -43,6 +47,7 @@ class WrittenFile:
     bytes: int
     partition_values: dict[str, Any] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
+    job: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1568 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1576 Python modules across 222 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -319,9 +319,9 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | module | lines | what it is |
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
-| `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1872 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2282 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `_write_opts.py` | 342 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
+| `reader.py` | 1969 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `writer.py` | 2393 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -1870,7 +1870,7 @@ Credential verification: turning a presented credential into a verified `Princip
 | `detect.py` | 467 | Format and layout detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 720 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 710 | Framework-interop ingestion — build a `Source` from a foreign object. |
-| `manifest.py` | 148 | Write results — the manifest a sink returns and a commit consumes. |
+| `manifest.py` | 153 | Write results — the manifest a sink returns and a commit consumes. |
 | `secret_backends.py` | 317 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
 | `sink.py` | 228 | Data sinks — persisting query results. |
 
@@ -2046,16 +2046,16 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 
 | module | lines | what it is |
 |---|---|---|
-| `_common.py` | 416 | Shared helpers for SQL/warehouse sources — query rewriting and import guards. |
+| `_common.py` | 427 | Shared helpers for SQL/warehouse sources — query rewriting and import guards. |
 | `_source_base.py` | 330 | Template-Method base for a query-backed source the server returns as one result. |
 | `bigquery.py` | 398 | BigQuery source — multi-stream Arrow reads via the Storage Read API. |
 | `clickhouse.py` | 240 | ClickHouse source and sink — Arrow reads and inserts via clickhouse-connect. |
-| `connectorx.py` | 216 | ConnectorX source — the parallel relational reader for the long tail. |
-| `databricks.py` | 428 | Databricks source — direct lakehouse read, warehouse fallback. |
+| `connectorx.py` | 246 | ConnectorX source — the parallel relational reader for the long tail. |
+| `databricks.py` | 502 | Databricks source — direct lakehouse read, warehouse fallback. |
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
 | `routing.py` | 139 | Which SQL backend serves this call — the one router the read and the write share. |
-| `snowflake.py` | 328 | Snowflake source + sink — one query submission, N shippable result chunks. |
+| `snowflake.py` | 355 | Snowflake source + sink — one query submission, N shippable result chunks. |
 | `uri.py` | 708 | Connection-URI parsing — one industry-standard URI, routed to the right backend. |
 
 ### `batcher/io/formats/sql/adbc/` — 2 · neutral IO
@@ -2065,7 +2065,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | module | lines | what it is |
 |---|---|---|
 | `sink.py` | 161 | ADBC bulk-ingest sink. |
-| `source.py` | 572 | ADBC / FlightSQL source — Arrow-native database connectivity. |
+| `source.py` | 596 | ADBC / FlightSQL source — Arrow-native database connectivity. |
 
 ### `batcher/io/formats/sql/dbapi/` — 2 · neutral IO
 
@@ -2073,14 +2073,28 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 
 | module | lines | what it is |
 |---|---|---|
-| `_arrow.py` | 148 | Turning DB-API rows into Arrow, faithfully. |
+| `_arrow.py` | 176 | Turning DB-API rows into Arrow, faithfully. |
 | `_bind.py` | 203 | Arrow columns → the parameter sets a PEP 249 ``executemany`` binds. |
 | `_ddl.py` | 303 | Arrow schema → ``CREATE TABLE`` — the one place a column type is chosen for a database. |
-| `_dsn.py` | 313 | Connection URI → the PEP 249 driver and the ``connect()`` kwargs it wants. |
+| `_dsn.py` | 329 | Connection URI → the PEP 249 driver and the ``connect()`` kwargs it wants. |
 | `_staged.py` | 146 | Staged SQL writes: every shard into its own staging table, one transaction to publish. |
-| `_statements.py` | 483 | Dialect-aware DML for the DB-API write path — the statement each write mode runs. |
+| `_statements.py` | 485 | Dialect-aware DML for the DB-API write path — the statement each write mode runs. |
 | `sink.py` | 640 | The row-level SQL write path — ``INSERT``, ``UPSERT``, ``UPDATE``, ``DELETE``. |
-| `source.py` | 677 | DB-API 2.0 (PEP 249) source — the universal fallback for any Python driver. |
+| `source.py` | 714 | DB-API 2.0 (PEP 249) source — the universal fallback for any Python driver. |
+
+### `batcher/io/formats/sql/vendors/` — 2 · neutral IO
+
+`vendors` — what Batcher states, and enforces, about specific databases and warehouses.
+
+| module | lines | what it is |
+|---|---|---|
+| `athena.py` | 79 | Athena connection profile — the PyAthena keywords, named the way Athena names them. |
+| `bigquery_sink.py` | 199 | BigQuery sink — one load job per shard, Parquet in, job identity out. |
+| `connect.py` | 106 | Vendor adjustments applied where a PEP 249 connection is opened — on the worker. |
+| `databricks_sink.py` | 215 | Databricks SQL sink — stage Parquet in a Unity Catalog volume, then ``COPY INTO``. |
+| `profiles.py` | 380 | Per-vendor profiles — which route serves a database, what it can write, what its types do. |
+| `snowflake_auth.py` | 154 | One declared Snowflake authentication strategy, carried unchanged to every worker. |
+| `types.py` | 246 | Declared conversions and precise refusals for the vendor types Arrow cannot take as-is. |
 
 ### `batcher/io/formats/streaming/` — 2 · neutral IO
 

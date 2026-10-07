@@ -147,7 +147,7 @@ _ALTERNATIVE_ROUTES: dict[str, str] = {
     "hana": "bt.read.table('odbc', connection_string=...)",
     "vertica": "bt.read.table('odbc', connection_string=...)",
     "hive": "bt.read.table('odbc', connection_string=...)",
-    "athena": "bt.read.table('odbc', connection_string=...)",
+    "athena": "bt.read.athena(query, region=..., workgroup=...)",
     "presto": "bt.read.table('odbc', connection_string=...)",
 }
 

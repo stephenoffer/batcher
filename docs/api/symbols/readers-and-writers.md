@@ -150,6 +150,7 @@ These submit a query or scan to an external system, and `table` reaches any regi
    Reader.sql
    Reader.snowflake
    Reader.bigquery
+   Reader.athena
    Reader.clickhouse
    Reader.mongo
    Reader.cassandra
@@ -256,6 +257,8 @@ These write rows into an external database, warehouse, or search index.
    Writer.sql
    Writer.clickhouse
    Writer.snowflake
+   Writer.bigquery
+   Writer.databricks
    Writer.mongo
    Writer.dynamodb
    Writer.cassandra

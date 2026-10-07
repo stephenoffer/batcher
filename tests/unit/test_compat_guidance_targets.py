@@ -358,7 +358,7 @@ def test_iter_rows_claims_match_its_behaviour() -> None:
     "broken",
     [
         "ds.approx_quantile('x', [0.5])",  # a list where one float is taken
-        "ds.write.bigquery(path)",  # a sink that does not exist
+        "ds.write.teradata(path)",  # a sink that does not exist
         "ds.sort('x').head(1).no_such_method()",  # a later segment that does not exist
         "ds.union(other, by_name=True)",  # a keyword the method does not take
         "ds.group_by('g').agg(n=bt.col('missing').sum())",  # fails only once collected
