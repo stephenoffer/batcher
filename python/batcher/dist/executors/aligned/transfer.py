@@ -151,6 +151,14 @@ def pack_held(held: dict[int, object], key: str) -> dict[int, object]:
         len(buffers),
         time.perf_counter() - started,
     )
+    for sid, batches in rows.items():
+        get_logger("dist").info(
+            "aligned: held %d: %d rows, %.0f MB, columns %s",
+            sid,
+            sum(b.num_rows for b in batches),
+            sum(b.nbytes for b in batches) / 1e6,
+            batches[0].schema.names if batches else [],
+        )
     return packed
 
 
