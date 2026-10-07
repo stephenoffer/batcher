@@ -160,6 +160,9 @@ kinesis = ["boto3>=1.34"]
 eventhubs = ["azure-eventhub>=5.11"]
 pubsub = ["google-cloud-pubsub>=2.21"]
 pulsar = ["pulsar-client>=3.4"]
+# --- HTTP APIs / SaaS (io.formats.http, io.formats.saas) ---
+# Everything there is urllib + pyarrow except Google Application Default Credentials.
+gsheets = ["google-auth[requests]>=2.20"]
 # --- Multimodal sources ---
 image = ["pillow>=10"]
 audio = ["soundfile>=0.12"]
@@ -280,7 +283,7 @@ docs = [
 all = [
     "batcher-engine[ray,polars,duckdb,redis,rocksdb,cloud,torch,tensorflow,nvml]",
     "batcher-engine[lance,avro,excel,xml,protobuf,msgpack,hdf5,zarr,tfrecord,pdf]",
-    "batcher-engine[lakehouse,warehouse,nosql,vector,streaming,multimodal,pandas,huggingface]",
+    "batcher-engine[lakehouse,warehouse,nosql,vector,streaming,multimodal,pandas,huggingface,gsheets]",
 ]
 
 [tool.maturin]

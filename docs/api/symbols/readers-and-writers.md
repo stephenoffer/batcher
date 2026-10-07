@@ -164,6 +164,26 @@ These submit a query or scan to an external system, and `table` reaches any regi
    Reader.table
 ```
 
+### HTTP APIs and SaaS
+
+These page through an HTTP API, a GraphQL endpoint, a SaaS service, or an Airbyte connector. See {doc}`/integrations/apis/index`.
+
+```{eval-rst}
+.. currentmodule:: batcher.api.io_namespace.reader
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   Reader.http_json
+   Reader.graphql
+   Reader.github
+   Reader.salesforce
+   Reader.google_sheets
+   Reader.sharepoint
+   Reader.airbyte
+```
+
 ### Streams
 
 These return an unbounded source for a streaming query, including incremental file discovery and the development sources.
@@ -270,6 +290,7 @@ These write rows into an external database, warehouse, or search index.
    Writer.pinecone
    Writer.milvus
    Writer.turbopuffer
+   Writer.google_sheets
 ```
 
 ### Streaming sinks

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import sqlite3
 
+import pyarrow as pa
 import pytest
 
 import batcher as bt
@@ -99,7 +100,34 @@ def test_read_sql_names_the_argument_it_could_not_parse():
 #: is expected to build a lazy plan or to fail with a message. Both are a pass: what is
 #: being checked is that the method is reachable and that a failure is actionable.
 READERS = [
+    ("airbyte", lambda: bt.read.airbyte("users", image="airbyte/source-faker:6")),
     ("cassandra", lambda: bt.read.cassandra(keyspace="k", table="t")),
+    ("github", lambda: bt.read.github("octo/repo")),
+    ("google_sheets", lambda: bt.read.google_sheets("sheet-id", "A1:B2")),
+    (
+        "graphql",
+        lambda: bt.read.graphql(
+            "http://127.0.0.1:9/graphql",
+            "{ items { id } }",
+            records_path="data.items",
+            schema=pa.schema([("id", pa.int64())]),
+        ),
+    ),
+    (
+        "http_json",
+        lambda: bt.read.http_json(
+            "http://127.0.0.1:9/items", schema=pa.schema([("id", pa.int64())])
+        ),
+    ),
+    (
+        "salesforce",
+        lambda: bt.read.salesforce(
+            "Account",
+            instance_url="https://x.my.salesforce.com",
+            schema=pa.schema([("Id", pa.string())]),
+        ),
+    ),
+    ("sharepoint", lambda: bt.read.sharepoint(drive_id="d")),
     ("clickhouse", lambda: bt.read.clickhouse("SELECT 1")),
     ("databricks", lambda: bt.read.databricks("cat.sch.tbl")),
     ("delta_sharing", lambda: bt.read.delta_sharing("share#schema.table")),

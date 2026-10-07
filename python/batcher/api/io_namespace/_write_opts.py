@@ -54,6 +54,7 @@ MODE_AWARE_SINKS = frozenset(
         "redis",
         "elasticsearch",
         "hbase",
+        "google_sheets",
     }
 )
 
@@ -77,6 +78,7 @@ DATABASE_SINKS = frozenset(
         "redis",
         "elasticsearch",
         "hbase",
+        "google_sheets",
     }
 )
 
