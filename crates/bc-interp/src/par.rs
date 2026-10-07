@@ -1646,28 +1646,57 @@ fn exec(
                         // Only this arm concatenates, and only after admission proved it fits.
                         let left = ops::materialize(&left_batches)?;
                         let right = ops::materialize(&right_batches)?;
-                        let p = rayon::current_num_threads().max(1);
-                        let li = ops::key_indices(&left, left_by)?;
-                        let ri = ops::key_indices(&right, right_by)?;
-                        let lb = shuffle::partition_by_keys(&left, &li, p)?;
-                        let rb = shuffle::partition_by_keys(&right, &ri, p)?;
-                        (0..p)
-                            .into_par_iter()
-                            .map(|i| {
-                                ops::asof_join_batches(
-                                    &lb[i],
-                                    &rb[i],
-                                    left_on,
-                                    right_on,
-                                    left_by,
-                                    right_by,
-                                    *direction,
-                                    *tolerance,
-                                    *allow_exact_matches,
-                                    output,
-                                )
-                            })
-                            .collect::<Result<Vec<_>, InterpError>>()?
+                        // The integer path parallelizes inside the call, so partitioning
+                        // both sides by `by` first only copies every column of both: one
+                        // call over the whole input, whose left side then gathers by the
+                        // identity and is shared rather than copied.
+                        if ops::asof_whole_input(
+                            &left,
+                            &right,
+                            left_on,
+                            right_on,
+                            left_by,
+                            right_by,
+                            *direction,
+                            *tolerance,
+                            *allow_exact_matches,
+                        ) {
+                            vec![ops::asof_join_batches(
+                                &left,
+                                &right,
+                                left_on,
+                                right_on,
+                                left_by,
+                                right_by,
+                                *direction,
+                                *tolerance,
+                                *allow_exact_matches,
+                                output,
+                            )?]
+                        } else {
+                            let p = rayon::current_num_threads().max(1);
+                            let li = ops::key_indices(&left, left_by)?;
+                            let ri = ops::key_indices(&right, right_by)?;
+                            let lb = shuffle::partition_by_keys(&left, &li, p)?;
+                            let rb = shuffle::partition_by_keys(&right, &ri, p)?;
+                            (0..p)
+                                .into_par_iter()
+                                .map(|i| {
+                                    ops::asof_join_batches(
+                                        &lb[i],
+                                        &rb[i],
+                                        left_on,
+                                        right_on,
+                                        left_by,
+                                        right_by,
+                                        *direction,
+                                        *tolerance,
+                                        *allow_exact_matches,
+                                        output,
+                                    )
+                                })
+                                .collect::<Result<Vec<_>, InterpError>>()?
+                        }
                     }
                 }
             };

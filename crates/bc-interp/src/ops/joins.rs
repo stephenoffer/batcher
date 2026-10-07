@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch, UInt32Array};
 use arrow::compute::interleave;
-use arrow::datatypes::{Field, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use bc_expr::Expr;
 use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType, SortKey};
 use bc_runtime::join::{self, JoinType as RtJoinType};
@@ -136,6 +136,48 @@ fn map_asof_direction(d: bc_ir::AsofDirection) -> join::AsofDirection {
         bc_ir::AsofDirection::Forward => join::AsofDirection::Forward,
         bc_ir::AsofDirection::Nearest => join::AsofDirection::Nearest,
     }
+}
+
+/// Whether an ASOF join over these batches parallelizes inside one call over the whole
+/// input ([`join::asof_is_whole_input`]), so a parallel caller should not hash-partition both
+/// sides by `by` first. An unknown column answers `false`, leaving the error to the join.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn asof_whole_input(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_on: &str,
+    right_on: &str,
+    left_by: &[String],
+    right_by: &[String],
+    direction: bc_ir::AsofDirection,
+    tolerance: Option<f64>,
+    allow_exact_matches: bool,
+) -> bool {
+    let types = |b: &RecordBatch, names: &[String]| -> Option<Vec<DataType>> {
+        names
+            .iter()
+            .map(|n| b.column_by_name(n).map(|c| c.data_type().clone()))
+            .collect()
+    };
+    let (Some(lon), Some(ron), Some(lby), Some(rby)) = (
+        left.column_by_name(left_on),
+        right.column_by_name(right_on),
+        types(left, left_by),
+        types(right, right_by),
+    ) else {
+        return false;
+    };
+    join::asof_is_whole_input(
+        lon.data_type(),
+        ron.data_type(),
+        &lby,
+        &rby,
+        join::AsofSpec {
+            direction: map_asof_direction(direction),
+            tolerance,
+            allow_exact_matches,
+        },
+    )
 }
 
 /// ASOF (nearest-match) join: each left row matched to the right row whose `on` key

@@ -3267,7 +3267,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `metrics.rs` | 387 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/byte_sort.rs` | 715 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `ops/external_sort.rs` | 465 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
-| `ops/joins.rs` | 657 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
+| `ops/joins.rs` | 699 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
 | `ops/mod.rs` | 1899 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
@@ -3284,7 +3284,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 772 | Single-node parallel full sort by **sample-sort**. |
 | `ops/window_stream.rs` | 687 | Bounded-memory window execution for a partition that does not fit the envelope. |
-| `par.rs` | 3712 | The multi-core executor. |
+| `par.rs` | 3741 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
 | `stream/breaker.rs` | 634 | The breakers: operators that must see all of their input before they can emit any output. |
@@ -3345,7 +3345,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 770 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `gather/spans.rs` | 136 | Copying a sequence of source byte spans into one output buffer, as few copies as possible. |
-| `join/asof.rs` | 539 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
+| `join/asof.rs` | 603 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 237 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 487 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
