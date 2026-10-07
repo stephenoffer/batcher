@@ -153,6 +153,7 @@ Reference and setup pages for the readers and writers above.
 :hidden:
 
 reading-data
+messy-input
 specialized-formats
 writing-data
 catalogs-and-tables

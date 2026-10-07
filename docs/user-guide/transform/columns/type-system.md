@@ -228,34 +228,7 @@ print(ds.cast({"i32": "float64", "i8": "string"}).schema)
 
 ## Null is absence, NaN is a value
 
-They are not the same thing and no operator conflates them. A null has no value. A NaN is a float, the result of an operation such as `0.0 / 0.0`. {py:meth}`is_null() <batcher.plan.expr_ir.core.Expr.is_null>` never sees a NaN, and `fill_null()` never replaces one. `fill_nan()` does.
-
-```python
-mixed = bt.from_pydict({"x": [1.0, float("nan"), None]})
-print(
-    mixed.select(
-        null=bt.col("x").is_null(),
-        nan=bt.col("x").is_nan(),
-        filled=bt.col("x").fill_null(-1.0),
-    ).to_pydict()
-)
-# {'null': [False, False, True], 'nan': [False, True, None], 'filled': [1.0, nan, -1.0]}
-```
-
-:::{important}
-Look at the `nan` column: {py:meth}`is_nan() <batcher.plan.expr_ir.core.Expr.is_nan>` on a *null* is null, not False. Three-valued logic applies to every predicate, which is why `filter(bt.col("x") > 0)` drops null rows: `null > 0` is null, and a filter keeps only rows that are *true*. A predicate you expect to partition the data into two halves partitions it into three.
-:::
-
-The frame-wide masks follow the same rule. {py:meth}`Dataset.isna <batcher.Dataset.isna>` and {py:meth}`Dataset.notna <batcher.Dataset.notna>` test for null only, which differs from pandas, where a NaN is missing too. Pass `nan=True` for the pandas reading. It ORs `is_nan()` into the test on every floating-point column, and the null row stays true because `true | null` is true:
-
-```python
-print(mixed.isna().to_pydict(), mixed.isna(nan=True).to_pydict())
-# {'x': [False, False, True]} {'x': [False, True, True]}
-```
-
-Where NaN and `-0.0` do get canonicalized is in a hash key: grouping, `distinct`, joins, and shuffles all treat every NaN as one key and `-0.0` as `0.0`, so a group cannot split across partitions. See {doc}`distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`.
-
-{doc}`Nulls and NaN <null-semantics>` has the whole matrix, one executed example per row, for comparisons, Boolean logic, membership, aggregates, sorting, and keys.
+They are not the same thing and no operator conflates them. A null has no value. A NaN is a float, the result of an operation such as `0.0 / 0.0`. `is_null()` never sees a NaN and `fill_null()` never replaces one, while `fill_nan()` does. {doc}`Nulls and NaN <null-semantics>` has the whole matrix, one executed example per row, including the pandas-style `isna(nan=True)` mask and how hash keys canonicalize NaN and `-0.0`.
 
 ## Integer division and mixed arithmetic
 
@@ -406,57 +379,7 @@ print(ms.union(us).schema.field("ts").type)
 
 ## Dates, timestamps, and time zones
 
-A timestamp column stores an instant as a count since the Unix epoch in UTC. A *tz-aware* column, such as `timestamp(us, America/New_York)`, also carries a zone, which says which wall clock to read that instant on. A naive column carries no zone.
-
-Every calendar field of a tz-aware column is read on that column's own clock. `hour()`, `day()`, `dayname()`, `strftime` and `truncate("day")` all agree about which day a row fell on, and calendar arithmetic such as `offset_by("1d")` moves by local days. To report in another zone, convert first with {py:meth}`convert_timezone <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.convert_timezone>` and then extract. {py:meth}`replace_timezone <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.replace_timezone>` attaches a zone to a naive wall clock instead, which chooses a new instant.
-
-Subtracting two temporal values gives a type that depends on the operands. The table below lists each pairing.
-
-| Expression | Result type | What it holds |
-|---|---|---|
-| timestamp - timestamp | `duration[us]` | Elapsed time. Two tz-aware columns subtract as instants, whatever their zones. |
-| date - date | `int64` | Whole days, as DuckDB returns them. |
-| timestamp + duration | `timestamp` | The instant moved by elapsed time. |
-| naive timestamp - tz-aware timestamp | `duration[us]` | The naive value is read as UTC. |
-
-A duration's `hour()`, `minute()`, `second()` and `day()` are its components, as DuckDB reads an interval, so 49 hours and 5 minutes has an `hour()` of 1. {py:meth}`total(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.total>` gives the total, 49 hours. Timestamps are 64-bit counts, so a microsecond timestamp spans roughly 292,000 years either side of 1970 and a nanosecond one only the years 1677 to 2262.
-
-Comparisons coerce without raising, and the coercion is worth knowing because it can move a filter's boundary. The following table lists the mixed comparisons.
-
-| Comparison | How it is read |
-|---|---|
-| date with timestamp | The date is its midnight. |
-| naive timestamp with tz-aware timestamp | The naive value is read as a UTC instant. |
-| two tz-aware timestamps | As instants, whatever their zones. |
-
-DuckDB reads a naive timestamp in its session `TimeZone` instead, and Polars refuses the comparison. Batcher keeps the comparison and reads naive as UTC, so when a naive column holds local wall clocks, attach its zone with `replace_timezone` before comparing it with an aware one.
-
-```python
-import datetime as dt
-
-stamps = bt.from_arrow(
-    pa.table(
-        {
-            "a": pa.array([dt.datetime(2024, 1, 3, 1, 5)], pa.timestamp("us")),
-            "b": pa.array([dt.datetime(2024, 1, 1)], pa.timestamp("us")),
-            "z": pa.array([dt.datetime(2024, 1, 3, 1, 5)], pa.timestamp("us", "UTC")),
-            "d1": pa.array([dt.date(2024, 1, 3)]),
-            "d2": pa.array([dt.date(2024, 1, 1)]),
-        }
-    )
-)
-diffs = stamps.select(
-    span=bt.col("a") - bt.col("b"),
-    days=bt.col("d1") - bt.col("d2"),
-    naive_is_utc=bt.col("a") == bt.col("z"),
-)
-print(diffs.schema)
-# span: duration[us]
-# days: int64
-# naive_is_utc: bool
-print(diffs.select(hour=bt.col("span").dt.hour(), total=bt.col("span").dt.total("h")).to_pydict())
-# {'hour': [1], 'total': [49]}
-```
+A tz-aware column reads every calendar field on its own clock, subtracting two temporal values gives a type that depends on the operands, and mixed comparisons coerce rather than raise. {doc}`/user-guide/analyze/time-series` covers all three, with the result-type and coercion tables.
 
 ## Inspect types without running anything
 

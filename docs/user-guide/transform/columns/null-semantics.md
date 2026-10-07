@@ -19,6 +19,18 @@ pairs = bt.from_pydict(
 )
 ```
 
+## Frame-wide masks and hash keys
+
+The frame-wide masks follow the same rule. {py:meth}`Dataset.isna <batcher.Dataset.isna>` and {py:meth}`Dataset.notna <batcher.Dataset.notna>` test for null only, which differs from pandas, where a NaN is missing too. Pass `nan=True` for the pandas reading. It ORs `is_nan()` into the test on every floating-point column, and the null row stays true because `true | null` is true:
+
+```python
+mixed = bt.from_pydict({"x": [1.0, float("nan"), None]})
+print(mixed.isna().to_pydict(), mixed.isna(nan=True).to_pydict())
+# {'x': [False, False, True]} {'x': [False, True, True]}
+```
+
+Where NaN and `-0.0` do get canonicalized is in a hash key: grouping, `distinct`, joins, and shuffles all treat every NaN as one key and `-0.0` as `0.0`, so a group cannot split across partitions. See {doc}`distinct and dedup </user-guide/transform/rows/distinct-and-dedup>`.
+
 ## Comparisons
 
 The following table summarizes the comparison operators:

@@ -270,6 +270,62 @@ print(runs.to_pydict())
 
 A value that comes back after an interruption opens a *new* run rather than rejoining the earlier one, which is what makes a run id a segmentation rather than a grouping.
 
+## Time zones and temporal types
+
+A timestamp column stores an instant as a count since the Unix epoch in UTC. A *tz-aware* column, such as `timestamp(us, America/New_York)`, also carries a zone, which says which wall clock to read that instant on. A naive column carries no zone.
+
+Every calendar field of a tz-aware column is read on that column's own clock. `hour()`, `day()`, `dayname()`, `strftime` and `truncate("day")` all agree about which day a row fell on, and calendar arithmetic such as `offset_by("1d")` moves by local days. To report in another zone, convert first with {py:meth}`convert_timezone <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.convert_timezone>` and then extract. {py:meth}`replace_timezone <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.replace_timezone>` attaches a zone to a naive wall clock instead, which chooses a new instant.
+
+Subtracting two temporal values gives a type that depends on the operands. The table below lists each pairing.
+
+| Expression | Result type | What it holds |
+|---|---|---|
+| timestamp - timestamp | `duration[us]` | Elapsed time. Two tz-aware columns subtract as instants, whatever their zones. |
+| date - date | `int64` | Whole days, as DuckDB returns them. |
+| timestamp + duration | `timestamp` | The instant moved by elapsed time. |
+| naive timestamp - tz-aware timestamp | `duration[us]` | The naive value is read as UTC. |
+
+A duration's `hour()`, `minute()`, `second()` and `day()` are its components, as DuckDB reads an interval, so 49 hours and 5 minutes has an `hour()` of 1. {py:meth}`total(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.total>` gives the total, 49 hours. Timestamps are 64-bit counts, so a microsecond timestamp spans roughly 292,000 years either side of 1970 and a nanosecond one only the years 1677 to 2262.
+
+Comparisons coerce without raising, and the coercion is worth knowing because it can move a filter's boundary. The following table lists the mixed comparisons.
+
+| Comparison | How it is read |
+|---|---|
+| date with timestamp | The date is its midnight. |
+| naive timestamp with tz-aware timestamp | The naive value is read as a UTC instant. |
+| two tz-aware timestamps | As instants, whatever their zones. |
+
+DuckDB reads a naive timestamp in its session `TimeZone` instead, and Polars refuses the comparison. Batcher keeps the comparison and reads naive as UTC, so when a naive column holds local wall clocks, attach its zone with `replace_timezone` before comparing it with an aware one.
+
+```python
+import datetime as dt
+
+import pyarrow as pa
+
+stamps = bt.from_arrow(
+    pa.table(
+        {
+            "a": pa.array([dt.datetime(2024, 1, 3, 1, 5)], pa.timestamp("us")),
+            "b": pa.array([dt.datetime(2024, 1, 1)], pa.timestamp("us")),
+            "z": pa.array([dt.datetime(2024, 1, 3, 1, 5)], pa.timestamp("us", "UTC")),
+            "d1": pa.array([dt.date(2024, 1, 3)]),
+            "d2": pa.array([dt.date(2024, 1, 1)]),
+        }
+    )
+)
+diffs = stamps.select(
+    span=bt.col("a") - bt.col("b"),
+    days=bt.col("d1") - bt.col("d2"),
+    naive_is_utc=bt.col("a") == bt.col("z"),
+)
+print(diffs.schema)
+# span: duration[us]
+# days: int64
+# naive_is_utc: bool
+print(diffs.select(hour=bt.col("span").dt.hour(), total=bt.col("span").dt.total("h")).to_pydict())
+# {'hour': [1], 'total': [49]}
+```
+
 ## Requirements and limitations
 
 - Every operation on this page that carries a value along an order requires `order_by`: the fills, `interpolate`, `rle_id`, and the EWM family. An unordered relation has no "previous row", and a morsel-parallel or distributed scan will not supply one.

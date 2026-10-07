@@ -29,9 +29,9 @@ _DESCRIPTIONS: dict[str, str] = {
     "upper": (
         "The string with every letter uppercased, by full Unicode case mapping.\n\n"
         "Locale-independent: the mapping is the Unicode Character Database's, never the\n"
-        "machine's. A character may map to several, so ``\"Straße\"`` becomes\n"
-        "``\"STRASSE\"`` and the result can be longer than the input. DuckDB maps one\n"
-        "character at a time and gives ``\"STRAẞE\"``.\n\n"
+        'machine\'s. A character may map to several, so ``"Straße"`` becomes\n'
+        '``"STRASSE"`` and the result can be longer than the input. DuckDB maps one\n'
+        'character at a time and gives ``"STRAẞE"``.\n\n'
         "Examples:\n"
         "    .. doctest::\n\n"
         "        >>> import batcher as bt\n"
