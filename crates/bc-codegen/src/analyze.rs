@@ -146,6 +146,7 @@ pub(crate) fn analyze(
                     Err(CodegenError::Unsupported("bitwise op".into()))
                 }
                 AddMonths => Err(CodegenError::Unsupported("date month arithmetic".into())),
+                AddDays => Err(CodegenError::Unsupported("date day arithmetic".into())),
                 // Floored division always falls back to the interpreter. Cranelift's
                 // `sdiv` truncates toward zero, so compiling it would need the explicit
                 // remainder-sign correction the interpreter applies — and the integer
@@ -441,6 +442,8 @@ pub(crate) fn analyze(
         Expr::MakeTemporal { .. } => Err(CodegenError::Unsupported("temporal constructor".into())),
         Expr::Strftime { .. } => Err(CodegenError::Unsupported("strftime".into())),
         Expr::ConvertTimezone { .. } => Err(CodegenError::Unsupported("convert_timezone".into())),
+        Expr::ReplaceTimezone { .. } => Err(CodegenError::Unsupported("replace_timezone".into())),
+        Expr::BusinessDay { .. } => Err(CodegenError::Unsupported("business-day calendar".into())),
         Expr::Strptime { .. } => Err(CodegenError::Unsupported("strptime".into())),
         Expr::ListBinary { .. } => Err(CodegenError::Unsupported("list binary op".into())),
         Expr::DateOffset { .. } => Err(CodegenError::Unsupported("offset_by".into())),

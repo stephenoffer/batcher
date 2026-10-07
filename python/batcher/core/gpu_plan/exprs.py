@@ -420,6 +420,8 @@ DECLINED_EXPRS: dict[str, str] = {
     # common zones and the recent decades, which is exactly the shape of disagreement a test
     # over ordinary data never reaches — the same reason a regex is declined next door.
     "convert_timezone": "three tz databases that agree only where a test would look",
+    "replace_timezone": "the same zone rules as convert_timezone, plus DST-gap policies",
+    "business_day": "a holiday-aware calendar kernel with no dataframe-library equivalent",
     # The per-row-parameter forms. Their constant siblings (`str`, `list_get`) translate,
     # but the engine answers these by grouping rows on the parameter and calling the same
     # kernel per group — a shape with no cuDF equivalent, and one this package will not

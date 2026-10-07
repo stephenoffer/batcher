@@ -2893,8 +2893,8 @@ mod tests {
     /// to the oracle when it does not.
     fn simd_admits(op: BinaryOp) -> bool {
         use BinaryOp::{
-            AddMonths, And, BitAnd, BitOr, BitXor, Concat, Div, Eq, FloorDiv, Ge, Gt, Le, Lt, Mod,
-            Mul, Ne, Or, ShiftLeft, ShiftRight, Sub,
+            AddDays, AddMonths, And, BitAnd, BitOr, BitXor, Concat, Div, Eq, FloorDiv, Ge, Gt, Le,
+            Lt, Mod, Mul, Ne, Or, ShiftLeft, ShiftRight, Sub,
         };
         match op {
             // Comparisons over numeric or same-type temporal operands - the filter win.
@@ -2908,7 +2908,9 @@ mod tests {
             // Scalarized `sdiv`/`srem` can trap; float `Mod` is an `fmod` libcall.
             Mod | FloorDiv => false,
             // Not numeric lanes: strings, integer bit twiddling, calendar arithmetic.
-            Concat | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | AddMonths => false,
+            Concat | BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight | AddMonths | AddDays => {
+                false
+            }
         }
     }
 
@@ -2929,7 +2931,7 @@ mod tests {
 
     #[test]
     fn the_documented_simd_binary_subset_is_what_simd_ty_admits() {
-        const ALL: [BinaryOp; 21] = [
+        const ALL: [BinaryOp; 22] = [
             BinaryOp::Eq,
             BinaryOp::Ne,
             BinaryOp::Lt,
@@ -2951,6 +2953,7 @@ mod tests {
             BinaryOp::ShiftLeft,
             BinaryOp::ShiftRight,
             BinaryOp::AddMonths,
+            BinaryOp::AddDays,
         ];
         let batch = make_batch(64, 7);
         let mut admitted_count = 0;

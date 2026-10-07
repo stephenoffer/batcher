@@ -10,14 +10,18 @@ add no engine surface.
 from __future__ import annotations
 
 import datetime as _dt
+from collections.abc import Iterable, Sequence
+from typing import Any
 
-from batcher._internal.errors import PlanError, require_int
-from batcher.plan.expr_ir.core import Expr, IntoExpr, Lit, _col_or_expr, _wrap
-from batcher.plan.expr_ir.func_nodes import MakeTemporal, WindowBuckets, WindowStart
+from batcher._internal.errors import PlanError, require_choice, require_int
+from batcher.plan.expr_ir.core import Binary, Expr, IntoExpr, Lit, _col_or_expr, _wrap
+from batcher.plan.expr_ir.func_nodes import DateOffset, MakeTemporal, WindowBuckets, WindowStart
+from batcher.plan.expr_ir.namespaces._calendar import business_day
 from batcher.plan.expr_ir.namespaces.temporal import parse_offset
 from batcher.plan.ir_tags import MICROS_PER_DAY
 
 __all__ = [
+    "business_day_count",
     "current_date",
     "current_timestamp",
     "date_add",
@@ -76,8 +80,39 @@ def _positive_micros(total: int, duration: str, arg: str) -> int:
     return total
 
 
-def window(time_col: IntoExpr, duration: str, slide: str | None = None) -> Expr:
-    """Assign each row to an event-time window (Spark ``window``).
+def _origin_micros(origin: _dt.datetime | _dt.date | None, offset: str | None) -> int:
+    """The window grid's anchor in epoch microseconds: `origin` (default the epoch) + `offset`.
+
+    An aware `origin` is read as the instant it names; a naive one as UTC, which is how the
+    engine reads a naive timestamp. The offset may be negative -- it only slides the grid.
+    """
+    if origin is None:
+        micros = 0
+    elif isinstance(origin, _dt.datetime):
+        aware = origin if origin.tzinfo else origin.replace(tzinfo=_dt.UTC)
+        epoch = _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)
+        micros = (aware - epoch) // _dt.timedelta(microseconds=1)
+    elif isinstance(origin, _dt.date):
+        micros = (origin - _dt.date(1970, 1, 1)).days * MICROS_PER_DAY
+    else:
+        raise PlanError(f"window(): origin must be a datetime or date, got {origin!r}")
+    if offset is not None:
+        sign, body = (-1, offset[1:]) if offset.startswith("-") else (1, offset)
+        micros += sign * _duration_micros(body, arg="window offset")
+    return micros
+
+
+def window(
+    time_col: IntoExpr,
+    duration: str,
+    slide: str | None = None,
+    *,
+    origin: _dt.datetime | _dt.date | None = None,
+    offset: str | None = None,
+    label: str = "left",
+    closed: str = "left",
+) -> Expr:
+    """Assign each row to an event-time window (Spark ``window``, Polars ``group_by_dynamic``).
 
     Returns the window-**start** timestamp to group by:
     ``ds.group_by(w=window(col("ts"), "1 hour")).agg(...)`` buckets rows into hourly
@@ -86,16 +121,34 @@ def window(time_col: IntoExpr, duration: str, slide: str | None = None) -> Expr:
     before grouping. Durations are fixed-length (days/hours/minutes/seconds); a
     calendar unit (month/year) is rejected.
 
+    Tumbling windows start on a grid anchored at the Unix epoch, so a ``"1d"`` window is a
+    UTC day. ``origin`` and ``offset`` move the grid: windows start at ``origin + offset +
+    k * duration`` for every integer ``k``, so a fifteen-minute bin anchored at ``09:07``
+    has reproducible boundaries whatever the data holds. ``closed="right"`` makes each
+    window ``(start, end]`` instead of ``[start, end)``, and ``label="right"`` labels it by
+    its end instead of its start. A tz-aware column keeps its zone on the window label; the
+    grid itself is elapsed time, not a local calendar.
+
     Args:
         time_col: The event-time column to bucket.
         duration: Fixed-length window width, e.g. ``"1h"`` or ``"30m"``.
         slide: Optional hop for sliding windows; ``None`` gives tumbling windows.
+        origin: A ``datetime`` (or ``date``, read as its midnight) the grid passes through;
+            the Unix epoch when omitted. A naive value is read as UTC. Tumbling only.
+        offset: A fixed duration added to ``origin``, e.g. ``"7m"`` or ``"-1h"`` (Polars
+            ``offset=``). Tumbling only.
+        label: ``"left"`` (the default) labels a window by its start, ``"right"`` by its end.
+            Tumbling only.
+        closed: ``"left"`` (the default) is ``[start, end)``; ``"right"`` is ``(start, end]``,
+            so an instant exactly on a boundary belongs to the window it ends. Tumbling only.
 
     Returns:
-        The window-start timestamp to group by (a list of starts when ``slide`` is set).
+        The window timestamp to group by (a list of starts when ``slide`` is set).
 
     Raises:
-        PlanError: If a duration uses a calendar unit or is not positive.
+        PlanError: If a duration uses a calendar unit or is not positive, if ``label`` or
+            ``closed`` is not ``"left"``/``"right"``, or if ``origin``, ``offset``, ``label``
+            or ``closed`` is combined with ``slide``.
 
     Examples:
         .. doctest::
@@ -114,12 +167,38 @@ def window(time_col: IntoExpr, duration: str, slide: str | None = None) -> Expr:
             [datetime.datetime(2024, 1, 1, 10, 0), datetime.datetime(2024, 1, 1, 11, 0)]
             >>> out["s"]
             [1, 3]
+
+            >>> at = dt.datetime(2024, 1, 1, 9, 7)
+            >>> ds.select(w=bt.window(bt.col("ts"), "15m", origin=at)).to_pydict()["w"]
+            [datetime.datetime(2024, 1, 1, 9, 52), datetime.datetime(2024, 1, 1, 10, 52)]
+
+            >>> edge = bt.from_pydict({"ts": [dt.datetime(2024, 1, 1, 11, 0)]})
+            >>> w = bt.window(bt.col("ts"), "1h", closed="right", label="right")
+            >>> edge.select(w=w).to_pydict()
+            {'w': [datetime.datetime(2024, 1, 1, 11, 0)]}
     """
+    label = require_choice(label, func="window", arg="label", choices=("left", "right"))
+    closed = require_choice(closed, func="window", arg="closed", choices=("left", "right"))
     width = _duration_micros(duration, arg="window duration")
     expr = _wrap(time_col)
-    if slide is None:
-        return WindowStart(expr, width)
-    return WindowBuckets(expr, width, _duration_micros(slide, arg="window slide"))
+    if slide is not None:
+        if origin is not None or offset is not None or label != "left" or closed != "left":
+            raise PlanError(
+                "window(): origin=, offset=, label= and closed= apply to tumbling windows; "
+                "drop slide= or bucket the sliding windows' starts afterwards"
+            )
+        return WindowBuckets(expr, width, _duration_micros(slide, arg="window slide"))
+    anchor = _origin_micros(origin, offset)
+    # Reduce the anchor into one window so the IR carries a small number; the grid is the
+    # same for any anchor congruent modulo the width.
+    anchor %= width
+    if closed == "left":
+        start: Expr = WindowStart(expr, width, anchor)
+    else:
+        # `(s, s + w]` is `[s + 1us, s + w + 1us)` on the microsecond grid: bucket on a grid
+        # one microsecond later and step the label back onto the real boundary.
+        start = DateOffset(WindowStart(expr, width, (anchor + 1) % width), 0, 0, -1)
+    return start if label == "left" else DateOffset(start, 0, 0, width)
 
 
 # date_part unit (lowercased) → `.dt` accessor method name. Covers the DuckDB/SQL
@@ -223,15 +302,26 @@ def date_part(part: str, expr: IntoExpr) -> Expr:
     return getattr(_wrap(expr).dt, method)()
 
 
-def date_add(expr: IntoExpr, days: int) -> Expr:
+def _shift_days(expr: IntoExpr, days: IntoExpr, sign: int, func: str) -> Expr:
+    """`expr` shifted by `sign * days` calendar days; a constant or a per-row count."""
+    if isinstance(days, Expr):
+        count = days if sign > 0 else -days
+        return Binary("add_days", _wrap(expr), count)
+    days = require_int(days, func=func, arg="days")
+    return _wrap(expr).dt.offset_by(f"{sign * days}d")
+
+
+def date_add(expr: IntoExpr, days: int | Expr) -> Expr:
     """Add a whole number of days to a date/time column (Spark ``date_add``).
 
-    ``days`` is a plain integer literal; for calendar units like months or years use
-    ``.dt.offset_by``. Negative values subtract.
+    ``days`` is an integer or an integer column, so each row can move by its own count;
+    for calendar units like months or years use ``.dt.offset_by`` or ``.dt.add_months``.
+    Negative values subtract. A day is a calendar day: on a tz-aware timestamp the clock
+    reads the same after a DST change. A null count gives null.
 
     Args:
         expr: The date/time column to shift.
-        days: Number of days to add (may be negative).
+        days: Number of days to add (may be negative): an integer or an integer expression.
 
     Returns:
         The date/time column shifted forward by ``days`` days.
@@ -244,19 +334,23 @@ def date_add(expr: IntoExpr, days: int) -> Expr:
             >>> ds = bt.from_pydict({"d": [dt.date(2024, 1, 31)]})
             >>> ds.select(bt.date_add(bt.col("d"), 5).alias("r")).to_pydict()
             {'r': [datetime.date(2024, 2, 5)]}
+
+            >>> per_row = bt.from_pydict({"d": [dt.date(2024, 1, 31)] * 2, "n": [1, 30]})
+            >>> per_row.select(r=bt.date_add(bt.col("d"), bt.col("n"))).to_pydict()
+            {'r': [datetime.date(2024, 2, 1), datetime.date(2024, 3, 1)]}
     """
-    days = require_int(days, func="date_add", arg="days")
-    return _wrap(expr).dt.offset_by(f"{days}d")
+    return _shift_days(expr, days, 1, "date_add")
 
 
-def date_sub(expr: IntoExpr, days: int) -> Expr:
+def date_sub(expr: IntoExpr, days: int | Expr) -> Expr:
     """Subtract a whole number of days from a date/time column (Spark ``date_sub``).
 
-    The mirror of :func:`date_add`; ``days`` is a plain integer literal.
+    The mirror of :func:`date_add`; ``days`` is an integer or an integer column.
 
     Args:
         expr: The date/time column to shift.
-        days: Number of days to subtract (may be negative).
+        days: Number of days to subtract (may be negative): an integer or an integer
+            expression.
 
     Returns:
         The date/time column shifted back by ``days`` days.
@@ -270,8 +364,61 @@ def date_sub(expr: IntoExpr, days: int) -> Expr:
             >>> ds.select(bt.date_sub(bt.col("d"), 5).alias("r")).to_pydict()
             {'r': [datetime.date(2024, 3, 10)]}
     """
-    days = require_int(days, func="date_sub", arg="days")
-    return _wrap(expr).dt.offset_by(f"{-days}d")
+    return _shift_days(expr, days, -1, "date_sub")
+
+
+def business_day_count(
+    start: IntoExpr,
+    end: IntoExpr,
+    *,
+    holidays: Iterable[Any] = (),
+    weekmask: str | Sequence[bool] = "1111100",
+) -> Expr:
+    """Count business days in ``[start, end)`` (numpy ``busday_count``).
+
+    A business day is a weekday ``weekmask`` admits that is not in ``holidays``: the same
+    calendar ``.dt.add_business_days`` and ``.dt.is_business_day`` use, so the three agree on
+    every date (Polars ``business_day_count``). The range is half-open, so a start equal to
+    the end counts zero. An end before the start counts the business days in
+    ``(end, start]``, negated, as numpy does. A timestamp counts by its calendar date (its
+    own zone's, if tz-aware).
+
+    A bare string names a column, as in :func:`from_epoch`.
+
+    Args:
+        start: The first day of the range (a date or timestamp column, or its name).
+        end: The day after the last one counted.
+        holidays: Dates that are never business days (``datetime.date`` values or
+            ``"YYYY-MM-DD"`` strings). A plan-time constant.
+        weekmask: Seven Monday-first flags: ``"1111100"`` (the default, Monday to Friday),
+            or a sequence of bools.
+
+    Returns:
+        An Int64 expression; null where either end is null.
+
+    Raises:
+        PlanError: If the calendar is malformed.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> import datetime as dt
+            >>> ds = bt.from_pydict({"a": [dt.date(2024, 12, 23)], "b": [dt.date(2025, 1, 6)]})
+            >>> ds.select(n=bt.business_day_count("a", "b")).to_pydict()
+            {'n': [10]}
+            >>> off = [dt.date(2024, 12, 25), dt.date(2025, 1, 1)]
+            >>> ds.select(n=bt.business_day_count("a", "b", holidays=off)).to_pydict()
+            {'n': [8]}
+    """
+    return business_day(
+        "business_day_count",
+        "count",
+        _col_or_expr(start),
+        _col_or_expr(end),
+        holidays,
+        weekmask,
+    )
 
 
 # Epoch unit → the engine `MakeTemporal` function that reads a count in that unit.

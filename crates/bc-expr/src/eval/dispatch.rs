@@ -27,13 +27,14 @@ use crate::eval::media::image::ImageArgs;
 use crate::eval::media::{eval_audio, eval_image, eval_image_crop, eval_video, Bounds};
 use crate::eval::spatial::eval_spatial;
 use crate::eval::str::{eval_str, try_dict_str};
+use crate::eval::temporal::business::eval_business_day;
 use crate::eval::temporal::date::{
     eval_date, eval_date_offset, eval_date_trunc, eval_window_buckets, eval_window_start,
     parse_dtype,
 };
 use crate::eval::temporal::make::eval_make_temporal;
 use crate::eval::temporal::text::{eval_strftime, eval_strptime};
-use crate::eval::temporal::timezone::eval_convert_timezone;
+use crate::eval::temporal::timezone::{eval_convert_timezone, eval_replace_timezone};
 use crate::{BinaryOp, Expr, ExprError};
 
 /// Decode a dictionary-encoded array to its value type; identity for any other array.
@@ -451,9 +452,32 @@ impl Expr {
                 input,
                 from_tz,
                 to_tz,
+                ambiguous,
+                nonexistent,
             } => {
                 let arr = input.eval(batch)?;
-                eval_convert_timezone(&arr, from_tz, to_tz)
+                eval_convert_timezone(&arr, from_tz, to_tz, *ambiguous, *nonexistent)
+            }
+            Expr::ReplaceTimezone {
+                input,
+                tz,
+                ambiguous,
+                nonexistent,
+            } => {
+                let arr = input.eval(batch)?;
+                eval_replace_timezone(&arr, tz.as_deref(), *ambiguous, *nonexistent)
+            }
+            Expr::BusinessDay {
+                func,
+                input,
+                other,
+                holidays,
+                weekmask,
+                roll,
+            } => {
+                let arr = input.eval(batch)?;
+                let other = other.as_ref().map(|o| o.eval(batch)).transpose()?;
+                eval_business_day(*func, &arr, other.as_ref(), holidays, *weekmask, *roll)
             }
             Expr::Strptime {
                 input,

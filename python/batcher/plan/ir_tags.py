@@ -77,6 +77,8 @@ class ExprTag:
     STRFTIME: Final = "strftime"
     STRPTIME: Final = "strptime"
     CONVERT_TIMEZONE: Final = "convert_timezone"
+    REPLACE_TIMEZONE: Final = "replace_timezone"
+    BUSINESS_DAY: Final = "business_day"
     LIST: Final = "list"
     LIST_BINARY: Final = "list_binary"
     LIST_JOIN: Final = "list_join"

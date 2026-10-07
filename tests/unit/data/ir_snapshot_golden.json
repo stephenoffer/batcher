@@ -1,4 +1,16 @@
 {
+  "add_days": {
+    "e": "binary",
+    "left": {
+      "e": "col",
+      "name": "d"
+    },
+    "op": "add_days",
+    "right": {
+      "e": "col",
+      "name": "n"
+    }
+  },
   "agg_binary": {
     "alias": "r",
     "func": "corr",
@@ -141,6 +153,39 @@
       }
     }
   },
+  "business_day_add": {
+    "e": "business_day",
+    "fn": "add",
+    "holidays": [
+      19723
+    ],
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "other": {
+      "e": "col",
+      "name": "n"
+    },
+    "roll": "forward",
+    "weekmask": [
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "business_day_is": {
+    "e": "business_day",
+    "fn": "is",
+    "input": {
+      "e": "col",
+      "name": "d"
+    }
+  },
   "case": {
     "branches": [
       {
@@ -219,6 +264,25 @@
       "name": "d"
     },
     "to_tz": "America/New_York"
+  },
+  "convert_timezone_policies": {
+    "ambiguous": "earliest",
+    "e": "convert_timezone",
+    "from_tz": "America/New_York",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "nonexistent": "shift_forward",
+    "to_tz": "UTC"
+  },
+  "date_epoch_ns": {
+    "e": "date",
+    "fn": "epoch_ns",
+    "input": {
+      "e": "col",
+      "name": "d"
+    }
   },
   "date_func": {
     "e": "date",
@@ -848,6 +912,22 @@
       }
     }
   },
+  "replace_timezone": {
+    "ambiguous": "raise",
+    "e": "replace_timezone",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "tz": "Europe/Paris"
+  },
+  "replace_timezone_strip": {
+    "e": "replace_timezone",
+    "input": {
+      "e": "col",
+      "name": "d"
+    }
+  },
   "seq_bare": {
     "e": "seq",
     "fn": "reverse_complement",
@@ -1103,6 +1183,17 @@
   "strptime": {
     "e": "strptime",
     "format": "%Y-%m-%d",
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
+  "strptime_formats": {
+    "e": "strptime",
+    "format": [
+      "%Y-%m-%d",
+      "%d/%m/%Y"
+    ],
     "input": {
       "e": "col",
       "name": "s"

@@ -51,6 +51,8 @@ EXPR_GOLDEN = {
     "COALESCE": "coalesce",
     "COL": "col",
     "CONVERT_TIMEZONE": "convert_timezone",
+    "REPLACE_TIMEZONE": "replace_timezone",
+    "BUSINESS_DAY": "business_day",
     "DATE": "date",
     "DATE_OFFSET": "date_offset",
     "DATE_TRUNC": "date_trunc",

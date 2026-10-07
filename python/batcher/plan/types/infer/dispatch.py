@@ -28,6 +28,7 @@ from batcher.plan.types.infer.collections import (
 )
 from batcher.plan.types.infer.geospatial import geofunc_type, spatialfunc_type
 from batcher.plan.types.infer.scalars import datefunc_type, make_temporal_type, strfunc_type
+from batcher.plan.types.infer.temporal import temporal_node_type
 from batcher.plan.types.lattice import promote
 from batcher.plan.types.media import audiofunc_type, imagefunc_type, videofunc_type
 from batcher.plan.types.registry import resolve_dtype
@@ -53,7 +54,7 @@ _NODES_BOUND = False
 
 def _bind_nodes() -> None:
     """Import the expression node classes `infer_type` dispatches on into module globals."""
-    global _NODES_BOUND
+    global _NODES_BOUND, BusinessDay, ReplaceTimezone
     global Aliased, Array, AudioFunc, Binary, Case, Cast, Coalesce, Col, ConvertTimezone
     global DateFunc, DateOffset, DateTrunc, GeoFunc, Greatest, HashRows, ImageCrop, ImageFunc
     global InList, IsInf, IsNan, IsNotNull, IsNull, Least, ListBinary, ListContains, ListFilter
@@ -78,9 +79,11 @@ def _bind_nodes() -> None:
         Not,
     )
     from batcher.plan.expr_ir.func_nodes import (
+        BusinessDay,
         GeoFunc,
         ListTransform,
         MakeTemporal,
+        ReplaceTimezone,
         SpatialFunc,
         WindowBuckets,
         WindowStart,
@@ -215,18 +218,21 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return pa.timestamp("us")  # parses a string into a microsecond timestamp
     if isinstance(expr, Strftime):
         return pa.string()  # formats a Date/Timestamp into text
-    if isinstance(expr, DateTrunc):
-        # `date_trunc` returns a microsecond Timestamp for both date and timestamp
-        # inputs (verified against the engine), unless `preserve_type` keeps a date a date.
-        if expr.preserve_type:
-            source = infer_type(expr.input, schema)
-            if source is None:
-                return None  # the engine answers the input's type, which is unknown here
-            if pa.types.is_date32(source):
-                return pa.date32()
-        return pa.timestamp("us")
-    if isinstance(expr, (DateOffset, ConvertTimezone)):
-        return infer_type(expr.input, schema)  # type-preserving (shift/tz-convert)
+    if isinstance(
+        expr,
+        (
+            BusinessDay,
+            ConvertTimezone,
+            DateOffset,
+            DateTrunc,
+            ReplaceTimezone,
+            WindowBuckets,
+            WindowStart,
+        ),
+    ):
+        # `date_trunc`, `offset_by`, the tz ops, the window keys and the business-day
+        # calendar: each keeps (or sets) a timestamp's zone, so each must see its operand.
+        return temporal_node_type(expr, schema, infer_type)
     if isinstance(expr, ListContains):
         return pa.bool_()
     if isinstance(expr, ListPosition):
@@ -276,18 +282,6 @@ def infer_type(expr: Expr, schema: SchemaRef) -> pa.DataType | None:
         return _make_struct_type(expr.fields, schema)
     if isinstance(expr, MakeMap):
         return _make_map_type(expr.keys, expr.values, schema)
-    if isinstance(expr, WindowStart):
-        # A timestamp, whatever the input was -- NOT the input's own type. That reading is
-        # the obvious one and it is false, which `_sql`'s bucket lowering proves: for a DATE
-        # argument it builds `Cast(WindowStart(value, width), "date")`, and that cast is only
-        # there because the window yields a timestamp. Declaring `date32` here made the cast
-        # look redundant, it was eliminated, and `time_bucket(INTERVAL 1 DAY, DATE ...)` came
-        # back `timestamp[us]` -- a wrong declared type turning into a wrong *result*.
-        return pa.timestamp("us")
-    if isinstance(expr, WindowBuckets):
-        # The hopping form puts each instant in every overlapping bucket, so it is a list of
-        # the same window starts.
-        return pa.list_(pa.timestamp("us"))
     return None
 
 

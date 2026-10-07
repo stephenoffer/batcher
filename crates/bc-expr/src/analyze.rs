@@ -221,6 +221,8 @@ impl Expr {
             | Expr::DateTrunc { .. }
             | Expr::Strftime { .. }
             | Expr::ConvertTimezone { .. }
+            | Expr::ReplaceTimezone { .. }
+            | Expr::BusinessDay { .. }
             | Expr::Strptime { .. }
             | Expr::DateOffset { .. }
             | Expr::ListJoin { .. }
@@ -446,6 +448,7 @@ impl Expr {
             | Expr::DateTrunc { input, .. }
             | Expr::Strftime { input, .. }
             | Expr::ConvertTimezone { input, .. }
+            | Expr::ReplaceTimezone { input, .. }
             | Expr::Strptime { input, .. }
             | Expr::DateOffset { input, .. }
             | Expr::ListJoin { input, .. }
@@ -462,6 +465,14 @@ impl Expr {
             | Expr::ListBinary { left, right, .. } => {
                 visit(left);
                 visit(right);
+            }
+            // A business-day op's second operand (the day count or the end date) is a
+            // per-row expression too.
+            Expr::BusinessDay { input, other, .. } => {
+                visit(input);
+                if let Some(o) = other {
+                    visit(o);
+                }
             }
             Expr::ListTransform { input, func } => {
                 visit(input);

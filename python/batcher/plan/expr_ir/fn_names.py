@@ -169,9 +169,9 @@ would leak a key into a traceback."""
 DATE_FNS: Final[frozenset[str]] = frozenset(
     {
         "century", "day", "day_of_week", "day_of_year", "dayname", "days_in_month",
-        "decade", "epoch", "hour", "is_leap_year", "iso_year", "isodow", "last_day",
-        "millennium", "minute", "month", "monthname", "quarter", "second", "week",
-        "year",
+        "decade", "epoch", "epoch_ns", "hour", "is_leap_year", "iso_year", "isodow",
+        "last_day", "millennium", "minute", "month", "monthname", "nanosecond", "quarter",
+        "second", "week", "year",
     }
 )  # fmt: skip
 

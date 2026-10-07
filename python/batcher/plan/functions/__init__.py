@@ -116,6 +116,7 @@ from batcher.plan.functions.string import (
     strip_reasoning,
 )
 from batcher.plan.functions.temporal import (
+    business_day_count,
     current_date,
     current_timestamp,
     date_add,
@@ -135,6 +136,7 @@ __all__ = [
     "any_horizontal",
     "arctan2",
     "bit_get",
+    "business_day_count",
     "chatml_prompt",
     "concat",
     "concat_ws",

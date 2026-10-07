@@ -64,6 +64,19 @@ def _engine_profile() -> str:
     return str(getattr(engine(), "__engine_profile__", "unknown"))
 
 
+def _tzdata_version() -> str:
+    """The IANA time-zone database release compiled into the engine, e.g. ``2025b``.
+
+    Every zone conversion uses the engine's own compiled-in copy of the database, not the
+    host's ``tzdata``, so this is the release that decides what a timestamp in a zone whose
+    rules changed means -- and two engines built against different releases can disagree
+    about a future instant there. ``unknown`` for an engine built before it was reported.
+    """
+    from batcher._internal.native import engine
+
+    return str(getattr(engine(), "__tzdata_version__", "unknown"))
+
+
 def versions() -> dict[str, str]:
     """Return the Batcher, engine, Python, platform, and optional-backend versions.
 
@@ -76,6 +89,10 @@ def versions() -> dict[str, str]:
     build`` installs — is unoptimized, and nothing else about a running query says so, so
     it is the first thing to check when a pipeline is unexpectedly slow.
 
+    ``tzdata`` is the IANA time-zone database release compiled into the engine (such as
+    ``2025b``). Zone conversions use that copy, never the host's, so it is the version to
+    quote when a DST boundary or a zone's changed rules give a surprising timestamp.
+
     Returns:
         A mapping of component name to version string.
 
@@ -85,6 +102,8 @@ def versions() -> dict[str, str]:
             >>> import batcher as bt
             >>> bt.versions()["batcher"]
             '0.1.0'
+            >>> len(bt.versions()["tzdata"])  # an IANA release such as '2025b'
+            5
     """
     import batcher
 
@@ -93,6 +112,7 @@ def versions() -> dict[str, str]:
         "engine": engine_version(),
         # `debug` here is the answer to "why is this slow?" more often than any plan.
         "engine_profile": _engine_profile(),
+        "tzdata": _tzdata_version(),
         "python": sys.version.split()[0],
         "platform": platform.platform(),
     }
