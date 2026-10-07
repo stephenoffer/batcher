@@ -153,9 +153,7 @@ def test_sum_distinct_mixed_with_plain_agg(duck, tables):
     _check(duck, tables, "SELECT sum(DISTINCT sal) AS s, count(sal) AS c FROM emp")
 
 
-def test_sum_distinct_with_non_mergeable_agg_clean_error(tables):
+def test_sum_distinct_with_non_mergeable_agg(duck, tables):
     # `avg` has no single-column mergeable partial, so it cannot be pre-aggregated
-    # alongside the dedup. That must stay an explicit error, never a plausible wrong number.
-    emp, dept = tables
-    with pytest.raises(NotImplementedError, match="mergeable partial"):
-        bt.sql("SELECT sum(DISTINCT sal) s, avg(sal) a FROM emp", emp=emp, dept=dept).collect()
+    # alongside the dedup; it takes the Expand rewrite instead (`agg_rewrites.py`).
+    _check(duck, tables, "SELECT sum(DISTINCT sal) AS s, avg(sal) AS a FROM emp")

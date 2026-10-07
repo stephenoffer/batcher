@@ -3484,11 +3484,18 @@ class Expr:
         """
         return AggExpr("median", self)
 
-    def quantile(self, q: float, interpolation: str = "linear") -> AggExpr:
+    def quantile(self, q: float | Sequence[float], interpolation: str = "linear") -> AggExpr | Expr:
         """Continuous quantile at ``q`` in [0, 1] (linear interpolation).
 
         ``quantile(0.5)`` equals :meth:`median`. Raises ``PlanError`` if ``q`` is
         outside [0, 1].
+
+        A list of fractions, ``quantile([0.25, 0.5, 0.75])``, answers one ``List`` of the
+        quantiles in the order given, in the same pass, as DuckDB's
+        ``quantile_cont(x, [0.25, 0.5, 0.75])`` does. A group with no non-null value
+        answers a null list, not a list of nulls. Each fraction is still its own exact
+        quantile state, so memory grows with the number of fractions. The list form has
+        no window spelling; use it in ``agg(...)``.
 
         `interpolation` decides what happens when rank ``q·(n-1)`` falls between two
         values, with Polars' names: ``"linear"`` (DuckDB's ``quantile_cont``, the default),
@@ -3497,14 +3504,15 @@ class Expr:
         ``ceil(q·n) - 1``, which is :meth:`quantile_disc`).
 
         Args:
-            q: The quantile in ``[0, 1]``.
+            q: The quantile in ``[0, 1]``, or a list or tuple of them.
             interpolation: How to resolve a rank between two values.
 
         Returns:
-            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``;
+            for a list of fractions, a ``List`` expression for ``agg(...)``.
 
         Raises:
-            PlanError: If `q` is outside ``[0, 1]``.
+            PlanError: If a `q` is outside ``[0, 1]``, or the list of fractions is empty.
 
         Examples:
             .. doctest::
@@ -3516,10 +3524,17 @@ class Expr:
                 >>> nearest = bt.col("x").quantile(0.5, "nearest")
                 >>> ds.group_by("g").agg(r=nearest).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2.0, 10.0]}
+
+                >>> ds.agg(r=bt.col("x").quantile([0.5, 0.0])).to_pydict()
+                {'r': [[2.0, 1.0]]}
         """
         from batcher._internal.errors import PlanError
         from batcher.plan.ir_tags import QUANTILE_INTERPOLATIONS
 
+        if isinstance(q, (list, tuple)):
+            from batcher.plan.functions.aggregate_semantics import quantile_list
+
+            return quantile_list(self, list(q), interpolation)
         q = require_float(q, func="quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"quantile q must be in [0, 1], got {q}")
@@ -4178,6 +4193,7 @@ class Expr:
         descending: bool | Sequence[bool] = False,
         nulls_last: bool | Sequence[bool] = True,
         ignore_nulls: bool = False,
+        distinct: bool = False,
     ) -> AggExpr | Expr:
         """Collect each group's values (including nulls) into a ``List`` (SQL ``array_agg``).
 
@@ -4201,6 +4217,14 @@ class Expr:
         ``ignore_nulls=True`` leaves the nulls out, as Spark's ``collect_list`` and
         ``array_agg`` do, so a group of only nulls collects to ``[]``.
 
+        ``distinct=True`` keeps each value once, sorted by the value, as SQL's
+        ``array_agg(DISTINCT x ORDER BY x)`` and Spark's ``array_sort(collect_set(x))`` do.
+        One null is kept unless ``ignore_nulls=True``. ``order_by`` may then only name the
+        value itself, to choose ``descending`` or ``nulls_last``: among duplicates there is
+        no single row whose key could decide a position, so any other key is refused, as
+        in Postgres and DuckDB. The list is collected in full and deduplicated afterwards,
+        so it holds every value of the group until then.
+
         Args:
             order_by: The key or keys that order the elements; none leaves the order
                 unspecified.
@@ -4208,13 +4232,15 @@ class Expr:
             nulls_last: Place elements whose key is null after the others, for every key or
                 per key.
             ignore_nulls: Whether to leave null values out of the list.
+            distinct: Whether to keep each value once, sorted by the value.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)``.
 
         Raises:
             PlanError: If ``descending`` or ``nulls_last`` is a sequence whose length is not
-                the number of ``order_by`` keys.
+                the number of ``order_by`` keys, or ``distinct=True`` is ordered by anything
+                but the value itself.
 
         Examples:
             .. doctest::
@@ -4231,13 +4257,19 @@ class Expr:
                 >>> nulls = bt.from_pydict({"x": [1, None]})
                 >>> nulls.agg(r=bt.col("x").array_agg(ignore_nulls=True)).to_pydict()
                 {'r': [[1]]}
+
+                >>> dup = bt.from_pydict({"x": [2, None, 1, 2]})
+                >>> dup.agg(r=bt.col("x").array_agg(distinct=True)).to_pydict()
+                {'r': [[1, 2, None]]}
         """
+        from batcher.plan.functions import aggregate_semantics as sem
+
         keys = _agg_order_keys(order_by, descending, nulls_last, func="array_agg")
+        if distinct:
+            return sem.distinct_array_agg(self, keys, drop_nulls=ignore_nulls)
         agg = AggExpr("list_agg", self, order_by=keys)
         if not ignore_nulls:
             return agg
-        from batcher.plan.functions import aggregate_semantics as sem
-
         return sem.array_agg_without_nulls(agg)
 
     # --- Cumulative / shift (Polars-style window conveniences) ------------------
@@ -6534,6 +6566,46 @@ class AggExpr:
             interpolation=self.interpolation,
             order_by=self.order_by,
         )
+
+    def filter(self, predicate: IntoExpr) -> AggExpr | Expr:
+        """Aggregate only the rows where `predicate` is true (SQL ``agg FILTER (WHERE p)``).
+
+        Rows where `predicate` is false or null are left out of this aggregate alone; the
+        group keys, and every other aggregate in the same `agg(...)`, still see every row.
+        That is how one pass computes a total beside a subset total, where filtering the
+        `Dataset` first would need two passes and a join.
+
+        The aggregate's own empty rule is untouched by the filter: a group with no matching
+        row counts ``0`` and sums to null, exactly as a group with no rows at all does, and
+        ``array_agg`` keeps the null values of the rows that match. For a different empty
+        answer, coalesce the result: ``bt.coalesce(col("x").sum().filter(p), 0)``. SQL's
+        ``FILTER (WHERE ...)`` lowers through the same code, so the two spellings agree.
+
+        Args:
+            predicate: A boolean expression over the input rows.
+
+        Returns:
+            The restricted aggregate, for ``group_by().agg(...)`` or ``Dataset.agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 5, 2]})
+                >>> big = bt.col("x") > 1
+                >>> ds.group_by("g").agg(
+                ...     n=bt.count(),
+                ...     n_big=bt.count().filter(big),
+                ...     s_big=bt.col("x").sum().filter(big),
+                ... ).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'n': [2, 1], 'n_big': [1, 1], 's_big': [5, 2]}
+
+                >>> ds.agg(none=bt.col("x").sum().filter(bt.col("x") > 9)).to_pydict()
+                {'none': [None]}
+        """
+        from batcher.plan.functions.aggregate_semantics import filter_aggregate
+
+        return filter_aggregate(self, _wrap(predicate))
 
     def to_ir(self, alias: str | None = None) -> dict[str, Any]:
         """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`.

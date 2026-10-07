@@ -162,6 +162,55 @@ print(derived.to_pydict())
 # {'category': ['a', 'b'], 'revenue': [350.0, 200.0], 'avg_price': [30.0, 30.0], 'spread': [40.0, 20.0]}
 ```
 
+## Filtered aggregates
+
+{py:meth}`AggExpr.filter(predicate) <batcher.AggExpr.filter>` restricts one aggregate to the rows where `predicate` is true, SQL's `agg(...) FILTER (WHERE ...)`. Every other aggregate in the same `agg` still sees every row, so a total and a subset total come out of one pass rather than two passes and a join. A group with no matching row counts `0` and sums to null, the same answer a group with no rows at all gives, and a filtered `array_agg` leaves the rejected rows out instead of collecting them as nulls. SQL's `FILTER` clause lowers through the same code, so the two spellings agree.
+
+```python
+big = bt.col("price") > 25
+filtered = (
+    ds.group_by("category")
+    .agg(
+        orders=bt.count(),
+        big_orders=bt.count().filter(big),
+        big_revenue=bt.col("price").sum().filter(big),
+        big_prices=bt.col("price").array_agg(order_by="price").filter(big),
+    )
+    .sort("category")
+)
+print(filtered.to_pydict())
+# {'category': ['a', 'b'], 'orders': [3, 2], 'big_orders': [2, 1], 'big_revenue': [80.0, 40.0],
+#  'big_prices': [[30.0, 50.0], [40.0]]}
+```
+
+Two list-valued forms round this out. {py:meth}`quantile([...]) <batcher.plan.expr_ir.core.Expr.quantile>` with a list of fractions returns one list of quantiles in the order given, DuckDB's `quantile_cont(x, [...])`, and a null list for a group with no values. {py:meth}`array_agg(distinct=True) <batcher.plan.expr_ir.core.Expr.array_agg>` keeps each value once, sorted by the value, which is SQL's `array_agg(DISTINCT x ORDER BY x)`.
+
+```python
+lists = (
+    ds.group_by("category")
+    .agg(
+        quartiles=bt.col("price").quantile([0.25, 0.5, 0.75]),
+        qtys=bt.col("qty").array_agg(distinct=True),
+    )
+    .sort("category")
+)
+print(lists.to_pydict())
+# {'category': ['a', 'b'], 'quartiles': [[20.0, 30.0, 40.0], [25.0, 30.0, 35.0]],
+#  'qtys': [[1, 3, 5], [2, 4]]}
+```
+
+## Filter groups or keep their rows
+
+{py:meth}`GroupBy.having <batcher.GroupBy.having>` drops the groups whose aggregates fail a predicate and returns one row per surviving group. To keep the *original rows* of the groups that pass, filter on a window aggregate instead. {py:meth}`bt.count().over(keys) <batcher.AggExpr.over>` broadcasts each group's row count to its rows, so the filter below keeps every row of a category with at least three rows. That is SQL's `QUALIFY count(*) OVER (PARTITION BY category) >= 3`, and it counts the rows of a null key as one group.
+
+```python
+print(ds.group_by("category").having(bt.count() >= 3).agg(n=bt.count()).to_pydict())
+# {'category': ['a'], 'n': [3]}
+
+print(ds.filter(bt.count().over("category") >= 3).sort("price").to_pydict())
+# {'category': ['a', 'a', 'a'], 'price': [10.0, 30.0, 50.0], 'qty': [1, 3, 5]}
+```
+
 ## Linear regression
 
 The `regr_*` family is built on expressions over aggregates. It fits a least-squares line of a dependent column `y` on an independent column `x` per group, matching the SQL / DuckDB / PostgreSQL functions. {py:obj}`bt.regr_slope(y, x) <batcher.regr_slope>` and {py:obj}`bt.regr_intercept(y, x) <batcher.regr_intercept>` give the line, {py:obj}`bt.regr_r2(y, x) <batcher.regr_r2>` its fit, and {py:obj}`bt.regr_count(y, x) <batcher.regr_count>`, {py:obj}`bt.regr_avgx(y, x) <batcher.regr_avgx>` / {py:obj}`bt.regr_avgy(y, x) <batcher.regr_avgy>`, and {py:obj}`bt.regr_sxx(y, x) <batcher.regr_sxx>` / {py:obj}`bt.regr_syy(y, x) <batcher.regr_syy>` / {py:obj}`bt.regr_sxy(y, x) <batcher.regr_sxy>` the underlying moments. Every function uses only rows where both columns are non-null. Because each result is an expression, you can round or combine it further.

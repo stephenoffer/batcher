@@ -5867,18 +5867,20 @@ class Dataset:
         self._require_column(column, "var")
         return self._exec_scalar(Col(column).var())
 
-    def quantile(self, column: str, q: float) -> Any:
+    def quantile(self, column: str, q: float | Sequence[float]) -> Any:
         """The exact `q`-quantile of `column` (SQL ``QUANTILE_CONT``), ignoring nulls.
 
         The exact counterpart of `approx_quantile`, which answers from a mergeable
-        TDigest instead.
+        TDigest instead. A list of fractions answers a list of quantiles in one pass.
 
         Args:
             column: The column to reduce.
-            q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median).
+            q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median), or a list
+                of them.
 
         Returns:
-            The quantile value, or ``None`` for an empty/all-null column.
+            The quantile value (a list of them for a list of fractions), or ``None`` for
+            an empty/all-null column.
 
         Raises:
             PlanError: If `q` is outside ``[0, 1]``.
@@ -5889,10 +5891,10 @@ class Dataset:
                 >>> import batcher as bt
                 >>> bt.from_pydict({"x": [1, 2, 3, 4]}).quantile("x", 0.25)
                 1.75
+                >>> bt.from_pydict({"x": [1, 2, 3, 4]}).quantile("x", [0.25, 0.5])
+                [1.75, 2.5]
         """
         self._require_column(column, "quantile")
-        if not 0.0 <= q <= 1.0:
-            raise PlanError(f"quantile(): q must be in [0, 1], got {q}")
         return self._exec_scalar(Col(column).quantile(q))
 
     def corr(self, x: str, y: str) -> float | None:
