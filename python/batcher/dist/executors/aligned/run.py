@@ -39,6 +39,7 @@ from batcher.dist.executors.aligned.local import local_broadcast, resolve_local
 from batcher.dist.executors.aligned.memory_fit import fit_units_to_cluster
 from batcher.dist.executors.aligned.reduce import (
     prefer_hash_joins,
+    push_top_n,
     reduce_broadcasts,
     sliceable_broadcasts,
 )
@@ -326,7 +327,11 @@ def run_cut(
     started = time.perf_counter()
     held_tables: dict[int, pa.Table] = {}
     local: dict[int, LogicalPlan] = {}
-    grouped = group_broadcast_joins(cut.body, cut.aligned)
+    from batcher.dist.executors.aligned.route import unbroadcastable
+
+    grouped = group_broadcast_joins(
+        cut.body, cut.aligned, reduce=lambda side: unbroadcastable(side, sources)
+    )
     body = hoist_broadcasts(grouped, cut, sources, held_tables, workers, local, oversized)
     if body is None:
         return None
@@ -459,6 +464,7 @@ def run_plan(
 
     # Placeholders are numbered from `len(sources)` in execution order, so each result lands
     # at exactly the id the later cuts and the residual read it by.
+    plan = push_top_n(plan)
     bound: list[Source] = list(sources)
     results: dict[int, pa.Table] = {}
     computed: dict[object, pa.Table] = {}

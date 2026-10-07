@@ -976,7 +976,7 @@ Window-function translation for the SQL front-end.
 |---|---|---|
 | `executor.py` | 3300 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 903 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_broadcast.py` | 616 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
+| `flight_broadcast.py` | 637 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
@@ -1022,11 +1022,11 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `hoist.py` | 163 | Evaluate the parts of an aligned cut that read no aligned source, once, before its units. |
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
 | `memory_fit.py` | 95 | How many aligned units a node may run at once, from its memory as well as its cores. |
-| `reduce.py` | 216 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
-| `rewrite.py` | 232 | Push each join against a broadcast input down to the broadcast input it keys on. |
-| `route.py` | 458 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
-| `run.py` | 508 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
-| `transfer.py` | 328 | Moving an aligned run's inputs and results between the driver and the fleet. |
+| `reduce.py` | 278 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
+| `rewrite.py` | 465 | Push each join against a broadcast input down to the broadcast input it keys on. |
+| `route.py` | 535 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
+| `run.py` | 514 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
+| `transfer.py` | 399 | Moving an aligned run's inputs and results between the driver and the fleet. |
 | `units.py` | 295 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
 
 ### `batcher/dist/executors/partition_io/` — 4 · backend

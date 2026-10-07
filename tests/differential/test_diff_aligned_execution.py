@@ -206,6 +206,36 @@ def test_key_grouped_aggregate_sorted_and_limited_above(tables):
     assert_same_for_query(_run_aligned(ds), _duck(tables, query), query)
 
 
+def test_a_residual_top_n_is_kept_per_unit(tables, monkeypatch):
+    """TPC-H q10's ending: a top-N over groups each unit computes whole.
+
+    Each unit keeps its own first N, the driver's sort picks the answer among them. Ties are
+    excluded by the order (`l_ok` breaks them), so the expected rows are exact.
+    """
+    from batcher.dist.executors.aligned import reduce
+    from batcher.plan.logical import Sort
+
+    seen = []
+    real = reduce.push_top_n
+    monkeypatch.setattr(aligned_run, "push_top_n", lambda p: seen.append(real(p)) or seen[-1])
+    li, orders = _read(tables, "lineitem"), _read(tables, "orders")
+    ds = (
+        li.join(orders, left_on="l_ok", right_on="o_ok")
+        .group_by("l_ok", "o_prio")
+        .agg(s=col("l_qty").sum())
+        .sort("s", "l_ok", descending=[True, False])
+        .limit(7)
+    )
+    query = (
+        "SELECT l_ok, o_prio, sum(l_qty) AS s FROM lineitem JOIN orders ON l_ok = o_ok "
+        "GROUP BY l_ok, o_prio ORDER BY s DESC, l_ok LIMIT 7"
+    )
+    assert_same_for_query(_run_aligned(ds), _duck(tables, query), query)
+    # Positive control: the cut each unit ran was the top 7 of its own groups.
+    tops = [c.body for p in seen for c in p.cuts if isinstance(c.body, Sort)]
+    assert tops and all(t.limit == 7 for t in tops)
+
+
 def test_left_join_keeps_unmatched_rows(tables):
     """Fact keys 2900-2999 have no order, so the left join emits them null-padded."""
     li, orders = _read(tables, "lineitem"), _read(tables, "orders")
@@ -588,6 +618,253 @@ def test_a_broadcast_no_node_can_hold_is_left_to_the_residual(tables, monkeypatc
     assert_same_for_query(got, _duck(tables, query), query)
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+def test_a_dimension_between_two_aligned_tables_is_moved_out_of_their_way(
+    tables, monkeypatch, grouped
+):
+    """TPC-H q10's shape at SF1000: `lineitem JOIN (customer JOIN orders)`, `customer` too
+    large to hold on every node.
+
+    The two key-ordered tables meet only above the dimension, so no cut can join them per
+    range without broadcasting it. Moved down to `orders`, `lineitem` joins it per range and
+    `customer` is left to the residual. Grouped, the facts are also pre-aggregated by the
+    customer key beneath it, which is what keeps the units' results small.
+    """
+    from batcher.dist.executors.aligned import route
+
+    monkeypatch.setattr(aligned_run, "BROADCAST_BYTES", 1)
+    li, orders, cust = _read(tables, "lineitem"), _read(tables, "orders"), _read(tables, "customer")
+    ds = li.join(
+        cust.join(orders, left_on="c_ck", right_on="o_ck"), left_on="l_ok", right_on="o_ok"
+    )
+    if grouped:
+        # A second dimension joined on top, as q10 joins `nation` to `customer`: that is what
+        # keeps the plain star re-association from pre-aggregating the facts on its own.
+        seg = _read(tables, "segment")
+        ds = (
+            ds.join(seg, left_on="c_seg", right_on="g_seg")
+            .group_by("c_ck", "c_seg", "g_region")
+            .agg(rev=col("l_price").sum(), n=bt.count())
+        )
+        query = (
+            "SELECT c_ck, c_seg, g_region, sum(l_price) AS rev, count(*) AS n FROM lineitem "
+            "JOIN (SELECT * FROM customer JOIN orders ON c_ck = o_ck) ON l_ok = o_ok "
+            "JOIN segment ON c_seg = g_seg GROUP BY c_ck, c_seg, g_region"
+        )
+    else:
+        ds = ds.select("l_ok", "l_price", "c_seg", "o_prio")
+        query = (
+            "SELECT l_ok, l_price, c_seg, o_prio FROM lineitem "
+            "JOIN (SELECT * FROM customer JOIN orders ON c_ck = o_ck) ON l_ok = o_ok"
+        )
+    li_id, o_id = (
+        next(i for i, s in enumerate(ds._sources) if c in s.schema().names)
+        for c in ("l_ok", "o_ok")
+    )
+
+    def pair_aligned(found) -> bool:
+        return found is not None and any({li_id, o_id} <= cut.aligned for cut in found.cuts)
+
+    # The plan as written: at this size Kyber would join the two facts first itself.
+    found = choose_plan(ds._plan, ds._sources, strict=False)
+    assert pair_aligned(found)
+    if grouped:
+        assert any(cut.aggregate is not None for cut in found.cuts if {li_id, o_id} <= cut.aligned)
+    # Positive control: without the move, the pair never shares a cut.
+    monkeypatch.setattr(route, "colocate_aligned_joins", lambda plan, aligned: plan)
+    assert not pair_aligned(choose_plan(ds._plan, ds._sources, strict=False))
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert got is not None
+    assert_same_for_query(got, _duck(tables, query), query)
+
+
+def test_a_membership_filter_over_a_dimension_join_sinks_to_the_table_it_filters(
+    tables, monkeypatch
+):
+    """TPC-H q18's warm plan: `lineitem JOIN ((orders JOIN customer) SEMI large_orders)`.
+
+    The semi join filters on an `orders` column, so it moves onto `orders`; then `lineitem`
+    moves down to it, and the large orders, their lines and the filter share one cut, with
+    `customer` (too large to hold) joined by the residual.
+    """
+    import dataclasses
+
+    from batcher.dist.executors.aligned import rewrite
+    from batcher.plan.visitor import transform_up
+
+    monkeypatch.setattr(aligned_run, "BROADCAST_BYTES", 1)
+    li, orders, cust = _read(tables, "lineitem"), _read(tables, "orders"), _read(tables, "customer")
+    big = li.group_by("l_ok").agg(q=col("l_qty").sum()).filter(col("q") > 100).select("l_ok")
+    big = big.select(b_ok=col("l_ok"))
+    filtered = orders.join(cust, left_on="o_ck", right_on="c_ck").join(
+        big, left_on="o_ok", right_on="b_ok", how="semi"
+    )
+    ds = (
+        li.join(filtered, left_on="l_ok", right_on="o_ok")
+        .group_by("l_ok", "c_seg")
+        .agg(s=col("l_qty").sum())
+    )
+    query = (
+        "SELECT l_ok, c_seg, sum(l_qty) AS s FROM lineitem JOIN orders ON l_ok = o_ok "
+        "JOIN customer ON o_ck = c_ck WHERE o_ok IN (SELECT l_ok FROM lineitem GROUP BY l_ok "
+        "HAVING sum(l_qty) > 100) GROUP BY l_ok, c_seg"
+    )
+    li_ids = {i for i, s in enumerate(ds._sources) if "l_ok" in s.schema().names}
+    o_id = next(i for i, s in enumerate(ds._sources) if "o_ok" in s.schema().names)
+
+    def all_facts_in_one_cut(found) -> bool:
+        return found is not None and any(li_ids | {o_id} <= cut.aligned for cut in found.cuts)
+
+    found = choose_plan(ds._plan, ds._sources, strict=False)
+    assert all_facts_in_one_cut(found)
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert got is not None
+    assert_same_for_query(got, _duck(tables, query), query)
+
+    # Projection pushdown prunes what such a semi join emits, so it does not pass the inner
+    # join's output through whole -- the shape the warm SF1000 plan had. Pruned the same way
+    # here: `o_prio`, which nothing above reads, dropped from the semi join and its parent.
+    def prune(node):
+        reads_semi = isinstance(node, Join) and any(
+            isinstance(c, Join) and c.join_type == "semi" for c in (node.left, node.right)
+        )
+        if isinstance(node, Join) and (node.join_type == "semi" or reads_semi):
+            kept = tuple(o for o in node.output if o.alias != "o_prio")
+            if len(kept) < len(node.output):
+                return dataclasses.replace(node, output=kept)
+        return node
+
+    pruned = transform_up(ds._plan, prune)
+    semis = [n for n in _walk(pruned) if isinstance(n, Join) and n.join_type == "semi"]
+    assert semis and len(semis[0].output) < len(semis[0].left.output)
+    found = choose_plan(pruned, ds._sources, strict=False)
+    assert all_facts_in_one_cut(found)
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert_same_for_query(got, _duck(tables, query), query)
+    # Positive control: with the semi join left above `customer`, no cut holds all three.
+    monkeypatch.setattr(rewrite, "_sink_membership", lambda node: None)
+    assert not all_facts_in_one_cut(choose_plan(ds._plan, ds._sources, strict=False))
+
+
+def test_a_broadcast_too_large_to_hold_is_cut_to_the_keys_another_broadcast_admits(
+    tables, monkeypatch
+):
+    """TPC-H q9's shape: `partsupp` joined on a fact key that green `part` already filters.
+
+    Here `custflag` is joined on `(o_ck, l_flag)` after a filtered `customer` was joined on
+    `o_ck = c_ck`, so every row reaching it carries a BUILDING customer's key. Whole, it is
+    past the broadcast budget and the cut must stop below it; semi-joined to the filtered
+    customers, it is a held input like any filtered one, and the aggregate stays in the cut.
+    """
+    from batcher.dist.executors.aligned import rewrite, units
+
+    li, orders, cust = _read(tables, "lineitem"), _read(tables, "orders"), _read(tables, "customer")
+    custflag = _read(tables, "custflag")
+    building = cust.filter(col("c_seg") == "BUILDING")
+    ds = (
+        li.join(orders, left_on="l_ok", right_on="o_ok")
+        .join(building, left_on="o_ck", right_on="c_ck")
+        .join(custflag, left_on=["o_ck", "l_flag"], right_on=["x_ck", "x_flag"])
+        .group_by("l_flag")
+        .agg(rev=col("l_price").sum(), n=bt.count())
+    )
+    query = (
+        "SELECT l_flag, sum(l_price) AS rev, count(*) AS n FROM lineitem "
+        "JOIN orders ON l_ok = o_ok JOIN customer ON o_ck = c_ck "
+        "JOIN custflag ON o_ck = x_ck AND l_flag = x_flag "
+        "WHERE c_seg = 'BUILDING' GROUP BY l_flag"
+    )
+    cf_id = next(i for i, s in enumerate(ds._sources) if "x_ck" in s.schema().names)
+    # The planner's budget just under `custflag`'s size; the run's own bound is untouched.
+    monkeypatch.setattr(
+        aligned_run, "BROADCAST_BYTES", units.projected_bytes(ds._sources[cf_id], None) - 1
+    )
+
+    def held_in_a_cut(found) -> bool:
+        return found is not None and any(cf_id in cut.broadcast for cut in found.cuts)
+
+    found = choose_plan(ds._plan, ds._sources, strict=False)
+    assert held_in_a_cut(found)
+    assert any(cut.aggregate is not None for cut in found.cuts)
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert got is not None
+    assert_same_for_query(got, _duck(tables, query), query)
+    # Positive control: without the reduction, `custflag` is left to the residual.
+    monkeypatch.setattr(rewrite, "_semi_reduced", lambda node, aligned, worth: None)
+    assert not held_in_a_cut(choose_plan(ds._plan, ds._sources, strict=False))
+
+
+def test_a_by_file_cut_is_charged_for_every_unit_building_a_large_broadcast(tables, monkeypatch):
+    """TPC-H q14's shape: `lineitem` split by file, every unit hashing all of `part`.
+
+    Held whole, a broadcast past `_CHEAP_BUILD_BYTES` is built once per unit, so a by-file cut
+    holding one is weighed with that cost and, here, declined; below it the same plan runs
+    aligned and matches DuckDB.
+    """
+    from batcher.dist.executors.aligned import route
+
+    li, custflag = _read(tables, "lineitem"), _read(tables, "custflag")
+    ds = (
+        li.join(custflag, left_on="l_flag", right_on="x_flag")
+        .group_by("l_flag")
+        .agg(n=bt.count(), s=col("l_price").sum())
+    )
+    query = (
+        "SELECT l_flag, count(*) AS n, sum(l_price) AS s FROM lineitem "
+        "JOIN custflag ON l_flag = x_flag GROUP BY l_flag"
+    )
+    opt = kyber.optimize_logical(ds._plan, sources=ds._sources)
+    found = choose_plan(opt, ds._sources, strict=False)
+    assert found is not None and all(cut.key.keyless for cut in found.cuts)
+    assert_same_for_query(
+        aligned_run.run_plan(found, ds._sources, workers=2), _duck(tables, query), query
+    )
+    # A held input this small is not charged per unit however many units there are ...
+    monkeypatch.setattr(route, "_UNIT_BUILDS", 1 << 20)
+    assert choose_plan(opt, ds._sources, strict=False) is not None
+    # ... and counted as large, the units' builds outweigh what the cut spreads.
+    monkeypatch.setattr(route, "_CHEAP_BUILD_BYTES", 0)
+    assert choose_plan(opt, ds._sources, strict=False) is None
+
+
+@pytest.mark.parametrize("how", ["anti", "semi"])
+def test_a_membership_side_is_cut_to_the_keys_a_filtered_side_holds(tables, monkeypatch, how):
+    """TPC-H q22's shape at SF1000: filtered customers with (or without) an order, `orders`
+    too large to hold. Its distinct customer keys are taken only among the filtered ones."""
+    from batcher.dist.executors.aligned import units
+    from batcher.dist.executors.aligned.rewrite import distinct_membership_sides
+    from batcher.plan.logical import Aggregate
+
+    cust, shuffled = _read(tables, "customer"), _read(tables, "shuffled")
+    ds = (
+        cust.filter(col("c_seg") == "BUILDING")
+        .join(shuffled, left_on="c_ck", right_on="o_ck", how=how)
+        .group_by("c_seg")
+        .agg(n=bt.count())
+    )
+    op = "NOT EXISTS" if how == "anti" else "EXISTS"
+    query = (
+        f"SELECT c_seg, count(*) AS n FROM customer WHERE c_seg = 'BUILDING' AND {op} "
+        "(SELECT 1 FROM shuffled WHERE o_ck = c_ck) GROUP BY c_seg"
+    )
+    o_id = next(i for i, s in enumerate(ds._sources) if "o_ck" in s.schema().names)
+    monkeypatch.setattr(
+        aligned_run, "BROADCAST_BYTES", units.projected_bytes(ds._sources[o_id], None) - 1
+    )
+    assert_same_for_query(_run_aligned(ds), _duck(tables, query), query)
+    # Positive control: the membership side reads the filtered customers' keys, and that is
+    # the plan the executor ran.
+    opt = kyber.optimize_logical(ds._plan, sources=ds._sources)
+    cut = distinct_membership_sides(opt, lambda side: True)
+    sides = [n.right for n in _walk(cut) if isinstance(n, Join) and n.join_type == how]
+    assert sides and isinstance(sides[0], Aggregate)
+    assert any(isinstance(n, Join) and n.join_type == "semi" for n in _walk(sides[0]))
+    found = choose_plan(opt, ds._sources, strict=False)
+    assert any(
+        isinstance(n, Join) and n.join_type == "semi" for c in found.cuts for n in _walk(c.body)
+    )
+
+
 @pytest.mark.parametrize("how", ["anti", "semi"])
 def test_a_membership_join_to_an_unclustered_table_slices_its_keys(tables, monkeypatch, how):
     """TPC-H q22's shape: rows of a key-ordered table with (or without) a match in a table
@@ -632,9 +909,7 @@ def test_only_a_membership_side_too_large_to_hold_is_cut_to_its_keys(tables, mon
     opt = kyber.optimize_logical(ds._plan, sources=ds._sources)
 
     def gated() -> object:
-        return distinct_membership_sides(
-            opt, lambda side: route._unbroadcastable(side, ds._sources)
-        )
+        return distinct_membership_sides(opt, lambda side: route.unbroadcastable(side, ds._sources))
 
     assert gated() is opt
     # Positive control: the same side, past the broadcast budget, is cut to its keys.

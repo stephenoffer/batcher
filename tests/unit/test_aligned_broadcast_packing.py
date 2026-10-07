@@ -25,9 +25,20 @@ def test_large_broadcasts_round_trip_compressed(monkeypatch):
     held = {3: table.to_batches(max_chunksize=4096), 4: [empty]}
     packed = transfer.pack_held(held, "run")
     assert all(isinstance(v, transfer.Packed) for v in packed.values())
+    # Cut into several streams (compressed in parallel), and reassembled in order.
+    assert len(packed[3].parts) > 1
     back = transfer.unpack_held(packed)
     assert pa.Table.from_batches(back[3]).equals(table)
     assert pa.Table.from_batches(back[4], schema=empty.schema).num_rows == 0
+
+
+def test_one_large_batch_is_compressed_in_several_parts(monkeypatch):
+    """A hoisted broadcast is often one batch (a finalized aggregate): sliced, not one stream."""
+    monkeypatch.setattr(transfer, "PACK_BYTES", 1)
+    table = pa.table({"k": pa.array(range(200_000), pa.int64())}).combine_chunks()
+    packed = transfer.pack_held({0: table.to_batches()}, "run")
+    assert len(table.to_batches()) == 1 and len(packed[0].parts) > 1
+    assert pa.Table.from_batches(transfer.unpack_held(packed)[0]).equals(table)
 
 
 def test_small_broadcasts_are_left_as_they_are():

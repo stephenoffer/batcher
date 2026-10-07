@@ -14,6 +14,7 @@ two aligned sources is exactly the exchange the layout makes unnecessary.
 
 from __future__ import annotations
 
+import contextvars
 import operator
 from collections import OrderedDict
 
@@ -28,6 +29,7 @@ from batcher.dist.executors.aligned.analysis import (
     key_classes,
 )
 from batcher.dist.executors.aligned.rewrite import (
+    colocate_aligned_joins,
     distinct_membership_sides,
     group_broadcast_joins,
 )
@@ -36,7 +38,16 @@ from batcher.dist.executors.aligned.units import clustered, projected_bytes, sou
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
-__all__ = ["aligned_route", "choose_plan", "scan_plan", "try_aligned"]
+__all__ = ["aligned_route", "choose_plan", "scan_plan", "try_aligned", "unbroadcastable"]
+
+
+#: Per `choose_plan` call: whether each `(source, column)` is stored in key order. One call
+#: asks it of every key class of every rewritten variant, and each answer is a sweep over
+#: every file's footer -- on TPC-H q10 at SF1000, 90 sweeps of ~1000 files, 7.8 s of a 8.8 s
+#: call. Scoped to the call, so it never outlives the sources it was asked about.
+_CLUSTERED: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "aligned_clustered", default=None
+)
 
 
 def choose_plan(
@@ -55,6 +66,22 @@ def choose_plan(
     makes far smaller than its source. `exclude` names sources no cut may broadcast, because a
     run has already found their broadcast too large to hold.
     """
+    if _CLUSTERED.get() is not None:
+        return _choose_plan(plan, sources, strict, single_table, exclude)
+    token = _CLUSTERED.set({})
+    try:
+        return _choose_plan(plan, sources, strict, single_table, exclude)
+    finally:
+        _CLUSTERED.reset(token)
+
+
+def _choose_plan(
+    plan: LogicalPlan,
+    sources: list[Source],
+    strict: bool,
+    single_table: bool,
+    exclude: frozenset[int],
+) -> AlignedPlan | None:
     from batcher.config import active_config
     from batcher.kyber.rules.agg_pushdown import pre_aggregate_facts
 
@@ -71,8 +98,20 @@ def choose_plan(
     # side too large to broadcast as it is: split by file, every unit returns the distinct
     # keys of its own slice, ~1.4M of SF100's 10M customer keys each, and the driver merges
     # them all -- q22 at SF100 took 10 s that way, and 2.8 s left to the shuffle.
-    membership = distinct_membership_sides(plan, lambda side: _unbroadcastable(side, sources))
-    for rewritten in {id(p): p for p in (pre_aggregate_facts(plan), membership)}.values():
+    membership = distinct_membership_sides(plan, lambda side: unbroadcastable(side, sources))
+    variants = [pre_aggregate_facts(plan), membership]
+    # A dimension the join order put between two aligned tables keeps them out of one cut:
+    # TPC-H q10's `lineitem JOIN (customer JOIN orders)`. With the aligned side moved down to
+    # the table it keys on, the pair joins per range, and pre-aggregated, the dimension leaves
+    # the cut altogether.
+    for aligned in {_aligned_on(key, sources) for key in key_classes(plan)}:
+        if len(aligned) < 2:
+            continue
+        moved = colocate_aligned_joins(plan, aligned)
+        if moved is not plan:
+            # Pre-aggregated first: on a tie it returns partial groups rather than joined rows.
+            variants += [pre_aggregate_facts(moved), moved]
+    for rewritten in {id(p): p for p in variants}.values():
         if rewritten is plan:
             continue
         other = _best_plan(rewritten, sources, strict, single_table, exclude)
@@ -81,7 +120,7 @@ def choose_plan(
     return best[1] if best is not None else None
 
 
-def _unbroadcastable(node: LogicalPlan, sources: list[Source]) -> bool:
+def unbroadcastable(node: LogicalPlan, sources: list[Source]) -> bool:
     """Whether what `node` reads, projected, is past what every node can hold, or unsized."""
     from batcher.dist.executors.aligned.run import BROADCAST_BYTES
     from batcher.dist.executors.partition_io import source_pushdown
@@ -108,11 +147,7 @@ def _best_plan(
     scanned = scanned_source_ids(plan)
     candidates: list[tuple[KeyClass, frozenset[int]]] = []
     for key in key_classes(plan):
-        aligned = frozenset(
-            sid
-            for sid in {s for s, _ in key.columns}
-            if sid < len(sources) and _clustered_on(sources[sid], key.column_of(sid))
-        )
+        aligned = _aligned_on(key, sources)
         if aligned:
             candidates.append((key, aligned))
     # Split by file: one table and every other scan of it (a relation the query uses twice),
@@ -162,7 +197,7 @@ def _oversized_broadcasts(found: AlignedPlan, sources: list[Source]) -> frozense
             if (
                 size is not None
                 and size > BROADCAST_BYTES
-                and not _filtered(cut.body, sid, cut.aligned, sources[sid])
+                and not _filtered(cut.body, sid, cut.aligned, sources[sid], sources)
             ):
                 big.add(sid)
     return frozenset(big)
@@ -214,6 +249,23 @@ def _identity(source: Source) -> object:
 #: Copies of a broadcast input the fleet holds: one per node, on a typical cluster.
 _BROADCAST_COPIES = 8
 
+#: Hash builds of an unfiltered broadcast input: every unit's engine call prepares its own
+#: build sides, and a large cut runs several units per slot -- 77 on 8 x 16-core nodes at
+#: SF1000. Measured there on TPC-H q14, which holds all 200M rows of `part` for a by-file cut
+#: of `lineitem`: 27.8 s aligned (7 s of unpacking per task, 3.8 s of compute per unit)
+#: against 20.2 s for the shuffle join. A filtered input is charged as it is read (once),
+#: since what each unit builds is the filter's result.
+#:
+#: Charged only to a cut split by file: a keyed cut's large broadcasts are cut down before its
+#: units run, to the keys another broadcast admits (`reduce.reduce_broadcasts`) or to each
+#: unit's own key range (`reduce.sliceable_broadcasts`) -- TPC-H q5 holds `customer` (2.4 GB
+#: projected, 30M rows once its region is known) and runs aligned in 24 s against 37 s staged.
+_UNIT_BUILDS = 64
+#: Held bytes below which a unit's build of a broadcast is noise against its own work: TPC-H
+#: `supplier` (10M rows, ~0.2 GB projected) is held by most SF1000 cuts and costs each unit
+#: well under a second to hash.
+_CHEAP_BUILD_BYTES = 1 << 30
+
 
 def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | None:
     """The projected bytes `found` spreads across the fleet, or None when it should not run.
@@ -232,7 +284,7 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
     # does in one. Summed, TPC-H q21 at SF100 took the three-cut plan for 28 GB spread over
     # the one-cut plan's 22 GB, and ran 132 s against 4.8 s.
     spread_by: dict[object, int] = {}
-    held = driver = 0
+    held = driver = rebuilt = 0
     for cut in found.cuts:
         # A placeholder is an earlier cut's result, which has no size until it has run; an id
         # past the sources is one of an enclosing plan's (a residual being planned itself).
@@ -245,7 +297,7 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
             if sid in cut.aligned:
                 table = _identity(sources[sid])
                 spread_by[table] = max(spread_by.get(table, 0), size)
-            elif _filtered(cut.body, sid, cut.aligned, sources[sid]):
+            elif _filtered(cut.body, sid, cut.aligned, sources[sid], sources):
                 # What is held is the filtered result, which the fleet reads once, in parallel
                 # (`scan_plan`), and which is usually a sliver of its source: TPC-H q20 reads
                 # 3 GB of `partsupp` and `part` at SF100 to keep 1% of the parts. Charged at its
@@ -254,6 +306,8 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
                 driver += size
             else:
                 held += size
+                if cut.key.keyless and size > _CHEAP_BUILD_BYTES:
+                    rebuilt += size
                 if strict and size > BROADCAST_BYTES:
                     return None
     residual_sources = {s for s in scanned_source_ids(found.residual) if s < len(sources)}
@@ -267,16 +321,21 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
             return None
         driver += size
     # A broadcast input is held by every node and joined by every unit, so it costs about
-    # its size once per node; charge it that way. Split by file, TPC-H q18 would read
+    # its size once per node, and a large one once per unit too; charge it that way. Split by
+    # file, TPC-H q18 would read
     # `lineitem` in place (96 GB spread) but hold all of `orders` on every node, where
     # aligned on `orderkey` it spreads 120 GB and broadcasts only `customer`. A residual input
     # is read once, by the driver or by a residual that aligns itself, and is charged once.
-    weight = sum(spread_by.values()) - _BROADCAST_COPIES * held - driver
+    weight = sum(spread_by.values()) - _BROADCAST_COPIES * held - _UNIT_BUILDS * rebuilt - driver
     return weight if weight > 0 else None
 
 
 def _filtered(
-    body: LogicalPlan, sid: int, aligned: frozenset[int], source: Source | None = None
+    body: LogicalPlan,
+    sid: int,
+    aligned: frozenset[int],
+    source: Source | None = None,
+    sources: list[Source] | None = None,
 ) -> bool:
     """Whether the broadcast subtree reading `sid` filters it, so its result can be far
     smaller than the source: what is held is that result, bounded when it is evaluated.
@@ -316,7 +375,10 @@ def _filtered(
 
     # After the broadcast joins are grouped, as they are when the cut runs: q9's filter on
     # `part` reaches `partsupp` only once the rewrite has moved the one onto the other.
-    found = subtree(group_broadcast_joins(body, aligned))
+    # With `sources`, a broadcast too large to hold is cut to the keys the facts can carry
+    # first, as the run cuts it (`rewrite._semi_reduced`): q9's `partsupp` by green `part`.
+    reduce = None if sources is None else (lambda side: unbroadcastable(side, sources))
+    found = subtree(group_broadcast_joins(body, aligned, reduce=reduce))
     # A grouped aggregate reduces as surely as a filter: q22's distinct customer keys are 100M
     # of `orders`' 1.5B rows.
     return found is not None and any(
@@ -367,12 +429,27 @@ def _implied_by_bounds(ir: dict, columns: dict) -> bool:
     return passes(bound, value)
 
 
+def _aligned_on(key: KeyClass, sources: list[Source]) -> frozenset[int]:
+    """The sources of `key`'s class whose files store its column in order."""
+    return frozenset(
+        sid
+        for sid in {s for s, _ in key.columns}
+        if sid < len(sources) and _clustered_on(sources[sid], key.column_of(sid))
+    )
+
+
 def _clustered_on(source: Source, column: str | None) -> bool:
     """Whether `source`'s files store `column` in order, per their footers."""
     if column is None:
         return False
+    memo = _CLUSTERED.get()
+    if memo is not None and (id(source), column) in memo:
+        return memo[(id(source), column)]
     bounds = source_key_bounds(source, column)
-    return bounds is not None and clustered(bounds)
+    answer = bounds is not None and clustered(bounds)
+    if memo is not None:
+        memo[(id(source), column)] = answer
+    return answer
 
 
 def aligned_route(plan: LogicalPlan, sources: list[Source]) -> bool:

@@ -27,7 +27,7 @@ from collections.abc import Callable
 from batcher.plan.expr_ir import Col, col
 from batcher.plan.logical import Filter, Join, JoinOutputCol, LogicalPlan, Project, Projection
 
-__all__ = ["distinct_membership_sides", "group_broadcast_joins"]
+__all__ = ["colocate_aligned_joins", "distinct_membership_sides", "group_broadcast_joins"]
 
 _FRESH = itertools.count()
 
@@ -71,16 +71,16 @@ def _push(
     b2: LogicalPlan,
     keys: list[str],
     b2_keys: tuple[str, ...],
-    aligned,
+    leaf: Callable[[LogicalPlan], bool],
     carry: list[str],
 ) -> tuple[LogicalPlan, dict[str, str]] | None:
-    """`node` with `b2` joined in on `keys` (names in `node`'s output) at the broadcast leaf.
+    """`node` with `b2` joined in on `keys` (names in `node`'s output) at the first `leaf`.
 
     Returns the rewritten node, whose output is `node`'s plus each `carry` column of `b2`,
     and the map from each of those names to its alias there; None when no such leaf exists
     on a path of inner joins, filters and plain projections.
     """
-    if _source_free(node, aligned):
+    if leaf(node):
         b2_out = {c: _fresh(c) for c in carry}
         output = [JoinOutputCol("left", c, c) for c in node.available_columns()]
         output += [JoinOutputCol("right", c, alias) for c, alias in b2_out.items()]
@@ -94,7 +94,7 @@ def _push(
         )
         return joined, b2_out
     if isinstance(node, Filter):
-        pushed = _push(node.input, b2, keys, b2_keys, aligned, carry)
+        pushed = _push(node.input, b2, keys, b2_keys, leaf, carry)
         if pushed is None:
             return None
         return Filter(input=pushed[0], predicate=node.predicate), pushed[1]
@@ -102,7 +102,7 @@ def _push(
         by_alias = {item.alias: item.expr for item in node.items}
         if not all(isinstance(by_alias.get(k), Col) for k in keys):
             return None
-        pushed = _push(node.input, b2, [by_alias[k].name for k in keys], b2_keys, aligned, carry)
+        pushed = _push(node.input, b2, [by_alias[k].name for k in keys], b2_keys, leaf, carry)
         if pushed is None:
             return None
         inner, colmap = pushed
@@ -119,7 +119,7 @@ def _push(
             names = _names_on(node, [origin[k] for k in keys], side)
             child = node.left if side == "left" else node.right
             if names is not None:
-                pushed = _push(child, b2, names, b2_keys, aligned, carry)
+                pushed = _push(child, b2, names, b2_keys, leaf, carry)
             if pushed is not None:
                 break
         if pushed is None:
@@ -143,43 +143,49 @@ def _push(
     return None
 
 
-def _move_down(node: Join, aligned: frozenset[int]) -> LogicalPlan | None:
-    """`node` with its broadcast side joined in further down the other side, or None."""
+def _move(
+    node: Join,
+    mover: Callable[[LogicalPlan], bool],
+    leaf: Callable[[LogicalPlan], bool],
+    *,
+    flatten: bool = False,
+) -> LogicalPlan | None:
+    """`node` with its `mover` side joined in at the first `leaf` down the other side, or None.
+
+    The other side (the spine) must not itself be a `mover`. The result is projected back to
+    `node`'s exact output, so nothing above sees a column it did not see before; `flatten`
+    does that by renaming a moved join's own output instead, so the join stays directly under
+    whatever reads it (the star rewrites above look for a join, not a projection of one).
+    """
     if node.join_type != "inner":
         return None
-    if _source_free(node.right, aligned) and not _source_free(node.left, aligned):
-        spine, b2, spine_keys, b2_keys, spine_side = (
-            node.left,
-            node.right,
-            node.left_keys,
-            node.right_keys,
-            "left",
-        )
-    elif _source_free(node.left, aligned) and not _source_free(node.right, aligned):
-        spine, b2, spine_keys, b2_keys, spine_side = (
-            node.right,
-            node.left,
-            node.right_keys,
-            node.left_keys,
-            "right",
-        )
+    for spine_side, b2_side in (("left", "right"), ("right", "left")):
+        spine, b2 = getattr(node, spine_side), getattr(node, b2_side)
+        if mover(b2) and not mover(spine):
+            break
     else:
         return None
-    if (
-        isinstance(spine, Join)
-        and _source_free(spine.left, aligned) is False
-        and (spine.right is b2 or spine.left is b2)
-    ):
-        return None
+    spine_keys, b2_keys = (
+        (node.left_keys, node.right_keys)
+        if spine_side == "left"
+        else (node.right_keys, node.left_keys)
+    )
     # Only what the old join emitted from `b2` rides up: carrying every column of a wide
     # dimension widens the broadcast each unit holds, for columns nothing above reads.
     carry = list(dict.fromkeys(o.name for o in node.output if o.side != spine_side))
-    pushed = _push(spine, b2, list(spine_keys), b2_keys, aligned, carry)
+    pushed = _push(spine, b2, list(spine_keys), b2_keys, leaf, carry)
     if pushed is None:
         return None
     moved, colmap = pushed
-    if _source_free(moved, aligned):
+    if mover(moved):
         return None
+    if flatten and isinstance(moved, Join):
+        emitted = {o.alias: o for o in moved.output}
+        renamed = []
+        for o in node.output:
+            src = emitted[o.name if o.side == spine_side else colmap[o.name]]
+            renamed.append(JoinOutputCol(src.side, src.name, o.alias))
+        return dataclasses.replace(moved, output=tuple(renamed))
     items = tuple(
         Projection(o.alias, col(o.name if o.side == spine_side else colmap[o.name]))
         for o in node.output
@@ -187,13 +193,197 @@ def _move_down(node: Join, aligned: frozenset[int]) -> LogicalPlan | None:
     return Project(input=moved, items=items)
 
 
-def group_broadcast_joins(body: LogicalPlan, aligned: frozenset[int]) -> LogicalPlan:
-    """`body` with every movable broadcast join pushed down to its broadcast leaf."""
+def _move_down(node: Join, aligned: frozenset[int]) -> LogicalPlan | None:
+    """`node` with its broadcast side joined in further down the other side, or None."""
+    free = lambda n: _source_free(n, aligned)  # noqa: E731
+    for spine, b2 in ((node.left, node.right), (node.right, node.left)):
+        if free(b2) and not free(spine):
+            if (
+                isinstance(spine, Join)
+                and _source_free(spine.left, aligned) is False
+                and (spine.right is b2 or spine.left is b2)
+            ):
+                return None
+            break
+    return _move(node, free, free)
+
+
+def _free_key(
+    node: LogicalPlan, key: str, aligned: frozenset[int]
+) -> tuple[LogicalPlan, str] | None:
+    """An aligned-free subtree of `node`, and its column, whose values every row carries in `key`.
+
+    Followed through filters, plain-column projections and inner joins, and at an inner join
+    across its key pair too, since each row it emits has equal values in the two key columns.
+    """
+    if _source_free(node, aligned):
+        return node, key
+    if isinstance(node, Filter):
+        return _free_key(node.input, key, aligned)
+    if isinstance(node, Project):
+        expr = {item.alias: item.expr for item in node.items}.get(key)
+        return _free_key(node.input, expr.name, aligned) if isinstance(expr, Col) else None
+    if not (isinstance(node, Join) and node.join_type == "inner"):
+        return None
+    origin = {o.alias: (o.side, o.name) for o in node.output}.get(key)
+    if origin is None:
+        return None
+    side, name = origin
+    own, other = (
+        (node.left_keys, node.right_keys) if side == "left" else (node.right_keys, node.left_keys)
+    )
+    child, partner = (node.left, node.right) if side == "left" else (node.right, node.left)
+    found = _free_key(child, name, aligned)
+    if found is None and name in own:
+        found = _free_key(partner, other[own.index(name)], aligned)
+    return found
+
+
+def _semi_reduced(
+    node: Join, aligned: frozenset[int], worth: Callable[[LogicalPlan], bool]
+) -> LogicalPlan | None:
+    """`node` with its broadcast side cut, by a semi join, to the keys the other side can carry.
+
+    TPC-H q9 joins `partsupp` (800M rows at SF1000) to `lineitem JOIN part` on
+    `ps_partkey = l_partkey`, and `part` is filtered to green parts, joined on
+    `l_partkey = p_partkey`. Every row reaching the `partsupp` join carries a green part's key,
+    so a `partsupp` row with any other can never match. The semi join says so before the
+    broadcast is evaluated: `partsupp` becomes ~43M rows every node can hold, where whole it
+    was too large to broadcast and the cut stopped below it, returning 325M joined rows the
+    driver could not take. `part` stays where it was; the semi join only drops rows, keeps
+    `partsupp`'s columns, and reads the same aligned-free subtree `part` is joined from.
+    """
+    if node.join_type != "inner":
+        return None
+    for b_side in ("right", "left"):
+        b = node.right if b_side == "right" else node.left
+        spine = node.left if b_side == "right" else node.right
+        if not _source_free(b, aligned) or _source_free(spine, aligned) or not worth(b):
+            continue
+        b_keys, s_keys = (
+            (node.right_keys, node.left_keys)
+            if b_side == "right"
+            else (node.left_keys, node.right_keys)
+        )
+        for bk, sk in zip(b_keys, s_keys, strict=True):
+            found = _free_key(spine, sk, aligned)
+            if found is None:
+                continue
+            d, dk = found
+            if isinstance(b, Join) and b.join_type == "semi" and b.right == d:
+                return None  # already reduced by this subtree
+            reduced = Join(
+                left=b,
+                right=d,
+                left_keys=(bk,),
+                right_keys=(dk,),
+                join_type="semi",
+                output=tuple(JoinOutputCol("left", c, c) for c in b.available_columns()),
+            )
+            return dataclasses.replace(node, **{b_side: reduced})
+    return None
+
+
+def _aligned_only(node: LogicalPlan, aligned: frozenset[int]) -> bool:
+    from batcher.plan.visitor import scanned_source_ids
+
+    scanned = scanned_source_ids(node)
+    return bool(scanned) and scanned <= aligned
+
+
+def colocate_aligned_joins(plan: LogicalPlan, aligned: frozenset[int]) -> LogicalPlan:
+    """`plan` with each join of an aligned-only side moved down to the aligned input it keys on.
+
+    The mirror of `group_broadcast_joins`, for the join order statistics choose on one node:
+    TPC-H q10 at SF1000 is `lineitem JOIN (customer JOIN orders)`, the dimension sitting
+    between two tables stored in `orderkey` order. No per-range cut can hold that join without
+    holding all of `customer` (25 GB) on every node, so the query lost its aligned plan and ran
+    staged, three shuffles deep. Moved, `customer JOIN (orders JOIN lineitem)` puts the two
+    aligned tables in one subtree that joins on the key. Inner joins associate and commute
+    through their key-equality pairs, so the relation is unchanged; whether the moved plan
+    aligns better is the aligned planner's question, asked of both.
+
+    A semi or anti join over an inner join is first sunk to the side its keys come from
+    (`_sink_membership`), so the aligned side it filters is a leaf the move can reach: the
+    warm TPC-H q18 plan filters `orders JOIN customer` to the large orders, and sunk to
+    `orders`, the filter, `orders` and `lineitem` share one cut with `customer` above it.
+    """
+    from batcher.plan.visitor import transform_up
+
+    only = lambda n: _aligned_only(n, aligned)  # noqa: E731
+
+    def step(node: LogicalPlan) -> LogicalPlan:
+        if isinstance(node, Join):
+            sunk = _sink_membership(node)
+            if sunk is not None:
+                return sunk
+            moved = _move(node, only, only, flatten=True)
+            if moved is not None:
+                return moved
+        return node
+
+    return transform_up(plan, step)
+
+
+def _sink_membership(node: Join) -> LogicalPlan | None:
+    """A semi or anti join over an inner join, moved onto the inner join's input its keys
+    come from, or None.
+
+    `(A JOIN B) SEMI R ON a = r` is `(A SEMI R ON a = r) JOIN B`: the membership test reads
+    only `A`'s column, and the inner join neither changes that column's value on a row nor
+    keeps a row of `A` whose test failed. The same holds for an anti join, NULL keys included,
+    since a NULL key matches nothing on either side of the move.
+    """
+    if node.join_type not in ("semi", "anti"):
+        return None
+    inner = node.left
+    if not (isinstance(inner, Join) and inner.join_type == "inner"):
+        return None
+    # The membership join's own output -- often a pruned subset of the inner join's, which
+    # projection pushdown leaves it to emit -- becomes the inner join's, so nothing above sees
+    # a column it did not see before.
+    emitted = {o.alias: o for o in inner.output}
+    if not all(o.side == "left" and o.name in emitted for o in node.output):
+        return None
+    output = tuple(
+        JoinOutputCol(emitted[o.name].side, emitted[o.name].name, o.alias) for o in node.output
+    )
+    origin = {o.alias: (o.side, o.name) for o in inner.output}
+    sides = {origin[k][0] for k in node.left_keys if k in origin}
+    if len(sides) != 1 or not all(k in origin for k in node.left_keys):
+        return None
+    (side,) = sides
+    child = inner.left if side == "left" else inner.right
+    keys = tuple(origin[k][1] for k in node.left_keys)
+    filtered = Join(
+        left=child,
+        right=node.right,
+        left_keys=keys,
+        right_keys=node.right_keys,
+        join_type=node.join_type,
+        output=tuple(JoinOutputCol("left", c, c) for c in child.available_columns()),
+    )
+    filtered = _sink_membership(filtered) or filtered
+    return dataclasses.replace(inner, **{side: filtered}, output=output)
+
+
+def group_broadcast_joins(
+    body: LogicalPlan,
+    aligned: frozenset[int],
+    reduce: Callable[[LogicalPlan], bool] | None = None,
+) -> LogicalPlan:
+    """`body` with every movable broadcast join pushed down to its broadcast leaf.
+
+    `reduce`, given, picks the broadcast sides that a join which cannot move is cut down to
+    the keys the other side can carry (`_semi_reduced`): those too large to hold whole.
+    """
     from batcher.plan.visitor import transform_up
 
     def step(node: LogicalPlan) -> LogicalPlan:
         if isinstance(node, Join):
             moved = _move_down(node, aligned)
+            if moved is None and reduce is not None:
+                moved = _semi_reduced(node, aligned, reduce)
             if moved is not None:
                 return moved
         return node
@@ -225,8 +415,51 @@ def distinct_membership_sides(
             and not isinstance(node.right, Aggregate)
             and (worth is None or worth(node.right))
         ):
+            right = _reduced_by_left(node) if worth is not None else node.right
             keys = tuple(Projection(k, col(k)) for k in dict.fromkeys(node.right_keys))
-            return dataclasses.replace(node, right=Aggregate(node.right, keys, ()))
+            return dataclasses.replace(node, right=Aggregate(right, keys, ()))
         return node
 
     return transform_up(plan, step)
+
+
+def _reduced_by_left(node: Join) -> LogicalPlan:
+    """`node`'s right side semi-joined to the keys its filtered left side holds.
+
+    A key the left side never carries cannot change which left rows match, so dropping it
+    leaves the semi or anti join exactly as it was (a NULL key matches nothing either way).
+    TPC-H q22 at SF1000 asks which of ~21M filtered customers have no order: cut to their
+    keys first, each unit's distinct `o_custkey` is a few million rather than most of the
+    100M customers with an order, which is what outgrew the driver's 4.8 GiB budget and sent
+    the query to the staged path (~60-100 s). Only for a left side a predicate filters: an
+    unfiltered one holds every key and would only be read twice.
+    """
+    if not _really_filtered(node.left):
+        return node.right
+    aliases = [_fresh(k) for k in node.left_keys]
+    keys = Project(
+        input=node.left,
+        items=tuple(Projection(a, col(k)) for a, k in zip(aliases, node.left_keys, strict=True)),
+    )
+    return Join(
+        left=node.right,
+        right=keys,
+        left_keys=node.right_keys,
+        right_keys=tuple(aliases),
+        join_type="semi",
+        output=tuple(JoinOutputCol("left", c, c) for c in node.right.available_columns()),
+    )
+
+
+def _really_filtered(node: LogicalPlan) -> bool:
+    """Whether some filter in `node` tests more than `IS NOT NULL` (which joins add)."""
+    from batcher.plan.visitor import walk
+
+    def real(ir: dict) -> bool:
+        if ir.get("e") == "is_not_null":
+            return False
+        if ir.get("e") == "binary" and ir.get("op") == "and":
+            return real(ir["left"]) or real(ir["right"])
+        return True
+
+    return any(isinstance(n, Filter) and real(n.predicate.to_ir()) for n in walk(node))
