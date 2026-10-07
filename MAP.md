@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1646 Python modules across 236 packages and 346 Rust files across 14 crates.
+Covering 1647 Python modules across 236 packages and 346 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -1304,7 +1304,7 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 508 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 239 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 645 | The `Optimizer` façade and the module-level entry points. |
+| `facade.py` | 702 | The `Optimizer` façade and the module-level entry points. |
 | `plan_deps.py` | 176 | Re-validate a memoized plan against the measurements its own planning read. |
 
 ### `batcher/kyber/plan_cache/` — 3 · subsystem
@@ -1314,7 +1314,8 @@ Memoize the optimizer — the same query, planned once.
 | module | lines | what it is |
 |---|---|---|
 | `keys.py` | 574 | The plan-cache key: an exact half that decides meaning and a learned half that decides quality. |
-| `memo.py` | 315 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
+| `memo.py` | 318 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
+| `normalized.py` | 60 | Memoize the NORMALIZE phase's output, so a re-plan does not re-derive it. |
 | `writes.py` | 128 | Advance the learning generation only when a write could change a plan. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -1343,7 +1344,7 @@ Aggregate-through-join pushdown: pre-aggregate a join side to shrink its input.
 |---|---|---|
 | `conditional.py` | 74 | A dimension-conditional aggregate input, split so its measure can be pre-aggregated. |
 | `gates.py` | 342 | The cost gates the aggregate-through-join pushdown rules consult. |
-| `reassociate.py` | 544 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
+| `reassociate.py` | 549 | Re-associate a star join so its measures can be pre-aggregated by the dimension key. |
 | `rules.py` | 597 | Aggregate-through-join pushdown — pre-aggregate a join side to shrink its input. |
 
 ### `batcher/kyber/rules/aggregate_algebra/` — 3 · subsystem
