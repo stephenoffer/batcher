@@ -151,6 +151,49 @@ def _unit_slots(workers: int) -> tuple[int, int]:
     return _UNIT_CPUS, max(1, workers)
 
 
+def _slot_nodes(unit_cpus: int) -> list[str]:
+    """One node id per unit slot, in a fixed order: task `t` is placed on entry `t`.
+
+    Units are dealt to tasks round-robin in unit order, so with the slots in a fixed order a
+    unit runs on the same node every time the query runs. Without it Ray places each task on
+    whichever node is free, and a node's warm caches (the object-byte cache, the decoded scan
+    cache) serve the units the previous run happened to send there -- about one in eight on
+    an eight-node fleet. Soft affinity: a node that cannot take its task does not stall it.
+    """
+    try:
+        import ray
+
+        nodes = sorted(
+            (n["NodeID"], int(n.get("Resources", {}).get("CPU", 0)))
+            for n in ray.nodes()
+            if n.get("Alive")
+        )
+    except Exception as exc:  # placement is an optimization; any failure leaves it to Ray
+        from batcher._internal.logging import note_suppressed
+
+        note_suppressed("dist", "list nodes for aligned unit placement", exc)
+        return []
+    per_node = [[nid] * (cpus // unit_cpus) for nid, cpus in nodes if cpus >= unit_cpus]
+    # Interleaved, so the first tasks land on different nodes rather than filling one.
+    return [
+        ids[i]
+        for i in range(max(map(len, per_node), default=0))
+        for ids in per_node
+        if i < len(ids)
+    ]
+
+
+def _placement(placed: list[str], t: int) -> dict:
+    """Ray options pinning task `t` (softly) to its slot's node, or none when unknown."""
+    if not placed:
+        return {}
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    return {
+        "scheduling_strategy": NodeAffinitySchedulingStrategy(placed[t % len(placed)], soft=True)
+    }
+
+
 def _aligned_units_task(calls: list[tuple], held: dict, empties: dict) -> list[tuple]:
     """`run_units_here` as a Ray task (the lifecycle wraps this name, not that one)."""
     return run_units_here(calls, held, empties)
@@ -262,6 +305,7 @@ def _run_units(
         # No warm fleet: plain tasks, and a fleet that is not warm enough to use is yielded
         # when it is what stands between the units and the cores.
         yield_session_fleet(float(unit_cpus))
+        placed = _slot_nodes(unit_cpus)
         # One task per slot, the units dealt round-robin: every slot starts at once and runs
         # the same number of units, each task prefetching its next. Grouped three to a task,
         # 77 units made 26 tasks for 17 slots, and the second wave ran nine slots through six
@@ -269,9 +313,9 @@ def _run_units(
         return gather_units(
             calls,
             min(len(calls), slots),
-            lambda _t, units: _aligned_units_task.options(num_cpus=unit_cpus).remote(
-                units, held_ref, empties
-            ),
+            lambda t, units: _aligned_units_task.options(
+                num_cpus=unit_cpus, **_placement(placed, t)
+            ).remote(units, held_ref, empties),
         )
     finally:
         if actors:
