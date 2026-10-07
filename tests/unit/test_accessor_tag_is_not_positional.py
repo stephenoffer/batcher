@@ -80,6 +80,20 @@ def test_the_published_signature_still_advertises_no_arguments():
     assert [p for p in signature.parameters if not p.startswith("_")] == []
 
 
+def _takes_no_positional_argument(signature: inspect.Signature) -> bool:
+    """Whether every public parameter is a keyword-only option with a default.
+
+    Such an accessor is still called with no arguments, and a positional one must still be
+    refused, so an optional keyword (`list.std(*, ddof=1)`) does not take it out of the
+    sweep. Counting only bare signatures dropped each accessor that gained one.
+    """
+    return all(
+        p.kind is p.KEYWORD_ONLY and p.default is not p.empty
+        for name, p in signature.parameters.items()
+        if not name.startswith("_")
+    )
+
+
 def _every_zero_argument_accessor() -> list[tuple[str, str]]:
     """(namespace, method) for every accessor that takes no arguments, read off the live
     objects rather than a list, so a namespace added later is covered."""
@@ -98,7 +112,7 @@ def _every_zero_argument_accessor() -> list[tuple[str, str]]:
                 signature = inspect.signature(function)
             except (TypeError, ValueError):
                 continue
-            if [p for p in signature.parameters if not p.startswith("_")]:
+            if not _takes_no_positional_argument(signature):
                 continue
             out.append((label, name))
     return out

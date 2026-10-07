@@ -21,6 +21,18 @@ from batcher.dist.executors.ray_runtime import lifecycle
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _outside_a_ray_job(monkeypatch):
+    """Pin the driver outside a Ray job unless a test says otherwise.
+
+    Inside a job (`ray job submit`, an Anyscale job) Ray hands the driver the job's config in
+    `RAY_JOB_CONFIG_JSON_ENV_VAR`, and the self-shipped env yields every field the job sets.
+    Run under such a job, these assertions would read the job's fields instead of Batcher's
+    defaults. The test of that path sets the variable itself.
+    """
+    monkeypatch.delenv("RAY_JOB_CONFIG_JSON_ENV_VAR", raising=False)
+
+
 @pytest.fixture
 def restore_config():
     saved = active_config()

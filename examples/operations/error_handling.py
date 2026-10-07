@@ -53,9 +53,10 @@ def main() -> None:
 
     assert run(ds) == "ColumnNotFoundError"
 
-    # A plan-time argument mistake is also a PlanError, with an actionable message.
+    # A plan-time argument mistake is also a PlanError, with an actionable message: here a
+    # column where the function needs a value known when the plan is built.
     try:
-        ds.select(bad=col("a").str.levenshtein(col("a"))).to_pydict()
+        ds.select(bad=col("a").list.contains(col("a"))).to_pydict()
     except bt.PlanError as exc:
         print("PlanError:", str(exc)[:80])
     else:

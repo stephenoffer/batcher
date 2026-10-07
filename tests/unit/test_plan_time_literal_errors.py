@@ -1,7 +1,7 @@
 """Passing a column where a plan-time constant is required fails clearly.
 
 Several accessor methods take a value that is lowered into the JSON IR as a *constant*:
-`.str.jaccard(text)`, `.map.get(key)`, `.list.contains(value)`, `.list.position(value)`.
+`.json.contains(value)`, `.map.get(key)`, `.list.contains(value)`, `.list.position(value)`.
 An expression in one of those slots cannot be evaluated — but nothing checked, so the
 failure surfaced far from the call and as an internal error:
 
@@ -11,6 +11,12 @@ failure surfaced far from the call and as an internal error:
 * `.map.get(col("k"))` and the `.list` literal slots raised a bare
   ``TypeError: unsupported literal type: Col`` at plan-build time, equally far from the
   line the user wrote.
+
+`.str.jaccard` and `.str.levenshtein` were the string-family cases here until they gained a
+per-row target: a column there is now a column-against-column comparison, pinned against
+DuckDB by `tests/differential/test_diff_str_dynamic_params.py` and on the wire by
+`tests/unit/test_str_wire_shapes.py`. `.json.contains` is the string-family node whose
+`pattern` slot is still a plan-time constant, so it carries the contract instead.
 
 Both are internal errors escaping to someone who wrote an ordinary expression, and both
 are `TypeError` rather than the project's `PlanError`. Validation now happens where the
@@ -39,8 +45,7 @@ def frame():
 
 
 CASES = [
-    ("str.jaccard", lambda: col("s").str.jaccard(col("k")), "pattern"),
-    ("str.levenshtein", lambda: col("s").str.levenshtein(col("k")), "pattern"),
+    ("json.contains", lambda: col("s").json.contains(col("k")), "pattern"),
     ("map.get", lambda: col("m").map.get(col("k")), "key"),
     # `.map.contains` is composed over `keys().list.contains`, so it is that node's
     # literal slot that rejects — which is correct, and worth pinning as such.
@@ -74,9 +79,9 @@ def test_the_error_is_not_an_internal_one(name, build, argument):
 
 @pytest.mark.unit
 def test_the_error_names_the_function_the_user_called():
-    """`StrFunc` is an implementation detail nobody typed; `jaccard_similarity` is not."""
-    with pytest.raises(PlanError, match=r"jaccard_similarity\(\)"):
-        col("s").str.jaccard(col("k"))
+    """`StrFunc` is an implementation detail nobody typed; `json_contains` is not."""
+    with pytest.raises(PlanError, match=r"json_contains\(\)"):
+        col("s").json.contains(col("k"))
 
 
 @pytest.mark.unit
@@ -84,7 +89,7 @@ def test_it_fails_at_the_call_not_at_collect(frame):
     """Constructing the expression is enough to raise — the point of validating at the
     edge is that the traceback points at the line the user wrote."""
     with pytest.raises(PlanError):
-        col("s").str.jaccard(col("k"))
+        col("s").json.contains(col("k"))
 
 
 @pytest.mark.unit
