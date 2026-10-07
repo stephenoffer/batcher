@@ -3614,7 +3614,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
 | `late.rs` | 404 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
 | `lib.rs` | 795 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
-| `mapped.rs` | 130 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
+| `mapped.rs` | 213 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 109 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns, and put a decoded batch's columns back in the order they were requested. |
