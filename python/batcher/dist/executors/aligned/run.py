@@ -44,11 +44,11 @@ from batcher.dist.executors.aligned.reduce import (
 )
 from batcher.dist.executors.aligned.rewrite import group_broadcast_joins
 from batcher.dist.executors.aligned.transfer import (
-    RESULT_BYTES,
     gather_units,
     pack_held,
     pull_units,
     read_unit,
+    result_budget,
     trace_units,
     unpack_held,
 )
@@ -177,7 +177,9 @@ def run_units_here(calls: list[tuple], held: dict, empties: dict) -> list[tuple]
             t0 = time.perf_counter()
             inputs, in_bytes = pending.result()
             waited = time.perf_counter() - t0
-            if i + 1 < len(calls):
+            more = i + 1 < len(calls)
+            early = more and _room_to_prefetch(in_bytes)
+            if early:
                 pending = prefetch.submit(read_unit, calls[i + 1][1], empties)
             for sid, batches in held.items():
                 inputs[sid] = batches
@@ -186,9 +188,36 @@ def run_units_here(calls: list[tuple], held: dict, empties: dict) -> list[tuple]
             if agg_spec is not None:
                 rows = [engine().partial_aggregate(agg_spec[0], agg_spec[1], rows)]
             del inputs
+            if more and not early:
+                # Tight enough that the read waited: give the unit just freed back first. The
+                # engine's allocator is reclaimed by its own guard; pyarrow's pool, which decoded
+                # the unit, is reachable only from here.
+                pa.default_memory_pool().release_unused()
+                pending = prefetch.submit(read_unit, calls[i + 1][1], empties)
             timing = (waited, time.perf_counter() - t1, in_bytes, started, setup)
             results.append((rows, metrics_json, timing))
     return results
+
+
+#: A unit's resident footprint while it is read, as a multiple of its Arrow bytes: the decoded
+#: batches plus the reader's compressed pages and decode buffers in flight.
+_READ_FOOTPRINT = 2
+
+
+def _room_to_prefetch(unit_bytes: int) -> bool:
+    """Whether reading another unit of about `unit_bytes` now keeps the node above its floor.
+
+    Prefetching hides a unit's read behind the engine's run of the one before, and costs a
+    second unit resident beside it. When the node is short, that second unit is what pushes
+    it under: TPC-H q9 at SF1000 ran two tasks per 64 GB node, each holding ~6 GB units, and
+    each grew past 30 GB before the kernel killed it. So the read waits for the current unit to
+    finish when it would not leave the engine's headroom floor (`bc_resource::headroom`) intact.
+    """
+    reading = engine().memory_headroom()
+    if reading is None:
+        return True
+    available, floor = reading
+    return available - _READ_FOOTPRINT * unit_bytes > floor
 
 
 def _run_units(
@@ -352,8 +381,8 @@ def run_cut(
     results = _run_units(calls, held, empties, unit_cpus, slots, depth)
     if results is None:
         get_logger("dist").info(
-            "aligned: unit results outgrew the driver budget (%d GiB); declined a %s cut over %s",
-            RESULT_BYTES >> 30,
+            "aligned: unit results outgrew the driver budget (%.1f GiB); declined a %s cut over %s",
+            result_budget() / (1 << 30),
             "partial-aggregate" if cut.aggregate is not None else "row-returning",
             type(cut.body).__name__,
         )

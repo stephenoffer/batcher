@@ -640,10 +640,11 @@ pub(crate) fn broadcast_join(
             JoinStrategy::Hash,
         )
     };
-    // Full: a single pass (chunks would duplicate both sides' unmatched rows).
-    if matches!(join_type, JoinType::Full) {
-        return Ok(vec![single_pass()?]);
-    }
+    // Full runs its probe-driven half as a LEFT join in parallel chunks, then emits the build
+    // rows no chunk matched once, null-extended: the split `ProbeStream` makes, across cores.
+    // It used to be one serial pass, because chunking a *full* join emits each chunk's
+    // unmatched build rows; a 500K x 3M full join took 1.5x DuckDB's time on one core.
+    let full = matches!(join_type, JoinType::Full);
     // An empty probe has no row-range chunks, so the chunked path below would produce
     // *zero* batches — and a batch is the only thing that carries a schema. Every
     // downstream pipeline breaker (join, aggregate, distinct) materializes its input and
@@ -671,7 +672,7 @@ pub(crate) fn broadcast_join(
                 right,
                 left_keys,
                 right_keys,
-                join_type,
+                if full { JoinType::Left } else { join_type },
                 output.to_vec(),
             )
         };
@@ -697,9 +698,29 @@ pub(crate) fn broadcast_join(
         tuning.bloom_fp_rate,
         tuning.bloom_min_build_rows,
     )?;
-    idxs.par_iter()
+    let mut batches = idxs
+        .par_iter()
         .map(|idx| ops::gather_join_output(probe, build, idx, &out))
-        .collect()
+        .collect::<Result<Vec<_>, InterpError>>()?;
+    if full {
+        let mut seen = vec![false; build.num_rows()];
+        for idx in &idxs {
+            for r in idx.right.iter().flatten() {
+                seen[r as usize] = true;
+            }
+        }
+        let unmatched: arrow::array::UInt32Array = (0..build.num_rows() as u32)
+            .filter(|&r| !seen[r as usize])
+            .collect();
+        if !unmatched.is_empty() {
+            let rest = join::JoinIndices {
+                left: arrow::array::UInt32Array::new_null(unmatched.len()),
+                right: unmatched,
+            };
+            batches.push(ops::gather_join_output(probe, build, &rest, &out)?);
+        }
+    }
+    Ok(batches)
 }
 
 // A bucket is "skewed" when it holds far more probe rows than the average bucket
@@ -1083,6 +1104,76 @@ mod tests {
     /// **Inner and left agree only below the radix threshold**; above it the sequential path
     /// emits partition-major and the broadcast probe emits probe-major. Both halves are asserted,
     /// because the second is the reason the swap is not applied to every join type.
+    /// A FULL join probed in parallel chunks emits the same multiset as the sequential join:
+    /// every probe row once (null-extended when unmatched, null keys included) and every build
+    /// row no chunk matched exactly once. Sizes past one morsel, so the probe really is chunked.
+    #[test]
+    fn a_chunked_full_broadcast_join_matches_the_sequential_one() {
+        use arrow::array::{Array, ArrayRef, Int64Array};
+        use bc_ir::{JoinOutputCol, JoinSide, JoinStrategy, JoinType};
+        let rows = |b: &RecordBatch| -> Vec<(Option<i64>, Option<i64>)> {
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            let bk = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            let mut v: Vec<_> = (0..b.num_rows())
+                .map(|i| {
+                    let at = |a: &Int64Array| (!a.is_null(i)).then(|| a.value(i));
+                    (at(k), at(bk))
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        for (n_probe, n_build) in [(1_000_usize, 700_usize), (90_000, 40_000), (70_000, 5)] {
+            // Probe keys overshoot the build's range (unmatched probe rows), skip every third
+            // build key (unmatched build rows), and every 97th of either side is NULL.
+            let probe_keys: ArrayRef =
+                Arc::new(Int64Array::from_iter((0..n_probe as i64).map(|i| {
+                    (i % 97 != 0).then_some((i * 3) % (n_build as i64 + 50))
+                })));
+            let build_keys: ArrayRef = Arc::new(Int64Array::from_iter(
+                (0..n_build as i64).map(|i| (i % 97 != 5).then_some(i * 3 / 2)),
+            ));
+            let probe = RecordBatch::try_from_iter(vec![("k", probe_keys)]).unwrap();
+            let build = RecordBatch::try_from_iter(vec![("bk", build_keys)]).unwrap();
+            let output = vec![
+                JoinOutputCol {
+                    side: JoinSide::Left,
+                    name: "k".into(),
+                    alias: "k".into(),
+                },
+                JoinOutputCol {
+                    side: JoinSide::Right,
+                    name: "bk".into(),
+                    alias: "bk".into(),
+                },
+            ];
+            let seq = ops::join_batches(
+                &probe,
+                &build,
+                &["k".into()],
+                &["bk".into()],
+                JoinType::Full,
+                &output,
+                JoinStrategy::Hash,
+            )
+            .unwrap();
+            let par = broadcast_join(
+                &probe,
+                &build,
+                &["k".into()],
+                &["bk".into()],
+                JoinType::Full,
+                &output,
+            )
+            .unwrap();
+            let par = ops::materialize(&par).unwrap();
+            let (s, p) = (rows(&seq), rows(&par));
+            // Positive controls: both halves of a full join are present.
+            assert!(s.iter().any(|r| r.1.is_none()) && s.iter().any(|r| r.0.is_none()));
+            assert_eq!(s, p, "full join {n_probe}x{n_build}");
+        }
+    }
+
     #[test]
     fn broadcast_matches_the_sequential_join_where_the_order_is_defined() {
         use arrow::array::{ArrayRef, Int64Array};

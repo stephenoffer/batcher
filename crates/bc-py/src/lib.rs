@@ -697,6 +697,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_plan, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_metered, m)?)?;
     m.add_function(wrap_pyfunction!(cancel_query, m)?)?;
+    m.add_function(wrap_pyfunction!(pool::memory_headroom, m)?)?;
     m.add_function(wrap_pyfunction!(register_query, m)?)?;
     m.add_function(wrap_pyfunction!(unregister_query, m)?)?;
     m.add_function(wrap_pyfunction!(running_queries, m)?)?;

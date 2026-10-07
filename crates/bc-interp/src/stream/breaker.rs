@@ -76,6 +76,9 @@ fn drain_within_budget(
         // is the difference between running and returning `MemoryBudgetExceeded` for a query
         // that fits, because this counter is the check.
         held += crate::column_bytes(batch.columns());
+        if let Some(h) = bc_resource::headroom::low() {
+            return Err(crate::error::low_memory(h));
+        }
         if held as usize > budget {
             // `out` is dropped on the way out, so the bail releases what it accumulated.
             return Err(InterpError::MemoryBudgetExceeded {

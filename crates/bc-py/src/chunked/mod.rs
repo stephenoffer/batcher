@@ -47,6 +47,39 @@ pub(crate) fn execute_plan_chunked(
     query_id: Option<&str>,
     memory_budget: usize,
 ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
+    let args = (plan_json, engine_config, query_id, memory_budget);
+    chunked_call(py, args, sources, driving, chunks, false).map(|(out, _)| out)
+}
+
+/// [`execute_plan_chunked`], also returning the per-operator metrics document
+/// `execute_plan_metered` returns, summed over every chunk (`bc_interp::execute_chunked_metered`).
+#[pyfunction]
+#[pyo3(signature = (plan_json, sources, driving, chunks, engine_config="", query_id=None, memory_budget=0))]
+pub(crate) fn execute_plan_chunked_metered(
+    py: Python<'_>,
+    plan_json: &str,
+    sources: Vec<Vec<PyArrowType<RecordBatch>>>,
+    driving: usize,
+    chunks: Bound<'_, PyAny>,
+    engine_config: &str,
+    query_id: Option<&str>,
+    memory_budget: usize,
+) -> PyResult<(Vec<PyArrowType<RecordBatch>>, String)> {
+    let args = (plan_json, engine_config, query_id, memory_budget);
+    chunked_call(py, args, sources, driving, chunks, true)
+        .map(|(out, m)| (out, m.unwrap_or_default()))
+}
+
+/// The body of both chunked entry points; `metered` adds the metrics document.
+type ChunkedOut = (Vec<PyArrowType<RecordBatch>>, Option<String>);
+fn chunked_call(
+    py: Python<'_>,
+    (plan_json, engine_config, query_id, memory_budget): (&str, &str, Option<&str>, usize),
+    sources: Vec<Vec<PyArrowType<RecordBatch>>>,
+    driving: usize,
+    chunks: Bound<'_, PyAny>,
+    metered: bool,
+) -> PyResult<ChunkedOut> {
     let ExecSetup {
         plan,
         sources,
@@ -88,14 +121,22 @@ pub(crate) fn execute_plan_chunked(
                 })
                 .transpose()
         };
-        bc_interp::execute_chunked(&plan, &sources, driving, &mut next, workers, budget, &opts)
+        if metered {
+            bc_interp::execute_chunked_metered(
+                &plan, &sources, driving, &mut next, workers, budget, &opts,
+            )
+            .map(|(out, metrics)| (out, Some(metrics.to_json())))
+        } else {
+            bc_interp::execute_chunked(&plan, &sources, driving, &mut next, workers, budget, &opts)
+                .map(|out| (out, None))
+        }
     });
     if let Some(err) = raised.into_inner().ok().flatten() {
         return Err(err);
     }
-    let out = out.map_err(errors::interp_to_pyerr)?;
+    let (out, metrics) = out.map_err(errors::interp_to_pyerr)?;
     let out = bc_interp::coalesce_small_batches(rebase_nested_offsets(narrow_output(out, &narrow)));
-    Ok(out.into_iter().map(PyArrowType).collect())
+    Ok((out.into_iter().map(PyArrowType).collect(), metrics))
 }
 
 /// The iterator's next chunk, normalized exactly as `prepare_exec` normalizes a resident source.
@@ -641,6 +682,7 @@ pub(crate) fn partial_aggregate_parquet(
 /// Register this module's entry points on the extension module.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_plan_chunked, m)?)?;
+    m.add_function(wrap_pyfunction!(execute_plan_chunked_metered, m)?)?;
     m.add_function(wrap_pyfunction!(plan_chunkable, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_parquet, m)?)?;
     m.add_function(wrap_pyfunction!(partial_aggregate_parquet, m)?)?;

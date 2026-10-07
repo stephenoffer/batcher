@@ -275,3 +275,32 @@ def test_results_past_the_driver_budget_decline_rather_than_raise(monkeypatch):
     out = transfer._drain([(), ()], pending, lambda worker, ref: None, 0.0)
     assert out is None
     assert cancelled == ["b"]
+
+
+def test_the_driver_gathers_no_more_than_its_machine_holds(monkeypatch):
+    """`result_budget`: the constant ceiling, lowered to what the driver can actually hold.
+
+    TPC-H q22 at SF1000 was killed on a 32 GB head node gathering 18 GB under a 12 GiB
+    constant beside the object store. A roomy driver keeps the ceiling (the control).
+    """
+    from batcher.dist.executors.aligned import transfer
+
+    gib = 1 << 30
+
+    class _Engine:
+        reading: tuple[int, int] | None = (200 * gib, 4 * gib)
+
+        def memory_headroom(self):
+            return self.reading
+
+    fake = _Engine()
+    monkeypatch.setattr("batcher._internal.native.engine", lambda: fake)
+    monkeypatch.setattr(transfer, "RESULT_BYTES", 12 * gib)
+    assert transfer.result_budget() == 12 * gib
+    fake.reading = (20 * gib, 2 * gib)
+    assert transfer.result_budget() == 8 * gib  # (20 - 2x2) / 2
+    fake.reading = None
+    assert transfer.result_budget() == 12 * gib
+    monkeypatch.setattr(transfer, "RESULT_BYTES", 0)
+    fake.reading = (200 * gib, 4 * gib)
+    assert transfer.result_budget() == 0  # the configured ceiling always wins

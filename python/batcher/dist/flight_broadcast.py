@@ -17,6 +17,7 @@ makes it scale with workers rather than flatten out.
 
 from __future__ import annotations
 
+import itertools
 import json
 from collections.abc import Callable
 
@@ -94,15 +95,20 @@ def _output_budget(granted: int = 0) -> int:
     Returns:
         The bound in bytes, or `0` to disable it.
     """
-    if granted > 0:
-        return granted
     try:
         import psutil
 
-        return int(psutil.virtual_memory().total * _OUTPUT_BUDGET_FRACTION)
+        share = int(psutil.virtual_memory().total * _OUTPUT_BUDGET_FRACTION)
     except Exception as exc:  # pragma: no cover - optional host probe
         note_suppressed("dist", "read node memory for a broadcast output bound", exc)
-        return 0
+        share = 0
+    # The larger of the two, never the grant alone. The grant is the worker's *spill
+    # threshold*: an estimate of the plan's peak divided across tasks and calls, routinely far
+    # below what the node holds, and as a hard bound it declined broadcasts that fitted easily
+    # -- TPC-H q9 at SF1000 on four 64 GB workers gave up at 0.1 GiB of output per node and fell
+    # to a co-partition shuffle that ran its reduce on one worker for 28 minutes. What keeps a
+    # broadcast from taking a node down is the node's real headroom, checked live by `_charge`.
+    return max(granted, share)
 
 
 def broadcast_eligible(join: Join) -> bool:
@@ -190,6 +196,15 @@ def stream_probe_join(
     # cluster-wide OOM. Going over raises, the driver catches it, and the co-partition path
     # (which streams both sides) answers the query instead.
     budget = _output_budget(output_budget)
+    if gk is None:
+        joined = _join_chunked(
+            nat, probe_ir, join_ir, probe_batches, build_side, engine_config, budget
+        )
+        if joined is not None:
+            out_rows, metrics_json = joined
+            if on_metrics is not None and metrics_json:
+                on_metrics(metrics_json)
+            return out_rows
     held = 0
     out: list[pa.RecordBatch] = []
     for chunk in _byte_chunks(probe_batches, _PROBE_CHUNK_BYTES):
@@ -216,6 +231,52 @@ def stream_probe_join(
     return out
 
 
+def _join_chunked(nat, probe_ir, join_ir, probe_batches, build_side, engine_config, budget):
+    """The plain probe join in one engine call, the build side prepared once; `None` if the
+    join cannot run that way.
+
+    One native call per probe chunk prepared the replicated build side again on every call: on
+    TPC-H q9 at SF1000 the broadcast stage probed ~6B `lineitem` rows against a 10M-row `part`
+    build in thousands of 32 MiB chunks per worker, with 1-5 of 16 cores busy, for 4.6 minutes.
+    Measured locally on an 8-core box, 8 chunks against a 5M-row build: 268 ms per-chunk, 70 ms
+    chunked. The map prefix still runs per chunk, inside the iterator the engine pulls from.
+
+    Returns:
+        `(batches, metrics_json)`, or `None` for a join the chunked path does not take.
+
+    Raises:
+        BroadcastOutputTooLarge: The joined output outgrew `budget`, or the node ran short.
+    """
+    from batcher._internal.errors import MemoryBudgetExceededError
+    from batcher.dist.executors.ray_runtime.metering import execute_chunked_metered
+
+    if not nat.plan_chunkable(join_ir, 0):
+        return None
+    chunks = (
+        kept
+        for chunk in _byte_chunks(probe_batches, _PROBE_CHUNK_BYTES)
+        if (kept := [b for b in nat.execute_plan(probe_ir, [chunk], engine_config) if b.num_rows])
+    )
+    first = next(chunks, None)
+    if first is None:
+        return [], ""
+    carrier = [first[0].slice(0, 0)]
+    try:
+        return execute_chunked_metered(
+            join_ir,
+            [carrier, build_side],
+            0,
+            itertools.chain([first], chunks),
+            engine_config,
+            budget,
+        )
+    except MemoryBudgetExceededError as exc:
+        raise BroadcastOutputTooLarge(
+            f"broadcast probe output outgrew its {budget / (1 << 30):.1f} GiB bound or the node "
+            f"ran short of memory ({exc}); falling back to the co-partition shuffle"
+        ) from exc
+
+
 def _charge(held: int, budget: int, batches) -> int:
     """Add `batches` to the running held-bytes total, raising once it passes `budget`.
 
@@ -227,12 +288,23 @@ def _charge(held: int, budget: int, batches) -> int:
     if not budget:
         return held
     held += sum(retained_bytes(b) for b in batches)
-    if held > budget:
+    if held > budget or _memory_short():
         raise BroadcastOutputTooLarge(
-            f"broadcast probe output reached {held / (1 << 30):.1f} GiB on this node, over the "
-            f"{budget / (1 << 30):.1f} GiB bound; falling back to the co-partition shuffle"
+            f"broadcast probe output reached {held / (1 << 30):.1f} GiB on this node against a "
+            f"{budget / (1 << 30):.1f} GiB bound, or the node ran short of memory; falling back "
+            "to the co-partition shuffle"
         )
     return held
+
+
+def _memory_short() -> bool:
+    """Whether the node is within twice the engine's headroom floor (`bc_resource::headroom`).
+
+    The live check behind `_output_budget`'s generous bound: accumulating joined output is
+    Python holding batches, which no engine-side guard sees, so the probe task asks.
+    """
+    reading = engine().memory_headroom()
+    return reading is not None and reading[0] < 2 * reading[1]
 
 
 def execute_broadcast_join_flight(

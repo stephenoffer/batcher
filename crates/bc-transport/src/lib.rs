@@ -173,11 +173,28 @@ pub const H2_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
 /// window-bound.
 pub const H2_CONNECTION_WINDOW: u32 = 128 * 1024 * 1024;
 
+/// `err` and every error beneath it, joined by `": "` -- the detail a terse `Display` hides.
+fn source_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut next = err.source();
+    while let Some(e) = next {
+        out.push_str(": ");
+        out.push_str(&e.to_string());
+        next = e.source();
+    }
+    out
+}
+
 /// Errors surfaced by the transport's client/server helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     /// The gRPC transport failed to connect or bind.
-    #[error("transport error: {0}")]
+    ///
+    /// Printed with its whole source chain: tonic's own `Display` for this error is the bare
+    /// words "transport error", so a distributed TPC-H run that lost a cross-stage fetch
+    /// reported `transport error: transport error` and nothing about which of a refused
+    /// connection, a DNS failure or a reset it was.
+    #[error("transport error: {}", source_chain(.0))]
     Transport(#[from] tonic::transport::Error),
     /// A Flight RPC returned a non-OK status (e.g. unknown ticket -> NotFound).
     /// Boxed: `tonic::Status` is large, so keeping it inline would bloat every
@@ -906,6 +923,28 @@ mod tests {
     /// The Flight encoder only splits between rows, so a single 6 MB string is one message.
     /// Before the limit was raised this failed with "decoded message length too large";
     /// a single-node run never reaches it because same-host buckets use shared memory.
+    /// A refused connection says it was refused, not just "transport error: transport error".
+    #[tokio::test]
+    async fn a_failed_connect_names_its_cause() {
+        // Bind then drop a listener, so the port is (almost certainly) closed and refuses.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let err = FlightClient::connect(format!("http://127.0.0.1:{port}"))
+            .await
+            .err()
+            .expect("nothing listens there");
+        let msg = err.to_string();
+        assert!(msg.starts_with("transport error: "), "{msg}");
+        assert_ne!(
+            msg, "transport error: transport error",
+            "the cause was dropped"
+        );
+        assert!(matches!(classify(&err), FetchFault::Retryable), "{msg}");
+    }
+
     #[tokio::test]
     async fn a_row_wider_than_the_grpc_default_message_still_fetches() {
         let wide = "x".repeat(6_000_000);

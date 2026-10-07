@@ -75,7 +75,13 @@ fn shuffle_runtime_threads() -> usize {
 /// blow. The limit only grows (`max(current, budget)`) so a smaller-budget query
 /// can't shrink the envelope below a larger concurrent query's live reservations;
 /// reservations are RAII, so `used()` returns to 0 between queries.
+///
+/// Every budgeted query passes through here, so it is also where the engine's memory headroom
+/// guard is armed: the estimates the budget is checked against cannot see what the machine
+/// actually has left, and `bc_resource::headroom` reads it.
 pub(crate) fn shared_memory_pool(budget: usize) -> Arc<MemoryPool> {
+    bc_resource::headroom::set_reclaimer(crate::hardware::collect_retained);
+    bc_resource::headroom::arm();
     let pool = MEMORY_POOL.get_or_init(|| MemoryPool::new(budget));
     if budget > pool.limit() {
         pool.set_limit(budget);

@@ -103,16 +103,28 @@ pub fn execute_streaming_parallel_or_hand_off(
 /// cancel when that build finishes. The materializing executor's operator-boundary check and
 /// the external sort's per-merge-pass check cover the cases where that matters most; a
 /// breaker-internal poll is a further step, not this one.
+///
+/// A query running under a memory budget is also checked against the machine's available
+/// memory on every morsel (`bc_resource::headroom`), and gives way with
+/// `MemoryBudgetExceeded` when it falls below its floor -- the same handoff a breaker over
+/// budget makes, so the caller re-runs on the materializing executor, which spills.
 fn with_cancellation<'a>(
     it: Box<dyn Iterator<Item = Result<RecordBatch, InterpError>> + 'a>,
     cancel: Option<&CancelToken>,
+    budget: usize,
 ) -> Box<dyn Iterator<Item = Result<RecordBatch, InterpError>> + 'a> {
-    let Some(token) = cancel.cloned() else {
-        return it; // not cancellable: the iterator is handed back untouched
-    };
+    let token = cancel.cloned();
+    if token.is_none() && budget == 0 {
+        return it; // nothing to poll: the iterator is handed back untouched
+    }
     Box::new(it.map(move |b| {
-        if token.is_cancelled() {
+        if token.as_ref().is_some_and(CancelToken::is_cancelled) {
             return Err(InterpError::Cancelled);
+        }
+        if budget > 0 {
+            if let Some(h) = bc_resource::headroom::low() {
+                return Err(crate::error::low_memory(h));
+            }
         }
         b
     }))
@@ -652,7 +664,7 @@ fn run_with_cache(
                 .map(|sh| {
                     let ctx = sh.ctx(cache, meter, budget, mats);
                     fold_partial(
-                        with_cancellation(build_with(input, ctx)?, cancel),
+                        with_cancellation(build_with(input, ctx)?, cancel, budget),
                         group_keys,
                         aggregates,
                         &jit,
@@ -752,7 +764,7 @@ fn run_with_cache(
                         let mut acc = bc_runtime::agg::DistinctPrefix::new(*k);
                         let mut held: Vec<RecordBatch> = Vec::new();
                         let mut gave_up = false;
-                        for batch in with_cancellation(build_with(input, ctx)?, cancel) {
+                        for batch in with_cancellation(build_with(input, ctx)?, cancel, budget) {
                             let batch = batch?;
                             if !gave_up {
                                 acc.push(&batch)?;
@@ -831,7 +843,7 @@ fn run_with_cache(
                 .par_iter()
                 .map(|sh| {
                     let ctx = sh.ctx(cache, meter, budget, mats);
-                    with_cancellation(build_with(input, ctx)?, cancel)
+                    with_cancellation(build_with(input, ctx)?, cancel, budget)
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, InterpError>>()?;
@@ -871,7 +883,8 @@ fn run_with_cache(
                 .par_iter()
                 .map(|sh| {
                     let ctx = sh.ctx(cache, meter, budget, mats);
-                    with_cancellation(build_with(plan, ctx)?, cancel).collect::<Result<Vec<_>, _>>()
+                    with_cancellation(build_with(plan, ctx)?, cancel, budget)
+                        .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, InterpError>>()?;
             // Shards are contiguous, in-order row ranges, so concatenating them in shard order
@@ -1002,7 +1015,7 @@ fn fallback_with(
     // parallel evaluation of whatever spine breaker made it decline.
     let ctx = Ctx::with_workers(sources, cache, meter, budget, workers).with_mats(mats);
     let out: Vec<RecordBatch> =
-        with_cancellation(build_with(plan, ctx)?, cancel).collect::<Result<_, _>>()?;
+        with_cancellation(build_with(plan, ctx)?, cancel, budget).collect::<Result<_, _>>()?;
     Ok(strip_empties(out))
 }
 

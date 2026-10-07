@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1644 Python modules across 236 packages and 342 Rust files across 14 crates.
+Covering 1644 Python modules across 236 packages and 344 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -350,13 +350,13 @@ The shared Kyber → Carbonite → Core contract loop for relational plans.
 | module | lines | what it is |
 |---|---|---|
 | `autoconfig.py` | 129 | Zero-config resolution: sense the machine once, and pin it for the query's scope. |
-| `chunked.py` | 434 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
+| `chunked.py` | 470 | Run a scan-heavy plan with its largest input streamed into the engine, not read up front. |
 | `chunked_sideways.py` | 647 | Stream a decorrelated subquery's aggregate restricted to the keys its outer query produces. |
 | `fast_path.py` | 256 | The small-query fast path: Kyber and the engine, and nothing else. |
 | `logical_profile.py` | 145 | `OpProfile`s built from the un-lowered LOGICAL plan tree. |
 | `phases.py` | 97 | The control plane's phase vocabulary: what a query is doing, while it is doing it. |
 | `prepared.py` | 273 | The prepared-execution cache: derive a small query's execution once, then dispatch it. |
-| `run.py` | 674 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
+| `run.py` | 679 | The contract loop: Kyber optimizes, Carbonite admits, Core executes, metadata flows back. |
 | `sizing.py` | 394 | What the conductor needs to know about a plan's size before it runs it. |
 | `stages.py` | 592 | The three ways the conductor can execute an admitted plan, plus the source read. |
 | `topn_seeding.py` | 148 | Run a top-N from a bound: remembered from the last run, or proved by the source's footers. |
@@ -975,7 +975,7 @@ Window-function translation for the SQL front-end.
 |---|---|---|
 | `executor.py` | 3300 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 903 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
-| `flight_broadcast.py` | 544 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
+| `flight_broadcast.py` | 616 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
@@ -1003,7 +1003,7 @@ Per-operator distributed executor implementations.
 | `distinct.py` | 196 | Distributed deduplication — whole-row via the aggregate shuffle, keyed via a row shuffle. |
 | `join.py` | 895 | Distributed join: a broadcast path and a co-partition hash-shuffle path. |
 | `keyed_shuffle.py` | 219 | Shuffle raw rows by key columns, then run one plan per bucket. |
-| `map.py` | 3366 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
+| `map.py` | 3372 | Distributed `map_batches` (batch inference) — the Ray Data competitor path. |
 | `plan_analysis.py` | 590 | Plan-shape analysis for the distributed dispatcher. |
 | `scan_read.py` | 643 | Worker-side scan read primitives — how a distributed worker reads its split slice. |
 | `sort.py` | 531 | Distributed sort over a disk Arrow-IPC shuffle. |
@@ -1020,12 +1020,12 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `analysis.py` | 487 | Which part of a plan can run whole on each worker, over one key range of its inputs. |
 | `hoist.py` | 163 | Evaluate the parts of an aligned cut that read no aligned source, once, before its units. |
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
-| `memory_fit.py` | 86 | How many aligned units a node may run at once, from its memory as well as its cores. |
+| `memory_fit.py` | 95 | How many aligned units a node may run at once, from its memory as well as its cores. |
 | `reduce.py` | 216 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
 | `rewrite.py` | 232 | Push each join against a broadcast input down to the broadcast input it keys on. |
 | `route.py` | 458 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
-| `run.py` | 479 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
-| `transfer.py` | 306 | Moving an aligned run's inputs and results between the driver and the fleet. |
+| `run.py` | 508 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
+| `transfer.py` | 328 | Moving an aligned run's inputs and results between the driver and the fleet. |
 | `units.py` | 295 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
 
 ### `batcher/dist/executors/partition_io/` — 4 · backend
@@ -1051,7 +1051,7 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 | `fleet_health.py` | 340 | Live device health across the fleet — every accelerator node, never cached. |
 | `hardware_probe.py` | 568 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 724 | Ray lifecycle + single-node fallback for the distributed executor. |
-| `metering.py` | 194 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
+| `metering.py` | 233 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
 | `readiness.py` | 502 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 432 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
@@ -1222,7 +1222,7 @@ Kyber — the query optimizer. **Optimization and planning only.**
 | `common_subplan.py` | 440 | Plan-level common-subplan elimination: which repeated subplans to compute once. |
 | `correction.py` | 166 | What a window of measured q-errors means: a correction factor, and whether to trust it. |
 | `cpu_shares.py` | 200 | Adaptive per-task CPU share — turn measured CPU utilization into a `num_cpus`. |
-| `learning.py` | 688 | Cross-execution learning — the metadata feedback loop. |
+| `learning.py` | 727 | Cross-execution learning — the metadata feedback loop. |
 | `measured_fold.py` | 189 | The incremental per-signature fold the measured-quantity readers share. |
 | `measured_selectivity.py` | 78 | Filter selectivity derived from what Core measured, per plan signature. |
 | `measured_width.py` | 106 | Output row width derived from what Core measured, per plan signature. |
@@ -1303,8 +1303,8 @@ The Kyber optimizer entry point.
 |---|---|---|
 | `driver.py` | 508 | The rule-application engine: phases, fixpoint, and the levels of fusion. |
 | `expr_dispatch.py` | 239 | Expression-level rule dispatch: the vocabulary index, the fused chain, and its memo. |
-| `facade.py` | 637 | The `Optimizer` façade and the module-level entry points. |
-| `plan_deps.py` | 118 | Re-validate a memoized plan against the measurements its own planning read. |
+| `facade.py` | 645 | The `Optimizer` façade and the module-level entry points. |
+| `plan_deps.py` | 176 | Re-validate a memoized plan against the measurements its own planning read. |
 
 ### `batcher/kyber/plan_cache/` — 3 · subsystem
 
@@ -1313,7 +1313,7 @@ Memoize the optimizer — the same query, planned once.
 | module | lines | what it is |
 |---|---|---|
 | `keys.py` | 574 | The plan-cache key: an exact half that decides meaning and a learned half that decides quality. |
-| `memo.py` | 275 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
+| `memo.py` | 315 | The memo itself: exact-key entries, their learning rounds, lookup, store, clear. |
 | `writes.py` | 128 | Advance the learning generation only when a write could change a plan. |
 
 ### `batcher/kyber/rules/` — 3 · subsystem
@@ -1619,7 +1619,7 @@ EXACT-gated metadata shortcuts (façade) — the answers that need no scan.
 | `constants.py` | 76 | When a *computed* column is provably a constant — the one projection that keeps EXACT. |
 | `derived.py` | 270 | Bounds through a monotonic arithmetic projection — the one *non-constant* computed |
 | `distribution.py` | 497 | Distributional primitives shared by the cardinality and selectivity estimators. |
-| `estimator.py` | 2422 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
+| `estimator.py` | 2440 | `StatsEstimator` — propagate `RelStats` (rows + column stats) through a plan. |
 | `group_bound.py` | 87 | An upper bound on a group-by's output from where its keys come from, not what they hold. |
 | `join_columns.py` | 202 | Join column-statistics propagation. |
 | `predicate_bounds.py` | 178 | Tighten a filtered column's bounds to the values its own predicate admits. |
@@ -2952,7 +2952,7 @@ Effective hardware detection — what this process's machine really is and reall
 | module | lines | what it is |
 |---|---|---|
 | `cache.py` | 151 | The CPU cache hierarchy this process runs on — the sizes every blocking decision needs. |
-| `cgroup.py` | 379 | cgroup file-format mechanics — the container limits that override what the host reports. |
+| `cgroup.py` | 390 | cgroup file-format mechanics — the container limits that override what the host reports. |
 | `cpu.py` | 369 | The CPU budget this process really has, and how much of it something else is taking. |
 | `isa.py` | 215 | CPU identity and instruction-set features — what this silicon can actually execute. |
 | `memory.py` | 212 | The memory ceiling and page geometry this process runs under. |
@@ -3226,14 +3226,14 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg.rs` | 76 | The distributed aggregate's map and reduce steps: `partial_aggregate`, `combine` and `combine_finalize`, the mergeable folds the shuffle composes across… |
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
-| `chunked/mod.rs` | 648 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/mod.rs` | 690 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 728 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
-| `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 755 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `hardware.rs` | 342 | What the engine's own process knows about its hardware and its allocator. |
+| `lib.rs` | 756 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 787 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
-| `pool.rs` | 165 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
-| `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
+| `pool.rs` | 176 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
+| `process.rs` | 112 | Process-wide singletons the FFI layer shares across calls. |
 | `route.rs` | 175 | Which executor a plan runs on, and the two different affordability tests behind that. |
 | `shuffle/gather.rs` | 433 | The reducer's gather: how a worker pulls its bucket from every mapper. |
 | `shuffle/mod.rs` | 554 | Shuffle FFI: partitioners and the concurrent reducer gather. |
@@ -3252,9 +3252,9 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `coalesce.rs` | 172 | Merge a result's small batches before it leaves the engine. |
 | `dist.rs` | 627 | Distributed-execution primitives. |
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
-| `error.rs` | 177 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
+| `error.rs` | 188 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par/asof_stream.rs` | 454 | A keyless ASOF join that does not fit: a merge over two out-of-core sorted streams. |
-| `join_par/mod.rs` | 710 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `join_par/mod.rs` | 731 | Parallel join strategies shared by the multi-core executor (`par`). |
 | `join_par/orient.rs` | 163 | Which side of a join to build on, once both sides' true sizes are known. |
 | `join_par/probe_stream.rs` | 223 | Streaming a join's probe side past a build side that is already resident. |
 | `join_par/range_blocked.rs` | 169 | A range join whose right side does not fit: block-nested over chunks of both sides. |
@@ -3280,12 +3280,13 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 772 | Single-node parallel full sort by **sample-sort**. |
 | `ops/window_stream.rs` | 687 | Bounded-memory window execution for a partition that does not fit the envelope. |
-| `par.rs` | 3661 | The multi-core executor. |
+| `par.rs` | 3712 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
-| `stream/breaker.rs` | 631 | The breakers: operators that must see all of their input before they can emit any output. |
-| `stream/builds.rs` | 770 | Preparing a hash join's build side once, for every worker that will probe it. |
-| `stream/chunked/mod.rs` | 789 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
+| `stream/breaker.rs` | 634 | The breakers: operators that must see all of their input before they can emit any output. |
+| `stream/builds.rs` | 775 | Preparing a hash join's build side once, for every worker that will probe it. |
+| `stream/chunked/drive.rs` | 147 | The chunk-driven entry points: [`execute_chunked`] and its metered twin. |
+| `stream/chunked/mod.rs` | 726 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
@@ -3295,7 +3296,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/meter.rs` | 429 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 786 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
-| `stream/parallel.rs` | 1683 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/parallel.rs` | 1696 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 284 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 733 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
@@ -3341,10 +3342,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather/spans.rs` | 136 | Copying a sequence of source byte spans into one output buffer, as few copies as possible. |
 | `join/asof.rs` | 539 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 237 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
-| `join/dense.rs` | 444 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
+| `join/dense.rs` | 487 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
 | `join/key_filter.rs` | 419 | The build side's key set, digested into a filter the probe side applies *before* the join. |
-| `join/mod.rs` | 2238 | Hash join — produces match index-pairs, built to distribute. |
+| `join/mod.rs` | 2242 | Hash join — produces match index-pairs, built to distribute. |
 | `join/probe_par.rs` | 113 | The flat hash join's probe, across cores, emitting exactly what the serial probe emits. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
 | `join/range/band.rs` | 378 | The band join: two inequalities that bound **one** right key from both sides. |
@@ -3535,7 +3536,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 |---|---|---|
 | `dtype_name.rs` | 226 | The cast dtype-*name* grammar — the one place a wire name becomes an Arrow type. |
 | `float_ident.rs` | 216 | The engine's one definition of **float identity**. |
-| `hardware.rs` | 397 | Host CPU capability detection for adaptive execution. |
+| `hardware.rs` | 423 | Host CPU capability detection for adaptive execution. |
 | `hash.rs` | 308 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 231 | The host's instruction-set capabilities, in full. |
 | `lib.rs` | 233 | `bc-arrow` — Arrow building blocks shared across the engine. |
@@ -3592,7 +3593,8 @@ Process-wide memory accounting for reserve-before-allocate.
 | file | lines | what it is |
 |---|---|---|
 | `cancel.rs` | 201 | Cooperative cancellation: a flag the executor polls, and the registry that finds it. |
-| `lib.rs` | 595 | Process-wide memory accounting for reserve-before-allocate. |
+| `headroom.rs` | 287 | How much memory the machine has left, read rather than estimated. |
+| `lib.rs` | 606 | Process-wide memory accounting for reserve-before-allocate. |
 
 ### `bc-io`
 

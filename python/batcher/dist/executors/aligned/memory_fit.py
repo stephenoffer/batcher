@@ -22,8 +22,17 @@ __all__ = ["UnitFit", "fit_units", "fit_units_to_cluster"]
 
 #: A unit task's peak memory, as a multiple of its largest unit's projected input bytes: the
 #: unit it computes on, the one it prefetches, and the engine state over the first. Read off
-#: TPC-H q9 at SF1000: 28 GB per task over units of ~6 GB.
-UNIT_FOOTPRINT = 4.5
+#: TPC-H q9 at SF1000: 28 GB per task over units of ~6 GB at 4.5; re-measured 2026-10-05 at
+#: 30-35 GB of resident memory per task over the same units, so 6. An under-count here is an
+#: OOM kill (two tasks per 64 GB node at 30+ GB each); an over-count is a node running one
+#: task where it could have run two, which the engine's headroom guard now makes safe to risk.
+UNIT_FOOTPRINT = 6.0
+
+#: The share of a node's Ray-schedulable memory unit tasks may plan on. Ray reports the whole
+#: node (64 GB on an m6id.4xlarge), and the object store, the raylet, the driver's broadcasts and
+#: the OS live in it too: TPC-H q9 at SF1000 was fitted two tasks per node at 32 GB each, the
+#: entire node, and Ray's memory monitor killed them at 95% of it.
+USABLE_FRACTION = 0.85
 
 
 @dataclass(frozen=True)
@@ -51,7 +60,7 @@ def fit_units(
         The fit. Unchanged, with no budget, when no node reports both cores and memory: an
         unmeasured node is no evidence for running fewer tasks.
     """
-    usable = [(c, m) for c, m in nodes if c >= unit_cpus and m > 0]
+    usable = [(c, int(m * USABLE_FRACTION)) for c, m in nodes if c >= unit_cpus and m > 0]
     if not usable or largest_unit <= 0:
         return UnitFit(unit_cpus, slots, slots, None)
     need = int(largest_unit * UNIT_FOOTPRINT)

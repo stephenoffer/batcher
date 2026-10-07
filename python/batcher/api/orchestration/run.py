@@ -13,6 +13,7 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.api._join_helpers import _empty_result_schema
+from batcher.api.orchestration import chunked as _chunked
 from batcher.api.orchestration import phases
 from batcher.api.orchestration.chunked import run_chunked
 from batcher.api.orchestration.sizing import (
@@ -576,6 +577,8 @@ def _run_relational_scoped(
             plan, logical_opt, ctx, rm, sources, streamed.num_rows, decisions, started=started
         )
         return streamed, decisions
+    refused = _chunked.refused_for_memory()  # never answered by reading every source in
+    spill = spill or refused
     if spill:
         phases.begin("core.execute.spilled")
         mark = time.perf_counter()
@@ -589,6 +592,8 @@ def _run_relational_scoped(
         # An *advisory* infeasibility rests on a `Provenance.DEFAULT` guess: worth routing
         # out-of-core, but a guess must never fail a legitimate query (the admission
         # contract), so fall through to the in-memory path instead of raising.
+        if refused:
+            raise _chunked.memory_refusal_error()
         if must_spill and not verdict.advisory:
             raise PlanError(
                 "plan does not fit the memory envelope and has no out-of-core path "

@@ -175,3 +175,14 @@ impl std::fmt::Display for SetOpConflict {
         )
     }
 }
+
+/// The error a memory-budgeted executor gives way with when the machine's available memory
+/// has fallen below the guard's floor (`bc_resource::headroom`): the same signal a breaker
+/// over its budget sends, so every caller already routes it to an executor that spills.
+pub(crate) fn low_memory(h: bc_resource::headroom::Headroom) -> InterpError {
+    InterpError::MemoryBudgetExceeded {
+        needed: usize::try_from(h.floor).unwrap_or(usize::MAX),
+        budget: usize::try_from(h.available).unwrap_or(usize::MAX),
+        reason: "the machine's available memory fell below the guard's floor",
+    }
+}

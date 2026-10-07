@@ -124,7 +124,7 @@ def test_a_newly_measured_dependency_replans_only_within_the_learning_rounds(mon
     from batcher.kyber.optimizer import plan_deps
 
     measured = {"sig": 0.5}
-    monkeypatch.setattr(plan_deps, "_measured", lambda _hub: (measured, {}, {}))
+    monkeypatch.setattr(plan_deps, "_measured", lambda _hub: (measured, {}, {}, {}))
     unmeasured = (("sig", None, None, None),)
     verdicts = [
         plan_deps.dependencies_hold(_Hub(), unmeasured, r)
@@ -152,3 +152,61 @@ def test_the_plan_cache_counts_the_rounds_a_key_was_replanned():
         plan_cache.store("k", "plan", None, 8, ("dep",))
     assert seen == [0, 1]
     plan_cache.clear()
+
+
+def test_a_measurement_landing_on_the_planned_value_does_not_replan(monkeypatch):
+    """A first measurement is judged against what the plan used, not against its absence.
+
+    Re-planning on a measurement that confirms the estimate rebuilds the same plan from the
+    same number: TPC-DS q37 re-planned three times that way. One that lands two octaves away
+    re-plans, which is the positive control that the comparison is live.
+    """
+    from batcher.kyber.optimizer import plan_deps
+
+    measured: dict[str, float] = {}
+    monkeypatch.setattr(plan_deps, "_measured", lambda _hub: (measured, {}, {}, {}))
+    snapshot = plan_deps.dependency_snapshot(_Hub(), {"sig"}, {"sig": [0.3, None, None]})
+    assert plan_deps.dependencies_hold(_Hub(), snapshot, 0)  # nothing measured yet
+    measured["sig"] = 0.33  # within a bucket of the planned 0.3
+    assert plan_deps.dependencies_hold(_Hub(), snapshot, 0)
+    measured["sig"] = 0.3 / 4
+    assert not plan_deps.dependencies_hold(_Hub(), snapshot, 0)
+
+
+def test_a_correctable_operator_is_judged_by_its_rows_not_its_factor(monkeypatch):
+    """A drifting correction factor re-plans nothing while the measured rows hold still.
+
+    The factor multiplies a structural estimate that sharpens as column statistics arrive,
+    so it moves run to run (q37: 0.03, then 0.14, then 0.28) while the corrected row count
+    the plan turns on does not. Rows far from the planned estimate still re-plan.
+    """
+    from batcher.kyber.optimizer import plan_deps
+
+    corr, rows = {"sig": 0.03}, {"sig": 16.0}
+    monkeypatch.setattr(plan_deps, "_measured", lambda _hub: ({}, corr, {}, rows))
+    snapshot = plan_deps.dependency_snapshot(_Hub(), {"sig"}, {"sig": [None, 18.0, None]})
+    corr["sig"] = 0.28  # six buckets: alone, this used to re-plan
+    assert plan_deps.dependencies_hold(_Hub(), snapshot, 0)
+    rows["sig"] = 16.0 * 8
+    assert not plan_deps.dependencies_hold(_Hub(), snapshot, 0)
+
+
+def test_a_settled_plan_replans_only_for_drift_or_a_new_measurement(monkeypatch):
+    """`settled`: what the reproducing re-plan already saw re-plans only by drifting.
+
+    A dependency measured *after* it (a filter's selectivity, folded a run later than the
+    corrections that triggered the re-plan, the TPC-H q18 case) is still judged as usual.
+    """
+    from batcher.kyber.optimizer import plan_deps
+
+    sel, rows = {}, {"r": 16.0}
+    monkeypatch.setattr(plan_deps, "_measured", lambda _hub: (sel, {}, {}, rows))
+    used = {"r": [None, 1_000.0, None], "f": [0.33, None, None]}
+    snapshot = plan_deps.dependency_snapshot(_Hub(), {"r", "f"}, used)
+    assert not plan_deps.dependencies_hold(_Hub(), snapshot, 0)  # rows far from the plan
+    assert plan_deps.dependencies_hold(_Hub(), snapshot, 0, settled=True)
+    sel["f"] = 57 / 1_500_000  # measured after the settling re-plan, far from 0.33
+    assert not plan_deps.dependencies_hold(_Hub(), snapshot, 0, settled=True)
+    sel.clear()
+    rows["r"] = 16.0 * 8  # drift of what was already measured
+    assert not plan_deps.dependencies_hold(_Hub(), snapshot, 0, settled=True)

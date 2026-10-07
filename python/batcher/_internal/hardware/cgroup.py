@@ -141,6 +141,17 @@ def cgroup_v2_dirs() -> tuple[str, ...]:
     except OSError:
         return tuple(dirs)
     parts = [p for p in sub.split("/") if p]
+    # Under a namespace the reported path is the host's, and the mount shows the container's
+    # cgroup at its root -- but not necessarily the process's own: an Anyscale node reports
+    # `/anyscale/ctr_<id>/workers` for a Ray worker whose cgroup is `/sys/fs/cgroup/workers`,
+    # capped at 75% of the container. Drop leading components until the path names a directory
+    # under the mount, so that limit is read; the filter below otherwise left only the root,
+    # and every envelope was sized to a third more memory than the process may use.
+    skip = next(
+        (k for k in range(len(parts)) if os.path.isdir("/sys/fs/cgroup/" + "/".join(parts[k:]))),
+        0,
+    )
+    parts = parts[skip:]
     # Leaf first (most specific) down to the root; `cfs_quota_count` mins over all anyway.
     for i in range(len(parts), 0, -1):
         dirs.append("/sys/fs/cgroup/" + "/".join(parts[:i]))
