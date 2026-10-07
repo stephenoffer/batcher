@@ -66,7 +66,7 @@ Each method returns a new `Dataset`. They chain.
 | `.sort(*by, descending=False, nulls_first=False)` | Order rows. `by` is a name or expression. |
 | {py:meth}`.limit(n, offset=0) <batcher.Dataset.limit>` | Take `n` rows after skipping `offset`. |
 | `.tail(n=5)` | Take the last `n` rows (executes a `count` first). |
-| {py:meth}`.sample(fraction=None, *, n=None, seed=None) <batcher.Dataset.sample>` | Sample a `fraction` of rows or a fixed count `n`. Deterministic and partition-independent (a stable seeded content hash), so identical single-node or distributed. |
+| {py:meth}`.sample(fraction=None, *, n=None, seed=None, weights=None, key=None) <batcher.Dataset.sample>` | Sample a `fraction` of rows or a fixed count `n`. Deterministic and partition-independent (a stable seeded content hash), so identical single-node or distributed. `weights=` weights a count sample; `key=` keeps whole keys in a fraction sample. |
 | {py:meth}`.split_at_indices(indices) <batcher.Dataset.split_at_indices>` | Cut into consecutive row ranges at the given positions (Ray Data's spelling). Every part stays lazy. |
 | {py:meth}`.split_proportionately(proportions) <batcher.Dataset.split_proportionately>` | Cut into parts holding the given row fractions, with exact sizes (executes a `count` first). |
 | {py:meth}`.split(n, *, order_by, equal=False) <batcher.Dataset.split>` | Cut into `n` consecutive parts of near-equal size under `order_by` (Ray Data's spelling; executes a `count` first). |
@@ -74,6 +74,7 @@ Each method returns a new `Dataset`. They chain.
 | {py:meth}`.drop_nans(subset=None) <batcher.Dataset.drop_nans>` | Drop rows holding a NaN in the floating-point columns; nulls stay. |
 | {py:meth}`.match_to_schema(schema, *, missing_columns="raise", extra_columns="raise") <batcher.Dataset.match_to_schema>` | Conform to a schema's columns, order and types, refusing a mismatch. |
 | {py:meth}`.transpose(*, column_names=None, include_header=False, header_name="column", order_by=None) <batcher.Dataset.transpose>` | Turn rows into columns (executes eagerly to learn the names). |
+| {py:meth}`.upsample(time_col, every, *, by=None, fill=None, indicator=None) <batcher.Dataset.upsample>` | Insert a row at every missing step of a regular time grid per group, keeping every observed row. |
 | {py:meth}`.distinct() <batcher.Dataset.distinct>` | Drop duplicate rows. |
 | `.union(*others, distinct=False)` | Concatenate datasets; set `distinct=True` to dedupe. |
 | `.intersect(other)` | Rows present in both. |
@@ -84,9 +85,9 @@ Each method returns a new `Dataset`. They chain.
 | {py:meth}`.zip(*others, order_by) <batcher.Dataset.zip>` | Pair rows by position under `order_by`, side by side (Ray Data's spelling; counts each input first). |
 | {py:meth}`.window(...) <batcher.Dataset.window>` | Per-row windowed columns (see below). |
 | {py:meth}`.group_by(*keys, **derived) <batcher.Dataset.group_by>` | Start a grouped aggregation (returns `GroupBy`). |
-| `.rollup(*keys)` | Aggregate at every prefix of `keys` plus the grand total (SQL `ROLLUP`). |
-| `.cube(*keys)` | Aggregate at every subset of `keys` (SQL `CUBE`). |
-| {py:meth}`.grouping_sets(*sets) <batcher.Dataset.grouping_sets>` | Aggregate at exactly the levels given (SQL `GROUPING SETS`). |
+| `.rollup(*keys, grouping_id=None)` | Aggregate at every prefix of `keys` plus the grand total (SQL `ROLLUP`). `grouping_id=` names a column holding each row's level. |
+| `.cube(*keys, grouping_id=None)` | Aggregate at every subset of `keys` (SQL `CUBE`). |
+| {py:meth}`.grouping_sets(*sets, grouping_id=None) <batcher.Dataset.grouping_sets>` | Aggregate at exactly the levels given (SQL `GROUPING SETS`). |
 | `.map_batches(fn, ...)` | Apply a Python function to whole Arrow batches. |
 | {py:meth}`.offload_blobs(column="bytes", ...) <batcher.Dataset.offload_blobs>` | Move a large-payload column to a content-addressed store, leaving URI handles ({doc}`blob-by-reference </ml/preparing/multimodal/index>`). |
 | {py:meth}`.materialize_blobs(...) <batcher.Dataset.materialize_blobs>` | Read offloaded payloads back from their handles (inverse of {py:meth}`offload_blobs <batcher.Dataset.offload_blobs>`). |
@@ -288,6 +289,8 @@ report = ds.rollup("category").agg(revenue=bt.col("price").sum())
 print(report.sort("category").to_pydict())
 # {'category': ['a', 'b', 'c', None], 'revenue': [90.0, 60.0, 60.0, 210.0]}
 ```
+
+When a key can itself hold NULL, that NULL and a subtotal's look alike. Pass `grouping_id="<name>"` to any of the three to append each row's level as SQL `GROUPING_ID` bits, first key most significant, so `0` marks a detail row and a set bit marks a rolled-up key.
 
 ## Terminal operations
 

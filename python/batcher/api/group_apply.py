@@ -61,7 +61,15 @@ class GroupApply:
     #: Python cost is the thing a profile most needs to attribute.
     batcher_group_adapter = True
 
-    __slots__ = ("batch_format", "columns", "fn", "keys")
+    __slots__ = (
+        "batch_format",
+        "columns",
+        "fn",
+        "keys",
+        "max_group_bytes",
+        "max_group_rows",
+        "output_schema",
+    )
 
     def __init__(
         self,
@@ -69,11 +77,18 @@ class GroupApply:
         keys: tuple[str, ...],
         columns: tuple[str, ...],
         batch_format: str = "pyarrow",
+        *,
+        output_schema: pa.Schema | None = None,
+        max_group_rows: int | None = None,
+        max_group_bytes: int | None = None,
     ) -> None:
         self.fn = fn
         self.keys = keys
         self.columns = columns
         self.batch_format = batch_format
+        self.output_schema = output_schema
+        self.max_group_rows = max_group_rows
+        self.max_group_bytes = max_group_bytes
 
     def __repr__(self) -> str:
         name = getattr(self.fn, "__qualname__", repr(self.fn))
@@ -90,13 +105,59 @@ class GroupApply:
             # `null` here -- the group reassembly reads the type-less column as a list. The
             # `fn` sees this schema, so it is the one the result is held to.
             group = self._group(batch, row)
-            out.extend(_coerce_udf_result(self._call_one(group), group.schema))
+            self._check_size(batch, row, group)
+            reference = self.output_schema if self.output_schema is not None else group.schema
+            out.extend(_coerce_udf_result(self._call_one(group), reference))
+        if self.output_schema is not None:
+            return self._conform(out)
         if not out:
-            # No groups in this batch, so there is no output schema to report. A zero-column
-            # empty table unifies with the real batches of the same stage, the way an empty
-            # per-row result does in `dataset._udf.rows.rows_to_table`.
+            # No groups in this batch, and no declared schema to report. A zero-column empty
+            # table unifies with the real batches of the same stage, the way an empty
+            # per-row result does in `dataset._udf.rows.rows_to_table` -- but when *every*
+            # batch is empty the result has no columns, which is what `output_schema` fixes.
             return pa.table({})
         return pa.Table.from_batches(out)
+
+    def _check_size(self, batch: pa.RecordBatch, row: int, group: pa.RecordBatch) -> None:
+        """Refuse a group over `max_group_rows` / `max_group_bytes` before `fn` sees it.
+
+        The engine has already assembled the group by now, so this guards the Python side --
+        the conversion to `batch_format` and whatever `fn` builds from it -- not engine memory.
+        """
+        size, limit, unit = group.num_rows, self.max_group_rows, "rows"
+        if limit is None or size <= limit:
+            size, limit, unit = group.nbytes, self.max_group_bytes, "bytes"
+            if limit is None or size <= limit:
+                return
+        from batcher._internal.errors import ExecutionError
+
+        key = {k: batch.column(k)[row].as_py() for k in self.keys}
+        raise ExecutionError(
+            f"map_groups: group {key} holds {size:,} {unit}, over the limit of {limit:,}. "
+            "Reduce it with agg(...) or a window (over(...)) instead of a per-group callback, "
+            f"or raise max_group_{unit}= if the group really fits."
+        )
+
+    def _conform(self, out: list[pa.RecordBatch]) -> pa.Table:
+        """Hold every result batch to the declared `output_schema`, in its column order."""
+        from batcher._internal.errors import ExecutionError
+
+        schema = self.output_schema
+        assert schema is not None  # only called when a schema was declared
+        tables = []
+        for b in out:
+            if set(b.schema.names) != set(schema.names):
+                raise ExecutionError(
+                    f"map_groups: the function returned columns {b.schema.names}, but "
+                    f"output_schema declares {schema.names}"
+                )
+            try:
+                tables.append(pa.Table.from_batches([b]).select(schema.names).cast(schema))
+            except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError) as exc:
+                raise ExecutionError(
+                    f"map_groups: a result does not match output_schema ({exc})"
+                ) from exc
+        return pa.concat_tables(tables) if tables else schema.empty_table()
 
     def _call_one(self, group: pa.RecordBatch) -> Any:
         """Call `fn` on one group, reframed to `batch_format`.
@@ -134,6 +195,10 @@ def build_map_groups(
     keys: tuple[str, ...],
     fn: Callable,
     options: dict[str, Any],
+    output_schema: pa.Schema | None = None,
+    *,
+    max_group_rows: int | None = None,
+    max_group_bytes: int | None = None,
 ) -> Dataset:
     """Lower ``group_by(keys).map_groups(fn)`` to ``agg(array_agg) -> map_batches``.
 
@@ -142,12 +207,17 @@ def build_map_groups(
         keys: The group-key column names.
         fn: The per-group callback.
         options: `map_batches` options to forward (`batch_format`, `num_gpus`, ...).
+        output_schema: The declared result schema, also the result of an input with no
+            groups; ``None`` leaves the result's schema to whatever `fn` returns.
+        max_group_rows: Refuse a group with more rows than this before calling `fn`.
+        max_group_bytes: Refuse a group larger than this many bytes before calling `fn`.
 
     Returns:
         A new lazy `Dataset` holding what `fn` returned for each group, concatenated.
 
     Raises:
-        PlanError: if every column is a group key, leaving nothing to hand the function.
+        PlanError: if every column is a group key, leaving nothing to hand the function,
+            or an option is malformed.
     """
     from batcher._internal.errors import PlanError
     from batcher.plan.expr_ir import Col
@@ -160,6 +230,7 @@ def build_map_groups(
             f"column of this dataset is a group key ({list(keys)}). Group by fewer columns, "
             "or use .agg(n=bt.count()) if you only need the group sizes."
         )
+    _check_options(options, output_schema, max_group_rows, max_group_bytes)
     # `input_columns`/`preserves_columns` describe the stage's input, and this stage's input
     # is the *aggregated* relation, not the user's. Forwarding them would prune or push a
     # predicate against a schema the caller never saw, so refuse rather than misapply them.
@@ -172,6 +243,43 @@ def build_map_groups(
             )
         options.pop(name, None)
     # The reframing happens per group inside the adapter, so the outer stage stays Arrow.
-    adapter = GroupApply(fn, keys, columns, options.pop("batch_format", "pyarrow"))
+    adapter = GroupApply(
+        fn,
+        keys,
+        columns,
+        options.pop("batch_format", "pyarrow"),
+        output_schema=output_schema,
+        max_group_rows=max_group_rows,
+        max_group_bytes=max_group_bytes,
+    )
     collected = source.group_by(*keys).agg(**{name: Col(name).array_agg() for name in columns})
     return collected.map_batches(adapter, **options)
+
+
+def _check_options(
+    options: dict[str, Any],
+    output_schema: pa.Schema | None,
+    max_group_rows: int | None,
+    max_group_bytes: int | None,
+) -> None:
+    """Validate the size limits and `output_schema`, which also sets `output_columns`."""
+    from batcher._internal.errors import PlanError
+
+    for name, limit in (("max_group_rows", max_group_rows), ("max_group_bytes", max_group_bytes)):
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            raise PlanError(f"map_groups({name}=...) must be a positive integer, got {limit!r}")
+    if output_schema is not None:
+        if not isinstance(output_schema, pa.Schema):
+            raise PlanError(
+                f"map_groups(output_schema=...) must be a pyarrow.Schema, got "
+                f"{type(output_schema).__name__}"
+            )
+        declared = options.get("output_columns")
+        if declared is not None and list(declared) != output_schema.names:
+            raise PlanError(
+                f"map_groups: output_columns {list(declared)} disagree with output_schema "
+                f"{output_schema.names}; pass output_schema alone"
+            )
+        options["output_columns"] = list(output_schema.names)

@@ -297,6 +297,16 @@ print(by_pair.to_pydict())
 #  'total': [20.0, 10.0, 40.0, 30.0], 'n': [1, 1, 1, 1]}
 ```
 
+A null key is a value like any other: rows whose key is null form one group with a null key, as in SQL and Polars. pandas drops them by default with `groupby(dropna=True)`, and the equivalent here is to drop them first.
+
+```python
+tagged = bt.from_pydict({"tag": ["x", None, "x", None], "n": [1, 2, 3, 4]})
+print(tagged.group_by("tag").agg(total=bt.col("n").sum()).sort("tag").to_pydict())
+# {'tag': ['x', None], 'total': [4, 6]}
+print(tagged.drop_nulls(subset=["tag"]).group_by("tag").agg(total=bt.col("n").sum()).to_pydict())
+# {'tag': ['x'], 'total': [4]}
+```
+
 A derived key works the same way. Define it in {py:meth}`with_columns <batcher.Dataset.with_columns>` (or pass the expression straight to `group_by`) and group on the result.
 
 ```python
@@ -311,6 +321,23 @@ buckets = (
 print(buckets.to_pydict())
 # {'tier': ['high', 'low'], 'n': [3, 2], 'revenue': [120.0, 30.0]}
 ```
+
+## Subtotals with rollup and cube
+
+{py:meth}`rollup <batcher.Dataset.rollup>` aggregates at every prefix of its keys plus a grand total, {py:meth}`cube <batcher.Dataset.cube>` at every subset, and {py:meth}`grouping_sets <batcher.Dataset.grouping_sets>` at exactly the levels you list. A rolled-up key reads as null, which is how SQL marks a subtotal row, so a genuine null in the data looks the same. Pass `grouping_id=` to tell them apart: it appends each row's level as SQL `GROUPING_ID` bits, first key most significant, a bit set where that key is rolled up.
+
+```python
+print(
+    sales.rollup("category", "region", grouping_id="level")
+    .agg(total=bt.col("amount").sum())
+    .sort("level", "category", "region")
+    .to_pydict()
+)
+# {'category': ['a', 'a', 'b', 'b', 'a', 'b', None], 'region': ['east', 'west', 'east', 'west', None, None, None],
+#  'total': [20.0, 10.0, 40.0, 30.0, 30.0, 70.0, 100.0], 'level': [0, 0, 0, 0, 1, 1, 3]}
+```
+
+Level 0 is the full grouping, 1 rolls up `region`, and 3 rolls up both. One key's flag is `(level >> (n - 1 - i)) & 1` for key `i` of `n`.
 
 ## Filtering groups
 

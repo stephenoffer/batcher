@@ -390,6 +390,10 @@ def stratified_split(
     a rare class rounds *towards* being represented in the test half rather than away from it,
     which is the direction that keeps a metric meaningful. A label with a single row goes to
     train, because a model that never saw the class is the worse of the two mistakes.
+    Exactly: a label of `n` rows keeps ``max(floor((1 - test_size) * n), 1)`` in train and
+    sends the rest to test. `Dataset.stratified_split` uses a different rule (a percent-rank
+    cut, which sends a single-row label to test), so the two are not interchangeable on tiny
+    classes.
 
     Rows are ordered inside each label by a hash of their own values, so the split is
     reproducible and partition-independent: a row lands on the same side however the data is

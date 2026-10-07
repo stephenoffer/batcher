@@ -151,6 +151,7 @@
 "unpersist" = "Dataset"
 "unpivot" = "Dataset"
 "update" = "Dataset"
+"upsample" = "Dataset"
 "value_counts" = "Dataset"
 "vstack" = "Dataset"
 "window" = "Dataset"

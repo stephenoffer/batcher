@@ -15,7 +15,7 @@ from sqlglot import expressions as exp
 from batcher._sql.parser.clauses import _is_order_all, _order_all
 from batcher._sql.parser.core_utils import _alias_of, _row_window, grouping_levels
 from batcher.api.dataset import Dataset
-from batcher.api.multi_group import cube_levels, rollup_levels, stack_levels
+from batcher.api.multi_group import cube_levels, grouping_bits, rollup_levels, stack_levels
 from batcher.plan.expr_ir import col
 
 
@@ -263,9 +263,7 @@ def _grouping_level_node(node, active: dict, every: dict):
     # most-significant bit (DuckDB/SQL-standard). GROUPING_ID(...) is a spelling of the
     # same bit-vector. Replace either with that literal.
     for gnode in list(m.find_all(exp.Grouping, exp.GroupingId)):
-        bits = 0
-        for arg in gnode.expressions:
-            bits = (bits << 1) | (0 if _grouping_key(arg) in active else 1)
+        bits = grouping_bits(_grouping_key(arg) not in active for arg in gnode.expressions)
         # Paren-wrap so an `ORDER BY GROUPING(a)` constant is not mistaken for a
         # 1-based positional SELECT-item reference.
         gnode.replace(exp.Paren(this=exp.Literal.number(bits)))

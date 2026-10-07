@@ -43,6 +43,38 @@ print(
 # {'region': ['east', 'west'], 'q1': [30.0, 7.5], 'q2': [40.0, 20.0]}
 ```
 
+## Pivot several values or aggregates
+
+`values` and `aggregate` each take a list, and every combination gets one column per category. With one value and one aggregate a column is named by its category alone. Otherwise it is named `{value}_{aggregate}_{category}`, leaving out whichever of the two has a single entry, and the columns are ordered by value, then aggregate, then category.
+
+```python
+both = sales.pivot(index="region", on="quarter", values="amount", aggregate=["sum", "count"])
+print(both.columns)
+# ['region', 'sum_q1', 'sum_q2', 'count_q1', 'count_q2']
+print(both.sort("region").to_pydict()["sum_q1"])
+# [30.0, 15.0]
+```
+
+It is still one grouped aggregate and one pass, with one conditional aggregate per output column. A generated name that collides with an `index` column raises `PlanError` rather than overwriting it.
+
+## Fill cells that have no rows
+
+A cell whose `(index, category)` combination has no rows is null, or `0` for `count`. `fill_value` replaces exactly those cells. A cell whose rows exist but aggregate to null stays null, because "nothing was recorded" and "something was recorded as unknown" are different facts, and a blanket {py:meth}`fill_null <batcher.Dataset.fill_null>` afterwards would merge them.
+
+```python
+readings = bt.from_pydict(
+    {"site": ["a", "a", "b"], "sensor": ["t", "h", "t"], "value": [21.0, None, 19.5]}
+)
+print(
+    readings.pivot(index="site", on="sensor", values="value", fill_value=-1.0)
+    .sort("site")
+    .to_pydict()
+)
+# {'site': ['a', 'b'], 'h': [None, -1.0], 't': [21.0, 19.5]}
+```
+
+Site `a` has an `h` row whose value is null, so its cell stays null. Site `b` has no `h` row at all, so its cell is filled.
+
 ## Fix the columns and skip the pre-pass
 
 :::{warning}
@@ -58,6 +90,8 @@ print(fixed.sort("region").to_pydict())
 ```
 
 A value present in the data but absent from `columns` is dropped. That is the trade: you get a stable schema by declaring it, and declaring it means owning it.
+
+The `columns` values are checked against the type of `on` when the plan is built. A string category for an integer column, a `None`, or two values that select the same rows or name the same column, such as `1` and `1.0`, raise `PlanError` instead of producing an empty or duplicated column.
 
 :::{note}
 Mind the cardinality. `on` a column with 50,000 distinct values produces a 50,000 column table, and nothing in the API stops you. Pivot on a dimension with a small, known domain, such as quarter, status, or country. For anything wider, keep it long and {py:meth}`group_by <batcher.Dataset.group_by>` it.
@@ -85,6 +119,14 @@ print(long.to_pydict())
 #  'amount': [15.0, 30.0, 20.0, 40.0]}
 ```
 
+A null cell becomes a row with a null value, as in pandas `melt` and Polars `unpivot`. Pass `include_nulls=False` to drop those rows instead, which is what SQL `UNPIVOT` does by default.
+
+```python
+gaps = bt.from_pydict({"region": ["west", "east"], "q1": [15.0, None], "q2": [None, 40.0]})
+print(gaps.unpivot(index="region", include_nulls=False).sort("region").to_pydict())
+# {'region': ['east', 'west'], 'variable': ['q2', 'q1'], 'value': [40.0, 15.0]}
+```
+
 The melted columns must share a type, since they end up in one output column and Arrow has no union-typed column here. Melting an int column and a string column together is an error, not a silent cast. `cast` them to a common type first if that is really what you mean.
 
 `unpivot` is a pure row-wise operator: no breaker, no pre-pass, no schema surprise. It distributes and streams like a `select`. Side by side, the two are not mirror images at all:
@@ -96,6 +138,15 @@ The melted columns must share a type, since they end up in one output column and
 | Extra pass over the data | yes, unless you pass `columns` | never |
 | Pipeline breaker | yes, it groups | no, it streams |
 | Needs an aggregate | yes, a cell can hold many rows | no, a row becomes rows |
+
+## Row and column order
+
+The reshapers promise a column order and, mostly, not a row order. A relation has no row order of its own, so sort the result whenever order matters.
+
+- `pivot` puts the `index` columns first, then the pivoted ones. Discovered categories ascend, and a null category is dropped, because a null never equals itself and so cannot select any rows. A `columns=[...]` list is used in the order given. Rows come out one per `index` group in no defined order.
+- `unpivot` puts the `index` columns first, then `variable_name`, then `value_name`. Rows have no defined order. In practice they arrive grouped by melted column, every row's `q1` before any row's `q2`, which is the reverse of DuckDB's row-by-row order.
+- `explode` keeps every column in place and appends the `index` column last. It emits a row's elements in list order, and `index` records each element's position so the order survives a shuffle.
+- `transpose` emits one row per input column, in the input's column order.
 
 ## Pivot is a grouped conditional aggregate
 
@@ -146,6 +197,8 @@ print(
 # {'region': ['east', 'east', 'west', 'west'], 'quarter': ['q1', 'q2', 'q1', 'q2'],
 #  'amount': [30.0, 40.0, 15.0, 20.0]}
 ```
+
+A bare `UNPIVOT` drops the rows whose melted value is null, as the SQL standard and DuckDB do, and `UNPIVOT INCLUDE NULLS` keeps them. The `IN` values of a `PIVOT` keep their SQL type, so an integer key pivots with `IN (1, 2)`, and each output column is named by the value's text, `1` and `2`.
 
 One `PIVOT` or `UNPIVOT` modifier per table reference is supported. Stacking two raises `NotImplementedError`.
 

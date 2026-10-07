@@ -345,6 +345,20 @@ print(
 
 Prefer both of those when they fit. `map_groups` materializes one group at a time, so a single key holding hundreds of millions of rows needs a reduction rather than a callback. Row order within a group is not guaranteed either, so sort inside the function when it matters.
 
+Two keywords make the callback safe on real data. `output_schema` declares the result's schema. An input with no groups never calls the function, so without a schema there is nothing to learn the result's columns from, and the empty result has no columns at all. With one, it is an empty table of that schema, and every result is cast to it.
+
+```python
+import pyarrow as pa
+
+schema = pa.schema([("region", pa.string()), ("spread", pa.float64())])
+none = sales.filter(bt.col("amount") > 100).group_by("region")
+print(none.map_groups(spread, output_schema=schema).collect().schema)
+# region: string
+# spread: double
+```
+
+`max_group_rows` and `max_group_bytes` refuse a group over either limit before the function sees it, with an `ExecutionError` naming the group's key and size. The engine has already assembled the group by then, so the limits protect the Python side, the conversion to `batch_format` and whatever your function builds, rather than engine memory.
+
 :::{note}
 `map_groups` builds an aggregation followed by a `map_batches`, so whether {py:meth}`collect(distributed=True) <batcher.Dataset.collect>` accepts the plan is the same question as for {py:meth}`ds.group_by("k").agg(...).map_batches(fn) <batcher.Dataset.group_by>`. Check it on your plan before relying on it.
 :::

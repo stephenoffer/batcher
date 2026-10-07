@@ -86,6 +86,23 @@ print(carried.to_pydict()["mean"], carried.to_pydict()["n"])
 
 A missing *count* is genuinely zero. A missing *temperature* is not, so it is carried forward instead. The count beside it is how a reader knows the value was carried rather than measured.
 
+## Upsample raw readings onto a grid
+
+The grid above is built by hand because it spans a fixed window for every sensor. When each series should run from its own first reading to its own last, {py:meth}`upsample <batcher.Dataset.upsample>` builds that grid for you. It inserts a row at every step of `every` that a series has no reading for, and `indicator=` names a boolean column marking the inserted rows.
+
+```python
+regular = readings.upsample(
+    "at", "15m", by="sensor", fill="forward", indicator="inserted"
+).sort("sensor", "at")
+print(regular.to_pydict()["celsius"], regular.to_pydict()["inserted"])
+# [20.0, 21.0, 22.0, 22.0, 22.0, 26.0, 5.0, 5.0, 5.0, 9.0]
+# [False, False, False, True, True, False, False, True, True, False]
+```
+
+Each sensor gains rows at 09:15 and 09:30, each filled from the reading before it in time. Every observed reading is kept, including those at 09:01, 09:02 and 09:32 that fall between grid points. That differs from Polars `upsample`, whose join onto the grid drops them. So `upsample` makes a series *complete* on the grid. It does not make it *regular*. Downsample with `bt.window` when you need exactly one row per step.
+
+The grid is built per series with `sequence` and `explode`, in the column's own unit, so the step must be a fixed duration and a whole number of that unit, such as whole days for a `date` column. Its size is the series' span divided by `every`, so a step much finer than the data makes a very large result.
+
 ## Fill gaps within a series
 
 {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` holds the last reading flat across a gap. {py:meth}`interpolate <batcher.plan.expr_ir.core.Expr.interpolate>` draws a straight line across it instead. Which is right depends on the quantity, not on the data: a configuration setting or a device state genuinely holds between reports, while a temperature or a meter reading was moving the whole time.

@@ -80,6 +80,22 @@ The stratified count is the same for every seed, because it is a property of the
 
 Reach for {py:func}`stratified_split <batcher.ml.splitting.stratified_split>` directly when you want the same behaviour outside the `ds.ml` surface.
 
+Exactly, a label of `n` rows keeps `max(floor((1 - test_size) * n), 1)` rows in train and sends the rest to test. {py:meth}`Dataset.stratified_split <batcher.Dataset.stratified_split>` cuts on percent rank instead, sending `ceil(test_size * (n - 1))` rows to test and a single-row label to test, so the two disagree on tiny classes.
+
+## Keeping a group on one side
+
+`key=` on `train_test_split` and `random_split` hashes only the named columns, and a key that is not unique keeps every row sharing it in the same part. That is a group split. A patient with ten visits lands wholly in train, validation, or test, never across them, which is the leak a row-level split cannot see.
+
+```python
+visits = bt.from_pydict({"patient": [i // 5 for i in range(500)], "x": list(range(500))})
+parts = visits.ml.random_split([0.7, 0.15, 0.15], seed=1, key="patient")
+seen = [set(p.to_pydict()["patient"]) for p in parts]
+print(seen[0] & seen[1], seen[0] & seen[2], seen[1] & seen[2])
+# set() set() set()
+```
+
+The parts are sized in patients rather than visits, so their row counts vary with group size. For folds, the same idea is `kfold(group=...)` below.
+
 ## Cross-validation splits
 
 A fold here is a **content hash** of each row compared against fold boundaries, never a materialized shuffle. That means a fold is an ordinary row-wise filter, the assignment is identical however the data is partitioned, and the training half of a fold stays lazy until something reads it.

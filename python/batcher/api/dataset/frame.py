@@ -2721,6 +2721,11 @@ class Dataset:
         own list (Spark ``posexplode``), which is what lets chunks be reassembled in order
         after a shuffle. It is NULL for a row kept only by `outer`.
 
+        **Order.** The columns keep their positions, with `index` appended last. A row's
+        elements come out in list order, but rows as a whole have no defined order once
+        the plan is parallel or distributed, so carry `index` (and a row key) and sort on
+        them when the order matters.
+
         Args:
             column: The list/array column to explode.
             alias: Rename the exploded column to this name.
@@ -2998,7 +3003,7 @@ class Dataset:
         time_col = column_name(time_col, arg="time_col", api="session_window")
         return build_session_window(self, time_col, gap, partition_by or [], aggs)
 
-    def unnest(self, *columns: str) -> Dataset:
+    def unnest(self, *columns: str, separator: str | None = None, max_depth: int = 1) -> Dataset:
         """Expand each struct `column` into its fields as top-level columns.
 
         Matches Polars ``unnest`` / Spark ``select("s.*")``. Each struct field becomes
@@ -3006,9 +3011,20 @@ class Dataset:
         `PlanError` if a column is not a struct or if an expanded field name would
         collide with an existing column.
 
+        By default one level is expanded and each output keeps its bare field name.
+        ``max_depth=n`` keeps expanding a field that is itself a struct, down to `n`
+        levels, and `separator` names every output by its full path, starting with the
+        expanded column's own name, as Polars does: with ``separator="."`` a struct ``s``
+        with a field ``b`` holding a struct with field ``c`` yields ``s.b.c`` at
+        ``max_depth=2``. A null struct gives null fields. Both are worked out from the
+        schema, so nothing executes.
+
         Args:
             *columns: The struct columns to expand. A list is accepted in place of
                 separate arguments.
+            separator: Joins the field path into each output name; ``None`` keeps the bare
+                field name.
+            max_depth: How many levels of nested structs to expand, at least 1.
 
         Returns:
             A new `Dataset` with each struct's fields promoted to columns.
@@ -3020,8 +3036,14 @@ class Dataset:
                 >>> ds = bt.from_pydict({"s": [{"a": 1, "b": 2}]})
                 >>> ds.unnest("s").to_pydict()
                 {'a': [1], 'b': [2]}
+
+                >>> nested = bt.from_pydict({"s": [{"a": 1, "b": {"c": 2}}]})
+                >>> nested.unnest("s", separator=".", max_depth=2).to_pydict()
+                {'s.a': [1], 's.b.c': [2]}
         """
-        return build_unnest(self, list(flatten_varargs(columns)))
+        return build_unnest(
+            self, list(flatten_varargs(columns)), separator=separator, max_depth=max_depth
+        )
 
     def sample(
         self,
@@ -3029,6 +3051,8 @@ class Dataset:
         *,
         n: int | None = None,
         seed: int | None = None,
+        weights: str | None = None,
+        key: str | list[str] | None = None,
     ) -> Dataset:
         """Sample rows by a `fraction` (``0.0`` to ``1.0``) or a fixed count `n`.
 
@@ -3050,6 +3074,20 @@ class Dataset:
         the one you are sampling; both restore a row-level sample. This is a real
         limitation of the current sampler rather than a subtlety of the API.
 
+        ``weights="<column>"`` makes a count sample weighted, without replacement: a row
+        is chosen with probability proportional to its weight (Efraimidis-Spirakis, so each
+        row draws ``u`` from its hash and the `n` rows with the smallest ``-ln(u) / w`` are
+        kept). A null or zero weight is never chosen, and when fewer than `n` rows have a
+        positive weight all of them are returned. The weights are checked by one eager
+        aggregate before the plan is returned, which raises on a negative weight or on
+        weights totalling zero over a non-empty input; it needs a bounded input. Weights
+        apply to `n` only, because a weighted fraction has no defined size.
+
+        ``key="<column>"`` (or a list) makes a fraction sample hash only those columns,
+        so every row sharing a key is kept or dropped together and the choice survives a
+        change to any other column, the way ``ds.ml.train_test_split(key=...)`` does. It
+        applies to `fraction` only, since keeping whole keys cannot promise a row count.
+
         The positional argument reads the way both neighbouring libraries spell it:
         an `int` is a row count (``sample(100)``, as in Polars) and a `float` is a
         fraction (``sample(0.1)``).
@@ -3059,13 +3097,17 @@ class Dataset:
                 when a `float`.
             n: An exact number of rows to keep (mutually exclusive with `fraction`).
             seed: Seeds the sampling; ``None`` bakes a fresh seed at plan-build.
+            weights: A numeric column weighting each row of a count sample.
+            key: The column(s) a fraction sample hashes, keeping whole keys together.
 
         Returns:
             A new `Dataset` of the sampled rows.
 
         Raises:
             PlanError: If both a row count and a fraction are given, if neither is,
-                or if an alias conflicts with the name it aliases.
+                if `weights` is given without `n` or `key` without a fraction, if a
+                weight is negative or the weights total zero, or if an alias conflicts
+                with the name it aliases.
 
         Examples:
             .. doctest::
@@ -3077,6 +3119,17 @@ class Dataset:
 
                 >>> ds.sample(3, seed=1).count()
                 3
+
+                >>> # Only rows with a positive weight can be chosen.
+                >>> w = bt.from_pydict({"x": [1, 2, 3, 4], "w": [0.0, 1.0, 0.0, 5.0]})
+                >>> sorted(w.sample(n=2, weights="w", seed=7).to_pydict()["x"])
+                [2, 4]
+
+                >>> # Every row of a user is kept or dropped together.
+                >>> ev = bt.from_pydict({"user": [1, 1, 2, 2, 3, 3], "e": list(range(6))})
+                >>> got = ev.sample(0.5, key="user", seed=3).group_by("user").agg(n=bt.count())
+                >>> set(got.to_pydict()["n"]) <= {2}
+                True
         """
         # A bare int positional is a row count, not a >100% fraction. bool is an int
         # subclass, so exclude it rather than reading `True` as "sample one row".
@@ -3088,16 +3141,17 @@ class Dataset:
                 f"sample() takes a row count or a fraction, not both; got n={n} "
                 f"and fraction={fraction}"
             )
-        return build_sample(self, fraction, seed, n)
+        return build_sample(self, fraction, seed, n, weights=weights, key=key)
 
     def pivot(
         self,
         *,
         index: str | list[str],
         on: str,
-        values: str,
-        aggregate: str = "sum",
+        values: str | list[str],
+        aggregate: str | list[str] = "sum",
         columns: list | None = None,
+        fill_value: Any = None,
     ) -> Dataset:
         """Reshape long → wide (SQL ``PIVOT`` / pandas ``pivot_table``).
 
@@ -3107,17 +3161,45 @@ class Dataset:
         values are discovered by an eager pre-pass over `on`; pass `columns=[...]` to
         fix them (and avoid the pre-pass). Lowers to a grouped conditional aggregate.
 
+        **Order.** The output columns are the `index` columns, then the pivoted ones.
+        Discovered categories are sorted ascending and a **null category is dropped**,
+        because a null never equals itself and so cannot select rows; `columns=[...]` is
+        used in the order given. Rows come out one per `index` group in no defined order,
+        as for `group_by`, so sort the result when order matters.
+
+        **Several values or aggregates.** `values` and `aggregate` each take a list. With
+        one of each, a column is named by its category (``a``). Otherwise it is named
+        ``{value}_{aggregate}_{category}``, leaving out whichever of the two has a single
+        entry: ``values="v", aggregate=["sum", "count"]`` gives ``sum_a``, ``count_a``, ...
+        and ``values=["x", "y"]`` gives ``x_a``, ``y_a``, .... Columns are ordered by
+        value, then aggregate, then category. A generated name that collides with an
+        `index` column, or with another generated name, raises `PlanError`.
+
+        **Missing cells.** A cell whose (index, category) combination has no rows is null
+        (``0`` for ``count``). `fill_value` replaces exactly those cells, and leaves a
+        cell whose rows exist but aggregate to null as null, so the two stay distinct.
+
+        `columns` values are checked at plan time against the type of `on`: a string
+        category for a numeric column, a null, or two values that select the same rows or
+        name the same column (``1`` and ``1.0``) raise `PlanError`.
+
         Args:
             index: The columns to group by (the output row key).
             on: The column whose distinct values become output columns.
-            values: The column aggregated into each pivoted cell.
-            aggregate: The aggregate to apply — sum/mean/min/max/count.
+            values: The column or columns aggregated into each pivoted cell.
+            aggregate: The aggregate or aggregates to apply — sum/mean/min/max/count.
             columns: Fix the pivot values explicitly, skipping the discovery pre-pass.
                 Note this is *not* the pandas ``pivot_table(columns=...)``, which
                 names the spread column — that is `on` here.
+            fill_value: The value of a cell whose combination has no rows; ``None``
+                leaves it null.
 
         Returns:
             A new `Dataset` reshaped from long to wide.
+
+        Raises:
+            PlanError: For an unknown column or aggregate, a `columns` value of the wrong
+                type, or a colliding output name.
 
         Examples:
             .. doctest::
@@ -3128,8 +3210,24 @@ class Dataset:
                 ... )
                 >>> ds.pivot(index=["idx"], on="k", values="v").sort("idx").to_pydict()
                 {'idx': ['r', 's'], 'a': [1, 3], 'b': [2, None]}
+
+                >>> wide = ds.pivot(
+                ...     index="idx", on="k", values="v", aggregate=["sum", "count"], fill_value=0
+                ... )
+                >>> wide.columns
+                ['idx', 'sum_a', 'sum_b', 'count_a', 'count_b']
+                >>> wide.sort("idx").to_pydict()["sum_b"]
+                [2, 0]
         """
-        return build_pivot(self, _as_opt_str_list(index), on, values, aggregate, columns)
+        return build_pivot(
+            self,
+            _as_opt_str_list(index),
+            on,
+            [values] if isinstance(values, str) else list(values),
+            [aggregate] if isinstance(aggregate, str) else list(aggregate),
+            columns,
+            fill_value,
+        )
 
     def unpivot(
         self,
@@ -3138,6 +3236,7 @@ class Dataset:
         on: str | list[str] | None = None,
         variable_name: str = "variable",
         value_name: str = "value",
+        include_nulls: bool = True,
     ) -> Dataset:
         """Reshape wide → long (SQL ``UNPIVOT`` / pandas ``melt`` / Polars ``unpivot``).
 
@@ -3146,11 +3245,21 @@ class Dataset:
         (its value). Omit `on` to melt every non-`index` column, or omit `index` to
         keep every non-`on` column as an identifier. The `on` columns must share a type.
 
+        A null cell is kept as a row with a null value by default, as pandas ``melt`` and
+        Polars ``unpivot`` do. ``include_nulls=False`` drops those rows, which is what SQL
+        ``UNPIVOT`` does unless it says ``INCLUDE NULLS``.
+
+        **Order.** The output columns are the `index` columns, then `variable_name`, then
+        `value_name`. Rows have no defined order. In practice they come out grouped by
+        melted column (every row's ``a``, then every row's ``b``), unlike DuckDB, which
+        emits each input row's cells together; sort when order matters.
+
         Args:
             index: The identifier columns that repeat per melted column.
             on: The columns to melt; ``None`` melts every non-`index` column.
             variable_name: The name of the column holding each melted column's name.
             value_name: The name of the column holding each melted value.
+            include_nulls: Keep the rows whose melted value is null.
 
         Returns:
             A new `Dataset` reshaped from wide to long.
@@ -3162,10 +3271,16 @@ class Dataset:
                 >>> ds = bt.from_pydict({"id": [1], "a": [10], "b": [20]})
                 >>> ds.unpivot(index=["id"]).to_pydict()
                 {'id': [1, 1], 'variable': ['a', 'b'], 'value': [10, 20]}
+
+                >>> sparse = bt.from_pydict({"id": [1, 2], "a": [10, None], "b": [None, 20]})
+                >>> sparse.unpivot(index="id", include_nulls=False).sort("id").to_pydict()
+                {'id': [1, 2], 'variable': ['a', 'b'], 'value': [10, 20]}
         """
         index = _as_opt_str_list(index, self, "unpivot(index=...)")
         on = _as_opt_str_list(on, self, "unpivot(on=...)")
-        return build_unpivot(self, index, on, variable_name, value_name)
+        return build_unpivot(
+            self, index, on, variable_name, value_name, include_nulls=include_nulls
+        )
 
     def transpose(
         self,
@@ -3188,8 +3303,9 @@ class Dataset:
         A list or positional names tie each name to a row by position, so they need
         `order_by`, because a relation has no row order of its own. Named by a column, the
         output columns follow `order_by` when it is given and ascend by name otherwise,
-        which is Spark's order. ``include_header=True`` keeps a `header_name` column holding
-        each input column's name. Spark's form is
+        which is Spark's order. The output rows follow the input's column order, so the
+        first output row is the first transposed input column. ``include_header=True`` keeps
+        a `header_name` column holding each input column's name. Spark's form is
         ``transpose(column_names=idx, include_header=True, header_name="key")``.
 
         The transposed values share one column type, so they are cast to their common
@@ -3222,6 +3338,69 @@ class Dataset:
         return build_transpose(
             self, column_names, include_header, header_name, order_by, descending
         )
+
+    def upsample(
+        self,
+        time_col: str,
+        every: str,
+        *,
+        by: str | list[str] | None = None,
+        fill: str | None = None,
+        indicator: str | None = None,
+    ) -> Dataset:
+        """Insert a row at every missing step of a regular time grid (Polars ``upsample``).
+
+        Each group of `by` (or the whole relation) gets a grid from its earliest `time_col`
+        value to its latest, in steps of `every`, and a row is inserted at each grid point
+        no observed row of that group has. An inserted row carries its group's `by` values
+        and the grid time, and null everywhere else unless `fill` is ``"forward"`` or
+        ``"backward"``, which carry each group's neighbouring values in time order
+        (:meth:`fill_null` with that strategy). ``indicator="<name>"`` appends a boolean
+        column that is true on inserted rows and false on observed ones, so the two can
+        always be told apart, even after a fill.
+
+        Every observed row is kept, including one whose time is null or falls between grid
+        points. That differs from Polars, whose left join onto the grid drops an off-grid
+        row. A null `by` key is a group of its own. Rows come out in no defined order, so
+        sort by ``(*by, time_col)`` when order matters.
+
+        `every` is a fixed duration such as ``"1h"``, ``"15m"`` or ``"1d"``; calendar units
+        (months, years) are refused, and the step must be a whole number of the column's
+        unit (whole days for a ``date`` column). The grid is built per group with
+        ``sequence`` and ``explode``, so its size is ``(latest - earliest) / every + 1`` rows
+        per group. A step much finer than the data's span makes a very large result.
+
+        Args:
+            time_col: The ``date`` or ``timestamp`` column the grid runs over.
+            every: The fixed grid step.
+            by: Columns whose groups each get their own grid.
+            fill: ``"forward"`` or ``"backward"`` to fill inserted rows, or ``None``.
+            indicator: Name of an appended boolean column marking inserted rows.
+
+        Returns:
+            A new `Dataset` with the observed rows plus one row per missing grid point.
+
+        Raises:
+            PlanError: For an unknown or non-temporal column, an unparseable or calendar
+                `every`, a step that is not a whole number of the column's unit, an unknown
+                `fill`, or an `indicator` naming an existing column.
+
+        Examples:
+            .. doctest::
+
+                >>> import datetime as dt
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict(
+                ...     {"t": [dt.datetime(2024, 1, 1, 0), dt.datetime(2024, 1, 1, 3)], "v": [1, 4]}
+                ... )
+                >>> out = ds.upsample("t", "1h", fill="forward", indicator="inserted")
+                >>> out.sort("t").to_pydict()["v"], out.sort("t").to_pydict()["inserted"]
+                ([1, 1, 1, 4], [False, True, True, False])
+        """
+        from batcher.api.dataset._build import build_upsample
+
+        keys = _as_opt_str_list(by, self, "upsample(by=...)") or []
+        return build_upsample(self, time_col, every, keys, fill, indicator)
 
     def fill_null(
         self,
@@ -4701,6 +4880,15 @@ class Dataset:
         `test_size` fraction. Being value-hashed rather than position-based, the split is
         identical single-node, parallel, and distributed.
 
+        **The rounding rule.** A row goes to test when its percent rank within its group,
+        ``(rank - 1) / (n - 1)``, is below `test_size`. So a group of ``n >= 2`` rows sends
+        ``ceil(test_size * (n - 1))`` rows to test, and a group of **one row always goes to
+        test** (its percent rank is 0), leaving that class absent from train. Duplicate rows
+        share a rank and so a side. Tiny groups therefore round toward test: at
+        ``test_size=0.25`` a 2-row group splits 1/1. Check ``group_by(by).len()`` on each
+        side when classes are rare. ``ds.ml.train_test_split(stratify=...)`` rounds the
+        other way, keeping a single-row class in train.
+
         Args:
             by: The column(s) whose proportions the split preserves (the label).
             test_size: Fraction of each group routed to the test side.
@@ -4742,7 +4930,9 @@ class Dataset:
 
         Applies :meth:`stratified_split` twice, so every class keeps its proportion in all
         three parts and the parts stay disjoint and complete. Value-hashed, so the split
-        is identical single-node and distributed.
+        is identical single-node and distributed. Each application follows that method's
+        rounding rule, so a single-row class always lands in test and a two-row class puts
+        one row in test and the other in validation.
 
         Args:
             by: The column(s) whose proportions each part preserves (the label).
@@ -5465,6 +5655,11 @@ class Dataset:
         smallest number, and the result is sorted on it. That costs a sort over the groups.
         A derived key cannot be named ``maintain_order``.
 
+        **Null keys form a group.** Rows whose key is null are grouped together into one
+        group with a null key, as in SQL and Polars, rather than dropped. pandas drops them
+        by default (``groupby(dropna=True)``); the equivalent here is
+        ``ds.drop_nulls(subset=keys).group_by(*keys)``.
+
         Args:
             *keys: Key columns by name. A list is accepted in place of separate
                 arguments.
@@ -5504,7 +5699,7 @@ class Dataset:
             _reject_sliding_window_key(alias, expr)
         return GroupBy(self, keys, named, maintain_order=maintain_order)
 
-    def rollup(self, *keys: str) -> MultiLevelGroupBy:
+    def rollup(self, *keys: str, grouping_id: str | None = None) -> MultiLevelGroupBy:
         """Aggregate at every prefix of `keys`, plus the grand total (SQL ``ROLLUP``).
 
         The subtotal report: ``ds.rollup("region", "city").agg(total=col("v").sum())``
@@ -5512,9 +5707,15 @@ class Dataset:
         grand-total row with both null. An inactive key reads as NULL, which is how SQL
         marks a subtotal row.
 
+        ``grouping_id="<name>"`` appends a column holding each row's level as SQL
+        ``GROUPING_ID`` bits over the keys, first key most significant: bit `i` from the left
+        is 1 when key `i` is rolled up. It tells a subtotal's NULL apart from a NULL in the
+        data, and one key's flag is ``(gid >> (n - 1 - i)) & 1`` for `n` keys.
+
         Args:
             *keys: The rollup key columns, most significant first. A list is accepted
                 in place of separate arguments.
+            grouping_id: Name of an appended column holding each row's grouping level.
 
         Returns:
             A `MultiLevelGroupBy` to finish with ``.agg(...)``.
@@ -5529,21 +5730,33 @@ class Dataset:
                 >>> ds = bt.from_pydict({"r": ["e", "e", "w"], "v": [1, 2, 4]})
                 >>> ds.rollup("r").agg(n=bt.col("v").sum()).sort("r").to_pydict()
                 {'r': ['e', 'w', None], 'n': [3, 4, 7]}
+
+                >>> # A data null and the subtotal's null, told apart by the level.
+                >>> nulls = bt.from_pydict({"r": ["e", None], "v": [1, 2]})
+                >>> out = nulls.rollup("r", grouping_id="gid").agg(n=bt.col("v").sum())
+                >>> out.sort("gid", "r").to_pydict()
+                {'r': ['e', None, None], 'n': [1, 2, 3], 'gid': [0, 0, 1]}
         """
         keys = flatten_varargs(keys)
         self._check_group_keys(keys, "rollup")
-        return MultiLevelGroupBy(self, keys, rollup_levels(keys))
+        return MultiLevelGroupBy(self, keys, rollup_levels(keys), grouping_id)
 
-    def cube(self, *keys: str) -> MultiLevelGroupBy:
+    def cube(self, *keys: str, grouping_id: str | None = None) -> MultiLevelGroupBy:
         """Aggregate at every *subset* of `keys` (SQL ``CUBE``).
 
         The cross-tabulation: every combination of the keys, from all of them down to
         the grand total, so a two-key cube gives per-pair, per-first, per-second and
         overall rows. Costs 2ⁿ levels, so keep `n` small.
 
+        ``grouping_id="<name>"`` appends a column holding each row's level as SQL
+        ``GROUPING_ID`` bits over the keys, first key most significant: bit `i` from the left
+        is 1 when key `i` is rolled up. It tells a subtotal's NULL apart from a NULL in the
+        data, and one key's flag is ``(gid >> (n - 1 - i)) & 1`` for `n` keys.
+
         Args:
             *keys: The cube key columns. A list is accepted in place of separate
                 arguments.
+            grouping_id: Name of an appended column holding each row's grouping level.
 
         Returns:
             A `MultiLevelGroupBy` to finish with ``.agg(...)``.
@@ -5561,17 +5774,24 @@ class Dataset:
         """
         keys = flatten_varargs(keys)
         self._check_group_keys(keys, "cube")
-        return MultiLevelGroupBy(self, keys, cube_levels(keys))
+        return MultiLevelGroupBy(self, keys, cube_levels(keys), grouping_id)
 
-    def grouping_sets(self, *sets: Sequence[str]) -> MultiLevelGroupBy:
+    def grouping_sets(
+        self, *sets: Sequence[str], grouping_id: str | None = None
+    ) -> MultiLevelGroupBy:
         """Aggregate at exactly the grouping levels given (SQL ``GROUPING SETS``).
 
         The explicit form the other two are shorthands for: each argument is one level's
         key list, and ``()`` is the grand total. Use it when the levels you want are not
         a prefix chain or a full cube.
 
+        ``grouping_id="<name>"`` appends each row's level as SQL ``GROUPING_ID`` bits over
+        every key the sets mention, in order of first mention, first key most significant;
+        see :meth:`rollup`.
+
         Args:
             *sets: One key-name sequence per grouping level.
+            grouping_id: Name of an appended column holding each row's grouping level.
 
         Returns:
             A `MultiLevelGroupBy` to finish with ``.agg(...)``.
@@ -5593,7 +5813,7 @@ class Dataset:
         for level in levels:
             keys.extend(k for k in level if k not in keys)
         self._check_group_keys(tuple(keys), "grouping_sets")
-        return MultiLevelGroupBy(self, tuple(keys), levels)
+        return MultiLevelGroupBy(self, tuple(keys), levels, grouping_id)
 
     def _check_group_keys(self, keys: tuple[str, ...], what: str) -> None:
         """Reject a non-column key with the same message `group_by` uses."""

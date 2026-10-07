@@ -866,6 +866,9 @@ class DatasetML:
                 per key column instead of one per column, and does not depend on how
                 floats render as text. The default hashes every column — correct and
                 reproducible, but re-splits whenever any value or the schema changes.
+                A key that is *not* unique keeps every row sharing it on the same side,
+                which is a group split: pass ``key="patient_id"`` and no patient's rows
+                leak between train and test.
 
         Returns:
             The ``(train, test)`` pair.
@@ -1073,6 +1076,11 @@ class DatasetML:
         The generalization of :meth:`train_test_split` to a train/validation/test
         three-way (or n-way) split, with the same content-hash assignment.
 
+        A non-unique `key` keeps every row sharing it in the same part, because the part is
+        chosen from the key's hash alone. That makes it a group split, such as all of one
+        patient's or one user's rows in exactly one of train, validation and test, with the
+        parts sized by groups rather than rows.
+
         Args:
             fractions: The share of rows per part; must be positive and sum to 1.0.
             seed: Seed for the row assignment; the same seed reproduces the split.
@@ -1093,6 +1101,14 @@ class DatasetML:
                 >>> train, val, test = ds.ml.random_split([0.7, 0.15, 0.15], seed=42)
                 >>> train.count() + val.count() + test.count()
                 1000
+
+                >>> # Grouped: every patient lands in exactly one part.
+                >>> ids = [i // 4 for i in range(400)]
+                >>> visits = bt.from_pydict({"patient": ids, "x": list(range(400))})
+                >>> parts = visits.ml.random_split([0.7, 0.15, 0.15], seed=1, key="patient")
+                >>> seen = [set(p.to_pydict()["patient"]) for p in parts]
+                >>> seen[0] & seen[1], seen[0] & seen[2], seen[1] & seen[2]
+                (set(), set(), set())
         """
         return build_random_split(self._ds, fractions, seed=seed, key=_as_key_columns(key))
 
