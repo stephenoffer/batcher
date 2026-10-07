@@ -89,8 +89,23 @@ def _read_stream(buffer: pa.Buffer) -> list[pa.RecordBatch]:
 
 
 def _contiguous(batches: list, parts: int) -> list[list]:
-    """`batches` cut into at most `parts` contiguous runs of about equal bytes."""
+    """`batches` cut into at most `parts` contiguous runs of about equal bytes.
+
+    A batch larger than one run's share is sliced first (zero-copy): a hoisted broadcast is
+    often one batch -- a combined aggregate is finalized into one -- and as one run it was
+    compressed on one thread however many were offered.
+    """
     total = sum(b.nbytes for b in batches) or 1
+    share = total / parts
+    sliced = []
+    for batch in batches:
+        pieces = min(batch.num_rows, int(batch.nbytes // share))
+        if pieces <= 1:
+            sliced.append(batch)
+            continue
+        step = -(-batch.num_rows // pieces)
+        sliced += [batch.slice(i, step) for i in range(0, batch.num_rows, step)]
+    batches = sliced
     runs: list[list] = [[]]
     filled = 0
     for batch in batches:
