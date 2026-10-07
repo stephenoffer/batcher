@@ -643,7 +643,7 @@ Streaming training-data loader — Batcher feeding PyTorch DDP/FSDP/DeepSpeed.
 | `indexed.py` | 496 | The indexed loaders: a deterministic, balanced, resumable global sample order per rank. |
 | `lazy.py` | 641 | The lazy path: stream a dataset to torch with no global length and no materialization. |
 | `sharding.py` | 141 | Build one rank's shard of a corpus by streaming it, never materializing the whole corpus. |
-| `tensors.py` | 215 | Arrow → torch conversion, and moving the result to a device. |
+| `tensors.py` | 239 | Arrow → torch conversion, and moving the result to a device. |
 
 ### `batcher/ml/metrics/` — 6 · front-end
 
