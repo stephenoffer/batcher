@@ -1023,11 +1023,11 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
 | `memory_fit.py` | 95 | How many aligned units a node may run at once, from its memory as well as its cores. |
 | `reduce.py` | 278 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
-| `rewrite.py` | 465 | Push each join against a broadcast input down to the broadcast input it keys on. |
-| `route.py` | 539 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
+| `rewrite.py` | 572 | Push each join against a broadcast input down to the broadcast input it keys on. |
+| `route.py` | 561 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
 | `run.py` | 550 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
 | `transfer.py` | 407 | Moving an aligned run's inputs and results between the driver and the fleet. |
-| `units.py` | 295 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
+| `units.py` | 339 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
 
 ### `batcher/dist/executors/partition_io/` — 4 · backend
 

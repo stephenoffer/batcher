@@ -15,7 +15,6 @@ two aligned sources is exactly the exchange the layout makes unnecessary.
 from __future__ import annotations
 
 import contextvars
-import operator
 from collections import OrderedDict
 
 import pyarrow as pa
@@ -32,9 +31,16 @@ from batcher.dist.executors.aligned.rewrite import (
     colocate_aligned_joins,
     distinct_membership_sides,
     group_broadcast_joins,
+    shared_semi_scan,
 )
 from batcher.dist.executors.aligned.run import run_plan
-from batcher.dist.executors.aligned.units import clustered, projected_bytes, source_key_bounds
+from batcher.dist.executors.aligned.units import (
+    clustered,
+    footer_columns,
+    implied_by_bounds,
+    projected_bytes,
+    source_key_bounds,
+)
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
@@ -117,7 +123,41 @@ def _choose_plan(
         other = _best_plan(rewritten, sources, strict, single_table, exclude)
         if other is not None and (best is None or other[0] > best[0]):
             best = other
+    shared = _shared_scan_plan(plan, sources, strict, exclude)
+    if shared is not None and (best is None or shared[0] > best[0]):
+        best = shared
     return best[1] if best is not None else None
+
+
+def _shared_scan_plan(
+    plan: LogicalPlan, sources: list[Source], strict: bool, exclude: frozenset[int]
+) -> tuple[int, AlignedPlan] | None:
+    """One by-file cut computing the semi join two joins of `plan` share, and its weight.
+
+    `rewrite.shared_semi_scan` finds the shared subtree; read once, it is a cut of its own and
+    everything above it -- both readers -- is the residual (TPC-H q17's two `lineitem` passes).
+    """
+    from batcher.plan.visitor import scanned_source_ids
+
+    found = shared_semi_scan(plan, sources, lambda sid: _identity(sources[sid]))
+    if found is None:
+        return None
+    semi, placeholder, rewritten = found
+    sid = semi.left.input.source_id
+    broadcast = frozenset(scanned_source_ids(semi)) - {sid}
+    if getattr(sources[sid], "key_bounds", None) is None or broadcast & exclude:
+        return None
+    cut = AlignedCut(
+        body=semi,
+        aggregate=None,
+        key=KeyClass.by_file(sid),
+        aligned=frozenset({sid}),
+        broadcast=broadcast,
+    )
+    aligned_plan = AlignedPlan((cut,), rewritten, (placeholder,))
+    weight = _weigh(aligned_plan, sources, strict)
+    get_logger("dist").debug("aligned candidate shared semi scan of %d: weight %s", sid, weight)
+    return None if weight is None else (weight, aligned_plan)
 
 
 def unbroadcastable(node: LogicalPlan, sources: list[Source]) -> bool:
@@ -327,7 +367,30 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
     # aligned on `orderkey` it spreads 120 GB and broadcasts only `customer`. A residual input
     # is read once, by the driver or by a residual that aligns itself, and is charged once.
     weight = sum(spread_by.values()) - _BROADCAST_COPIES * held - _UNIT_BUILDS * rebuilt - driver
-    return weight if weight > 0 else None
+    if weight <= 0:
+        return None
+    # Reading a table again only ranks a plan below one that reads it once; it never declines
+    # a plan that would otherwise run.
+    return max(1, weight - _reread(found, sources, spread_by))
+
+
+def _reread(found: AlignedPlan, sources: list[Source], spread_by: dict) -> int:
+    """Bytes `found` reads again: each table aligned by more than one distinct cut, once more
+    per extra cut. Identical cuts over twin scans run once (`run.run_plan`), so they count once.
+
+    `spread_by` alone counts a table once however many cuts read it, which is right for what is
+    spread and wrong for what is paid: TPC-H q17's two cuts each read `lineitem` whole, and
+    without this the one-pass plan (`_shared_scan_plan`) only tied with them.
+    """
+    from batcher.dist.executors.aligned.analysis import cut_signature
+
+    readers: dict[object, set] = {}
+    for i, cut in enumerate(found.cuts):
+        signature = cut_signature(cut, sources) or i
+        for sid in cut.aligned - set(found.placeholders):
+            if sid < len(sources):
+                readers.setdefault(_identity(sources[sid]), set()).add(signature)
+    return sum((len(sigs) - 1) * spread_by.get(table, 0) for table, sigs in readers.items())
 
 
 def _filtered(
@@ -364,14 +427,14 @@ def _filtered(
                 return found
         return None
 
-    columns = _footer_columns(source)
+    columns = footer_columns(source)
 
     def real(ir: dict) -> bool:
         if ir.get("e") == "is_not_null":
             return False
         if ir.get("e") == "binary" and ir.get("op") == "and":
             return real(ir["left"]) or real(ir["right"])
-        return not _implied_by_bounds(ir, columns)
+        return not implied_by_bounds(ir, columns)
 
     # After the broadcast joins are grouped, as they are when the cut runs: q9's filter on
     # `part` reaches `partsupp` only once the rewrite has moved the one onto the other.
@@ -390,47 +453,6 @@ def _filtered(
         or (isinstance(n, Join) and n.join_type in ("semi", "anti"))
         for n in walk(found)
     )
-
-
-def _footer_columns(source: Source | None) -> dict:
-    """The per-column statistics `source` declares, or an empty mapping when it has none."""
-    if source is None:
-        return {}
-    try:
-        stats = source.statistics()
-    except Exception as exc:
-        note_suppressed("dist", "read source statistics for a broadcast filter", exc)
-        return {}
-    return dict(getattr(stats, "columns", None) or {})
-
-
-#: `column <op> literal` holds for every row when the column's bound on that side does:
-#: (which bound, the comparison it must pass).
-_IMPLIED_BY = {
-    "ge": ("min", operator.ge),
-    "gt": ("min", operator.gt),
-    "le": ("max", operator.le),
-    "lt": ("max", operator.lt),
-}
-
-
-def _implied_by_bounds(ir: dict, columns: dict) -> bool:
-    """Whether a `column <op> literal` range conjunct holds for every row of the source.
-
-    Only an integer literal against an integer bound is judged, so no type coercion is
-    guessed at; anything else is taken to filter, which is the old, conservative answer.
-    """
-    if ir.get("e") != "binary" or ir.get("op") not in _IMPLIED_BY:
-        return False
-    left, right = ir.get("left", {}), ir.get("right", {})
-    if left.get("e") != "col" or right.get("e") != "lit":
-        return False
-    side, passes = _IMPLIED_BY[ir["op"]]
-    bound = getattr(columns.get(left.get("name")), side, None)
-    value = (right.get("value") or {}).get("int")
-    if not all(isinstance(x, int) and not isinstance(x, bool) for x in (value, bound)):
-        return False
-    return passes(bound, value)
 
 
 def _aligned_on(key: KeyClass, sources: list[Source]) -> frozenset[int]:

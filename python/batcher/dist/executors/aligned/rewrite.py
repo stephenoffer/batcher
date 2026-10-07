@@ -27,7 +27,12 @@ from collections.abc import Callable
 from batcher.plan.expr_ir import Col, col
 from batcher.plan.logical import Filter, Join, JoinOutputCol, LogicalPlan, Project, Projection
 
-__all__ = ["colocate_aligned_joins", "distinct_membership_sides", "group_broadcast_joins"]
+__all__ = [
+    "colocate_aligned_joins",
+    "distinct_membership_sides",
+    "group_broadcast_joins",
+    "shared_semi_scan",
+]
 
 _FRESH = itertools.count()
 
@@ -463,3 +468,105 @@ def _really_filtered(node: LogicalPlan) -> bool:
         return True
 
     return any(isinstance(n, Filter) and real(n.predicate.to_ir()) for n in walk(node))
+
+
+def shared_semi_scan(plan: LogicalPlan, sources: list, identity: Callable) -> tuple | None:
+    """`plan` with two joins of one table to one filtered dimension read in a single pass.
+
+    TPC-H q17 reads `lineitem` twice: once semi-joined to the filtered `part` (the per-part
+    average) and once inner-joined to the same filtered `part` (the rows compared with it).
+    Each is its own cut, so SF1000 decoded 96 GB and then 144 GB of `lineitem` for ~6M rows of
+    either. Both are `lineitem SEMI part` underneath -- an inner join is the semi join joined
+    again (`L JOIN P = (L SEMI P) JOIN P`, for any multiplicity) -- so one cut computes the
+    semi join once, with every column either reads, and both read its result.
+
+    Returns `(semi, placeholder_id, rewritten)` -- the shared subtree, the source id its result
+    is read under, and `plan` reading it in each place -- or None when no two joins share one.
+    Only joins whose table side is a projection of a bare scan, joined on one key to a
+    dimension subtree of projections, filters and scans (compared with its conjuncts in any
+    order and its scans named by table), are taken.
+    """
+    import json
+
+    from batcher.plan.logical import Scan
+    from batcher.plan.visitor import transform_up, walk
+
+    def table_side(node: LogicalPlan) -> tuple[Scan, dict[str, str]] | None:
+        if isinstance(node, Scan):
+            return node, {c: c for c in node.available_columns()}
+        if (
+            isinstance(node, Project)
+            and isinstance(node.input, Scan)
+            and all(isinstance(item.expr, Col) for item in node.items)
+        ):
+            return node.input, {item.alias: item.expr.name for item in node.items}
+        return None
+
+    def canon(node: LogicalPlan) -> str | None:
+        if isinstance(node, Scan):
+            return f"scan:{identity(node.source_id)}" if node.source_id < len(sources) else None
+        inner = canon(node.input) if isinstance(node, (Filter, Project)) else None
+        if inner is None:
+            return None
+        if isinstance(node, Filter):
+            parts = sorted(
+                json.dumps(c, sort_keys=True) for c in _conjuncts(node.predicate.to_ir())
+            )
+            return f"filter{parts}({inner})"
+        items = [(i.alias, json.dumps(i.expr.to_ir(), sort_keys=True)) for i in node.items]
+        return f"project{items}({inner})"
+
+    groups: dict[tuple, list] = {}
+    for node in walk(plan):
+        if not (
+            isinstance(node, Join)
+            and node.join_type in ("inner", "semi")
+            and len(node.left_keys) == 1
+        ):
+            continue
+        side = table_side(node.left)
+        dim = canon(node.right)
+        if side is None or dim is None:
+            continue
+        scan, src = side
+        if scan.source_id >= len(sources) or node.left_keys[0] not in src:
+            continue
+        key = (identity(scan.source_id), src[node.left_keys[0]], dim, node.right_keys[0])
+        groups.setdefault(key, []).append((node, scan, src))
+    shared = next((g for g in groups.values() if len(g) > 1), None)
+    if shared is None:
+        return None
+    first, scan, _src = shared[0]
+    columns = list(dict.fromkeys(c for _n, _s, src in shared for c in src.values()))
+    key_col = shared[0][2][first.left_keys[0]]
+    semi = Join(
+        left=Project(input=scan, items=tuple(Projection(c, col(c)) for c in columns)),
+        right=first.right,
+        left_keys=(key_col,),
+        right_keys=first.right_keys,
+        join_type="semi",
+        output=tuple(JoinOutputCol("left", c, c) for c in columns),
+    )
+    placeholder = Scan(len(sources), semi.available_schema())
+    members = {id(n): src for n, _s, src in shared}
+
+    def swap(node: LogicalPlan) -> LogicalPlan:
+        src = members.get(id(node))
+        if src is None:
+            return node
+        reads = Project(
+            input=placeholder, items=tuple(Projection(a, col(c)) for a, c in src.items())
+        )
+        if node.join_type == "semi":
+            return Project(
+                input=reads, items=tuple(Projection(o.alias, col(o.name)) for o in node.output)
+            )
+        return dataclasses.replace(node, left=reads)
+
+    return semi, placeholder.source_id, transform_up(plan, swap)
+
+
+def _conjuncts(ir: dict) -> list[dict]:
+    if ir.get("e") == "binary" and ir.get("op") == "and":
+        return _conjuncts(ir["left"]) + _conjuncts(ir["right"])
+    return [ir]
