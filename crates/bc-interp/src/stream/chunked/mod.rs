@@ -328,16 +328,32 @@ fn post_ids(plan: &RelOp, path: &[usize]) -> Vec<Option<u32>> {
 
 /// `units` split into contiguous, in-order ranges for `workers` workers.
 ///
-/// Two ranges per worker rather than one: units differ in cost (a row group a predicate
-/// empties decodes one column, a full one every column), and with one range each the slowest
-/// worker sets the time. Rayon hands the spare ranges to whichever worker finishes first.
+/// [`PIECES_PER_WORKER`] ranges per worker rather than one: units differ in cost (a row group a
+/// predicate empties decodes one column, a full one every column), and with one range each the
+/// slowest worker sets the time. Rayon hands the spare ranges to whichever worker finishes
+/// first, so the tail a query waits on at the end of its scan is about one range long.
+///
+/// The ranges are fixed before any runs, never claimed dynamically, and that is load-bearing:
+/// each range folds into its own partial and the partials combine in range order, so a float
+/// aggregate sums in an order that depends on the plan and the machine, never on timing. TPC-H
+/// q15 compares two executions' sums for equality and needs exactly that.
 fn unit_ranges(units: usize, workers: usize) -> Vec<std::ops::Range<usize>> {
-    let pieces = (workers * 2).clamp(1, units.max(1));
+    let pieces = (workers * PIECES_PER_WORKER).clamp(1, units.max(1));
     (0..pieces)
         .map(|k| (k * units / pieces)..((k + 1) * units / pieces))
         .filter(|r| !r.is_empty())
         .collect()
 }
+
+/// Ranges per worker for a streamed core, spine or aggregate alike.
+///
+/// At two per worker, sf100's ranges were ~7 row groups each and the last one to start set a
+/// 300-400 ms tail with most of a 64-core box idle. A spine pays one pipeline set-up per range
+/// and nothing else; an aggregate also pays one more partial to combine, which is why this was
+/// measured on the near-unique keys too. A/B on TPC-H over three rounds (c4-ab-par1, 64 cores):
+/// 2 -> 8 took sf100 from 31.6 to 29.2 s summed (geomean 0.91-0.93) and sf10 0.96-0.99, with
+/// q13 and q18, the ~150M-group aggregates, unchanged within noise.
+const PIECES_PER_WORKER: usize = 8;
 
 /// The node reached from `plan` by following the child indices in `path`.
 fn node_at<'a>(plan: &'a mut RelOp, path: &[usize]) -> &'a mut RelOp {

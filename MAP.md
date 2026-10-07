@@ -3286,7 +3286,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/breaker.rs` | 634 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 775 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/chunked/drive.rs` | 147 | The chunk-driven entry points: [`execute_chunked`] and its metered twin. |
-| `stream/chunked/mod.rs` | 752 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
+| `stream/chunked/mod.rs` | 742 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
