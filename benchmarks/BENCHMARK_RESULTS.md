@@ -1,5 +1,56 @@
 # Batcher CPU benchmark results
 
+## Distributed TPC-H SF1000 on eight m5d.4xlarge: 638 s plus an OOM -> 426 s, every query correct (2026-10-07)
+
+The aligned executor (`dist/executors/aligned/`) declined or was mis-planned on the queries
+that cost the most, and each fallback was slower or ran out of memory. Measured with the
+benchmark harness's distributed TPC-H suite (`benchmarks/run.py --benchmark tpch --scale 1000
+--engines batcher --scan --isolate`, `BENCH_BATCHER_DISTRIBUTED=1`) over zstd Parquet on S3,
+on 8 x m5d.4xlarge workers (16 cores, 64 GB) and an m6i.2xlarge head that runs the driver and
+schedules nothing: the Databricks Photon cluster's worker shape. Times are the harness's best
+warm run, in seconds. Every query passed the harness's correctness check in both runs.
+
+| Query | 43d507d5 | fe036eb9 | Photon, warm Delta |
+|---|---:|---:|---:|
+| q9 | OOM | 58.0 | 20.5 |
+| q10 | 118.8 | 23.6 | 18.5 |
+| q18 | 97.1 | 16.5 | 47.5 |
+| q22 | 65.2 | 12.2 | 5.6 |
+| q5 | 36.7 | 23.9 | 16.1 |
+| q14 | 28.8 | 19.8 | 6.0 |
+| the other 16 | 291.4 | 272.1 | 226.1 |
+| **total** | **638.0 + q9 OOM** | **425.9** | **340.3** |
+
+Photon's numbers are Databricks' published warm-Delta sweep on the same worker type
+(`databricks_results.md` in the campaign workspace); Batcher reads Parquet from S3 with no
+local disk cache. Totals are summed before rounding. Of the other sixteen, q20 moved most
+(32.6 -> 20.1 s); the rest moved by 1.6 s or less.
+
+What changed, each with a differential test against DuckDB and a positive control:
+
+- **q10**: join ordering with statistics builds `lineitem JOIN (customer JOIN orders)`, so the
+  two `orderkey`-ordered tables never met in one cut. `colocate_aligned_joins` moves the
+  aligned-only side down to the table it keys on; the planner weighs that plan and its
+  pre-aggregated form. The residual's `LIMIT 20` is kept per unit (`push_top_n`), where 44.5M
+  groups crossing to the driver OOM-killed the 32 GB head on the second run.
+- **q18**: warm, the optimizer filters `orders JOIN customer` with the large-orders semi join;
+  sunk to `orders` (`_sink_membership`), the warm plan aligns as the cold one did (warm runs had
+  been staged at 86-97 s).
+- **q9**: `partsupp` (800M rows) is semi-joined to green `part` before it is broadcast
+  (`_semi_reduced`), so the aggregate stays in the `lineitem`/`orders` cut instead of 325M joined
+  rows outgrowing the driver.
+- **q22**: the `NOT EXISTS` side's distinct keys are taken among the filtered customers only.
+- **q14**: a by-file cut is charged for every unit hashing a broadcast past 1 GiB, which sends
+  q14 to the shuffle join.
+- A broadcast probe's output bound was clipped to the worker's 16 MiB spill threshold, so every
+  probe task declined; it now holds to its own bound.
+
+Not changed here, and the largest remaining gap: per-unit engine CPU. Whole-node profiles of
+two workers during q9's and q19's units show ~16% in zstd, ~10% hashing build sides that every
+unit rebuilds, and string columns decoded by expanding their dictionaries before a filter
+compares them. An in-memory object-byte cache (`BATCHER_OBJECT_CACHE_BYTES`, 6 GiB a process)
+made every query slower (q12 8.3 -> 15.9 s, q14 35.1 -> 54.5 s) and stays off.
+
 ## The public-API review: a recorded cluster run, and no regression on TPC-H or the operator mix (2026-10-06)
 
 The public-API review (`feat/public-api-review`, against the base `4686ea63`) changed `dist/`
