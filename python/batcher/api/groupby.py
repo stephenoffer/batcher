@@ -14,6 +14,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.api._varargs import flatten_varargs
+from batcher.config.option_types import NanPolicy, QuantileInterpolation
 from batcher.plan.expr_ir import AggExpr, Aliased, Col, Expr, IntoExpr
 from batcher.plan.expr_ir.selectors import Selector, expand_one, expand_selectors, has_selector
 from batcher.plan.expr_rewrite.naming import output_name
@@ -518,7 +519,10 @@ class GroupBy:
         return self._reduce("count", columns)
 
     def quantile(
-        self, q: float | Sequence[float], *columns: str | Selector, interpolation: str = "linear"
+        self,
+        q: float | Sequence[float],
+        *columns: str | Selector,
+        interpolation: QuantileInterpolation = "linear",
     ) -> Dataset:
         """The `q`-quantile of each column per group (every non-key numeric column by default).
 
@@ -614,7 +618,7 @@ class GroupBy:
         """
         return self._reduce("min", columns)
 
-    def max(self, *columns: str | Selector, nan_policy: str = "propagate") -> Dataset:
+    def max(self, *columns: str | Selector, nan_policy: NanPolicy = "propagate") -> Dataset:
         """Maximum of each value column per group (all non-key columns by default).
 
         A NaN is the greatest float, so it is a group's maximum; ``nan_policy="ignore"``

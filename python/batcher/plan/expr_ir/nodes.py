@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from batcher._internal.errors import PlanError, require_int
+from batcher.config.option_types import MappingStrategy
 from batcher.plan.expr_ir.core import Expr, FrameSpec, IntoExpr, Lit, _col_or_expr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
@@ -413,7 +414,7 @@ class WindowExpr(Expr):
         *,
         descending: bool | Iterable[bool] = False,
         nulls_last: bool = True,
-        mapping_strategy: str = "group_to_rows",
+        mapping_strategy: MappingStrategy = "group_to_rows",
     ) -> WindowExpr:
         """Bind this window function to a partition/order (and optional frame).
 

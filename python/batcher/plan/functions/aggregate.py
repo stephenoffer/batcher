@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
+from batcher.config.option_types import NanPolicy
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr
 
 __all__ = [
@@ -205,7 +206,7 @@ def min(column: str | Expr) -> AggExpr:
     return _as_column(column).min()
 
 
-def max(column: str | Expr, *, nan_policy: str = "propagate") -> AggExpr | Expr:
+def max(column: str | Expr, *, nan_policy: NanPolicy = "propagate") -> AggExpr | Expr:
     """Maximum of a column — the ``pl.max('x')`` shorthand for ``col('x').max()``.
 
     ``pl.max`` skips NaN; that is ``nan_policy="ignore"`` here (see :meth:`Expr.max`).

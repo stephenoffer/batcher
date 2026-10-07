@@ -34,6 +34,7 @@ from batcher.api.io_namespace._write_opts import (
 )
 from batcher.api.security._write import authorize_write, required_privileges
 from batcher.api.session import read as _read
+from batcher.config.option_types import OutputModeName, TableWriteMode
 from batcher.io.formats.sql.routing import write_backend
 from batcher.io.sink import check_write_options
 
@@ -374,7 +375,7 @@ class Writer:
         sort_by: str | list[str] | None = None,
         replace_where: Any = None,
         trigger: Trigger,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         checkpoint: str | None = None,
         query_name: str | None = None,
         auto_compact: bool = False,
@@ -397,7 +398,7 @@ class Writer:
         sort_by: str | list[str] | None = None,
         replace_where: Any = None,
         trigger: None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         checkpoint: str | None = None,
         query_name: str | None = None,
         auto_compact: bool = False,
@@ -419,7 +420,7 @@ class Writer:
         sort_by: str | list[str] | None = None,
         replace_where: Any = None,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         checkpoint: str | None = None,
         query_name: str | None = None,
         auto_compact: bool = False,
@@ -882,7 +883,7 @@ class Writer:
         self,
         sink: Any,
         trigger: Trigger | None,
-        output_mode: str,
+        output_mode: OutputModeName,
         query_name: str | None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -908,7 +909,7 @@ class Writer:
         checkpoint: str | None,
         num_workers: int | None,
         query_name: str | None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
     ) -> StreamingQuery | None:
         """Run a `distributed=True` streaming write across the cluster, if eligible.
 
@@ -1042,7 +1043,7 @@ class Writer:
         self,
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         num_rows: int = 20,
         truncate: bool | int = True,
         query_name: str | None = None,
@@ -1088,7 +1089,7 @@ class Writer:
         name: str,
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -1146,7 +1147,7 @@ class Writer:
         fn: Callable[[pa.Table, int], Any],
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -1185,7 +1186,7 @@ class Writer:
         self,
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -1230,7 +1231,7 @@ class Writer:
         *,
         bootstrap_servers: str = "localhost:9092",
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
         **options: Any,
@@ -1288,7 +1289,7 @@ class Writer:
         service_url: str = "pulsar://localhost:6650",
         producer_name: str | None = None,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
         **options: Any,
@@ -1342,7 +1343,7 @@ class Writer:
         region: str = "us-east-1",
         ordered: bool = False,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
         **options: Any,
@@ -1392,7 +1393,7 @@ class Writer:
         *,
         ordered: bool = False,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
         **options: Any,
@@ -1442,7 +1443,7 @@ class Writer:
         *,
         connection_str: str = "",
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
         **options: Any,
@@ -1491,7 +1492,7 @@ class Writer:
         fn: Callable[[dict[str, Any]], Any],
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -1995,7 +1996,7 @@ class Writer:
         self,
         name: str,
         *,
-        mode: str = "error",
+        mode: TableWriteMode = "error",
         by_name: bool = True,
         partition_by: list[str] | None = None,
         properties: dict[str, str] | None = None,

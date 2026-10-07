@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from batcher.api.dataset._build import build_random_split, build_train_test_split
 from batcher.api.dataset._dedup import (
@@ -19,12 +19,19 @@ from batcher.api.dataset._dedup import (
     build_near_duplicates,
     build_similarity_join,
 )
+from batcher.config.option_types import BatchFormat
 from batcher.ml.stats._shared import require_columns
 
 if TYPE_CHECKING:
     import datetime
+    from collections.abc import Iterator
+
+    import numpy as np
+    import tensorflow as tf
+    import torch
 
     from batcher.api.dataset import Dataset
+    from batcher.io.formats.ml import ShardIndex
     from batcher.ml.feature_spec import FeatureSpec
 
 __all__ = ["DatasetML"]
@@ -449,7 +456,7 @@ class DatasetML:
         num_workers: int | str = "auto",
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
-        batch_format: str = "pyarrow",
+        batch_format: BatchFormat = "pyarrow",
         model_kwargs: dict | None = None,
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
@@ -1865,7 +1872,7 @@ class DatasetML:
         global_consumed: int = 0,
         collate_fn: object = None,
         shuffle_block_size: int | None = None,
-    ):
+    ) -> torch.utils.data.IterableDataset:
         """Feed this dataset to one training rank as a `torch` ``IterableDataset``.
 
         The streaming-training-ingest path for PyTorch DDP/FSDP/DeepSpeed (the
@@ -1936,7 +1943,7 @@ class DatasetML:
         distributed: bool | str = False,
         resume: bool = False,
         write_concurrency: int | None = None,
-    ):
+    ) -> ShardIndex:
         """Write this dataset as a training-shard corpus `shard_stream_loader` can stream.
 
         The on-ramp to the larger-than-memory training path (the MosaicML ``MDSWriter`` /
@@ -2009,7 +2016,7 @@ class DatasetML:
         seed: int = 0,
         epoch: int = 0,
         drop_last: bool = False,
-    ):
+    ) -> Iterator[Any]:
         """Stream this dataset to PyTorch as ``{column: tensor}`` batches (lazy).
 
         The bounded-memory training-iteration path (Ray Data's ``iter_torch_batches``):
@@ -2083,7 +2090,7 @@ class DatasetML:
         collate_fn: object = None,
         local_shuffle_buffer_size: int | None = None,
         **dataloader_kwargs: object,
-    ):
+    ) -> torch.utils.data.DataLoader:
         """Return a ready-to-iterate ``torch.utils.data.DataLoader`` over this dataset.
 
         Batching happens in the engine (one Arrow batch is one training batch), so the
@@ -2166,7 +2173,7 @@ class DatasetML:
         seed: int = 0,
         epoch: int = 0,
         drop_last: bool = False,
-    ):
+    ) -> tf.data.Dataset:
         """Stream this dataset to a ``tf.data.Dataset`` of ``{column: tensor}`` batches.
 
         The TensorFlow counterpart of `to_torch`, built over the public batch iterator so
@@ -2220,7 +2227,7 @@ class DatasetML:
         *,
         batch_size: int | None = None,
         columns: list[str] | None = None,
-    ):
+    ) -> Iterator[dict[str, np.ndarray]]:
         """Stream this dataset as ``{column: np.ndarray}`` dicts, one per batch (lazy).
 
         Numeric non-null columns convert zero-copy. The framework-agnostic loader for a
@@ -2754,7 +2761,7 @@ class DatasetML:
         num_workers: int | str = "auto",
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
-        batch_format: str = "pyarrow",
+        batch_format: BatchFormat = "pyarrow",
         accelerator_type: str | None = None,
         model_memory_gb: float = 0.0,
         normalize: bool = False,

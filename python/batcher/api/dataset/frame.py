@@ -101,6 +101,25 @@ from batcher.api.terminal import (
     _to_pydict,
     _to_pylist,
 )
+from batcher.config.option_types import (
+    AsofDirection,
+    Backend,
+    BatchFormat,
+    DaskMaterialize,
+    DistinctKeep,
+    DropNullsHow,
+    DtypeBackend,
+    ExtraColumns,
+    FillStrategy,
+    HuggingFaceMode,
+    JoinHow,
+    JoinValidate,
+    NanPolicy,
+    NumpyNulls,
+    QuantileInterpolation,
+    RowBatchFormat,
+    UpdateHow,
+)
 from batcher.io.source import Source
 from batcher.plan.expr_ir import AggExpr, Aliased, CaseBuilder, Col, Expr
 from batcher.plan.expr_ir.selectors import Selector, has_selector, resolve_names
@@ -128,8 +147,13 @@ from batcher.plan.streaming import Watermark
 if TYPE_CHECKING:
     from typing import TextIO
 
+    import daft
+    import dask.dataframe as dd
+    import datasets
     import pandas as pd
     import polars as pl
+    import pyspark.sql
+    import ray.data
 
     from batcher.api.dataset.dq import DatasetDQ
     from batcher.api.dataset.meta import DatasetMeta
@@ -1013,7 +1037,7 @@ class Dataset:
         self,
         *predicates: Expr | str | Mapping[str, Any] | Callable | type,
         batch_size: int | None = None,
-        batch_format: str = "pyarrow",
+        batch_format: BatchFormat = "pyarrow",
         input_columns: list[str] | None = None,
         num_workers: int | str = "auto",
         num_cpus: float | None = None,
@@ -1620,7 +1644,7 @@ class Dataset:
         fn: Callable | type,
         *,
         batch_size: int | None = None,
-        batch_format: str = "pyarrow",
+        batch_format: BatchFormat = "pyarrow",
         input_columns: list[str] | None = None,
         preserves_columns: list[str] | None = None,
         output_columns: list[str] | pa.Schema | None = None,
@@ -1923,7 +1947,7 @@ class Dataset:
         fn: Callable | type,
         *,
         batch_size: int | None = None,
-        batch_format: str = "pyarrow",
+        batch_format: RowBatchFormat = "pyarrow",
         input_columns: list[str] | None = None,
         output_columns: list[str] | pa.Schema | None = None,
         num_workers: int | str = "auto",
@@ -2021,7 +2045,7 @@ class Dataset:
         fn: Callable | type,
         *,
         batch_size: int | None = None,
-        batch_format: str = "pyarrow",
+        batch_format: RowBatchFormat = "pyarrow",
         input_columns: list[str] | None = None,
         output_columns: list[str] | pa.Schema | None = None,
         num_workers: int | str = "auto",
@@ -2318,7 +2342,7 @@ class Dataset:
         self,
         subset: str | list[str] | None = None,
         *,
-        keep: str = "any",
+        keep: DistinctKeep = "any",
         order_by: str | list[str] | list[tuple[str, bool]] | None = None,
     ) -> Dataset:
         """Remove duplicate rows.
@@ -2645,12 +2669,12 @@ class Dataset:
         self,
         other: Dataset,
         on: str | list[str] | None = None,
-        how: str = "left",
+        how: UpdateHow = "left",
         *,
         left_on: str | list[str] | None = None,
         right_on: str | list[str] | None = None,
         include_nulls: bool = False,
-        validate: str = "m:m",
+        validate: JoinValidate = "m:m",
     ) -> Dataset:
         """Overwrite values with `other`'s where the keys match (Polars ``update``).
 
@@ -3457,7 +3481,7 @@ class Dataset:
         self,
         value: Any | dict[str, Any] | None = None,
         *,
-        strategy: str | None = None,
+        strategy: FillStrategy | None = None,
         subset: list[str] | None = None,
         order_by: list[str] | None = None,
         partition_by: list[str] | None = None,
@@ -3517,7 +3541,9 @@ class Dataset:
             raise PlanError("fill_null(): provide a `value` or a `strategy`")
         return build_fill_null(self, value, subset)
 
-    def drop_nulls(self, subset: str | list[str] | None = None, *, how: str = "any") -> Dataset:
+    def drop_nulls(
+        self, subset: str | list[str] | None = None, *, how: DropNullsHow = "any"
+    ) -> Dataset:
         """Drop rows that are null in any of `subset` (default: any column).
 
         The row-filtering counterpart to `fill_null`: with ``how="any"`` a row
@@ -3620,7 +3646,7 @@ class Dataset:
         schema: dict[str, Any] | pa.Schema,
         *,
         missing_columns: str | dict[str, str | Expr] = "raise",
-        extra_columns: str = "raise",
+        extra_columns: ExtraColumns = "raise",
     ) -> Dataset:
         """Conform to `schema`: its columns, in its order, with its types (Polars' spelling).
 
@@ -5218,9 +5244,9 @@ class Dataset:
         *,
         left_on: str | Expr | list[str | Expr] | None = None,
         right_on: str | Expr | list[str | Expr] | None = None,
-        how: str = "inner",
+        how: JoinHow = "inner",
         suffix: str = "_right",
-        validate: str = "m:m",
+        validate: JoinValidate = "m:m",
         nulls_equal: bool | Sequence[bool] = False,
         coalesce: bool | None = None,
         indicator: str | None = None,
@@ -5438,7 +5464,7 @@ class Dataset:
         by: str | list[str] | None = None,
         left_by: str | list[str] | None = None,
         right_by: str | list[str] | None = None,
-        direction: str = "backward",
+        direction: AsofDirection = "backward",
         tolerance: int | float | str | timedelta | None = None,
         allow_exact_matches: bool = True,
         suffix: str = "_right",
@@ -5911,7 +5937,7 @@ class Dataset:
         num_partitions: int | None = None,
         adaptive: bool | str = "auto",
         transport: str = "auto",
-        backend: str = "cpu",
+        backend: Backend = "cpu",
         *,
         max_rows: int | None = None,
     ) -> pa.Table:
@@ -6055,7 +6081,7 @@ class Dataset:
         analyze: bool = False,
         *,
         format: str = "text",
-        backend: str = "cpu",
+        backend: Backend = "cpu",
         requirements: bool = False,
     ) -> str:
         """Return the query plan as a tree, optionally with measured execution profile.
@@ -6319,7 +6345,7 @@ class Dataset:
         answer = metadata_min(self._plan, self._sources, column)
         return answer if answer is not None else self._exec_scalar(Col(column).min())
 
-    def max(self, column: str, *, nan_policy: str = "propagate") -> Any:
+    def max(self, column: str, *, nan_policy: NanPolicy = "propagate") -> Any:
         """The maximum value of `column` (SQL ``MAX``), answered from metadata when exact.
 
         The upper-bound mirror of `min`: an EXACT footer bound answers with no scan,
@@ -6688,7 +6714,7 @@ class Dataset:
         column: str,
         q: float | Sequence[float],
         *,
-        interpolation: str = "linear",
+        interpolation: QuantileInterpolation = "linear",
     ) -> Any:
         """The exact `q`-quantile of `column` (SQL ``QUANTILE_CONT``), ignoring nulls.
 
@@ -7090,7 +7116,7 @@ class Dataset:
         self,
         batch_size: int | None = None,
         *,
-        batch_format: str = "pyarrow",
+        batch_format: BatchFormat = "pyarrow",
         drop_last: bool = False,
         local_shuffle_buffer_size: int | None = None,
         local_shuffle_seed: int | None = None,
@@ -7253,7 +7279,7 @@ class Dataset:
         """
         return _collect(self._plan, self._sources, self.columns, cache=self._cache)
 
-    def to_pandas(self, *, dtype_backend: str = "numpy") -> pd.DataFrame:
+    def to_pandas(self, *, dtype_backend: DtypeBackend = "numpy") -> pd.DataFrame:
         """Execute the plan and return the result as a pandas `DataFrame`.
 
         A terminal operation. Materializes the Arrow result and converts it via
@@ -7310,7 +7336,7 @@ class Dataset:
         return _to_polars(self._plan, self._sources, self.columns, self._cache)
 
     def to_numpy(
-        self, columns: str | list[str] | None = None, *, nulls: str = "nan"
+        self, columns: str | list[str] | None = None, *, nulls: NumpyNulls = "nan"
     ) -> dict[str, Any]:
         """Execute the plan and return the result as a ``{column: numpy.ndarray}`` dict.
 
@@ -7429,7 +7455,7 @@ class Dataset:
         batch_size: int | None = None,
         block_size_bytes: int | None = None,
         distributed: bool | str = False,
-    ) -> Any:
+    ) -> ray.data.Dataset:
         """Execute and hand the result to Ray Data as a ``ray.data.Dataset`` (needs `ray`).
 
         The return leg of :func:`batcher.from_ray_dataset`, so a Batcher query can feed a
@@ -7472,7 +7498,7 @@ class Dataset:
             distributed=distributed,
         )
 
-    def to_daft(self) -> Any:
+    def to_daft(self) -> daft.DataFrame:
         """Execute and hand the result to Daft as a ``daft.DataFrame`` (needs `daft`).
 
         The return leg of :func:`batcher.from_daft`. The output batches are coalesced into
@@ -7508,7 +7534,7 @@ class Dataset:
         *,
         max_arrow_bytes: int | None = None,
         staging_path: str | None = None,
-    ) -> Any:
+    ) -> pyspark.sql.DataFrame:
         """Execute and hand the result to a Spark session as a ``pyspark.sql.DataFrame``.
 
         The return leg of :func:`batcher.from_spark`, taking the session explicitly so the
@@ -7558,11 +7584,11 @@ class Dataset:
     def to_dask(
         self,
         *,
-        materialize: str = "arrow",
+        materialize: DaskMaterialize = "arrow",
         npartitions: int | None = None,
         partition_bytes: int | None = None,
         staging_path: str | None = None,
-    ) -> Any:
+    ) -> dd.DataFrame:
         """Hand the result to Dask as a lazy ``dask.dataframe.DataFrame`` (needs `dask`).
 
         The return leg of :func:`batcher.from_dask`. The frame is built with
@@ -7623,11 +7649,11 @@ class Dataset:
 
     def to_huggingface(
         self,
-        mode: str = "materialized",
+        mode: HuggingFaceMode = "materialized",
         *,
         class_labels: str | Sequence[str] | Mapping[str, Sequence[str]] | None = None,
         images: str | Sequence[str] | None = None,
-    ) -> Any:
+    ) -> datasets.Dataset | datasets.IterableDataset:
         """Hand the result to Hugging Face ``datasets`` (needs `datasets`).
 
         The return leg of :func:`batcher.from_huggingface`. ``mode="materialized"`` runs

@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError, require_float, require_int
 from batcher._internal.mathx import is_nan
+from batcher.config.option_types import MappingStrategy, NanPolicy, QuantileInterpolation
 from batcher.plan.expr_ir.compat import expr_attribute_error as _expr_attribute_error
 from batcher.plan.ir_tags import MICROS_PER_DAY, ExprTag
 from batcher.plan.types import (
@@ -3179,7 +3180,7 @@ class Expr:
         """
         return AggExpr("min", self)
 
-    def max(self, *, nan_policy: str = "propagate") -> AggExpr | Expr:
+    def max(self, *, nan_policy: NanPolicy = "propagate") -> AggExpr | Expr:
         """Maximum non-null value per group. Use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Floats follow SQL's total order, in which NaN is greater than every number, so one
@@ -3558,7 +3559,9 @@ class Expr:
         """
         return AggExpr("median", self)
 
-    def quantile(self, q: float | Sequence[float], interpolation: str = "linear") -> AggExpr | Expr:
+    def quantile(
+        self, q: float | Sequence[float], interpolation: QuantileInterpolation = "linear"
+    ) -> AggExpr | Expr:
         """Continuous quantile at ``q`` in [0, 1] (linear interpolation).
 
         ``quantile(0.5)`` equals :meth:`median`. Raises ``PlanError`` if ``q`` is
@@ -4578,7 +4581,7 @@ class Expr:
         *,
         descending: bool | Iterable[bool] = False,
         nulls_last: bool = True,
-        mapping_strategy: str = "group_to_rows",
+        mapping_strategy: MappingStrategy = "group_to_rows",
     ) -> Expr:
         """Evaluate this expression per window — Polars ``over``, SQL ``… OVER (…)``.
 
@@ -6947,7 +6950,7 @@ class AggExpr:
         *,
         descending: bool | Iterable[bool] = False,
         nulls_last: bool = True,
-        mapping_strategy: str = "group_to_rows",
+        mapping_strategy: MappingStrategy = "group_to_rows",
     ) -> WindowExpr:
         """Turn this aggregate into a window expression — SQL ``<agg> OVER (…)``.
 
