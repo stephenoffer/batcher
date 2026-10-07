@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from .base import impl, join, mb, revenue, take, year_of
+from .fraction import q11_fraction
 
 
 def _d(value: date) -> pa.Scalar:
@@ -183,7 +184,7 @@ def q11(h: dict[str, Any]) -> pa.Table:
         ),
     )
     joined = join(ps, supp, "ps_suppkey", "s_suppkey").materialize()
-    threshold = joined.sum("value") * 0.0001
+    threshold = joined.sum("value") * q11_fraction()
     rows = take(joined.groupby("ps_partkey").aggregate(Sum("value")))
     rows = [r for r in rows if r["sum(value)"] > threshold]
     rows.sort(key=lambda r: -r["sum(value)"])

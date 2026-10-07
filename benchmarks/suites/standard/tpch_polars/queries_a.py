@@ -15,6 +15,8 @@ from datetime import date
 
 import polars as pl
 
+from suites.standard.tpch_ray.fraction import q11_fraction
+
 from .base import impl, revenue
 
 
@@ -337,7 +339,7 @@ def q11(t: dict[str, pl.LazyFrame]) -> pl.LazyFrame:
     return (
         german_stock.group_by("ps_partkey")
         .agg(pl.col("stock_value").sum().alias("value"))
-        .filter(pl.col("value") > pl.col("value").sum() * 0.0001)
+        .filter(pl.col("value") > pl.col("value").sum() * q11_fraction())
         .select("ps_partkey", "value")
         .sort("value", descending=True)
     )

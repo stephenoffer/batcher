@@ -68,6 +68,7 @@ class Context:
     rename: dict[str, dict[str, str]] = field(default_factory=dict)
     corpora: dict[str, ScanCorpus] = field(default_factory=dict)
     images: ImageCorpus | None = None
+    scale: float = 1.0
     _runners: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _handles: dict[tuple[str, str], Any] = field(default_factory=dict, init=False, repr=False)
 
@@ -88,7 +89,7 @@ class Context:
         gets SIGKILLed, before any engine runs. `None` loads everything, as before.
         """
         tables = load_tables(SOURCE_FOR[benchmark], scale, source, needed)
-        return cls(benchmark=benchmark, tables=tables, engines=engines)
+        return cls(benchmark=benchmark, tables=tables, engines=engines, scale=scale)
 
     @classmethod
     def build_scan(
@@ -106,7 +107,14 @@ class Context:
         """
         uris = table_uris(SOURCE_FOR[benchmark], scale, source)
         rename = scan_rename(SOURCE_FOR[benchmark], uris)
-        return cls(benchmark=benchmark, tables={}, engines=engines, uris=uris, rename=rename)
+        return cls(
+            benchmark=benchmark,
+            tables={},
+            engines=engines,
+            uris=uris,
+            rename=rename,
+            scale=scale,
+        )
 
     @classmethod
     def build_corpus(
@@ -129,12 +137,14 @@ class Context:
                 tables={},
                 engines=engines,
                 images=image_corpus(scale, source),
+                scale=scale,
             )
         return cls(
             benchmark=benchmark,
             tables={},
             engines=engines,
             corpora=scan_corpora(scale, source),
+            scale=scale,
         )
 
     def table(self, name: str) -> pa.Table:

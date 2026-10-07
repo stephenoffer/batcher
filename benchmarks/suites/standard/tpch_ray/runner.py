@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 
 from registry import EngineQueries, sql_case
 
+from .fraction import scaled_sql, set_scale
+
 if TYPE_CHECKING:
     from context import Context
 
@@ -51,12 +53,12 @@ def case_with_ray(name: str, query: str) -> Callable[[Context], EngineQueries]:
     from suites.standard.tpch_dataframe import batcher_impl
     from suites.standard.tpch_polars import polars_impl
 
-    sql_build = sql_case(query)
     bt_impl = batcher_impl(name)
     pl_impl = polars_impl(name)
 
     def build(ctx: Context) -> EngineQueries:
-        fns = sql_build(ctx)
+        set_scale(ctx.scale)
+        fns = sql_case(scaled_sql(name, query))(ctx)
 
         def native(engine: str, impl: Callable[[dict[str, Any]], Any] | None) -> None:
             # The native (DataFrame / Ray) impls build on in-memory table handles. In scan
