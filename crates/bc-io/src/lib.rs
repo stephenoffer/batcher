@@ -59,8 +59,8 @@ pub use footer_stats::{
 };
 pub use late::{LateFilter, MaskFn, RowPredicate};
 pub use row_groups::{
-    parquet_column_bytes, parquet_row_groups, parquet_row_groups_surviving, read_parquet_row_group,
-    read_parquet_row_group_late, read_parquet_rows, ROW_NUMBER,
+    parquet_column_bytes, parquet_row_groups, parquet_row_groups_surviving, prefetch_row_group,
+    read_parquet_row_group, read_parquet_row_group_late, read_parquet_rows, ROW_NUMBER,
 };
 pub use split_read::block_cache::{stats as object_cache_stats, CacheStats};
 
@@ -278,28 +278,6 @@ pub fn read_parquet_many(
     })
 }
 
-/// Process-wide cache of parsed Parquet footers, keyed by URI: `(file_size, metadata)`.
-///
-/// This is the "never read the same metadata twice" guarantee: multiple splits of one
-/// file, and repeated queries over warm (session-fleet) workers, fetch + parse the footer
-/// ONCE instead of per read. `ArrowReaderMetadata` is `Arc`-backed, so a hit is a cheap
-/// clone.
-///
-/// It used to be justified by "Parquet files are write-once, so the footer is immutable".
-/// That holds for an immutable lake and not for a pipeline re-run, which overwrites its
-/// own output under the same deterministic name. The stored size is therefore *checked*
-/// rather than merely recorded: a hit whose file has changed size is treated as a miss.
-///
-/// The failure this prevents is not a stale-looking answer — it is reading the new bytes
-/// with the **old row-group offsets**, which surfaces as a corrupt-file error
-/// (`Column cannot have more than one dictionary`) on a perfectly valid file.
-fn meta_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, store::CachedFooter>>
-{
-    static C: OnceLock<std::sync::Mutex<std::collections::HashMap<String, store::CachedFooter>>> =
-        OnceLock::new();
-    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
 /// Load many files' Parquet footers in ONE runtime pass, best-effort, in URI order.
 ///
 /// The metadata counterpart to [`read_parquet_many`]: footer loads are latency-bound
@@ -427,10 +405,14 @@ pub(crate) async fn load_metadata_cached(
     // the same version -- and the expensive half, the ranged footer GET and the parse, is
     // served from memory. Serving an unvalidated hit costs correctness instead: the failure is
     // not a stale-looking answer but reading *new* bytes at the *old* row-group offsets.
-    let cached = meta_cache().lock().unwrap().get(uri).cloned();
+    let cached = store::meta_cache().lock().unwrap().get(uri).cloned();
     if let Some((size, version, amd)) = cached {
+        if resolved.remote && store::recently_validated(uri) {
+            return Ok((size, version, amd));
+        }
         let head = resolved.store.head(&resolved.path).await?;
         if head.size == size && store::object_version(&head) == version {
+            store::mark_validated(uri);
             return Ok((size, version, amd));
         }
     }
@@ -480,10 +462,11 @@ pub(crate) async fn load_metadata_cached(
     // costs nothing extra; when it is not, `PrefetchedFooter` fetches it and the file simply
     // takes the second request it would have taken anyway.
     let amd = ArrowReaderMetadata::load_async(&mut probe, page_index::required_options()).await?;
-    meta_cache()
+    store::meta_cache()
         .lock()
         .unwrap()
         .insert(uri.to_string(), (size, version.clone(), amd.clone()));
+    store::mark_validated(uri);
     Ok((size, version, amd))
 }
 

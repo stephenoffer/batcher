@@ -625,6 +625,33 @@ try:
                 budget = max(1, budget // self._concurrency)
             return budget, sdir, codec
 
+        def _node_output_share(self) -> int:
+            """Half this worker's share of its node's RAM, divided by the calls it runs at once.
+
+            The floor under a broadcast probe's output bound. `_reduce_budget` is the *spill*
+            threshold, and the envelope sizes that from Carbonite's estimate of the query's
+            footprint: a threshold an estimate under-shoots costs a spill, which is cheap. The
+            output bound is not a spill threshold -- crossing it abandons the broadcast and
+            re-runs the join as a co-partition shuffle of the probe side. On TPC-H sf1000 over
+            eight 64 GB nodes it came out at a few megabytes (a 2.4 GB estimate divided by the
+            actor's concurrency), every broadcast was abandoned, and q9 shuffled all of
+            `lineitem` for 27 minutes before failing in the transport.
+
+            The worker's share is its core grant over the node's cores, so several workers on
+            one node do not each claim the node.
+            """
+            try:
+                import psutil
+
+                total = psutil.virtual_memory().total
+            except Exception as exc:  # pragma: no cover - optional host probe
+                note_suppressed("dist", "read node memory for a broadcast output floor", exc)
+                return 0
+            cores = max(1, int(available_cpu_count()))
+            grant = json.loads(self._engine_config).get("parallelism") or cores
+            share = min(1.0, float(grant) / cores)
+            return int(total * 0.5 * share / max(1, self._concurrency))
+
         def _record_bucket_bytes(self, sizes: dict[int, int]) -> None:
             """Fold one map call's per-bucket byte counts into this plan's running totals.
 
@@ -1544,8 +1571,8 @@ try:
                 # it this actor measured every chunk it joined and discarded all of it.
                 on_metrics=self._metrics.append,
                 # This worker's own per-operation grant, so the bound tracks the fan-out and
-                # the actor's concurrency instead of a fixed share of the node.
-                output_budget=self._reduce_budget()[0],
+                # the actor's concurrency -- but never below its share of the node's RAM.
+                output_budget=max(self._reduce_budget()[0], self._node_output_share()),
             )
             if not publish:
                 return out

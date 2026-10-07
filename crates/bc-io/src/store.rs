@@ -424,6 +424,60 @@ fn as_duration(value: &str) -> String {
     }
 }
 
+/// Process-wide cache of parsed Parquet footers, keyed by URI: `(file_size, version, metadata)`.
+///
+/// This is the "never read the same metadata twice" guarantee: multiple splits of one
+/// file, and repeated queries over warm (session-fleet) workers, fetch + parse the footer
+/// ONCE instead of per read. `ArrowReaderMetadata` is `Arc`-backed, so a hit is a cheap
+/// clone.
+///
+/// It used to be justified by "Parquet files are write-once, so the footer is immutable".
+/// That holds for an immutable lake and not for a pipeline re-run, which overwrites its
+/// own output under the same deterministic name. The stored size is therefore *checked*
+/// rather than merely recorded: a hit whose file has changed size is treated as a miss.
+///
+/// The failure this prevents is not a stale-looking answer — it is reading the new bytes
+/// with the **old row-group offsets**, which surfaces as a corrupt-file error
+/// (`Column cannot have more than one dictionary`) on a perfectly valid file.
+pub(crate) fn meta_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedFooter>> {
+    static C: OnceLock<std::sync::Mutex<std::collections::HashMap<String, CachedFooter>>> =
+        OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How long a remote object's validated footer is reused without asking the store again.
+///
+/// A unit reader reads a file's row groups one after another, and each read confirmed the cached
+/// footer with a `HEAD` -- a round trip per row group, 49 per TPC-H sf1000 `lineitem` file, on
+/// the path whose latency [`crate::split_read::prefetch`] exists to hide. Within this window a
+/// footer validated once is taken as current. An object rewritten in place inside the window can
+/// be read against its old footer; that is the trade, bounded to seconds, and it is confined to
+/// remote stores: a local file is re-validated on every read, which costs a `stat`.
+const FOOTER_REVALIDATE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn validated() -> &'static Mutex<HashMap<String, std::time::Instant>> {
+    static V: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+    V.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether `uri`'s cached footer was confirmed against the store within the reuse window.
+pub(crate) fn recently_validated(uri: &str) -> bool {
+    validated()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(uri)
+        .is_some_and(|at| at.elapsed() < FOOTER_REVALIDATE_AFTER)
+}
+
+/// Record that `uri`'s cached footer was just confirmed (or freshly read).
+pub(crate) fn mark_validated(uri: &str) {
+    validated()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(uri.to_string(), std::time::Instant::now());
+}
+
 /// A cached Parquet footer: the object's size and [`object_version`], and its metadata.
 pub(crate) type CachedFooter = (
     u64,

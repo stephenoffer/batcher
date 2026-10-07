@@ -119,6 +119,11 @@ fn next_chunk(py: Python<'_>, iterator: &Py<PyAny>) -> PyResult<Option<Vec<Recor
 /// computes over the rows and frees them on the same thread. Reading ahead onto the I/O pool was
 /// measured and dropped: with the decode already on every worker it only added threads competing
 /// for the same cores (TPC-H sf10 q6, 158 ms without it, 182 ms with).
+///
+/// What *is* read ahead is a remote unit's **bytes** ([`bc_io::prefetch_row_group`]), which costs
+/// no core: one GET at a time per worker left a node latency-bound at a fifth of its link
+/// (TPC-H sf1000 on three 16-core nodes, ~250 MB/s received with the CPUs 12-24% busy). A local
+/// file reads from the page cache and is never prefetched.
 struct ParquetUnits<'a> {
     uris: &'a [String],
     columns: Option<&'a [String]>,
@@ -137,6 +142,20 @@ struct ParquetUnits<'a> {
     /// unit of one execution is handed the same keys, and sharing one filter is what lets
     /// `bc_io::LateFilter` time the keyed read across units and keep the faster way.
     keyed: std::sync::OnceLock<Option<Arc<bc_io::LateFilter>>>,
+    /// Which units a read-ahead was started for, so each is requested once.
+    prefetched: Vec<std::sync::atomic::AtomicBool>,
+}
+
+/// Units ahead of the one being read whose bytes are fetched in the background
+/// (`BATCHER_UNIT_PREFETCH`, `0` to turn it off).
+fn unit_prefetch_depth() -> usize {
+    static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("BATCHER_UNIT_PREFETCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12)
+    })
 }
 
 impl<'a> ParquetUnits<'a> {
@@ -161,12 +180,29 @@ impl<'a> ParquetUnits<'a> {
             columns,
             predicate,
             batch_size: batch_size.max(1),
-            units,
             rows,
             late: late::late_of(plan_stages.clone(), &read_columns),
             plan_stages,
             read_columns,
             keyed: std::sync::OnceLock::new(),
+            prefetched: (0..units.len())
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            units,
+        }
+    }
+
+    /// Start the byte reads of the units after `unit`, which this worker reads next: its units
+    /// are a contiguous range read in order (`bc_interp`'s `unit_ranges`).
+    fn read_ahead(&self, unit: usize) {
+        use std::sync::atomic::Ordering;
+        let depth = unit_prefetch_depth();
+        for next in (unit + 1)..(unit + 1 + depth).min(self.units.len()) {
+            if self.prefetched[next].swap(true, Ordering::Relaxed) {
+                continue;
+            }
+            let (file, rg) = self.units[next];
+            bc_io::prefetch_row_group(&self.uris[file], rg, self.columns);
         }
     }
 
@@ -177,6 +213,7 @@ impl<'a> ParquetUnits<'a> {
         late: Option<&Arc<bc_io::LateFilter>>,
     ) -> Result<Vec<RecordBatch>, bc_interp::InterpError> {
         let source = |e: String| bc_interp::InterpError::ChunkSource(e);
+        self.read_ahead(unit);
         let (file, rg) = self.units[unit];
         bc_io::read_parquet_row_group_late(
             &self.uris[file],
