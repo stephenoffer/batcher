@@ -1783,6 +1783,8 @@ class Reader:
     def qdrant(self, collection: str, **opts: Any) -> Dataset:
         """Read a Qdrant collection by scrolling it, one row per point.
 
+        Requires the ``qdrant`` extra: ``pip install 'batcher-engine[qdrant]'``.
+
         Rows hold the point id, one ``fixed_size_list<float32>`` column per vector (an
         unnamed vector reads into ``embedding``), and one column per payload key. Not yet
         verified against a live Qdrant; see tests/PENDING_VERIFICATION.md.
@@ -1806,6 +1808,8 @@ class Reader:
     def pinecone(self, index: str, **opts: Any) -> Dataset:
         """Read one namespace of a serverless Pinecone index, listing its ids and fetching them.
 
+        Requires the ``pinecone`` extra: ``pip install 'batcher-engine[pinecone]'``.
+
         Rows hold the record id, its vector in ``embedding`` and one column per metadata
         field. Not yet verified against a live Pinecone; see tests/PENDING_VERIFICATION.md.
 
@@ -1827,6 +1831,8 @@ class Reader:
 
     def milvus(self, collection: str, **opts: Any) -> Dataset:
         """Read a Milvus collection, one split per partition, with ``query_iterator``.
+
+        Requires the ``milvus`` extra: ``pip install 'batcher-engine[milvus]'``.
 
         Columns are the collection's fields; a float-vector field reads as
         ``fixed_size_list<float32>``. Not yet verified against a live Milvus; see
@@ -1850,6 +1856,8 @@ class Reader:
 
     def turbopuffer(self, namespace: str, **opts: Any) -> Dataset:
         """Read a Turbopuffer namespace, paged in id order.
+
+        Requires the ``turbopuffer`` extra: ``pip install 'batcher-engine[turbopuffer]'``.
 
         Columns come from the namespace's attribute schema; ``vector`` reads into
         ``embedding``. Not yet verified against a live Turbopuffer; see
@@ -2057,6 +2065,8 @@ class Reader:
 
     def google_sheets(self, spreadsheet_id: str, range: str, **opts: Any) -> Dataset:
         """Read a range of a Google Sheet as a table.
+
+        Requires the ``gsheets`` extra: ``pip install 'batcher-engine[gsheets]'``.
 
         The first row is the header unless ``header=False`` (columns ``c0``, ``c1``, ...)
         or ``header=[names]``. Values are read unformatted by default, so numbers arrive as

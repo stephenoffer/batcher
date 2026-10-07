@@ -2800,6 +2800,8 @@ class Writer:
     def qdrant(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Upsert or delete points in an existing Qdrant collection.
 
+        Requires the ``qdrant`` extra: ``pip install 'batcher-engine[qdrant]'``.
+
         Every point is validated, and the collection's vector size and distance checked,
         before the first request; a failure names each point on `VectorWriteError`. A string
         id that is not a UUID is sent as a stable UUID derived from it, so a retried write
@@ -2828,6 +2830,8 @@ class Writer:
     def pinecone(self, index: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Upsert or delete records in one namespace of an existing Pinecone index.
 
+        Requires the ``pinecone`` extra: ``pip install 'batcher-engine[pinecone]'``.
+
         The index is described first, so a dimension or metric mismatch is refused before
         anything is sent. Columns other than the id and the vector become metadata. Not yet
         verified against a live Pinecone; see tests/PENDING_VERIFICATION.md.
@@ -2854,6 +2858,8 @@ class Writer:
 
     def milvus(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Upsert, insert or delete rows in an existing Milvus collection.
+
+        Requires the ``milvus`` extra: ``pip install 'batcher-engine[milvus]'``.
 
         The collection's schema is read first: the id column is sent as its primary key, the
         vector column as its float-vector field, and a column the collection has no field
@@ -2882,6 +2888,8 @@ class Writer:
 
     def turbopuffer(self, namespace: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Upsert or delete documents in a Turbopuffer namespace.
+
+        Requires the ``turbopuffer`` extra: ``pip install 'batcher-engine[turbopuffer]'``.
 
         The id column is sent as ``id``, the vector column as ``vector``, and every other
         column as an attribute. ``metric=`` defaults to ``"cosine_distance"``. Not yet
@@ -2913,6 +2921,8 @@ class Writer:
         self, spreadsheet_id: str, range: str, *, mode: str = "overwrite", **opts: Any
     ) -> WriteManifest:
         """Write the result into a range of a Google Sheet, in bounded batches.
+
+        Requires the ``gsheets`` extra: ``pip install 'batcher-engine[gsheets]'``.
 
         ``mode="overwrite"`` clears exactly `range` and writes the header and rows into it;
         nothing outside the range is touched. ``mode="append"`` adds the rows (no header)
