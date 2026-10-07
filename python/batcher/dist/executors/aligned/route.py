@@ -14,6 +14,7 @@ two aligned sources is exactly the exchange the layout makes unnecessary.
 
 from __future__ import annotations
 
+import contextvars
 import operator
 from collections import OrderedDict
 
@@ -37,7 +38,16 @@ from batcher.dist.executors.aligned.units import clustered, projected_bytes, sou
 from batcher.io.source import Source
 from batcher.plan.logical import LogicalPlan
 
-__all__ = ["aligned_route", "choose_plan", "scan_plan", "try_aligned"]
+__all__ = ["aligned_route", "choose_plan", "scan_plan", "try_aligned", "unbroadcastable"]
+
+
+#: Per `choose_plan` call: whether each `(source, column)` is stored in key order. One call
+#: asks it of every key class of every rewritten variant, and each answer is a sweep over
+#: every file's footer -- on TPC-H q10 at SF1000, 90 sweeps of ~1000 files, 7.8 s of a 8.8 s
+#: call. Scoped to the call, so it never outlives the sources it was asked about.
+_CLUSTERED: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "aligned_clustered", default=None
+)
 
 
 def choose_plan(
@@ -56,6 +66,22 @@ def choose_plan(
     makes far smaller than its source. `exclude` names sources no cut may broadcast, because a
     run has already found their broadcast too large to hold.
     """
+    if _CLUSTERED.get() is not None:
+        return _choose_plan(plan, sources, strict, single_table, exclude)
+    token = _CLUSTERED.set({})
+    try:
+        return _choose_plan(plan, sources, strict, single_table, exclude)
+    finally:
+        _CLUSTERED.reset(token)
+
+
+def _choose_plan(
+    plan: LogicalPlan,
+    sources: list[Source],
+    strict: bool,
+    single_table: bool,
+    exclude: frozenset[int],
+) -> AlignedPlan | None:
     from batcher.config import active_config
     from batcher.kyber.rules.agg_pushdown import pre_aggregate_facts
 
@@ -72,7 +98,7 @@ def choose_plan(
     # side too large to broadcast as it is: split by file, every unit returns the distinct
     # keys of its own slice, ~1.4M of SF100's 10M customer keys each, and the driver merges
     # them all -- q22 at SF100 took 10 s that way, and 2.8 s left to the shuffle.
-    membership = distinct_membership_sides(plan, lambda side: _unbroadcastable(side, sources))
+    membership = distinct_membership_sides(plan, lambda side: unbroadcastable(side, sources))
     variants = [pre_aggregate_facts(plan), membership]
     # A dimension the join order put between two aligned tables keeps them out of one cut:
     # TPC-H q10's `lineitem JOIN (customer JOIN orders)`. With the aligned side moved down to
@@ -94,7 +120,7 @@ def choose_plan(
     return best[1] if best is not None else None
 
 
-def _unbroadcastable(node: LogicalPlan, sources: list[Source]) -> bool:
+def unbroadcastable(node: LogicalPlan, sources: list[Source]) -> bool:
     """Whether what `node` reads, projected, is past what every node can hold, or unsized."""
     from batcher.dist.executors.aligned.run import BROADCAST_BYTES
     from batcher.dist.executors.partition_io import source_pushdown
@@ -171,7 +197,7 @@ def _oversized_broadcasts(found: AlignedPlan, sources: list[Source]) -> frozense
             if (
                 size is not None
                 and size > BROADCAST_BYTES
-                and not _filtered(cut.body, sid, cut.aligned, sources[sid])
+                and not _filtered(cut.body, sid, cut.aligned, sources[sid], sources)
             ):
                 big.add(sid)
     return frozenset(big)
@@ -254,7 +280,7 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
             if sid in cut.aligned:
                 table = _identity(sources[sid])
                 spread_by[table] = max(spread_by.get(table, 0), size)
-            elif _filtered(cut.body, sid, cut.aligned, sources[sid]):
+            elif _filtered(cut.body, sid, cut.aligned, sources[sid], sources):
                 # What is held is the filtered result, which the fleet reads once, in parallel
                 # (`scan_plan`), and which is usually a sliver of its source: TPC-H q20 reads
                 # 3 GB of `partsupp` and `part` at SF100 to keep 1% of the parts. Charged at its
@@ -285,7 +311,11 @@ def _weigh(found: AlignedPlan, sources: list[Source], strict: bool) -> int | Non
 
 
 def _filtered(
-    body: LogicalPlan, sid: int, aligned: frozenset[int], source: Source | None = None
+    body: LogicalPlan,
+    sid: int,
+    aligned: frozenset[int],
+    source: Source | None = None,
+    sources: list[Source] | None = None,
 ) -> bool:
     """Whether the broadcast subtree reading `sid` filters it, so its result can be far
     smaller than the source: what is held is that result, bounded when it is evaluated.
@@ -325,7 +355,10 @@ def _filtered(
 
     # After the broadcast joins are grouped, as they are when the cut runs: q9's filter on
     # `part` reaches `partsupp` only once the rewrite has moved the one onto the other.
-    found = subtree(group_broadcast_joins(body, aligned))
+    # With `sources`, a broadcast too large to hold is cut to the keys the facts can carry
+    # first, as the run cuts it (`rewrite._semi_reduced`): q9's `partsupp` by green `part`.
+    reduce = None if sources is None else (lambda side: unbroadcastable(side, sources))
+    found = subtree(group_broadcast_joins(body, aligned, reduce=reduce))
     # A grouped aggregate reduces as surely as a filter: q22's distinct customer keys are 100M
     # of `orders`' 1.5B rows.
     return found is not None and any(
@@ -389,8 +422,14 @@ def _clustered_on(source: Source, column: str | None) -> bool:
     """Whether `source`'s files store `column` in order, per their footers."""
     if column is None:
         return False
+    memo = _CLUSTERED.get()
+    if memo is not None and (id(source), column) in memo:
+        return memo[(id(source), column)]
     bounds = source_key_bounds(source, column)
-    return bounds is not None and clustered(bounds)
+    answer = bounds is not None and clustered(bounds)
+    if memo is not None:
+        memo[(id(source), column)] = answer
+    return answer
 
 
 def aligned_route(plan: LogicalPlan, sources: list[Source]) -> bool:

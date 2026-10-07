@@ -208,6 +208,82 @@ def _move_down(node: Join, aligned: frozenset[int]) -> LogicalPlan | None:
     return _move(node, free, free)
 
 
+def _free_key(
+    node: LogicalPlan, key: str, aligned: frozenset[int]
+) -> tuple[LogicalPlan, str] | None:
+    """An aligned-free subtree of `node`, and its column, whose values every row carries in `key`.
+
+    Followed through filters, plain-column projections and inner joins, and at an inner join
+    across its key pair too, since each row it emits has equal values in the two key columns.
+    """
+    if _source_free(node, aligned):
+        return node, key
+    if isinstance(node, Filter):
+        return _free_key(node.input, key, aligned)
+    if isinstance(node, Project):
+        expr = {item.alias: item.expr for item in node.items}.get(key)
+        return _free_key(node.input, expr.name, aligned) if isinstance(expr, Col) else None
+    if not (isinstance(node, Join) and node.join_type == "inner"):
+        return None
+    origin = {o.alias: (o.side, o.name) for o in node.output}.get(key)
+    if origin is None:
+        return None
+    side, name = origin
+    own, other = (
+        (node.left_keys, node.right_keys) if side == "left" else (node.right_keys, node.left_keys)
+    )
+    child, partner = (node.left, node.right) if side == "left" else (node.right, node.left)
+    found = _free_key(child, name, aligned)
+    if found is None and name in own:
+        found = _free_key(partner, other[own.index(name)], aligned)
+    return found
+
+
+def _semi_reduced(
+    node: Join, aligned: frozenset[int], worth: Callable[[LogicalPlan], bool]
+) -> LogicalPlan | None:
+    """`node` with its broadcast side cut, by a semi join, to the keys the other side can carry.
+
+    TPC-H q9 joins `partsupp` (800M rows at SF1000) to `lineitem JOIN part` on
+    `ps_partkey = l_partkey`, and `part` is filtered to green parts, joined on
+    `l_partkey = p_partkey`. Every row reaching the `partsupp` join carries a green part's key,
+    so a `partsupp` row with any other can never match. The semi join says so before the
+    broadcast is evaluated: `partsupp` becomes ~43M rows every node can hold, where whole it
+    was too large to broadcast and the cut stopped below it, returning 325M joined rows the
+    driver could not take. `part` stays where it was; the semi join only drops rows, keeps
+    `partsupp`'s columns, and reads the same aligned-free subtree `part` is joined from.
+    """
+    if node.join_type != "inner":
+        return None
+    for b_side in ("right", "left"):
+        b = node.right if b_side == "right" else node.left
+        spine = node.left if b_side == "right" else node.right
+        if not _source_free(b, aligned) or _source_free(spine, aligned) or not worth(b):
+            continue
+        b_keys, s_keys = (
+            (node.right_keys, node.left_keys)
+            if b_side == "right"
+            else (node.left_keys, node.right_keys)
+        )
+        for bk, sk in zip(b_keys, s_keys, strict=True):
+            found = _free_key(spine, sk, aligned)
+            if found is None:
+                continue
+            d, dk = found
+            if isinstance(b, Join) and b.join_type == "semi" and b.right == d:
+                return None  # already reduced by this subtree
+            reduced = Join(
+                left=b,
+                right=d,
+                left_keys=(bk,),
+                right_keys=(dk,),
+                join_type="semi",
+                output=tuple(JoinOutputCol("left", c, c) for c in b.available_columns()),
+            )
+            return dataclasses.replace(node, **{b_side: reduced})
+    return None
+
+
 def _aligned_only(node: LogicalPlan, aligned: frozenset[int]) -> bool:
     from batcher.plan.visitor import scanned_source_ids
 
@@ -241,13 +317,23 @@ def colocate_aligned_joins(plan: LogicalPlan, aligned: frozenset[int]) -> Logica
     return transform_up(plan, step)
 
 
-def group_broadcast_joins(body: LogicalPlan, aligned: frozenset[int]) -> LogicalPlan:
-    """`body` with every movable broadcast join pushed down to its broadcast leaf."""
+def group_broadcast_joins(
+    body: LogicalPlan,
+    aligned: frozenset[int],
+    reduce: Callable[[LogicalPlan], bool] | None = None,
+) -> LogicalPlan:
+    """`body` with every movable broadcast join pushed down to its broadcast leaf.
+
+    `reduce`, given, picks the broadcast sides that a join which cannot move is cut down to
+    the keys the other side can carry (`_semi_reduced`): those too large to hold whole.
+    """
     from batcher.plan.visitor import transform_up
 
     def step(node: LogicalPlan) -> LogicalPlan:
         if isinstance(node, Join):
             moved = _move_down(node, aligned)
+            if moved is None and reduce is not None:
+                moved = _semi_reduced(node, aligned, reduce)
             if moved is not None:
                 return moved
         return node
