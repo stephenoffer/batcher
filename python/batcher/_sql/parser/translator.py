@@ -282,6 +282,9 @@ class _Translator:
         self._scope_types: dict[str, Any] = {}
         self._scope_schema: Any = None
         self._scalar_sub_n = 0
+        # Each uncorrelated scalar subquery's literal, so one written twice is run once
+        # (`expressions.scalar._subquery_key`).
+        self._scalar_values: dict[tuple, Any] = {}
         self._udf_n = 0
         self._win_arg_n = 0
 

@@ -41,10 +41,10 @@ from batcher._sql.parser.expressions.lowering import (
     null_boolean,
     positional_null,
     str_call,
-    typed_null,
 )
 from batcher._sql.parser.expressions.lowering.derived import derived_function
 from batcher._sql.parser.expressions.temporal import _date_diff
+from batcher._sql.parser.subquery.uncorrelated import scalar_subquery
 from batcher.plan.expr_ir import (
     Array,
     Binary,
@@ -161,9 +161,9 @@ def _scalar(tr, node) -> Expr:
         want = inner if bool(node.expression.this) else ~inner
         return coalesce(want, lit(False))
     if isinstance(node, exp.Subquery):
-        return _scalar_subquery(tr, node.this)
+        return scalar_subquery(tr, node.this)
     if isinstance(node, (exp.Select, exp.Union)):
-        return _scalar_subquery(tr, node)
+        return scalar_subquery(tr, node)
     if isinstance(node, exp.In):
         return in_membership(tr, node)
     if isinstance(node, exp.Between):
@@ -414,52 +414,6 @@ def _case(tr, node) -> Expr:
     # No ELSE → SQL yields NULL (typed as the THEN value) where nothing
     # matches. `nullif(x, x)` is exactly that typed NULL.
     return builder.otherwise(nullif(first_then, first_then))
-
-
-def _scalar_subquery(tr, select_node) -> Expr:
-    """Uncorrelated scalar subquery → a literal.
-
-    Translate the inner SELECT, collect it **eagerly** (this executes the subquery now,
-    while the SQL is being translated), check it is at most 1 row x 1 column, and inline the
-    value as a literal. A lazy join against the subquery's one row is the alternative, and it
-    measured ~60x slower than the literal filter over 4M rows. More than one row raises the
-    typed `ExecutionError` DuckDB's message describes.
-    """
-    tr._reject_correlated(select_node)
-    # Detach from the outer AST so ancestor walks (e.g. _has_aggregate's
-    # Subquery/Window checks) stay within the subquery's own scope.
-    select_node = select_node.copy()
-    # The subquery may itself aggregate, which resets the translator's aggregate
-    # bookkeeping (``_agg_map`` / ``_agg_n``). Save and restore it so the enclosing
-    # query's aggregate columns still resolve after the subquery is evaluated — e.g.
-    # ``HAVING sum(x) > (SELECT sum(x) * k FROM ...)`` (TPC-H Q11).
-    saved_agg_map, saved_agg_n = tr._agg_map, tr._agg_n
-    try:
-        inner_ds = tr.statement(select_node)
-        if len(inner_ds.columns) != 1:
-            raise NotImplementedError("scalar subquery must project exactly one column")
-        table = inner_ds.collect()
-    finally:
-        tr._agg_map, tr._agg_n = saved_agg_map, saved_agg_n
-    if table.num_rows == 0:
-        # SQL: a scalar subquery with no rows is NULL (typed as its output column),
-        # not an error — e.g. `(SELECT sal FROM emp WHERE id=999)` is NULL per row.
-        return typed_null(table.schema.field(0).type)
-    if table.num_rows > 1:
-        from batcher._internal.errors import ExecutionError
-        from batcher._sql.parser.subquery.scalar_sub import MULTIPLE_ROWS_MESSAGE
-
-        raise ExecutionError(f"{MULTIPLE_ROWS_MESSAGE} (got {table.num_rows} rows)")
-    value = table.column(0)[0].as_py()
-    if value is None:
-        # One row whose value *is* NULL — a different case from the no-rows one above, and
-        # the one an ordinary threshold query hits: `WHERE x > (SELECT AVG(x) FROM t)` over
-        # an empty or all-null column returns a single NULL row, not zero rows. `lit(None)`
-        # has no wire form (the IR has no untyped null literal), so this raised a bare
-        # `TypeError: unsupported literal type: NoneType` from deep inside `to_ir` where
-        # DuckDB simply returns no rows.
-        return typed_null(table.schema.field(0).type)
-    return lit(value)
 
 
 def _arg_nodes(node) -> list:
