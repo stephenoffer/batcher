@@ -387,14 +387,17 @@ class ShuffleClient:
         ticket: ShuffleTicket,
         credits: int | None = None,
         token: str | None = None,
+        required: bool = False,
     ) -> list[pa.RecordBatch]:
         """Fetch a remote partition over a credit-bounded stream on a pooled channel.
 
-        `token` is the shuffle auth secret presented to an auth-gated peer.
+        `token` is the shuffle auth secret presented to an auth-gated peer. With
+        `required=True` an unpublished ticket raises `RetryableShuffleError` rather than
+        reading as an empty partition; use it for a ticket known to have been published.
         """
         if credits is None:
-            return self._client.fetch(addr, str(ticket), token=token)
-        return self._client.fetch(addr, str(ticket), credits, token)
+            return self._client.fetch(addr, str(ticket), token=token, required=required)
+        return self._client.fetch(addr, str(ticket), credits, token, required)
 
     @property
     def connection_count(self) -> int:

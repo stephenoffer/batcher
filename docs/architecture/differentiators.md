@@ -47,7 +47,7 @@ This is the differentiator most often overstated, so here it is at full precisio
 
 During a query, Batcher re-optimizes at pipeline breakers on cardinalities it has *measured*. When an estimate was wrong by more than `optimizer.reoptimize_error` (2.0 by default), Kyber re-plans the rest of the query on the real numbers. That is stage-boundary re-optimization, the same granularity Spark AQE works at.
 
-Two things set it apart. It runs inside the Python process: AQE has been on by default since Spark 3.2 and also re-plans in local mode (`local[*]`), but it plans in a JVM beside Python, and DuckDB optimizes once with no way to revise. And what it measured survives the query. Core records actual cardinalities, operator times and peak memory into the `MetadataHub`, and the next run of that plan shape reads them: HyperLogLog distinct counts, KLL quantiles, cost coefficients calibrated from measured operator times, and a UCB1 bandit over equivalent join strategies. Neither DuckDB nor Spark keeps anything comparable between runs.
+Two things set it apart. It runs inside the Python process: AQE has been on by default since Spark 3.2 and also re-plans in local mode (`local[*]`), but it plans in a JVM beside Python, and DuckDB optimizes once with no way to revise. And what it measured survives the query. Core records actual cardinalities, operator times and peak memory into the `MetadataHub`, and the next run of that plan shape reads them: HyperLogLog distinct counts, KLL quantiles, cost coefficients calibrated from measured operator times, and a UCB1 bandit over equivalent join strategies. Neither DuckDB nor open-source Spark feeds measured execution statistics from one run into the next run's plan.
 
 You can watch an estimate change source after one run:
 
@@ -66,7 +66,7 @@ The within-query loop engages only where it pays. On a single node, `adaptive="a
 
 On a cluster, Ray schedules tasks and carries control-plane metadata. That's all. Only small `(address, ticket)` strings travel through Ray. Bulk Arrow batches move straight between workers over Arrow Flight under credit-based flow control: one credit is one in-flight batch slot, and a producer blocks at zero credits. An in-flight gauge in `bc-transport` enforces the bound.
 
-Put an object store in the data path and memory pressure turns into spill storms. Staying out of it is the main reason Batcher's distributed shuffles run far ahead of Ray Data's.
+Put an object store in the data path and memory pressure turns into spill storms. Ray Data's shuffle goes through its object store and Batcher's does not, and Batcher's distributed shuffles run far ahead of Ray Data's. No benchmark isolates how much of that margin the transport accounts for, and the design isn't unique to Batcher: Daft offers an Arrow Flight shuffle (`shuffle_algorithm="flight_shuffle"`) too.
 
 Within a node, the transport picks the cheapest tier itself. In the same process it reads straight from the local store. Across processes on one node it memory-maps a 64-byte-aligned Arrow IPC file, roughly 23x faster than a loopback Flight hop, and steps aside under memory pressure. Flight carries only what crosses nodes. Published shuffle output sits in RAM with a spill path behind it, so a reducer usually reads from memory.
 

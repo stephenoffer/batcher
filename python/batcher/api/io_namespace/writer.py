@@ -444,7 +444,7 @@ class Writer:
         * ``"error"`` — raise `PlanError` if `path` already exists.
         * ``"ignore"`` — skip the write (return an empty manifest) if `path` exists.
         * ``"append"`` — add to an existing table; only the sinks that can add to one
-          (`delta`/`iceberg`/`hudi`/`snowflake`) support it. A file sink raises, because
+          (`delta`/`iceberg`/`snowflake`) support it. A file sink raises, because
           it has nothing to append to.
 
         Spark's own ``"errorIfExists"`` and Python's file modes (``"w"``, ``"a"``,
@@ -694,7 +694,11 @@ class Writer:
                 opts["replace_where"] = replace_where.to_ir()
                 mode = "overwrite"
             elif resolve_filesystem(path).exists(path):
-                kept = _read(path, format=fmt).filter(~replace_where)
+                # Keep every row the predicate does not make TRUE, which is not the same as
+                # `~replace_where`: on a row where the predicate is NULL (a NULL partition
+                # value under `col("r") == "us"`) the negation is NULL too, the filter drops
+                # it, and the backfill deletes a row it never claimed to replace.
+                kept = _read(path, format=fmt).filter(~replace_where.fill_null(False))
                 # `union` is positional, and a partitioned read hands its partition columns
                 # back *last* (they come from the directory names, not the files), so the
                 # kept rows and the incoming ones agree on names and disagree on order.

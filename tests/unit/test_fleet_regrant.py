@@ -189,3 +189,63 @@ def test_a_leased_fleet_is_never_torn_down(monkeypatch, _no_ray):
     )
 
     assert _fleet._acquire_session_fleet(8, 64, "{}") is narrow
+
+
+class _RestartingActor(_FakeActor):
+    """An actor whose `set_grant` RPC fails, as one restarting mid-acquire does."""
+
+    class _Failing:
+        def remote(self, credits: int, cfg_json: str):
+            raise RuntimeError("actor is restarting")
+
+    @property
+    def set_grant(self) -> _RestartingActor._Failing:  # type: ignore[override]
+        return _RestartingActor._Failing()
+
+
+def _half_regrantable(n: int, credits: int, cfg_json: str) -> _fleet.ShuffleFleet:
+    """A fleet whose last actor refuses the re-grant after the others took it."""
+    fleet = _fleet_of(n, credits, cfg_json)
+    fleet.actors[-1] = _RestartingActor()
+    return fleet
+
+
+def test_a_failed_regrant_on_an_idle_fleet_respawns_it(monkeypatch, _no_ray, caplog):
+    """BT-078: a re-grant that half-landed was swallowed, leaving a mixed, stale grant."""
+    stale = _half_regrantable(4, credits=1, cfg_json='{"memory_budget_bytes": 1048576}')
+    monkeypatch.setattr(_fleet, "_SESSION", stale)
+    monkeypatch.setattr(_fleet, "_SESSION_LEASES", 0)
+    monkeypatch.setattr(_fleet, "_session_fleet_alive", lambda _f: True)
+    monkeypatch.setattr(_fleet.ShuffleFleet, "cleanup", lambda _self: None)
+    monkeypatch.setattr(
+        _fleet.ShuffleFleet,
+        "spawn",
+        classmethod(lambda _c, w, credits, cfg_json: _fleet_of(w, credits, cfg_json)),
+    )
+    want = '{"memory_budget_bytes": 389909338}'
+
+    with caplog.at_level("WARNING"):
+        got = _fleet._acquire_session_fleet(4, 64, want)
+
+    assert got is not stale  # nobody else holds it, so it is replaced, not reused
+    assert (got.credits, got.cfg_json) == (64, want)
+    assert any("re-grant" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failed_regrant_on_a_busy_fleet_is_regranted_next_time(monkeypatch, _no_ray):
+    """When the fleet cannot be respawned, it must at least not claim the grant it lacks."""
+    old = '{"memory_budget_bytes": 1048576}'
+    stale = _half_regrantable(4, credits=1, cfg_json=old)
+    monkeypatch.setattr(_fleet, "_SESSION", stale)
+    monkeypatch.setattr(_fleet, "_SESSION_LEASES", 1)  # an operator is mid-shuffle on it
+    monkeypatch.setattr(_fleet, "_session_fleet_alive", lambda _f: True)
+    monkeypatch.setattr(
+        _fleet.ShuffleFleet, "spawn", classmethod(lambda *a, **k: pytest.fail("must not respawn"))
+    )
+
+    got = _fleet._acquire_session_fleet(4, 64, '{"memory_budget_bytes": 389909338}')
+
+    assert got is stale
+    # Neither the old grant (it was partly overwritten) nor the new one (it did not land):
+    # recorded as matching nothing, so the next acquire re-grants instead of trusting it.
+    assert got.cfg_json not in (old, '{"memory_budget_bytes": 389909338}')

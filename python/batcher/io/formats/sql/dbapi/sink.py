@@ -21,10 +21,12 @@ does on the way in. The conversion is column-wise and per chunk (`_bind`), never
 why `ds.write.sql` still routes an append to ADBC and comes here for everything else.
 
 **A write is idempotent only where the mode is.** `with_retry` re-runs a transaction the
-server rolled back, which is safe because the rollback restored the pre-write state. An
-``append`` that the *client* lost the connection on after the server committed is the one
-case no retry can decide, and it is the same ambiguity every at-least-once writer has: an
-upsert absorbs the repeat, an append duplicates it. Prefer ``upsert`` where keys exist.
+server rolled back, which is safe because the rollback restored the pre-write state. A
+failed ``COMMIT`` is different: the server may have committed and only the acknowledgement
+was lost, and no client can tell which. An upsert absorbs the repeat, an append duplicates
+every row of it, so an ``append`` whose commit fails is *not* retried — it raises a
+`BackendError` saying the outcome is unknown, and the caller decides (`_NON_IDEMPOTENT_MODES`).
+Prefer ``upsert`` where keys exist.
 
 ## Transactions
 
@@ -77,6 +79,18 @@ WRITE_MODES = ("append", "overwrite", "upsert", "update", "delete", "delete_inse
 
 #: Modes that discard rows the write itself did not supply. Ruinous once per shard.
 _DESTRUCTIVE_MODES = frozenset({"overwrite"})
+
+#: Modes a repeated transaction does not leave equivalent to one. A failed commit in one of
+#: these is never retried: the server may already hold the rows (see `_commit`).
+_NON_IDEMPOTENT_MODES = frozenset({"append"})
+
+
+@dataclass(frozen=True, slots=True)
+class _CommitOutcomeUnknown:
+    """A failed commit of a non-idempotent write, carried out of the retry loop unretried."""
+
+    cause: Exception
+
 
 #: Modes whose statement is keyed on `key_columns`.
 _KEYED_MODES = frozenset({"upsert", "update", "delete", "delete_insert"})
@@ -325,6 +339,14 @@ class DBAPISink:
             attempts=self.retries + 1,
             backoff_base_s=self.retry_backoff_s,
         )
+        if isinstance(affected, _CommitOutcomeUnknown):
+            raise BackendError(
+                f"sql write: the commit of an {self.mode!r} to {path!r} failed, so its "
+                "outcome is unknown: the rows may or may not be present. It was not "
+                "repeated, because repeating an append duplicates it if the first commit "
+                "landed. Check the table before writing again, or use mode='upsert' with "
+                "key_columns so a repeat is harmless."
+            ) from affected.cause
         stats = {} if affected is None else {"affected_rows": affected}
         return WrittenFile(path=path, rows=table.num_rows, bytes=logical_bytes(table), stats=stats)
 
@@ -383,7 +405,7 @@ class DBAPISink:
             )
         return table
 
-    def _apply(self, table: pa.Table, path: str) -> int | None:
+    def _apply(self, table: pa.Table, path: str) -> int | _CommitOutcomeUnknown | None:
         """Run the whole write on one connection, committing once or rolling back whole."""
         borrowed = self.connection is not None
         conn = (
@@ -396,9 +418,6 @@ class DBAPISink:
             if self.create_table and self.mode != "delete" and not borrowed:
                 self._ensure_table(conn, table.schema, path)
             affected = self._run(conn, table, path)
-            if commit:
-                conn.commit()
-            return affected
         except Exception:
             if commit:
                 # Only unwind a transaction this sink owns. Rolling back a caller's
@@ -411,9 +430,40 @@ class DBAPISink:
                         f"{rollback_failure}"
                     ) from rollback_failure
             raise
+        else:
+            if commit:
+                unknown = self._commit(conn)
+                if unknown is not None:
+                    return unknown
+            return affected
         finally:
             if not borrowed:
                 conn.close()
+
+    def _commit(self, conn: Any) -> _CommitOutcomeUnknown | None:
+        """Commit, refusing to let a retry repeat an append whose commit may have landed.
+
+        A ``COMMIT`` that raises does not say whether the server applied it: a dropped
+        connection after the server committed but before the client heard back looks
+        exactly like one that never arrived, and is classified transient. Retrying an
+        append from there writes every row a second time. So for a non-idempotent mode
+        the failure is *returned*, not raised, and `write` raises it once it is outside
+        `with_retry`. Raising it inside would leave the decision to the transient
+        classifier, which reads message text: a path or driver name containing
+        ``timeout`` or ``ConnectionError`` would quietly re-arm the retry. The rollback
+        is skipped too, since its own failure on a dead connection would bury this one.
+        An idempotent mode keeps the retry, since a repeat of the transaction converges
+        on the same table.
+        """
+        try:
+            conn.commit()
+        except Exception as exc:
+            if self.mode in _NON_IDEMPOTENT_MODES:
+                return _CommitOutcomeUnknown(exc)
+            with suppress(Exception):  # the commit's failure is the one worth raising
+                conn.rollback()
+            raise
+        return None
 
     def _run(self, conn: Any, table: pa.Table, path: str) -> int | None:
         """Execute every statement of the plan; return the summed affected-row count."""

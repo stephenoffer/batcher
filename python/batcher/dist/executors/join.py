@@ -451,6 +451,20 @@ def _broadcast_join(
     return result
 
 
+def _schema_carrying(batches: list[pa.RecordBatch], plan: LogicalPlan) -> list[pa.RecordBatch]:
+    """A zero-row build side that still states its schema, or `[]` when nothing can.
+
+    The engine may return no batch at all for an empty side, and an IPC file needs one to
+    take its schema from; the plan's own type analysis answers for exactly that case.
+    """
+    if batches:
+        return [batches[0].slice(0, 0)]
+    schema = plan.available_schema()
+    if schema is None:
+        return []
+    return [pa.RecordBatch.from_pylist([], schema=schema.arrow)]
+
+
 def broadcast_probe_join(
     above: list[LogicalPlan],
     node: LogicalPlan,
@@ -461,6 +475,7 @@ def broadcast_probe_join(
     workers: int,
     hub=None,
     materialize: bool = True,
+    empty_build: bool = False,
 ):
     """Broadcast the small (right/build) side to every worker and split the big
     (left/probe) side — no shuffle of either side's keys.
@@ -489,6 +504,10 @@ def broadcast_probe_join(
         sources: The bound sources for the whole plan.
         workers: Probe-task fan-out.
         hub: Optional metadata hub for worker metrics.
+        empty_build: Broadcast an empty build side (as a zero-row batch carrying its
+            schema) instead of returning None for it. For a caller with no fallback, such
+            as the range join: an empty right side is the cheapest broadcast there is, and
+            left/anti still owe every left row.
         materialize: When False (and nothing is stacked `above`), keep each probe task's
             output where it was written and return a `MaterializedSource` over those files
             instead of concatenating them on the driver. Each probe task already writes one
@@ -530,9 +549,11 @@ def broadcast_probe_join(
     # offset from a larger one pins the parent, so `nbytes` here would pass a side well
     # over the threshold and then replicate it to every worker — the exact OOM this guard
     # exists to prevent, reached through the guard.
+    if empty_build and sum(b.num_rows for b in right_full) == 0:
+        right_full = _schema_carrying(right_full, right)
     if (
         not right_full
-        or sum(b.num_rows for b in right_full) == 0
+        or (sum(b.num_rows for b in right_full) == 0 and not empty_build)
         or total_retained_bytes(right_full)
         # `workers`, so the runtime guard asks the same question the planner did. Left at
         # the single-node default it would re-decline, on measurement, the very broadcasts

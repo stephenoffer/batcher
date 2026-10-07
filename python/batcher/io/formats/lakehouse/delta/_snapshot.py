@@ -50,6 +50,30 @@ _SNAPSHOT_CACHE_MAX = 8
 _LATEST_HANDLES: OrderedDict[tuple, Any] = OrderedDict()
 _HANDLE_LOCK = threading.Lock()
 
+# The protocol reader features this reader honours. A reader feature is the protocol's way
+# of saying "a reader that does not understand this returns wrong data", so anything outside
+# this set is refused by name rather than read. `deletionVectors` is applied as row masks
+# below; `timestampNtz` is only a type; `v2Checkpoint` and `vacuumProtocolCheck` are
+# log-replay concerns delta-rs settles before a snapshot exists. `variantType` is here
+# because delta-rs itself turns it on alongside deletion vectors, so refusing it would refuse
+# every DV-enabled table delta-rs writes; a variant column reads as its physical
+# ``struct<metadata, value>`` encoding, which is raw rather than wrong. `columnMapping` is
+# honoured only in mode ``none`` (see `_unreadable_reason`). Deliberately absent:
+# `typeWidening`, whose older files hold a narrower physical type than the schema states.
+_READABLE_FEATURES = frozenset(
+    {
+        "columnMapping",
+        "deletionVectors",
+        "timestampNtz",
+        "v2Checkpoint",
+        "vacuumProtocolCheck",
+        "variantType",
+        "variantType-preview",
+    }
+)
+# Reader version 3 is the table-features protocol; anything higher postdates this reader.
+_MAX_READER_VERSION = 3
+
 
 def require_deltalake() -> Any:
     """Import and return the `deltalake` module, or raise `BackendError`."""
@@ -75,6 +99,10 @@ class DeltaSnapshot:
     _add_actions: pa.Table
     _partition_columns: list[str]
     _masks: dict[str, Any]
+    # Why this version cannot be read correctly, or None. Kept rather than raised at
+    # construction so the metadata-only callers (a small-files count, a change-feed size
+    # estimate) still work; every path that reads rows or plans a read checks it.
+    _unreadable: str | None = None
     _full_index: tuple[Any, dict[str, Any]] | None = None
     _pinned: Any = None
 
@@ -95,8 +123,21 @@ class DeltaSnapshot:
             )
         return self._pinned
 
+    def require_readable(self) -> None:
+        """Raise `BackendError` if this version needs semantics the reader does not have.
+
+        Raises:
+            BackendError: Naming the feature, before any row is read.
+        """
+        if self._unreadable is not None:
+            raise BackendError(
+                f"cannot read Delta table {self.table_uri!r} at version {self.version}: "
+                f"{self._unreadable}"
+            )
+
     def schema(self) -> pa.Schema:
         """The table's Arrow schema, including partition columns."""
+        self.require_readable()
         return self._schema
 
     def add_actions(self) -> pa.Table:
@@ -132,20 +173,30 @@ class DeltaSnapshot:
         That flag is default-on for new Delta tables, so keying off it condemned every such
         table — including the overwhelming majority with no deletions at all — to the slow
         path for nothing.
+
+        Raises:
+            BackendError: When the vectors could not be read on a table allowed to have them.
         """
+        self.require_readable()
         return self._masks
 
     @staticmethod
     def _read_deletion_masks(table: Any, relative: Any) -> dict[str, Any]:
+        """Every data file's keep-mask, or an empty mapping when no file has a vector.
+
+        Fails **closed**. An empty mapping means "no row is deleted", so returning one
+        because the vectors could not be read hands every deleted row back to the query.
+        That answer is only sound when the protocol rules vectors out altogether; on a
+        table whose reader features include ``deletionVectors``, a failure raises instead.
+
+        Raises:
+            BackendError: When the vectors cannot be read and the table may carry them.
+        """
         import pyarrow as _pa
 
         masks: dict[str, Any] = {}
         try:
-            reader = table.deletion_vectors()
-        except Exception:  # an older delta-rs without the API
-            return masks
-        try:
-            for batch in reader:
+            for batch in table.deletion_vectors():
                 paths = batch.column("filepath")
                 vectors = batch.column("selection_vector")
                 for i in range(batch.num_rows):
@@ -155,6 +206,13 @@ class DeltaSnapshot:
                         vectors[i].values, type=_pa.bool_()
                     )
         except Exception as exc:
+            if "deletionVectors" in _reader_features(table):
+                raise BackendError(
+                    f"the table declares deletion vectors and they could not be read ({exc}); "
+                    "reading its files without them would return deleted rows"
+                ) from exc
+            # The protocol forbids vectors here, so "none" is the true answer whatever went
+            # wrong asking (an older delta-rs without the API, say).
             note_suppressed("io", "read deletion vectors", exc)
             return {}
         return masks
@@ -277,6 +335,7 @@ class DeltaSnapshot:
         table-relative path the log uses. Matching those two up outside this method is
         exactly the mismatch that silently returns zero rows.
         """
+        self.require_readable()
         # The unpruned index is what every split of this table looks its own file up in, so
         # it is built once per snapshot — and a snapshot is already cached per (uri, version)
         # and per worker process, which is exactly the caching a split read wants.
@@ -495,10 +554,53 @@ def _snapshot_from(
         _add_actions=add_actions,
         _partition_columns=partitions,
         _masks={},
+        _unreadable=_unreadable_reason(table),
     )
-    snapshot._masks = DeltaSnapshot._read_deletion_masks(table, snapshot._relative)
+    if snapshot._unreadable is None:
+        try:
+            snapshot._masks = DeltaSnapshot._read_deletion_masks(table, snapshot._relative)
+        except BackendError as exc:
+            snapshot._unreadable = str(exc)
     _cache_put((table_uri, resolved, opts_key), snapshot)
     return snapshot
+
+
+def _reader_features(table: Any) -> set[str]:
+    """The protocol's declared reader features (empty below reader version 3)."""
+    return set(table.protocol().reader_features or ())
+
+
+def _unreadable_reason(table: Any) -> str | None:
+    """Why `table`'s protocol asks for semantics this reader does not implement, or None.
+
+    Column mapping is the case this exists for. A column-mapped table stores each column in
+    its Parquet files under a *physical* name (``col-<uuid>``) and records the logical name
+    only in the log, so a reader matching columns by logical name finds none of them and
+    fills every column with NULL: the right row count, every value wrong, no error. delta-rs
+    1.6's own pyarrow dataset does exactly that, so there is no fallback to route to and
+    refusing is the only safe answer. The mode is read from the configuration rather than
+    the feature list because reader version 2 enables column mapping with no feature list.
+    """
+    protocol = table.protocol()
+    if protocol.min_reader_version > _MAX_READER_VERSION:
+        return (
+            f"it requires Delta reader version {protocol.min_reader_version}, and Batcher "
+            f"reads up to {_MAX_READER_VERSION}"
+        )
+    unknown = sorted(_reader_features(table) - _READABLE_FEATURES)
+    if unknown:
+        return (
+            f"it uses Delta reader feature(s) {unknown}, which Batcher does not implement; "
+            "a reader that ignores one returns wrong rows, so the read is refused"
+        )
+    mode = (table.metadata().configuration or {}).get("delta.columnMapping.mode", "none")
+    if str(mode).lower() != "none":
+        return (
+            f"it uses Delta column mapping (delta.columnMapping.mode={mode!r}), which Batcher "
+            "does not implement; its data files name columns by physical id, so every column "
+            "would read back as NULL"
+        )
+    return None
 
 
 def _relative_to(uri: str, table_uri: str) -> str:

@@ -5,6 +5,7 @@ variable, a join condition that is a `Column`, a sort key the inference cannot t
 declined template leaves the call alone with a marker. The transforms are grouped by what they
 restore: `columns` (column references, argument checks, positions, date patterns), `ordering`
 (sort and window keys) and `relational` (joins, writes, sessions, constructors, aggregates).
+`writes` is not a transform: it is the save-mode check every ported write goes through.
 """
 
 from __future__ import annotations

@@ -14,6 +14,9 @@ that is genuinely about Ray — which of its own exception types are deaths and 
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
+
 from batcher._internal.logging import note_suppressed
 from batcher.config import active_config
 
@@ -228,8 +231,18 @@ def check_results_trusted(exc: BaseException) -> None:
     ) from exc
 
 
+# The budget each running query draws its retries from, keyed by the query's shuffle plan id.
+# Bounded rather than freed at query end, because the scope that ends a query lives in
+# `dist.fleet.plan_id` and this module is a leaf: a few dozen live queries is far past any
+# real driver, and evicting the oldest only ever hands a query a fresh budget, which is what
+# every barrier got before budgets were shared at all.
+_QUERY_BUDGETS: OrderedDict[int, object] = OrderedDict()
+_QUERY_BUDGETS_MAX = 64
+_QUERY_BUDGETS_LOCK = threading.Lock()
+
+
 def retry_budget():
-    """The job-wide retry budget, built from the active config.
+    """The job-wide retry budget: one per distributed query, built from the active config.
 
     Per-task retry limits do not bound a job: `task_max_retries=2` over a hundred thousand
     partitions authorizes two hundred thousand retries, and a fleet broken in a way no probe
@@ -237,17 +250,36 @@ def retry_budget():
     the rate followed by whatever error happened to be last, long after the first one said
     exactly what was wrong.
 
+    One per *query*, not per call. Building a fresh budget per call gave every barrier its own
+    floor, so a query with K map and write barriers on a flapping fleet got K times the
+    retries the budget promises, and "fail on the first clear error" was multiplied by the
+    stage count. Inside a query's shuffle scope every caller now draws on the same budget
+    (each barrier still adds its own partitions to the attempts it is sized against);
+    outside one there is no query to share with, and the budget is fresh.
+
     Returns:
         A `RetryBudget` sized from `fault_tolerance.retry_budget_*`.
     """
     from batcher.carbonite.resilience import RetryBudget
+    from batcher.dist.fleet.plan_id import query_plan_id
 
     ft = active_config().fault_tolerance
-    return RetryBudget(
-        fraction=ft.retry_budget_fraction,
-        floor=ft.retry_budget_floor,
-        label="map",
-    )
+
+    def build() -> RetryBudget:
+        return RetryBudget(
+            fraction=ft.retry_budget_fraction, floor=ft.retry_budget_floor, label="map"
+        )
+
+    plan_id = query_plan_id()
+    if plan_id is None:
+        return build()
+    with _QUERY_BUDGETS_LOCK:
+        budget = _QUERY_BUDGETS.get(plan_id)
+        if budget is None:
+            budget = _QUERY_BUDGETS[plan_id] = build()
+            while len(_QUERY_BUDGETS) > _QUERY_BUDGETS_MAX:
+                _QUERY_BUDGETS.popitem(last=False)
+        return budget
 
 
 def node_ledger():

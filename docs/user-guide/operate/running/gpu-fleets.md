@@ -434,9 +434,8 @@ in any single region, so the job has to be split.
 An unregistered dataset is unrestricted. Batcher never infers a region from a bucket name or an
 endpoint, because guessing a legal fact is wrong in whichever direction it errs.
 
-Install the catalog once, at startup, with `bt.governance.set_residency`. The scheduler reads
-it through `active_residency`, so a rule applies to every stage rather than only the ones that
-remembered to pass it:
+Install the catalog once, at startup, with `bt.governance.set_residency`, and `active_residency`
+returns it to any code that asks:
 
 ```python
 from batcher.governance import ResidencyCatalog, active_residency, set_residency
@@ -447,10 +446,15 @@ print(active_residency().mode)
 _ = set_residency(previous)
 ```
 
-On a cluster, the catalog reaches the scheduler through
+The distributed scheduler does not read the catalog, so installing one changes no placement
+and a `strict` catalog raises nothing on its own. The filter that would apply it is
 `batcher.dist.executors.ray_runtime.fabric.permitted_nodes`, which keeps only the accelerator
-nodes whose region every input permits. By default a node with no region label is kept, so
-labelling your fleet is part of enabling the control. Build the catalog with
+nodes whose region every input permits. `plan_collective` calls it only when given the stage's
+datasets, and the scheduler calls `plan_collective` without them. To enforce residency, call
+`ResidencyCatalog.enforce` yourself before submitting work to a region.
+
+By default `permitted_nodes` keeps a node with no region label, so labelling your fleet is part
+of enabling the filter. Build the catalog with
 `ResidencyCatalog(mode="strict", refuse_unlabeled=True)` to fail closed instead: for a registered
 dataset, a node whose region can't be read is then excluded, and `check` refuses an empty region. `residency_report` gives the before and
 after device counts, which is what distinguishes a fleet narrowed by a compliance rule from one
@@ -469,6 +473,9 @@ that is merely busy.
   on its own.
 - MIG instances must already exist. Batcher plans against the profiles a device supports and
   never reconfigures one.
+- The distributed scheduler does not consult the residency catalog, so a rule constrains a
+  placement only where your code calls `ResidencyCatalog.enforce` or passes the stage's
+  datasets to `plan_collective` itself.
 - Residency applies to the regions Batcher can see on node labels. A worker whose region is
   unlabeled is kept by default, so labeling is part of enabling the control. Set
   `refuse_unlabeled=True` on the catalog to exclude such a worker from regulated data instead.

@@ -198,7 +198,7 @@ lake = bt.read.parquet("s3://bucket/orders/")
 bt.sql(
     "SELECT region, SUM(amount) AS revenue FROM o WHERE amount >= 25 GROUP BY region",
     o=lake,
-).write.parquet("s3://bucket/revenue_by_region/")
+).write.parquet("s3://bucket/revenue_by_region/", mode="overwrite")
 ```
 
 ## Where to go next

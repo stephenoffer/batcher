@@ -176,11 +176,15 @@ print(ds.filter(bt.col("price") > 25.0).explain())
 
 ## Read and write files
 
-Readers and writers share one API:
+Readers and writers share one API. A write's default save mode is `overwrite`, which replaces whatever is at the path, so name the mode you mean. This example writes to a fresh temporary directory with `mode="error"`, which raises rather than replace an existing path:
 
 ```python
-ds.write.parquet("sales.parquet")
-back = bt.read.parquet("sales.parquet")
+import os
+import tempfile
+
+out = os.path.join(tempfile.mkdtemp(), "sales.parquet")
+ds.write.parquet(out, mode="error")
+back = bt.read.parquet(out)
 print(back.count())
 # 5
 ```
@@ -190,7 +194,9 @@ Object stores work the same way:
 ```python
 # docs: skip
 events = bt.read("s3://<your-bucket>/events/*.parquet")
-events.filter(bt.col("status") == "active").write.parquet("s3://<your-bucket>/active.parquet")
+events.filter(bt.col("status") == "active").write.parquet(
+    "s3://<your-bucket>/active.parquet", mode="overwrite"
+)
 ```
 
 Replace `<your-bucket>` with your bucket and install the `cloud` extra. Formats and save modes are in {doc}`/user-guide/moving-data/reading-data` and {doc}`/user-guide/moving-data/writing-data`. Credentials are in {doc}`/user-guide/moving-data/cloud-storage`.

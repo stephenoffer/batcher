@@ -239,7 +239,8 @@ whichever region has spare accelerator capacity.
 {py:obj}`ResidencyCatalog <batcher.governance.ResidencyCatalog>` holds the rules and resolves
 a placement to a {py:obj}`ResidencyVerdict <batcher.governance.ResidencyVerdict>`. Its `mode`
 is one of `RESIDENCY_MODES`: `off` checks nothing, `advisory` reports a refusal a caller logs
-and proceeds past, and `strict` raises. An unregistered dataset is unrestricted, because
+and proceeds past, and `strict` makes `ResidencyCatalog.enforce` raise. `check` never raises in
+any mode, and nothing in Batcher calls `enforce` for you. An unregistered dataset is unrestricted, because
 residency is an obligation you state rather than one Batcher infers from a bucket name.
 
 ```python
@@ -255,9 +256,17 @@ print(verdict.message())
 # dataset 's3://eu-customers/orders' may not be processed in region 'us-east-1': permitted in eu-north-1 (GDPR Art. 44)
 ```
 
-Install the catalog once with `set_residency`, and the scheduler consults it through
-`active_residency` when placing accelerator work. A deployment that installs nothing keeps an
-empty `off` catalog, which permits everything.
+Install the catalog with `set_residency`, and `active_residency` returns it. A deployment that
+installs nothing keeps an empty `off` catalog, which permits everything.
+
+```{important}
+The distributed scheduler does not consult the catalog. The one placement hook that reads it,
+`plan_collective(..., datasets=...)`, filters nodes only when its caller names the stage's
+datasets, and the scheduler calls it without them. A registered rule therefore changes no
+placement, and a `strict` catalog raises nothing on its own, even when a stage reading a
+restricted dataset runs in a forbidden region. To enforce residency, call
+`ResidencyCatalog.enforce` yourself before you submit work to a region.
+```
 
 A job reading several datasets may run only where all of them may, so
 `permitted_regions` returns the intersection and `filter_regions` narrows a scheduler's

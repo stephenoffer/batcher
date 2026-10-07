@@ -184,13 +184,27 @@ They are listed in [Claims to retire](#claims-to-retire).
 These are real, and none of the competitors have all of them:
 
 1. **Mergeable algebra as the single semantics.** `partial → combine → finalize` in `bc-runtime`
-   serves one core, many cores, and many machines. Spark shuffles raw rows; Batcher's aggregate
-   mappers publish *pre-aggregated partials*, which is what makes the hierarchical combiner tree
-   (`dist/flight_aggregate.py:388`) and bounded reducer memory cheap.
+   serves one core, many cores, and many machines. Batcher's aggregate mappers publish
+   *pre-aggregated partials*, which is what makes the hierarchical combiner tree
+   (`dist/flight_aggregate.py::_tree_reduce`) and bounded reducer memory cheap. Pre-aggregating
+   before the shuffle is **not** what separates it from Spark: Spark SQL plans a partial
+   aggregate below the exchange (`AggUtils.planAggregateWithoutDistinct`), and the RDD API's
+   `reduceByKey` merges "locally on each mapper before sending results to a reducer", while
+   `aggregateByKey` goes through `combineByKey`, which combines each partition before
+   `partitionBy` (`pyspark/core/rdd.py`, Spark 4.2.0). An earlier version of this item said "Spark shuffles raw rows", which is wrong for
+   aggregates. What is specific here is that one `partial`/`combine`/`finalize` implementation
+   is also the single-node and multi-core path, so there is no second distributed operator.
 2. **The data plane bypasses the Ray object store entirely.** Only `(addr, ticket)` strings transit
    Ray; bulk Arrow moves over Flight with **credit-based flow control** whose bound is *proven* by
-   an in-flight gauge (`crates/bc-transport/src/store.rs:16-62`). This is the single biggest reason
-   Batcher beats Ray Data 50–450× — Ray Data's object-store spill storms are structural.
+   an in-flight gauge (`crates/bc-transport/src/store.rs`). This document used to call it "the
+   single biggest reason Batcher beats Ray Data 50–450×". That attribution is unproven:
+   `competitor_technique_review.md` measured the co-located tier at 16.9x Ray's object store
+   but the network Flight path at **0.33x** of it on loopback, and no benchmark isolates the
+   transport's share of the 50–450× margin. It is also **not exclusive to Batcher**: Daft
+   (0.7.25, `daft/context.py`) offers `shuffle_algorithm="flight_shuffle"`, which moves
+   shuffle partitions over Arrow Flight from per-node spill directories rather than as Ray
+   objects. The claim that holds is narrower: Ray Data's shuffle goes through the object
+   store, and Batcher's does not.
    **That margin is a claim about shuffles, and it does not extend to a pipeline that has none.**
    A `map_batches(GPU model) → aggregate` over 95.4 GiB of Parquet moves no bulk data between
    workers at all, and there Ray Data is **ahead**: 142.1 s against 175.3 s on 8 T4s, agreeing to
@@ -220,17 +234,26 @@ These are real, and none of the competitors have all of them:
    this shape without naming the row count**, and do not claim one at the saturated end at all:
    both engines call the same kernels on the same devices, and the engine at the floor cannot
    be beaten by more than the other's distance from it.
-3. **A learned cross-query loop nobody else has.** Sketch-backed cardinality (HLL/KLL wired end to
+3. **A learned cross-query loop.** Sketch-backed cardinality (HLL/KLL wired end to
    end), cost coefficients *calibrated from measured `op_stats`*, a UCB1 bandit over join
    strategies, learned partition counts and hot keys (`kyber/learning.py`, `learned_tuning/`,
-   `dist/skew.py`). DuckDB and Spark have nothing comparable.
+   `dist/skew.py`). Scoped to what was checked: DuckDB and open-source Spark plan each query
+   from table statistics and, for AQE, that query's own shuffle statistics, and neither feeds
+   measured execution back into the next run's plan. This item used to say "nobody else has"
+   it, which no one here has checked against every engine (managed warehouses included).
 4. **O(1)-memory global shuffle for training.** A 4-round Feistel permutation with cycle-walking
    (`ml/permutation.py`) makes the epoch order a *computed bijection*, not a materialized index
    list — so a rank streams an exabyte corpus in constant memory and seeks anywhere instantly.
    This is MosaicML-StreamingDataset's signature feature, done properly, plus mid-epoch resume
    and elastic (world-size-independent) ordering that Ray Train lacks.
-5. **Proactive spot-preemption migration** at stage boundaries (`carbonite/resilience/preemption.py`);
-   Spark has no out-of-the-box equivalent.
+5. **Proactive spot-preemption draining** (`carbonite/resilience/preemption.py`): a monitor
+   started under the `spot` profile reads a cloud reclamation notice, an orchestrator signal,
+   or a scheduler deadline, and drains the node before it dies. This item used to add "Spark
+   has no out-of-the-box equivalent", which is wrong: Spark has graceful decommissioning
+   (`spark.decommission.enabled`, with `spark.storage.decommission.shuffleBlocks.enabled` and
+   `spark.storage.decommission.rddBlocks.enabled` migrating blocks off a decommissioning
+   executor; the settings are in Spark 4.2.0's `spark-core`). What differs is the trigger sources and that it is wired to a
+   resilience profile, not that Spark cannot do it.
 6. **Adaptive aggregate switching on *measured* reduction ratio** (`bc-interp/src/agg_par.rs`) —
    more principled than a static optimizer estimate.
 7. **Session-warm inference actor pools** — the model loads once per *session*, reused across
@@ -468,6 +491,30 @@ first. This does **not** change the GPU-execution verdict (ceiling #5) or close 
 out next: **no ML-in-SQL** (BigQuery leads). Do not let a preprocessing-coverage win be read
 as a GPU-pipeline win.
 
+## Findings reconciled against `971fa7a1` (2026-10-05)
+
+The ceilings below were written over several months, and five of their claims had gone stale
+against the code. Each was re-read against commit `971fa7a1` and corrected in place. This
+table is the archive: the left column is what the document used to say and when it was true,
+and the right column is the state at `971fa7a1`, with the code that shows it.
+
+| Finding as previously written | Status at `971fa7a1` |
+|---|---|
+| Ceiling 3: inside the combiner tree only leaf partials are replicated; an interior combiner's output lives on one node. True when written (by `7bb8c9ed`, 2026-08-01). | **Fixed, archived.** `dist/shuffle_replication.py::replicate_interior_outputs`, called per level from `dist/flight_aggregate.py::_tree_reduce` (since `99193864`, 2026-08-11). |
+| Ceiling 3: `shuffle_replication` above 1 drops a lost worker's rows. Recorded on a 3-node cluster 2026-09-24. | **Cause fixed in code, unverified on hardware.** `replicate_shuffle_output(..., *, stages)` (`010b7790`, 2026-09-28); no cluster run since. Default stays 1 (`config/config.py`). |
+| Ceiling 4: Iceberg streaming writes are at-least-once, like Hudi. True when written (2026-08-11). | **Fixed single-node, archived.** `IcebergSink.is_committed` (`io/formats/lakehouse/iceberg/sink.py`, `18b85ead`). **Open:** distributed streaming to Iceberg is refused (`api/io_namespace/writer.py`). |
+| Ceiling 4: the windowed aggregate cannot use a changelog chain because it evicts. | **Stale, archived.** It writes one through a prefix tombstone (`core/streaming/folds/windowed.py::take_delta`). Dedup and keyed state still cannot. |
+| Ceiling 7: the distributed planner has no range-join staging and runs the operator whole. Written by `7bb8c9ed` (2026-08-01). | **Fixed, archived.** Broadcast-probe path, `dist/executor.py::_distributed_range_join`, gated by `_range_join_distributable`. **Open:** no strategy when both sides are large; an over-budget right side raises. |
+
+The Iceberg *batch* sink's scope is unchanged and current: `IcebergSink`
+(`io/formats/lakehouse/iceberg/sink.py`) takes `mode="append"` or `"overwrite"` (with an
+optional `replace_where`), has each worker stage its shard as a Parquet file, and registers
+them through `add_files` inside one driver-side `table.transaction()`, so an overwrite's delete
+and the new files commit together. Merge-on-read and equality-delete *writes* are not
+supported, as the class docstring states. The streaming engine the ceiling-4 findings refer to
+is `core/streaming_query/` (`engine.py` owns the micro-batch loop, checkpoints and
+`_run_resilient`; `processors.py` owns what each batch becomes).
+
 ## The structural ceilings
 
 Ranked by how much they block the mandate. These are the work.
@@ -632,16 +679,32 @@ then "exactly one caller"; both are out of date):
   exactly the small clusters it was testable on. The regeneration is now skipped when a copy
   survives on a live peer (at most once per source, so an unreachable replica still falls
   through to a recompute rather than exhausting the attempt budget).
-- `DistributedConfig.shuffle_replication` defaults to **1**, and no profile raises it any
-  more: above 1, a worker loss can drop that worker's share of the rows rather than fail
-  (`tests/integration/test_shuffle_replication.py`, reproduced on a 3-node cluster
-  2026-09-23), while replication off recovers exactly. The `spot` profile used to set 2.
+- `DistributedConfig.shuffle_replication` defaults to **1** (`config/config.py`), and no
+  profile raises it (`config/profiles.py`, the `spot` block). The 3-node run recorded in
+  `benchmarks/BENCHMARK_RESULTS.md` on 2026-09-24 found that above 1 a worker loss dropped
+  that worker's share of the rows (109,832 against 146,582) while replication off recovered
+  exactly, and the `spot` profile stopped setting 2. **The cause has since been found and
+  fixed in code** (`010b7790`, 2026-09-28): every shuffle publishes its map buckets under its
+  own `next_stage_base` block, but `replicate_shuffle_output` defaulted to stage 0, so each
+  replica copied a ticket nobody had published and read back empty. `stages` is now a
+  required argument, and `test_every_shuffle_declares_the_stages_it_publishes` pins it to the
+  block each driver reserves. **No cluster run since the fix is recorded**, and the default
+  and the `spot` profile were left where the defect put them, so treat "replication above 1
+  recovers exactly" as unverified on hardware at `971fa7a1`.
 
-So re-fetch recovery exists but is not safe to turn on; a spot cluster recomputes. What is still missing
-is the rest of the durability half: there is no external shuffle service, so a bucket cannot
-outlive its worker except by replication, and inside the combiner tree only the leaf partials
-are copied — an interior combiner's output lives on one node, so a loss there still costs a
-recompute round.
+So re-fetch recovery exists but is off by default; a spot cluster recomputes. What is still
+missing is the rest of the durability half: there is no external shuffle service, so a bucket
+cannot outlive its worker except by replication.
+
+**Interior combiner outputs are replicated (verified at `971fa7a1`).** Until `99193864`
+(2026-08-11) only the combiner tree's leaf partials carried copies, and this section said so.
+`dist/shuffle_replication.py::replicate_interior_outputs` now copies each level's merged
+partials off-node, called per level from `dist/flight_aggregate.py::_tree_reduce`, through
+`dist/flight_worker.py::replicate_tickets`, which copies an explicit ticket list rather than a
+mapper's whole `(stage, src, *)` row. `test_the_combiner_tree_replicates_its_interior_levels`
+and its replication-off control pin that the copies are placed and acked. They do not kill a
+worker mid-tree, because the fault hooks fire before and after the map barrier, so "an
+interior replica served a loss" is argued by construction rather than observed.
 
 **Bucket eviction: FIXED (2026-07-26).** `clear_plan`/`release` were bound end to end through
 Rust with **zero production call sites** — only the streaming pipeline released anything — so a
@@ -748,7 +811,7 @@ sequence so they cannot drift.
   **The changelog half is done, for the operator it mattered most for.** A running aggregate
   — the one with no watermark, so nothing evicts and the state only grows — now records the
   *partial* each micro-batch folded in rather than rewriting the whole state
-  (`core/streaming/folds.py::_AggFold.take_delta`, written by
+  (`core/streaming/folds/running.py::_AggFold.take_delta`, written by
   `checkpoint/state_store.py::snapshot_delta`, replayed by `restore_chain`). It is sound for
   exactly the reason the mergeable algebra exists: `combine` is associative and commutative
   (invariant #7), so a base plus every partial after it *is* the state. Measured over a run,
@@ -757,11 +820,14 @@ sequence so they cannot drift.
 
   Two limits are deliberate and should not be read as oversights. A delta is written only
   when it is at least twice as small as the state, so a stream that touches every group every
-  batch keeps whole snapshots and can never be worse off. And **only an operator whose state
-  never shrinks may use a chain**: the windowed aggregate, the watermark dedup and keyed state
-  all evict, a chain cannot express a removal, and replaying one would resurrect what they
-  dropped. That is opt-in per processor
-  (`streaming_query/processors.py::AggregateProcessor.snapshot_delta`) and pinned by
+  batch keeps whole snapshots and can never be worse off. And **an operator that removes
+  state may use a chain only if the chain can carry the removal**: the watermark dedup and
+  keyed state evict arbitrary entries, a chain cannot express that, and replaying one would
+  resurrect what they dropped. The windowed aggregate is the one evicting operator that
+  qualifies, through the one-integer prefix tombstone described above
+  (`streaming_query/processors.py::WindowedAggregateProcessor.snapshot_delta`); an earlier
+  version of this paragraph listed it among the excluded, which `971fa7a1` contradicts. The
+  chain is opt-in per processor (`AggregateProcessor.snapshot_delta` beside it) and pinned by
   `tests/integration/test_streaming_state_changelog.py`, because nothing else would catch it
   — a resurrected window is a wrong number, not an error.
 - **The driver is still a single point of failure.** `_run_resilient` restarts from the last
@@ -774,10 +840,23 @@ sequence so they cannot drift.
 Exactly-once *is* real for Delta (idempotent `txn` actions, genuinely good), for the file sink
 by batch position (`resume=True` skips a `part-batch<id>` already present), and — by a different
 route — for a **keyed** write to a database or operational store: `mode="upsert"`/`"update"`/
-`"delete"` writes the same keys to the same values, so a replayed micro-batch is a no-op with no
-transaction log involved (`TransactionalStreamSink._KEYED_MODES`). Everything else — Iceberg,
-Hudi, and any `mode="append"` — gets an ordinary append, and `TransactionalStreamSink.open()`
-warns once that a replayed epoch writes its rows twice.
+`"delete"`/`"delete_insert"` writes the same keys to the same values, so a replayed micro-batch
+is a no-op with no transaction log involved (`TransactionalStreamSink._KEYED_MODES`,
+`io/formats/streaming/sinks.py`).
+
+**Iceberg, re-checked at `971fa7a1`.** This paragraph used to put Iceberg with the
+at-least-once formats; that was true when it was written (2026-08-11) and is stale for a
+single-node stream. `IcebergSink.is_committed` (`io/formats/lakehouse/iceberg/sink.py`, landed
+in `18b85ead`) records the stream's `(app_id, batch_id)` in the snapshot summary and finds it
+again on replay, the rule Delta's `txn` uses, so `TransactionalStreamSink` treats Iceberg as
+idempotent. Two limits remain. A **distributed** streaming write to Iceberg is refused with a
+`PlanError` (`api/io_namespace/writer.py`, the `_MODE_AWARE_SINKS` check; pinned by
+`tests/integration/test_distributed_continuous_streaming.py::test_distributed_streaming_to_iceberg_is_refused_not_downgraded`),
+so a distributed exactly-once stream still means Delta. And the replay check is tested through
+fake sinks (`tests/io/test_streaming_table_sink.py`), not against a real Iceberg catalog.
+Hudi and any other format without `is_committed`, written with `mode="append"`, get an ordinary
+append, and `TransactionalStreamSink.open()` warns once that a replayed epoch writes its rows
+twice.
 
 ### 5. The AI moat was shipped disabled — **fixed (the CPU→GPU overlap is now default)**
 
@@ -992,10 +1071,25 @@ general form of that shape is still open; at this size it does not need the gene
 **So the honest state of this ceiling: the quadratic plan is gone, the memory wall with it, and
 the operator now wins below ~500,000 rows and loses above ~1,000,000 — except against a small
 right side, where it no longer sorts at all.** The named next step is the block
-decomposition above — which is also what would make the operator *distributable*, since both
-need the same "which block pairs can intersect" pruning. Today the distributed planner has no
-range-join staging and executes the operator whole, which satisfies single-node == distributed
-(`test_distributed_equals_single_node`) without scaling it out.
+decomposition above — which is also what would let the operator *co-partition* across a cluster, since both
+need the same "which block pairs can intersect" pruning.
+
+**Distributed range joins, re-checked at `971fa7a1`.** This paragraph used to say the
+distributed planner had no range-join staging and executed the operator whole. That is no
+longer true. `dist/executor.py::_distributed_range_join` broadcasts the right side and
+range-joins each partition of the left against it through the same
+`dist/executors/join.py::broadcast_probe_join` the equi-join's broadcast path uses, and it also
+serves an aggregate over a range join. It is gated by `_range_join_distributable`: the join type
+must be broadcast-safe (`plan/distribution/mergeable.py::BROADCAST_SAFE_JOINS`, the left-driven
+types, so `right` and `full` are excluded), both sides must be map-only, and the probe side must
+read a genuinely splittable source. When the measured right side is empty or exceeds
+`OptimizerConfig.resolved_broadcast_max_bytes`, it raises a `PlanError` naming the fixes
+rather than running the join on one node or replicating an oversized side. Coverage is
+`tests/integration/test_distributed_sample_and_range_join.py`, including
+`test_oversized_build_side_refuses_rather_than_replicating`, and the 2026-09-22 cluster record
+in `benchmarks/BENCHMARK_RESULTS.md`. What is still missing is a strategy for two large sides:
+an inequality has no key to co-partition on, so broadcast is the only distributed form, and the
+block-pair pruning above is what a second one would need.
 
 One property worth recording separately, because it is real and it is not an execution win: on
 the zero-copy Arrow input both engines actually share, Batcher is **14x to 600x faster**, because
@@ -1635,8 +1729,9 @@ In dependency order. (1) and (2) are the ones that change what Batcher *is*.
    instead of rewriting its whole state every epoch, and the *windowed* aggregate spills its
    cold windows instead of raising. What is left is the state the ordered-eviction trick does
    not reach: a keyed store with point lookups, so the **unwindowed** aggregate and keyed state
-   degrade instead of raising; a changelog for the evicting operators, which needs a tombstone
-   the current one has no way to express; and a driver that is not a single point of failure. Until those land, do not claim Flink parity —
+   degrade instead of raising; a changelog for the operators that evict arbitrary entries (the
+   watermark dedup and keyed state; the windowed aggregate has one, via its prefix tombstone),
+   which needs a per-key tombstone the current one has no way to express; and a driver that is not a single point of failure. Until those land, do not claim Flink parity —
    and refuse, loudly, the shapes that cannot be honoured (the distributed watermark gate and the
    unwindowed-watermark refusal both do).
 6. **Decouple tasks from nodes**; turn on speculation and skew splitting by default.

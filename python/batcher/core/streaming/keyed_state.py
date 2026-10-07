@@ -24,7 +24,8 @@ once to find the stale ones, twice more to size the retained bytes for the budge
 metrics — would make a ten-million-key space pay thirty million dict steps per second to
 expire nothing. Insertion order *is* touch order here
 (a touched key is reinserted, and the clock is held non-decreasing), so expiry walks the
-stale prefix and stops at the first live key, and the byte estimate is a running maximum
+stale prefix and stops at the first live key, and the byte estimate is a running total
+charged when a key's state is stored and credited back when it is replaced or forgotten,
 rather than a scan.
 
 **Checkpointable state.** State is a flat mapping of scalars, so the whole key space
@@ -37,6 +38,7 @@ cannot survive a restart is a demo.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from itertools import pairwise
 from typing import Any
@@ -56,12 +58,25 @@ __all__ = ["KeyedStateFold"]
 #: ever sees a state mapping.
 _TOUCHED = "__bt_state_touched_us"
 
-#: The column the group key rides in when the state is snapshotted. One JSON-encoded
-#: column rather than one column per key: the keys may be any mix of types, and a snapshot
-#: whose *shape* depends on the key types cannot be restored by a run that has not yet
-#: seen a row. JSON is the same encoding the checkpoint's offset log already uses for an
-#: opaque source position.
+#: The legacy key column: the whole key tuple JSON-encoded. Still read on restore so a
+#: checkpoint written before typed keys existed restarts, but no longer written, because JSON
+#: cannot encode a timestamp, date, decimal or bytes key and the first checkpointed commit of
+#: such a query raised `TypeError`.
 _KEY = "__bt_state_key"
+
+#: Prefix of the typed key columns, one per group-key component (`__bt_state_key_0`, ...).
+#: Each keeps the key's Arrow type, so any key the group-by accepted round-trips exactly.
+#: Restore needs no type in advance: the snapshot carries the columns it was written with.
+_KEY_PREFIX = "__bt_state_key_"
+
+#: What one retained slot costs before its payload: a boxed scalar, its dict slot, and its
+#: share of the containers around it, rounded up. Charged per state field, per key component
+#: and once per entry, so a key space of small scalars costs what it always did.
+_SLOT_BYTES = 64
+
+#: Scalars whose retained size grows with their value. Everything else a state may hold (an
+#: int, a float, a bool, None, a date) is fixed-width and fits in one slot.
+_VARIABLE_WIDTH = (str, bytes, bytearray)
 
 
 class KeyedStateFold:
@@ -73,12 +88,13 @@ class KeyedStateFold:
         "_clock",
         "_dropped",
         "_fn",
+        "_had_state",
+        "_held",
         "_input_ir",
         "_keys",
         "_nat",
         "_state",
         "_ttl",
-        "_widest",
     )
 
     def __init__(self, node: TransformWithState) -> None:
@@ -90,16 +106,25 @@ class KeyedStateFold:
         # Constant for the query, so read and serialize it once rather than per micro-batch
         # (the same hoist `_AggFold` makes, and for the same reason).
         self._cfg = active_config().engine_config_json()
-        #: ``{key_tuple: (state_mapping, last_touched_micros)}``, in **last-touched order**.
-        #: A touched key is removed and reinserted so it moves to the end, which is what lets
-        #: `_expire` stop at the first key that is still live instead of walking the rest.
-        self._state: dict[tuple, tuple[dict[str, Any], int]] = {}
+        #: ``{key_tuple: (state_mapping, last_touched_micros, charged_bytes)}``, in
+        #: **last-touched order**. A touched key is removed and reinserted so it moves to the
+        #: end, which is what lets `_expire` stop at the first key that is still live instead
+        #: of walking the rest. `charged_bytes` is what the entry added to `_held`, kept so
+        #: removing it credits back exactly that and the total never drifts.
+        self._state: dict[tuple, tuple[dict[str, Any], int, int]] = {}
         self._cap = active_config().memory.streaming_state_budget_bytes()
         self._dropped = 0
-        #: The most state fields any key has held. A running maximum rather than a scan, so
-        #: the budget check is O(1); it never falls when a wide key is forgotten, which
-        #: over-estimates the footprint and is the safe direction for a cap.
-        self._widest = 0
+        #: Bytes the retained entries are charged, maintained incrementally: added when an
+        #: entry is stored, subtracted when it is replaced, forgotten or expired. O(1) to read,
+        #: so the budget check and the metrics never scan the key space, and it tracks the
+        #: *payload* -- a key holding a 10 MiB string is charged its 10 MiB, which a per-field
+        #: constant charged as 192 bytes.
+        self._held = 0
+        #: Whether this fold has ever held a key. Once it has, an emptied key space must
+        #: still be checkpointed (as a zero-row snapshot): writing nothing leaves the older
+        #: snapshot as the newest, and a restart would restore every key that had since
+        #: expired or been forgotten.
+        self._had_state = False
         #: The last stamp handed out, held non-decreasing. `time.time()` can step backwards
         #: (an NTP correction), and a key stamped into the future would sit at the head of
         #: the order and stop expiry for every key behind it.
@@ -127,16 +152,20 @@ class KeyedStateFold:
         rows = self._nat.execute_plan(self._input_ir, [[batch]], self._cfg)
         out: list[pa.RecordBatch] = []
         now = self._tick()
+        stale_before = now - self._ttl if self._ttl > 0 else None
         for key, group in _group_by(rows, self._keys):
             previous = self._state.get(key)
+            if previous is not None and stale_before is not None and previous[1] < stale_before:
+                # Past its TTL but not yet swept: expiry runs at the end of the batch, so
+                # without this a key with new rows got its expired state back. A state
+                # lives until its TTL expires, and not one call longer.
+                previous = None
             produced, new_state = self._fn(key, group, previous[0] if previous else None)
             # Removed either way: a forgotten key is gone, and a retained one has to be
             # *reinserted* to move to the end of the last-touched order `_expire` reads.
-            self._state.pop(key, None)
+            self._forget(key)
             if new_state is not None:
-                checked = _check_state(new_state, key)
-                self._widest = max(self._widest, len(checked))
-                self._state[key] = (checked, now)
+                self._store(key, _check_state(new_state, key), now)
             emitted = _as_batch(produced)
             if emitted is not None and emitted.num_rows:
                 out.append(emitted)
@@ -173,14 +202,27 @@ class KeyedStateFold:
             return []
         cutoff = self._tick() - self._ttl
         stale = []
-        for key, (_, touched) in self._state.items():
+        for key, (_, touched, _charge) in self._state.items():
             if touched >= cutoff:
                 break  # and so is everything behind it — the order guarantees it
             stale.append(key)
         for key in stale:
-            del self._state[key]
+            self._forget(key)
         self._dropped = len(stale)
         return []
+
+    def _store(self, key: tuple, fields: dict[str, Any], touched: int) -> None:
+        """Retain `fields` for `key` at the end of the touch order, charging its footprint."""
+        self._had_state = True
+        charge = _entry_bytes(key, fields)
+        self._state[key] = (fields, touched, charge)
+        self._held += charge
+
+    def _forget(self, key: tuple) -> None:
+        """Drop `key` if it is retained, crediting back exactly what storing it charged."""
+        entry = self._state.pop(key, None)
+        if entry is not None:
+            self._held -= entry[2]
 
     def _check_bounded(self) -> None:
         """Fail loudly when the retained state has outgrown its budget."""
@@ -204,21 +246,18 @@ class KeyedStateFold:
     def nbytes(self) -> int:
         """A conservative estimate of the retained state's footprint.
 
-        The state is a Python dict of small mappings, so `sys.getsizeof` on the container
-        undercounts it by the size of everything it points at. Charging a flat per-entry
-        cost plus the key and value counts tracks the shape that actually grows — the
-        number of keys — which is what the budget is defending against.
+        The running total `_store` and `_forget` maintain: each entry is charged a slot per
+        field and per key component, plus the retained size of every variable-width value,
+        when it is stored, and credited back the same amount when it is replaced or dropped.
+        Reading it is O(1), which matters because it is read twice per micro-batch (the
+        budget check and the metrics); a scan here was two walks of the key space per
+        trigger.
 
-        The field count is the running maximum `push` maintains, not a scan of every value.
-        This is called twice per micro-batch (the budget check and the metrics), so a scan
-        here was two full walks of the key space per trigger to compute a number that
-        changes only when a key holds more fields than any key ever has.
+        The previous estimate charged a constant per field, so a key holding one 10 MiB
+        string was charged 192 bytes, and the budget meant to stop a runaway state could
+        not see the state that runs away fastest.
         """
-        if not self._state:
-            return 0
-        per_field = 64  # a boxed scalar plus its dict slot, rounded up
-        fields = 1 + self._widest
-        return len(self._state) * (per_field * (fields + len(self._keys)))
+        return self._held
 
     def metrics(self) -> StateOperatorProgress:
         """This operator's retained state after the last `push`."""
@@ -230,21 +269,36 @@ class KeyedStateFold:
         )
 
     def state(self) -> pa.RecordBatch | None:
-        """The whole key space as one checkpointable batch, or None when empty.
+        """The whole key space as one checkpointable batch, or None if no key was ever held.
 
-        The key rides as JSON in one column rather than as one column per key, because a
-        snapshot whose *shape* depends on the key types cannot be restored by a run that
-        has not yet seen a row — and restore happens before the first row by construction.
+        Each key component rides in its own typed column (`_KEY_PREFIX`), so a timestamp,
+        decimal or binary key round-trips exactly; the snapshot carries its own columns, so
+        a restore before the first row needs no type in advance.
+
+        An emptied key space is a zero-row batch, not None. None writes no snapshot, which
+        leaves an older one as the newest, and a restart restored keys that had expired.
         """
         if not self._state:
-            return None
-        keys = [json.dumps(list(key)) for key in self._state]
-        touched = [stamp for _, stamp in self._state.values()]
-        fields = sorted({name for value, _ in self._state.values() for name in value})
-        columns: dict[str, Any] = {_KEY: pa.array(keys, type=pa.string())}
+            if not self._had_state:
+                return None
+            return pa.record_batch({_TOUCHED: pa.array([], type=pa.int64())})
+        entries = list(self._state.items())
+        columns: dict[str, Any] = {}
+        for i in range(len(self._keys)):
+            columns[f"{_KEY_PREFIX}{i}"] = pa.array([key[i] for key, _ in entries])
+        fields = sorted({name for _, (value, _, _c) in entries for name in value})
         for name in fields:
-            columns[name] = pa.array([value.get(name) for value, _ in self._state.values()])
-        columns[_TOUCHED] = pa.array(touched, type=pa.int64())
+            try:
+                columns[name] = pa.array([value.get(name) for _, (value, _, _c) in entries])
+            except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+                from batcher._internal.errors import PlanError
+
+                raise PlanError(
+                    f"transform_with_state: state field {name!r} holds values of different "
+                    f"types across keys, so the key space cannot be checkpointed ({exc}). "
+                    "Give the field one type for every key."
+                ) from exc
+        columns[_TOUCHED] = pa.array([stamp for _, (_v, stamp, _c) in entries], type=pa.int64())
         return pa.record_batch(columns)
 
     def restore(self, state: pa.RecordBatch) -> None:
@@ -252,25 +306,50 @@ class KeyedStateFold:
 
         The snapshot's row order is the last-touched order `state()` wrote it in, and
         rebuilding in that order is what keeps `_expire`'s early stop correct across a
-        restart. The derived counters are rebuilt with it: a restored `_widest` of zero
-        would report a near-empty footprint and leave the state budget unenforced until
-        some key happened to be touched.
+        restart. The byte total is rebuilt with it: a restored total of zero would report an
+        empty footprint and leave the state budget unenforced until every key had been
+        touched again.
         """
         self._state = {}
-        self._widest = 0
-        if state is None or state.num_rows == 0:
+        self._held = 0
+        if state is None:
             return
-        names = [n for n in state.schema.names if n not in (_KEY, _TOUCHED)]
-        keys = state.column(_KEY).to_pylist()
+        # A snapshot exists, so this fold had state: an empty restore must keep checkpointing.
+        self._had_state = True
+        if state.num_rows == 0:
+            return
+        names = state.schema.names
+        key_columns = sorted(
+            (n for n in names if n.startswith(_KEY_PREFIX)),
+            key=lambda n: int(n[len(_KEY_PREFIX) :]),
+        )
+        fields = [n for n in names if n not in (_KEY, _TOUCHED) and n not in key_columns]
+        if key_columns:
+            parts = [state.column(n).to_pylist() for n in key_columns]
+            keys = [tuple(p[i] for p in parts) for i in range(state.num_rows)]
+        else:  # a checkpoint from before typed keys
+            keys = [tuple(json.loads(k)) for k in state.column(_KEY).to_pylist()]
         touched = state.column(_TOUCHED).to_pylist()
-        values = {name: state.column(name).to_pylist() for name in names}
+        values = {name: state.column(name).to_pylist() for name in fields}
         ordered = sorted(range(len(keys)), key=lambda i: int(touched[i]))
         for i in ordered:
-            key = tuple(json.loads(keys[i]))
-            fields = {n: values[n][i] for n in names}
-            self._widest = max(self._widest, len(fields))
-            self._state[key] = (fields, int(touched[i]))
+            self._store(keys[i], {n: values[n][i] for n in fields}, int(touched[i]))
         self._clock = max(self._clock, int(touched[ordered[-1]]))
+
+
+def _entry_bytes(key: tuple, fields: dict[str, Any]) -> int:
+    """What one retained entry costs: a slot per value, plus each variable-width payload.
+
+    `sys.getsizeof` on a `str` or `bytes` is its real retained size, header included, so a
+    large payload is charged in full. A fixed-width scalar fits in its slot. O(fields), paid
+    once when the entry is stored -- the same pass `_check_state` already makes over it.
+    """
+    total = _SLOT_BYTES  # the entry itself: its dict slot, tuple and inner mapping
+    for value in (*key, *fields.values()):
+        total += _SLOT_BYTES
+        if isinstance(value, _VARIABLE_WIDTH):
+            total += sys.getsizeof(value)
+    return total
 
 
 def _now_micros() -> int:

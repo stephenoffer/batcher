@@ -93,7 +93,7 @@ class Embedder:
 (
     bt.read.parquet("s3://bucket/docs.parquet")
     .map_batches(Embedder, batch_size=512, num_gpus=1.0, concurrency=4)
-    .write.parquet("output/embeddings.parquet")
+    .write.parquet("output/embeddings.parquet", mode="overwrite")
 )
 ```
 

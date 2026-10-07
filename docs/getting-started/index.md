@@ -27,11 +27,15 @@ print(bt.sql(query, orders=orders).to_pydict())
 # {'region': ['east', 'west'], 'revenue': [80.0, 165.0]}
 ```
 
-Real files change nothing else:
+Real files change nothing else. A write replaces existing output unless you say otherwise, so this one goes to a fresh temporary directory and passes `mode="error"`, which refuses to touch a path that already exists:
 
 ```python
-orders.write.parquet("orders.parquet")
-print(bt.read.parquet("orders.parquet").count())
+import os
+import tempfile
+
+out = os.path.join(tempfile.mkdtemp(), "orders.parquet")
+orders.write.parquet(out, mode="error")
+print(bt.read.parquet(out).count())
 # 3
 ```
 

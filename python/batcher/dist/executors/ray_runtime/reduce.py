@@ -24,7 +24,12 @@ from typing import Any
 
 from batcher._internal import events
 
-__all__ = ["gather_in_windows", "run_bucket_reduce"]
+__all__ = ["RELAUNCH", "check_complete", "gather_in_windows", "run_bucket_reduce"]
+
+#: A `failed` entry meaning "a bucket is unfinished but no source needs regenerating". Never a
+#: source id (those are non-negative), so `recompute` can skip it while the recovery loop
+#: still sees a non-empty `failed` and runs another round.
+RELAUNCH = -1
 
 
 def gather_in_windows(launch: Callable[[Any], Any], items: list[Any], workers: int) -> list[Any]:
@@ -254,6 +259,13 @@ def run_bucket_reduce(
         window = _reduce_window(workers)
         for start in range(0, len(pending), window):
             _reduce_chunk(pending[start : start + window], failed)
+        if not failed and len(done) < n_buckets:
+            # A bucket finished neither "ok" nor with a source to recompute: its host died
+            # holding no map output (more workers than partitions), or the failure could not
+            # be attributed to a host. An empty `failed` is the loop's "complete" signal, so
+            # returning it here handed back a result without that bucket's rows. Ask for
+            # another round instead; the bucket relaunches on a live host.
+            failed.add(RELAUNCH)
         return done, failed
 
     def _reduce_chunk(chunk: list[int], failed: set[int]) -> None:
@@ -355,6 +367,8 @@ def run_bucket_reduce(
 
     def recompute(failed_srcs: set[int]) -> None:
         for src in failed_srcs:
+            if src == RELAUNCH:
+                continue  # nothing to regenerate; the next attempt relaunches the bucket
             # The HOST holding `src` is what died, and that is `src` itself only until this
             # source has been relocated once. Marking `src` unconditionally would re-mark an
             # already-dead worker and leave the real one live for `_pick_live`/`_host_for` to
@@ -395,4 +409,24 @@ def run_bucket_reduce(
         with contextlib.suppress(Exception):
             recompute({s for host in proactive for s in placement.sources_on(host)})
 
-    return ShuffleRecovery(recovery_policy(), label=kind).run(attempt, recompute)
+    result = ShuffleRecovery(recovery_policy(), label=kind).run(attempt, recompute)
+    check_complete(kind, n_buckets, result)
+    return result
+
+
+def check_complete(kind: str, n_buckets: int, result: dict[int, Any]) -> None:
+    """Refuse to report success unless exactly one result was accepted per bucket.
+
+    The recovery loop's success signal is "no failures this round", which is a statement about
+    the round, not about the result. Checked here, at the one place every bucket's result is
+    assembled, so no future path out of `attempt` can return a short shuffle as a success.
+    """
+    missing = [b for b in range(n_buckets) if b not in result]
+    extra = [b for b in result if not 0 <= b < n_buckets]
+    if missing or extra:
+        from batcher._internal.errors import ResourceError
+
+        raise ResourceError(
+            f"{kind} shuffle finished without a result for every bucket "
+            f"(missing {missing[:8]}, unexpected {extra[:8]} of {n_buckets})"
+        )

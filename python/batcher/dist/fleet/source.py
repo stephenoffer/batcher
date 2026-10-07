@@ -65,12 +65,12 @@ class FlightFetchSplit:
         # worker at all.
         session = local_session(self.addr)
         if session is not None:
-            batches = session.fetch(self.addr, str(self.ticket))
+            batches = session.fetch(self.addr, str(self.ticket), required=True)
         else:
             # No session in this process (the driver collecting an intermediate itself).
             # Pooled, so an adaptive stage re-reading this intermediate reuses the channel
             # it already has to the holding actor rather than dialling it again per read.
-            batches = process_client().fetch(self.addr, str(self.ticket))
+            batches = process_client().fetch(self.addr, str(self.ticket), required=True)
         if projection is not None:
             batches = [b.select(projection) for b in batches]
         return batches

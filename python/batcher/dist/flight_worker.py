@@ -340,6 +340,10 @@ try:
             # largest buckets to local disk and reads them back on fetch, which is
             # result-preserving. Set before the server is created: each store captures the
             # cap at construction so its bound cannot shift mid-query.
+            # Its spills land on the same scratch every other spill path uses — the
+            # configured `spill_dir`, else the node's measured local volume — rather than a
+            # tempdir that may be a small RAM-backed tmpfs.
+            from batcher._internal.site import local_scratch_root
             from batcher.carbonite.policies import shuffle_store_cap
 
             # The gather's shape and its memory bound: how many concurrent Flight streams
@@ -354,6 +358,7 @@ try:
                 shuffle_store_cap(cfg),
                 cfg.flow_control.gather_streams,
                 cfg.flow_control.gather_inflight_bytes,
+                cfg.memory.spill_dir or local_scratch_root(),
             )
 
             # Shuffle TLS (off unless the operator mounted certs and enabled it). Read
@@ -824,7 +829,12 @@ try:
             """
             _use_plan(plan_id)
             for ticket in tickets:
-                self.session.publish(ticket, self.session.fetch(primary_addr, ticket))
+                # `required`: the primary published this ticket, so an absent one is lost
+                # data, and copying it leniently would publish an *empty* replica that every
+                # later reducer would trust as the bucket.
+                self.session.publish(
+                    ticket, self.session.fetch(primary_addr, ticket, required=True)
+                )
             return self.session.addr
 
         def reduce_fetch(

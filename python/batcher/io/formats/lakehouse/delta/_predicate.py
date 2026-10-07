@@ -87,7 +87,7 @@ def to_partition_filters(
         if column not in partitions:
             return False
         # A partition value is stored in the path, so delta-rs compares it as text.
-        out.append((column, _PARTITION_OPS[operator], str(_unwrap(value))))
+        out.append((column, _PARTITION_OPS[operator], _partition_text(value)))
         return True
 
     return out if walk(ir) else None
@@ -146,10 +146,23 @@ def _render(node: dict[str, Any], column: Callable[[str], str]) -> str:
     raise _Unrenderable(str(kind))
 
 
-def _unwrap(node: dict[str, Any]) -> Any:
-    """The Python value of a literal IR node."""
-    ((_kind, value),) = node["value"].items()
-    return value
+def _partition_text(node: dict[str, Any]) -> str:
+    """A literal IR node as the text a Delta partition value is written in.
+
+    A temporal literal travels in the IR as an epoch count (days for a date, microseconds
+    for a timestamp), and ``str`` of that count is ``'19727'``, which delta-rs cannot parse
+    as a date, so every ``replace_where`` on a date partition failed at commit. The text
+    form is the one the log stores and the sink writes (`_commit._partition_str`):
+    ``2024-01-05`` and ``2024-01-05 00:00:00``.
+    """
+    import datetime as dt
+
+    ((kind, raw),) = node["value"].items()
+    if kind == "date" and raw is not None:
+        return (dt.date(1970, 1, 1) + dt.timedelta(days=int(raw))).isoformat()
+    if kind == "timestamp" and raw is not None:
+        return str(dt.datetime(1970, 1, 1) + dt.timedelta(microseconds=int(raw)))
+    return str(raw)
 
 
 def _literal(value: dict[str, Any]) -> str:

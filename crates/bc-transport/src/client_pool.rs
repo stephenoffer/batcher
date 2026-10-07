@@ -138,8 +138,10 @@ impl ClientPool {
     ///
     /// If the cached connections are stale (the peer restarted), the first attempt
     /// fails with a transport/connect error; the peer's pool is then reset and the
-    /// fetch is retried once on a fresh connection. A `NotFound` (empty bucket)
-    /// is not a connection fault and is returned as-is.
+    /// fetch is retried once on a fresh connection.
+    ///
+    /// **Lenient**: an unpublished ticket reads as an empty partition. Use it only where the
+    /// caller cannot know whether the producer published; see [`Self::fetch_required`].
     pub async fn fetch_with_credits(
         &self,
         addr: &str,
@@ -151,6 +153,26 @@ impl ClientPool {
 
     /// As [`Self::fetch_with_credits`], presenting `token` to an auth-gated peer.
     pub async fn fetch_secured(
+        &self,
+        addr: &str,
+        ticket: &ShuffleTicket,
+        credits: u32,
+        token: Option<&str>,
+    ) -> TransportResult<Vec<RecordBatch>> {
+        match self.fetch_required(addr, ticket, credits, token).await {
+            Err(TransportError::MissingTicket(_)) => Ok(Vec::new()),
+            other => other,
+        }
+    }
+
+    /// Fetch a bucket the caller knows was published: an absent ticket is
+    /// [`TransportError::MissingTicket`], never an empty partition.
+    ///
+    /// For copying a mapper's bucket to a replica, and for reading a stage output through a
+    /// handle the producer returned. In both the ticket exists by construction, so absence
+    /// means it was lost, and a lenient read would publish or return an empty bucket in its
+    /// place.
+    pub async fn fetch_required(
         &self,
         addr: &str,
         ticket: &ShuffleTicket,
@@ -178,6 +200,12 @@ impl ClientPool {
         if let Ok((batches, starved, first)) = out.as_ref() {
             let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
             crate::record_fetch(addr, bytes as u64, started.elapsed(), *starved, *first);
+        }
+        if matches!(out, Err(TransportError::MissingTicket(_))) {
+            // The peer answered: it is reachable and its round trip moved no rows, so it
+            // registers with zero bytes and no starvation rather than being forgotten.
+            crate::record_fetch(addr, 0, started.elapsed(), Duration::ZERO, Duration::ZERO);
+            return out.map(|(batches, ..)| batches);
         }
         if out.is_err() {
             // Every failure path lands here, including a first `acquire` that could not
@@ -298,6 +326,13 @@ impl ClientPool {
     /// The union of the shards is the whole group, and order within it is not preserved (the
     /// reducer re-orders or commutatively combines downstream, as it already must across
     /// sources).
+    ///
+    /// **Strict**: every ticket in the group must be registered on the peer. The server
+    /// refuses a group with any member missing rather than streaming the members it has, and
+    /// that refusal arrives here as [`TransportError::MissingTicket`] naming the absent ones.
+    /// A grouped response is therefore complete by construction: it cannot carry two of
+    /// three required buckets while looking like a valid stream. The gather answers the
+    /// refusal by fetching bucket by bucket, which is what attributes the loss to a source.
     pub async fn fetch_secured_group_striped(
         &self,
         addr: &str,
@@ -339,6 +374,22 @@ impl ClientPool {
 
 /// Whether an error is a transport/connection failure (a dead peer / stale
 /// channel) worth redialing — i.e. the retryable class (see [`classify`]).
+///
+/// A missing or lost bucket is retryable for the *recovery loop* (try a replica, then
+/// recompute) but not a connection fault: the peer answered, and redialing it would ask the
+/// same question of the same store.
 fn is_connection_error(err: &TransportError) -> bool {
-    classify(err) == FetchFault::Retryable
+    classify(err) == FetchFault::Retryable && !is_lost_bucket(err)
+}
+
+/// Whether the peer answered that the bucket is absent (`MissingTicket`) or unreadable
+/// (`DataLoss`).
+fn is_lost_bucket(err: &TransportError) -> bool {
+    let code = match err {
+        TransportError::MissingTicket(_) => return true,
+        TransportError::Status(s) => s.code(),
+        TransportError::Flight(arrow_flight::error::FlightError::Tonic(s)) => s.code(),
+        _ => return false,
+    };
+    code == tonic::Code::DataLoss
 }

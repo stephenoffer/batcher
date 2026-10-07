@@ -552,6 +552,72 @@ def test_a_permanent_failure_is_raised_on_the_first_attempt(uri, monkeypatch) ->
     assert attempts["n"] == 1
 
 
+class _AckLostConnection:
+    """A real SQLite connection whose first `commit` lands and then loses its reply.
+
+    That is the ambiguous case: the server holds the rows, while the client sees the same
+    dropped-connection error as a commit that never arrived.
+    """
+
+    lost_acks = 0
+
+    def __init__(self, path: str) -> None:
+        self._conn = sqlite3.connect(path)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def commit(self) -> None:
+        self._conn.commit()
+        if _AckLostConnection.lost_acks == 0:
+            _AckLostConnection.lost_acks += 1
+            raise ConnectionError("server closed the connection unexpectedly")
+
+
+@pytest.fixture
+def ack_lost(uri, monkeypatch):
+    """Route the sink's connections through `_AckLostConnection`, one lost ack per test."""
+    seed = pa.table({"id": [1], "amt": [1.0]})
+    DBAPISink(uri=uri, mode="append", key_columns=("id",)).write(seed, "orders")
+    DBAPISink(uri=uri, mode="append").write(seed, "log")  # no key: nothing refuses a repeat
+    _AckLostConnection.lost_acks = 0
+    path = uri.removeprefix("sqlite:///")
+    monkeypatch.setattr(_source, "_connect", lambda *a, **k: _AckLostConnection(path))
+    return uri
+
+
+def test_an_append_whose_commit_ack_is_lost_is_not_repeated(ack_lost) -> None:
+    """Retrying it wrote every row twice once the first commit had landed (BT-305)."""
+    sink = DBAPISink(
+        module="sqlite3",
+        connect_kwargs={},
+        dialect="sqlite",
+        mode="append",
+        retries=3,
+        retry_backoff_s=0,
+        create_table=False,
+    )
+    with pytest.raises(BackendError, match="outcome is unknown"):
+        sink.write(pa.table({"id": [2, 3], "amt": [2.0, 3.0]}), "log")
+    assert rows(ack_lost, "log") == [(1, 1.0), (2, 2.0), (3, 3.0)]
+
+
+def test_an_idempotent_mode_still_retries_a_lost_commit_ack(ack_lost) -> None:
+    sink = DBAPISink(
+        module="sqlite3",
+        connect_kwargs={},
+        dialect="sqlite",
+        mode="upsert",
+        key_columns=("id",),
+        retries=3,
+        retry_backoff_s=0,
+        create_table=False,
+    )
+    sink.write(pa.table({"id": [1, 2], "amt": [9.0, 2.0]}), "orders")
+    assert _AckLostConnection.lost_acks == 1
+    assert rows(ack_lost) == [(1, 9.0), (2, 2.0)]
+
+
 def test_a_borrowed_connection_is_left_for_its_owner_to_commit(tmp_path) -> None:
     path = tmp_path / "app.db"
     owner = sqlite3.connect(path)

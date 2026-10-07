@@ -266,6 +266,7 @@ class KafkaSource(BrokerSource):
         "_offset_reset",
         "_partitions",
         "_poll_timeout",
+        "_restored",
         "_start_at",
     )
 
@@ -319,6 +320,9 @@ class KafkaSource(BrokerSource):
         # the driver forever against an unreachable bootstrap server. Also kept out of
         # `options` for the same reason.
         self._metadata_timeout = metadata_timeout
+        # Whether a checkpoint was restored, after which a partition it does not name is a
+        # new one and starts at the earliest offset (`_start_offset`).
+        self._restored = False
 
     @property
     def bounded(self) -> bool:
@@ -386,19 +390,12 @@ class KafkaSource(BrokerSource):
         """Assign every partition of the topic, seeking each to its configured start."""
         from confluent_kafka import TopicPartition
 
-        assigned = []
-        for partition in self._discover_partitions():
-            token = self._resume_from.get(partition)
-            if token is not None:
-                offset = int(token) + 1
-            elif partition in self._start_at:
-                offset = self._start_at[partition]
-            else:
-                from confluent_kafka import OFFSET_BEGINNING, OFFSET_END
-
-                offset = OFFSET_END if self._offset_reset == "latest" else OFFSET_BEGINNING
-            assigned.append(TopicPartition(self.topic, partition, offset))
-        self._consumer.assign(assigned)
+        self._consumer.assign(
+            [
+                TopicPartition(self.topic, p, self._start_offset(self._consumer, p, group=False))
+                for p in self._discover_partitions()
+            ]
+        )
 
     def _on_assign(self, consumer: Any, partitions: list[Any]) -> None:
         """On a group rebalance, resume each assigned partition from *Batcher's* checkpoint.
@@ -411,20 +408,68 @@ class KafkaSource(BrokerSource):
         it: the group offset had already advanced past messages the engine never published, and
         nothing repositioned the consumer back to them.
 
-        A partition with no checkpointed position keeps the offset the broker assigned
-        (``auto.offset.reset``), which is the right default for a partition this consumer has
-        not read before.
+        Every partition is given a concrete offset here, including one the checkpoint knows
+        nothing about — see `_start_offset`.
         """
         for tp in partitions:
-            token = self._resume_from.get(tp.partition)
-            if token is not None:
-                tp.offset = int(token) + 1  # resume strictly *after* the last published row
-            elif tp.partition in self._start_at:
-                # A first run with an explicit `starting_offsets` map. Only when there is no
-                # checkpointed position: the checkpoint is the source of truth once a query
-                # has run, or a restart would rewind to the configured start every time.
-                tp.offset = self._start_at[tp.partition]
+            tp.offset = self._start_offset(consumer, tp.partition, group=True)
         consumer.assign(partitions)
+
+    def seek(self, position: dict) -> None:
+        """Resume from a checkpoint, which is then the *whole* truth about where to read.
+
+        Positions tracked before the seek are dropped first: an in-process recovery rolls
+        back to the last committed epoch, and a partition first read in the epoch it
+        abandoned must be re-read, not resumed after rows that were never published.
+
+        Args:
+            position: The ``{"offsets": {partition: offset}}`` a checkpoint recorded.
+        """
+        self._positions.clear()
+        super().seek(position)
+        self._restored = True
+
+    def _start_offset(self, consumer: Any, partition: int, *, group: bool) -> int:
+        """Where `partition` starts, resolved to a real offset and recorded as a position.
+
+        A checkpoint used to hold only the partitions that had *delivered* a message. An idle
+        partition — or one added to the topic later — had no entry, so a restart left it to
+        ``auto.offset.reset``, and under ``starting_offsets="latest"`` that is the head *at
+        restart*: every message that landed on it while the query was down was skipped, with
+        no error. Spark avoids this by recording the resolved start of every partition, and
+        so does this: the concrete start is recorded as the position just before it, so the
+        next checkpoint carries the partition whether or not it ever delivers.
+
+        A partition the restored checkpoint does not name was added after it was written, so
+        it starts at the earliest offset, which is Spark's rule for a new partition: the
+        query had never read it, so none of it has been processed.
+
+        Args:
+            consumer: The client to resolve offsets with.
+            partition: The partition being assigned.
+            group: Whether the consumer group's committed offset outranks
+                ``auto.offset.reset`` (subscribe mode), as it does for the client itself.
+
+        Returns:
+            The first offset to read.
+        """
+        from confluent_kafka import TopicPartition
+
+        token = self._positions.get(partition)
+        if token is not None:
+            return int(token) + 1  # resume strictly *after* the last published row
+        tp = TopicPartition(self.topic, partition)
+        offset = None if self._restored else self._start_at.get(partition)
+        if offset is None and group and not self._restored:
+            committed = consumer.committed([tp], timeout=self._metadata_timeout)
+            stored = committed[0].offset if committed else -1
+            offset = stored if stored >= 0 else None
+        if offset is None:
+            low, high = consumer.get_watermark_offsets(tp, timeout=self._metadata_timeout)
+            latest = self._offset_reset == "latest" and not self._restored
+            offset = int(high if latest else low)
+        self._positions[partition] = offset - 1
+        return offset
 
     def _apply_seek(self, partition: int, token: Any) -> None:
         """Resume a checkpointed partition strictly after its published offset.
@@ -432,7 +477,7 @@ class KafkaSource(BrokerSource):
         With partitions explicitly assigned (the distributed split path) the consumer already
         owns them, so it is repositioned immediately. In subscribe mode ownership is decided by
         a group rebalance, so the seek cannot happen yet — `seek` has recorded the position in
-        `_resume_from` and `_on_assign` applies it the moment the group hands us the partition.
+        `_positions` and `_on_assign` applies it the moment the group hands us the partition.
         """
         if self._partitions is None:
             return  # deferred to `_on_assign` — see above

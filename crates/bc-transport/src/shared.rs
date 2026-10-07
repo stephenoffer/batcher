@@ -56,18 +56,34 @@ pub(crate) fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// replaces is token-authenticated and optionally mTLS, so the same-node fast path must
 /// not be the unauthenticated way in. Peers are the same OS user by construction (one Ray
 /// cluster, one worker account), so owner-only costs nothing that was ever intended to work.
+///
+/// Owner-only is *verified*, not just requested (see [`trusted_dir`]): a root another local
+/// user planted is skipped for the next base, and with none left the transfer falls back
+/// to Flight.
 fn shm_root() -> Option<PathBuf> {
     for base in ["/dev/shm", "/tmp"] {
         let p = std::path::Path::new(base);
         if p.is_dir() {
-            let root = p.join("batcher_shm");
-            if create_private_dir(&root).is_ok() {
+            if let Some(root) = trusted_dir(p.join("batcher_shm")) {
                 return Some(root);
             }
         }
     }
-    let root = std::env::temp_dir().join("batcher_shm");
-    create_private_dir(&root).ok().map(|()| root)
+    trusted_dir(std::env::temp_dir().join("batcher_shm"))
+}
+
+/// Create `dir` owner-only and return it only if it then *is* owner-only.
+///
+/// `create_private_dir` succeeds on a directory that already exists, and its chmod is
+/// best-effort, so on a world-writable mount it happily returns a directory another user
+/// pre-created 0777 -- into which they can rename a well-formed `.arrow` over a ticket a
+/// reducer is about to map, changing the answer -- or a symlink, under which
+/// `clear_shared`'s `remove_dir_all` deletes wherever it points. A directory that is not a
+/// real one, owned by this uid and closed to everyone else, is refused, which costs only
+/// the fast path: Flight is token-authenticated and always backs it.
+fn trusted_dir(dir: PathBuf) -> Option<PathBuf> {
+    create_private_dir(&dir).ok()?;
+    bc_arrow::verify_private_dir(&dir).then_some(dir)
 }
 
 /// Whether a shared-memory transfer directory is usable on this host.
@@ -86,8 +102,7 @@ fn sanitize(addr: &str) -> String {
 /// The file a partition published by `addr` under `ticket` lives at (producer and
 /// consumer derive the *same* path from data they both hold).
 fn shm_path(addr: &str, ticket: &str) -> Option<PathBuf> {
-    let dir = shm_root()?.join(sanitize(addr));
-    create_private_dir(&dir).ok()?;
+    let dir = trusted_dir(shm_root()?.join(sanitize(addr)))?;
     mark_owner(&dir);
     Some(dir.join(format!("{}.arrow", sanitize(ticket))))
 }
@@ -252,6 +267,21 @@ pub(crate) fn read_ipc_file(path: &std::path::Path) -> std::io::Result<Option<Ve
         return Ok(None);
     }
     Ok(read_mmap_zero_copy(mmap).ok())
+}
+
+/// Read an IPC file this process wrote and must find again, failing on anything short of it.
+///
+/// [`read_ipc_file`] is best-effort by design: on the shared-memory path a missing, short or
+/// undecodable file is a miss that Flight answers. A spilled shuffle bucket has no fallback.
+/// The store dropped its only in-memory copy when it wrote the file, so a missing, truncated
+/// or unreadable spill file means the data is lost. Reading that as "no batches" would serve
+/// a reducer an empty bucket. This reader reports each of those cases as an error instead.
+pub(crate) fn read_ipc_file_strict(path: &std::path::Path) -> std::io::Result<Vec<RecordBatch>> {
+    let file = File::open(path)?;
+    // SAFETY: as in `read_ipc_file` -- spill files are written temp-then-rename and never
+    // mutated in place.
+    let mmap = unsafe { Mmap::map(&file)? };
+    read_mmap_zero_copy(mmap).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Read the batches a same-node peer published under `(addr, ticket)`, or `None` if no
@@ -715,5 +745,51 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A peer directory someone else put in place as a symlink must not be published into
+    /// or read from: the link's owner chose where the bucket lands, and so what a reducer
+    /// maps back. `create_private_dir` follows the link and succeeds, so the refusal has to
+    /// come from verifying the result; the caller then falls back to Flight.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_peer_directory_is_refused() {
+        let Some(root) = shm_root() else { return };
+        let addr = &test_addr("symlinked-peer");
+        let peer = root.join(sanitize(addr));
+        let _ = fs::remove_dir_all(&peer);
+        let elsewhere =
+            std::env::temp_dir().join(format!("bc-shm-elsewhere-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&elsewhere);
+        create_private_dir(&elsewhere).expect("target");
+        std::os::unix::fs::symlink(&elsewhere, &peer).expect("plant the link");
+
+        let published = publish_shared(addr, "link/0/0/0", &[batch(&[1])]);
+        let landed = fs::read_dir(&elsewhere).map(|d| d.count()).unwrap_or(0);
+        let _ = fs::remove_file(&peer);
+        let _ = fs::remove_dir_all(&elsewhere);
+
+        assert!(published.is_err(), "published through a planted symlink");
+        assert_eq!(landed, 0, "the bucket landed where the link pointed");
+    }
+
+    /// `trusted_dir` refuses a symlink even to a directory that is itself private, and
+    /// accepts a real one it created.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_dir_refuses_a_symlink_and_accepts_a_real_directory() {
+        let scratch = std::env::temp_dir().join(format!("bc-trusted-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&scratch);
+        let real = scratch.join("real");
+        let link = scratch.join("link");
+        create_private_dir(&real).expect("real");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+
+        let accepted = trusted_dir(real.clone());
+        let refused = trusted_dir(link);
+        let _ = fs::remove_dir_all(&scratch);
+
+        assert_eq!(accepted, Some(real));
+        assert_eq!(refused, None);
     }
 }

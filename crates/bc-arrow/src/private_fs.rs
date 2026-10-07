@@ -70,6 +70,44 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Whether `dir` is a real directory this process owns and no one else can enter.
+///
+/// [`create_private_dir`] cannot promise that. It tolerates a chmod it could not apply and
+/// follows a symlink, and both are what a local attacker reaches for on a shared,
+/// world-writable mount: pre-create the path 0777 under their own uid, and the "private"
+/// directory is one they can rename a planted file into; make it a symlink, and a later
+/// `remove_dir_all` beneath it deletes under whatever it points at. A caller about to *trust*
+/// what it reads back from the directory -- the same-node shm fast path, which maps a bucket
+/// as authoritative shuffle data -- asks this afterwards and uses the directory only on
+/// `true`. Checked with `symlink_metadata`, so a link is judged as a link, not as its target.
+///
+/// On a non-unix platform there is no owner or mode to check, so any real directory passes,
+/// matching what `create_private_dir` can do there.
+#[must_use]
+pub fn verify_private_dir(dir: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.uid() == effective_uid() && meta.mode() & 0o077 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, touches no memory, and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -150,5 +188,65 @@ mod tests {
             .write_all(b"ab")
             .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"ab");
+    }
+
+    #[test]
+    fn a_created_directory_verifies_as_private() {
+        let scratch = Scratch::new("verify-ok");
+        let dir = scratch.join("d");
+        create_private_dir(&dir).unwrap();
+        assert!(verify_private_dir(&dir));
+    }
+
+    /// The mode a chmod could not tighten -- a directory another uid planted -- is refused,
+    /// not accepted because `create_private_dir` returned `Ok`.
+    #[test]
+    fn a_group_or_world_accessible_directory_does_not_verify() {
+        let scratch = Scratch::new("verify-mode");
+        let dir = scratch.join("loose");
+        std::fs::create_dir(&dir).unwrap();
+        for mode in [0o777, 0o750, 0o701] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                !verify_private_dir(&dir),
+                "mode {mode:o} verified as private"
+            );
+        }
+    }
+
+    /// A symlink to a private directory is still a symlink: whoever could create the link
+    /// decides where reads and deletes beneath it land.
+    #[test]
+    fn a_symlink_to_a_private_directory_does_not_verify() {
+        let scratch = Scratch::new("verify-link");
+        let target = scratch.join("target");
+        create_private_dir(&target).unwrap();
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(verify_private_dir(&target));
+        assert!(!verify_private_dir(&link));
+    }
+
+    /// A directory another uid owns does not verify even at 0700. `/root` is the one such
+    /// directory a test box reliably has; the case is vacuous when it is absent or when the
+    /// test runs as root, so it asserts only when the precondition holds.
+    #[test]
+    fn a_directory_owned_by_another_user_does_not_verify() {
+        use std::os::unix::fs::MetadataExt;
+        let other = Path::new("/root");
+        if let Ok(m) = std::fs::symlink_metadata(other) {
+            if m.is_dir() && m.uid() != effective_uid() && m.mode() & 0o077 == 0 {
+                assert!(!verify_private_dir(other));
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_path_or_a_file_does_not_verify() {
+        let scratch = Scratch::new("verify-missing");
+        assert!(!verify_private_dir(&scratch.join("absent")));
+        let file = scratch.join("f");
+        create_private_file(&file).unwrap();
+        assert!(!verify_private_dir(&file));
     }
 }
