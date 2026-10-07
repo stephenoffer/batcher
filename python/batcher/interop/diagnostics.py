@@ -206,7 +206,10 @@ def describe_unconvertible(column: str, value: object, dtype: pa.DataType | None
         A message of the form "column 'x' holds a sequence of uuid.UUID, which Arrow cannot
         represent. For a uuid.UUID, ...".
     """
-    short = reprlib.Repr(maxstring=40, maxother=40)
+    # Set as attributes, not constructor keywords: ``Repr`` takes keywords only from
+    # Python 3.12, and the declared floor is 3.11.
+    short = reprlib.Repr()
+    short.maxstring = short.maxother = 40
     if is_scalar_column(value):
         return (
             f"column {column!r} is a single {_type_label(value)} ({short.repr(value)}), not a "
