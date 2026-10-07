@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.compat.guidance import DT_UNSUPPORTED, accessor_attribute_error
@@ -33,6 +33,12 @@ from batcher.plan.expr_ir.namespaces._calendar import (
     tz_policies,
 )
 from batcher.plan.ir_tags import MICROS_PER_DAY
+
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.declared import DtBound as _Bound
+else:
+    # The runtime class binds these methods with `setattr`; checkers read `declared`.
+    _Bound = object
 
 # Offset-string units → (months, days, micros) contribution per unit count. `mo`
 # must precede `m` in the regex so "mo" parses as months, not minutes.
@@ -160,7 +166,7 @@ def _wrap_temporal(other: Any) -> Expr:
     )
 
 
-class _DtNamespace:
+class _DtNamespace(_Bound):
     """Date/time field extractions on a temporal column: ``col("d").dt.year()``, ``.dt.hour()``.
 
     The available extractors are **data, not code**: each is one row in

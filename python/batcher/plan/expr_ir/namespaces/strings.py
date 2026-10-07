@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError, require_bool, require_choice, require_int
 from batcher.plan.expr_ir.compat.guidance import STR_UNSUPPORTED, accessor_attribute_error
@@ -26,6 +26,12 @@ from batcher.plan.expr_ir.namespaces._dialect import (
 )
 from batcher.plan.expr_ir.namespaces.dynamic import str_call
 from batcher.plan.expr_ir.nodes import ListJoin
+
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.declared import StrBound as _Bound
+else:
+    # The runtime class binds these methods with `setattr`; checkers read `declared`.
+    _Bound = object
 
 # Where `str.chunk` may end a chunk; mirrors `bc-expr`'s `chunk::Boundary`.
 _CHUNK_BOUNDARIES = frozenset({"char", "word", "sentence", "line"})
@@ -108,7 +114,7 @@ _CASE_STYLES = frozenset(
 )
 
 
-class _StrNamespace:
+class _StrNamespace(_Bound):
     """String functions on a text column: ``col("s").str.upper()``, ``.str.contains("x")``.
 
     The parameterless string→string transforms are **data, not code**

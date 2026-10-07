@@ -53,6 +53,12 @@ if TYPE_CHECKING:
     from batcher.plan.expr_ir.selectors.core import _SelectorNameNamespace
     from batcher.plan.expr_ir.video import _VideoNamespace
 
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.declared import AggExprBound as _AggExprBound
+else:
+    # `AggExpr` borrows `Expr`'s math methods with `setattr`; checkers read `declared`.
+    _AggExprBound = object
+
 # A value that can be promoted to an expression: another Expr or a Python scalar.
 IntoExpr = Union["Expr", int, float, bool, str]
 #: One ``ORDER BY`` key of an ordered aggregate: the key expression, ``descending``, and
@@ -6661,7 +6667,7 @@ def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr] | None) -> list[IntoE
     return list(keys)
 
 
-class AggExpr:
+class AggExpr(_AggExprBound):
     """An aggregate over an optional input expression.
 
     Built via `col(...).sum()` etc. or the top-level `count()`; bound to an output

@@ -11,13 +11,19 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError, require_int
 from batcher.config.option_types import MappingStrategy
 from batcher.plan.expr_ir.core import Expr, FrameSpec, IntoExpr, Lit, _col_or_expr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
+
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.declared import CaseBuilderBound as _Bound
+else:
+    # The runtime class binds these methods with `setattr`; checkers read `declared`.
+    _Bound = object
 
 
 @expr_node
@@ -63,7 +69,7 @@ class Case(IRNode):
         }
 
 
-class CaseBuilder:
+class CaseBuilder(_Bound):
     """Fluent CASE builder: ``when(c).then(v).when(c2).then(v2).otherwise(d)``.
 
     A builder that has at least one ``then`` is already an expression, as Polars' ``Then``

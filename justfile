@@ -131,6 +131,12 @@ surface-diff path="/tmp/batcher-surface.json":
 gen-exports:
     python tools/gen_lazy_exports.py
 
+# Regenerate the typing declarations for methods bound onto expression classes at runtime
+# (the parameterless `.str`/`.dt`/`.list` accessors, `AggExpr` math, `CaseBuilder` operators).
+# Run after adding a row to an accessor table; `tests/unit/test_bound_decls.py` gates the drift.
+gen-decls:
+    python tools/gen_bound_decls.py
+
 # Regenerate MAP.md — the file-level index of what every module is for. It is derived
 # from each module's own docstring and each crate's manifest, so it cannot drift; run
 # this after adding, moving, or re-documenting a module. `--check` runs in CI.

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1643 Python modules across 235 packages and 341 Rust files across 14 crates.
+Covering 1644 Python modules across 236 packages and 341 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -2543,12 +2543,12 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 603 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 7241 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 7247 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 376 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 568 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 421 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
-| `nodes.py` | 715 | Leaf IR nodes the `Expr` base class does not construct. |
+| `nodes.py` | 721 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 278 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 385 | Structural traversals over the expression tree. |
@@ -2560,7 +2560,14 @@ Migration-error guidance for `Expr` and its typed accessors.
 | module | lines | what it is |
 |---|---|---|
 | `guidance.py` | 510 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
-| `namespaces.py` | 311 | Ecosystem-compatible spellings on the typed accessor namespaces. |
+
+### `batcher/plan/expr_ir/declared/` — 1 · contract
+
+Typing declarations for the methods bound onto expression classes at runtime.
+
+| module | lines | what it is |
+|---|---|---|
+| `bound.py` | 337 | Typing declarations for the methods bound onto expression classes at runtime. |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
 
@@ -2573,12 +2580,12 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | `_descriptions.py` | 399 | The curated per-accessor docstrings, keyed by accessor name. |
 | `_dialect.py` | 175 | Plan-time constants for the `.str` parameters that select another engine's semantics. |
 | `_json_path.py` | 170 | Plan-time check of the JSONPath subset the engine's `.json` kernels navigate. |
-| `collections.py` | 2272 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
+| `collections.py` | 2278 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
 | `dynamic.py` | 77 | Build a string function whose parameters may be columns rather than constants. |
 | `meta.py` | 317 | The `.meta` accessor: questions about an expression's *shape*, answered without data. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
-| `strings.py` | 4826 | The `.str` accessor namespace. |
-| `temporal.py` | 1666 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
+| `strings.py` | 4832 | The `.str` accessor namespace. |
+| `temporal.py` | 1672 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
 
 ### `batcher/plan/expr_ir/selectors/` — 1 · contract
 
