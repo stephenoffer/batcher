@@ -514,7 +514,7 @@ pub(crate) fn partials(
         .collect()
 }
 
-/// Contiguous runs of morsels whose first key column's value ranges do not overlap.
+/// Runs of morsels (as indices) whose first key column's value ranges do not overlap.
 ///
 /// This is the partition the relation already has, for free. `partitioned_aggregate` pays
 /// [`ops::partition_morsels`] — a gather of every row of every column into hash buckets — to
@@ -552,7 +552,7 @@ pub(crate) fn key_disjoint_runs(
     morsels: &[RecordBatch],
     keys: &[String],
     workers: usize,
-) -> Option<Vec<std::ops::Range<usize>>> {
+) -> Option<Vec<Vec<usize>>> {
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{DataType, Int64Type};
 
@@ -608,6 +608,11 @@ pub(crate) fn key_disjoint_runs(
 
     let bounds: Vec<(i64, i64)> = morsels.par_iter().map(bounds_of).collect::<Option<_>>()?;
 
+    // Cut in key order (a stable sort on the data, never on timing): TPC-H `lineitem`'s files are
+    // `l_orderkey` ranges listed `.1`, `.10`, `.100`, ..., which arrival order left uncuttable.
+    let mut order: Vec<usize> = (0..morsels.len()).collect();
+    order.sort_by_key(|&i| bounds[i].0);
+
     // A cut must be legal against **everything that follows**, not the next morsel alone. This
     // was `hi < bounds[i + 1].0` with `hi` reset per cut, which asks the weaker question; the
     // two agree on an ordered relation and not on a **concatenation of two**, where the left
@@ -619,23 +624,24 @@ pub(crate) fn key_disjoint_runs(
     // is the fix, still one O(morsels) pass, and the prefix max is **not** reset at a cut —
     // the guarantee is about all earlier runs, not the current one.
     let mut suffix_min = vec![i64::MAX; morsels.len() + 1];
-    for i in (0..morsels.len()).rev() {
-        suffix_min[i] = suffix_min[i + 1].min(bounds[i].0);
+    for p in (0..morsels.len()).rev() {
+        suffix_min[p] = suffix_min[p + 1].min(bounds[order[p]].0);
     }
 
     // Close a run at the first *legal* cut past its share of the rows.
-    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut runs: Vec<Vec<usize>> = Vec::new();
     let (mut start, mut rows, mut prefix_max) = (0usize, 0usize, i64::MIN);
-    for i in 0..morsels.len() {
+    for p in 0..morsels.len() {
+        let i = order[p];
         rows += morsels[i].num_rows();
         prefix_max = prefix_max.max(bounds[i].1);
-        let cuttable = i + 1 < morsels.len() && prefix_max < suffix_min[i + 1];
+        let cuttable = p + 1 < morsels.len() && prefix_max < suffix_min[p + 1];
         if cuttable && rows >= target {
-            runs.push(start..i + 1);
-            (start, rows) = (i + 1, 0);
+            runs.push(order[start..=p].to_vec());
+            (start, rows) = (p + 1, 0);
         }
     }
-    runs.push(start..morsels.len());
+    runs.push(order[start..].to_vec());
     (runs.len() >= workers.max(1).max(2)).then_some(runs)
 }
 
@@ -662,7 +668,7 @@ const MIN_DISJOINT_RUNS_PER_THREAD: usize = 2;
 /// relation.
 pub(crate) fn disjoint_run_aggregate(
     morsels: &[RecordBatch],
-    runs: &[std::ops::Range<usize>],
+    runs: &[Vec<usize>],
     group_keys: &[ProjectionItem],
     aggregates: &[AggregateItem],
     jit: &AggJit,
@@ -670,13 +676,13 @@ pub(crate) fn disjoint_run_aggregate(
 ) -> Result<Vec<RecordBatch>, InterpError> {
     runs.par_iter()
         .map(|run| {
-            let partial = match &morsels[run.clone()] {
+            let partial = match run.as_slice() {
                 [] => return Ok(None),
-                [only] => ops::eval_partial_jit(only, group_keys, aggregates, jit)?,
+                [only] => ops::eval_partial_jit(&morsels[*only], group_keys, aggregates, jit)?,
                 many => {
                     let parts: Vec<agg::Partial> = many
                         .iter()
-                        .map(|b| ops::eval_partial_jit(b, group_keys, aggregates, jit))
+                        .map(|&i| ops::eval_partial_jit(&morsels[i], group_keys, aggregates, jit))
                         .collect::<Result<_, _>>()?;
                     agg::combine(&parts, funcs)?
                 }
@@ -836,7 +842,7 @@ mod tests {
         };
         let mut seen: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
         for (r, run) in runs.iter().enumerate() {
-            for m in run.clone() {
+            for &m in run {
                 for &k in morsels[m].column(0).as_primitive::<Int64Type>().values() {
                     if let Some(&prev) = seen.get(&k) {
                         assert_eq!(prev, r, "key {k} appears in runs {prev} and {r}");
@@ -870,12 +876,13 @@ mod tests {
             runs.len()
         );
         // The runs tile the morsels exactly, and no key spans two of them.
-        assert_eq!(runs[0].start, 0);
-        assert_eq!(runs[runs.len() - 1].end, morsels.len());
+        let mut tiled: Vec<usize> = runs.iter().flatten().copied().collect();
+        tiled.sort_unstable();
+        assert_eq!(tiled, (0..morsels.len()).collect::<Vec<_>>());
         let mut last_max: Option<i64> = None;
         for run in &runs {
             let (mut lo, mut hi) = (i64::MAX, i64::MIN);
-            for b in &morsels[run.clone()] {
+            for b in run.iter().map(|&i| &morsels[i]) {
                 let a = b.column(0).as_primitive::<Int64Type>();
                 for i in 0..a.len() {
                     lo = lo.min(a.value(i));
@@ -889,6 +896,41 @@ mod tests {
                 );
             }
             last_max = Some(hi);
+        }
+    }
+
+    /// Ordered pieces arriving out of order -- TPC-H `lineitem`'s files listed `.1`, `.10`,
+    /// `.100`, `.11`, ... -- still cut, because the cuts are made in key order. Each run must
+    /// still be disjoint from every other, which is checked on the values, and the runs must
+    /// cover every morsel exactly once.
+    #[test]
+    fn ordered_pieces_out_of_order_still_cut_into_disjoint_runs() {
+        use arrow::array::AsArray;
+        use arrow::datatypes::Int64Type;
+        let per = 3i64;
+        // Eight pieces of fifty morsels, each piece an ascending key range of its own.
+        let piece = |p: usize| -> Vec<RecordBatch> {
+            (0..50)
+                .map(|m| keyed(((p * 50 + m) as i64) * 1_000 / per, 1_000, per))
+                .collect()
+        };
+        let morsels: Vec<RecordBatch> = [0usize, 7, 3, 1, 6, 2, 5, 4]
+            .iter()
+            .flat_map(|&p| piece(p))
+            .collect();
+        let keys = vec!["k".to_string()];
+        let runs = key_disjoint_runs(&morsels, &keys, 8).expect("ordered pieces yield runs");
+        assert!(runs.len() >= 8, "got {} runs", runs.len());
+        let mut tiled: Vec<usize> = runs.iter().flatten().copied().collect();
+        tiled.sort_unstable();
+        assert_eq!(tiled, (0..morsels.len()).collect::<Vec<_>>());
+        let mut owner: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        for (r, run) in runs.iter().enumerate() {
+            for &m in run {
+                for &k in morsels[m].column(0).as_primitive::<Int64Type>().values() {
+                    assert_eq!(*owner.entry(k).or_insert(r), r, "key {k} in two runs");
+                }
+            }
         }
     }
 

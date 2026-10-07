@@ -643,8 +643,19 @@ pub(crate) async fn read_parquet_inner(
         // string columns as `Dictionary`, cast back before returning (`late::DictionaryRead`).
         // A locating read keeps the plain decode: its metadata carries the row-number column,
         // which a supplied schema would have to restate.
+        // The native row filter installs when no late filter is installed or still timing the
+        // unfiltered side, and reads its string columns as `Dictionary` the same way.
+        let native = parsed.is_some()
+            && row_filter_cols.is_some()
+            && late.as_ref().is_none_or(|(l, on)| !on && !l.deciding());
         let dictionary = match (late.as_ref(), group) {
             (Some((l, true)), Some(g)) if !locate => l.dictionary_read(arrow_meta.schema(), g),
+            (_, Some(g)) if native && !locate => {
+                let cols = row_filter_cols.as_deref().unwrap_or_default();
+                late::dictionary_read(arrow_meta.schema(), g, |name| {
+                    cols.iter().any(|c| c == name)
+                })
+            }
             _ => None,
         };
         let (amd, dictionary) = match dictionary.and_then(|d| d.reader_metadata(&amd)) {
@@ -680,12 +691,13 @@ pub(crate) async fn read_parquet_inner(
             // when the probe above measured it worth doing, and only for a predicate proved to
             // carry the engine's own comparison semantics — unlike the pruning above, this
             // step *removes rows* rather than skipping provably-empty work.
+            // `native` is false while a late filter times the unfiltered side, which the native
+            // filter would turn into a third configuration. After `OFF` the native one installs.
             if let Some((late, true)) = late.as_ref() {
                 b = b.with_row_filter(late.row_filter(bloom_meta.parquet_schema()));
-            } else if late.as_ref().is_some_and(|(l, _)| l.deciding()) {
-                // Measuring the unfiltered side, which the native filter would turn into a third
-                // configuration. After `OFF` the read takes the native filter (`deciding`).
-            } else if let (Some(pred), Some(cols)) = (bloom_pred.as_ref(), rf_cols.as_ref()) {
+            } else if let (true, Some(pred), Some(cols)) =
+                (native, bloom_pred.as_ref(), rf_cols.as_ref())
+            {
                 b = b.with_row_filter(row_filter::build(pred, cols, bloom_meta.parquet_schema()));
             }
             let stream = b.build()?;
@@ -1250,6 +1262,56 @@ mod tests {
             vals64.contains(&big),
             "unsigned UInt64 group must be kept, got {vals64:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dictionary_string_row_filter_returns_the_matching_rows_as_strings() {
+        // The native row filter reads a dictionary-encoded string column as a `Dictionary`, so
+        // the comparison runs once per distinct value. The rows it keeps must be exactly the
+        // predicate's, and the column must come back as the file's own `Utf8`. Nulls are mixed
+        // in, and the matching value is rare enough (~1 %) that the selectivity gate installs
+        // the filter at all.
+        use arrow::array::StringArray;
+        let dir = std::env::temp_dir().join(format!("bcio_dictfilter_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.parquet");
+        let n: i64 = 300_000;
+        let modes = ["MAIL", "SHIP", "TRUCK", "RAIL", "FOB"];
+        let mode = |i: i64| -> Option<&'static str> {
+            match i % 97 {
+                0 => Some("AIR"),
+                1 => None,
+                k => Some(modes[(k % 5) as usize]),
+            }
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
+                Arc::new(StringArray::from((0..n).map(mode).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        write_parquet(&p, &[batch], 50_000);
+        let pred = r#"{"node":"cmp","col":"s","op":"eq","lit":"AIR"}"#;
+        let out = read_parquet_filtered(p.to_str().unwrap(), &[], None, 8192, pred).unwrap();
+        let mut keys = Vec::new();
+        for b in &out {
+            assert_eq!(b.schema().field(1).data_type(), &DataType::Utf8);
+            let s = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+            let k = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                assert_eq!(s.value(i), "AIR");
+                keys.push(k.value(i));
+            }
+        }
+        let want: Vec<i64> = (0..n).filter(|i| i % 97 == 0).collect();
+        assert_eq!(keys, want);
         std::fs::remove_dir_all(&dir).ok();
     }
 
