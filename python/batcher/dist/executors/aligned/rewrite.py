@@ -302,6 +302,11 @@ def colocate_aligned_joins(plan: LogicalPlan, aligned: frozenset[int]) -> Logica
     aligned tables in one subtree that joins on the key. Inner joins associate and commute
     through their key-equality pairs, so the relation is unchanged; whether the moved plan
     aligns better is the aligned planner's question, asked of both.
+
+    A semi or anti join over an inner join is first sunk to the side its keys come from
+    (`_sink_membership`), so the aligned side it filters is a leaf the move can reach: the
+    warm TPC-H q18 plan filters `orders JOIN customer` to the large orders, and sunk to
+    `orders`, the filter, `orders` and `lineitem` share one cut with `customer` above it.
     """
     from batcher.plan.visitor import transform_up
 
@@ -309,12 +314,53 @@ def colocate_aligned_joins(plan: LogicalPlan, aligned: frozenset[int]) -> Logica
 
     def step(node: LogicalPlan) -> LogicalPlan:
         if isinstance(node, Join):
+            sunk = _sink_membership(node)
+            if sunk is not None:
+                return sunk
             moved = _move(node, only, only, flatten=True)
             if moved is not None:
                 return moved
         return node
 
     return transform_up(plan, step)
+
+
+def _sink_membership(node: Join) -> LogicalPlan | None:
+    """A semi or anti join over an inner join, moved onto the inner join's input its keys
+    come from, or None.
+
+    `(A JOIN B) SEMI R ON a = r` is `(A SEMI R ON a = r) JOIN B`: the membership test reads
+    only `A`'s column, and the inner join neither changes that column's value on a row nor
+    keeps a row of `A` whose test failed. The same holds for an anti join, NULL keys included,
+    since a NULL key matches nothing on either side of the move.
+    """
+    if node.join_type not in ("semi", "anti"):
+        return None
+    inner = node.left
+    if not (isinstance(inner, Join) and inner.join_type == "inner"):
+        return None
+    # Only a membership join that passes its input through unchanged: the moved one returns
+    # the inner join's own output in its place.
+    passthrough = [JoinOutputCol("left", c, c) for c in inner.available_columns()]
+    if list(node.output) != passthrough:
+        return None
+    origin = {o.alias: (o.side, o.name) for o in inner.output}
+    sides = {origin[k][0] for k in node.left_keys if k in origin}
+    if len(sides) != 1 or not all(k in origin for k in node.left_keys):
+        return None
+    (side,) = sides
+    child = inner.left if side == "left" else inner.right
+    keys = tuple(origin[k][1] for k in node.left_keys)
+    filtered = Join(
+        left=child,
+        right=node.right,
+        left_keys=keys,
+        right_keys=node.right_keys,
+        join_type=node.join_type,
+        output=tuple(JoinOutputCol("left", c, c) for c in child.available_columns()),
+    )
+    filtered = _sink_membership(filtered) or filtered
+    return dataclasses.replace(inner, **{side: filtered})
 
 
 def group_broadcast_joins(

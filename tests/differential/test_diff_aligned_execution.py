@@ -678,6 +678,50 @@ def test_a_dimension_between_two_aligned_tables_is_moved_out_of_their_way(
     assert_same_for_query(got, _duck(tables, query), query)
 
 
+def test_a_membership_filter_over_a_dimension_join_sinks_to_the_table_it_filters(
+    tables, monkeypatch
+):
+    """TPC-H q18's warm plan: `lineitem JOIN ((orders JOIN customer) SEMI large_orders)`.
+
+    The semi join filters on an `orders` column, so it moves onto `orders`; then `lineitem`
+    moves down to it, and the large orders, their lines and the filter share one cut, with
+    `customer` (too large to hold) joined by the residual.
+    """
+    from batcher.dist.executors.aligned import rewrite
+
+    monkeypatch.setattr(aligned_run, "BROADCAST_BYTES", 1)
+    li, orders, cust = _read(tables, "lineitem"), _read(tables, "orders"), _read(tables, "customer")
+    big = li.group_by("l_ok").agg(q=col("l_qty").sum()).filter(col("q") > 100).select("l_ok")
+    big = big.select(b_ok=col("l_ok"))
+    filtered = orders.join(cust, left_on="o_ck", right_on="c_ck").join(
+        big, left_on="o_ok", right_on="b_ok", how="semi"
+    )
+    ds = (
+        li.join(filtered, left_on="l_ok", right_on="o_ok")
+        .group_by("l_ok", "c_seg")
+        .agg(s=col("l_qty").sum())
+    )
+    query = (
+        "SELECT l_ok, c_seg, sum(l_qty) AS s FROM lineitem JOIN orders ON l_ok = o_ok "
+        "JOIN customer ON o_ck = c_ck WHERE o_ok IN (SELECT l_ok FROM lineitem GROUP BY l_ok "
+        "HAVING sum(l_qty) > 100) GROUP BY l_ok, c_seg"
+    )
+    li_ids = {i for i, s in enumerate(ds._sources) if "l_ok" in s.schema().names}
+    o_id = next(i for i, s in enumerate(ds._sources) if "o_ok" in s.schema().names)
+
+    def all_facts_in_one_cut(found) -> bool:
+        return found is not None and any(li_ids | {o_id} <= cut.aligned for cut in found.cuts)
+
+    found = choose_plan(ds._plan, ds._sources, strict=False)
+    assert all_facts_in_one_cut(found)
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert got is not None
+    assert_same_for_query(got, _duck(tables, query), query)
+    # Positive control: with the semi join left above `customer`, no cut holds all three.
+    monkeypatch.setattr(rewrite, "_sink_membership", lambda node: None)
+    assert not all_facts_in_one_cut(choose_plan(ds._plan, ds._sources, strict=False))
+
+
 def test_a_broadcast_too_large_to_hold_is_cut_to_the_keys_another_broadcast_admits(
     tables, monkeypatch
 ):
