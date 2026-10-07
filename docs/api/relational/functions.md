@@ -49,6 +49,7 @@ Row-wise math, string, and date/time helpers usable anywhere an expression is.
    current_timestamp
    date_add
    date_sub
+   business_day_count
    date_part
    make_date
    make_timestamp

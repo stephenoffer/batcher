@@ -31,6 +31,14 @@ pub use error::ExprError;
 pub use select::ConjunctOrder;
 pub use supertype::common_supertype;
 
+/// The IANA time-zone database release compiled into the engine (e.g. `"2025b"`).
+///
+/// Every zone rule `convert_timezone`/`replace_timezone` and the zone-aware calendar kernels
+/// apply comes from this one compiled-in copy, not the host's `/usr/share/zoneinfo`, so the
+/// release is a property of the engine binary — and the one fact needed to explain why two
+/// builds disagree about a future instant in a zone whose rules changed in between.
+pub const TZDB_VERSION: &str = chrono_tz::IANA_TZDB_VERSION;
+
 /// What a payload's leading bytes say it is, or `None` when nothing recognizes them.
 ///
 /// Public so the IO layer can reach the *same* magic-number table the `.str.mime_type()`
@@ -602,12 +610,56 @@ pub enum Expr {
     /// `format` string (e.g. `%Y-%m-%d`). Null instants format to null. → Utf8.
     Strftime { input: Box<Expr>, format: String },
 
-    /// `convert_timezone(from_tz, to_tz, ts)` — shift each naive timestamp's
-    /// wall-clock from `from_tz` to `to_tz` (DST-aware). → Timestamp(us).
+    /// `convert_timezone(from_tz, to_tz, ts)` — the wall clock in `to_tz` of each instant.
+    /// → naive Timestamp(us).
+    ///
+    /// A naive input is a wall clock in `from_tz`, localized under the `ambiguous` /
+    /// `nonexistent` policies. A tz-aware input already names an instant, so it is read as
+    /// one: `from_tz` must then name the column's own zone, and a mismatch errors rather
+    /// than re-reading the instant as a wall clock in another zone (which silently shifted
+    /// it). Both policies default to `null`, today's DST behaviour.
     ConvertTimezone {
         input: Box<Expr>,
         from_tz: String,
         to_tz: String,
+        #[serde(default)]
+        ambiguous: Ambiguous,
+        #[serde(default)]
+        nonexistent: Nonexistent,
+    },
+
+    /// `replace_timezone(tz, ts)` — relabel each wall clock with a zone, keeping the clock
+    /// and so choosing a new instant (Polars `replace_time_zone`, pandas `tz_localize`).
+    /// → `Timestamp(us, tz)`, or a naive Timestamp(us) holding the local wall clock when `tz`
+    /// is absent. A naive input is localized in `tz`; an aware one is first read as its own
+    /// zone's wall clock. A DST gap or overlap follows `nonexistent` / `ambiguous`.
+    ReplaceTimezone {
+        input: Box<Expr>,
+        #[serde(default)]
+        tz: Option<String>,
+        #[serde(default)]
+        ambiguous: Ambiguous,
+        #[serde(default)]
+        nonexistent: Nonexistent,
+    },
+
+    /// A business-day calendar operation (`add_business_days`, `business_day_count`,
+    /// `is_business_day` with holidays). One variant, so the three share one definition of
+    /// "a business day": a weekday the `weekmask` admits (Monday first; absent = Monday to
+    /// Friday) that is not in `holidays` (days since the epoch). `other` is the per-row day
+    /// count for `add` and the end date for `count`.
+    BusinessDay {
+        #[serde(rename = "fn")]
+        func: BusinessDayFunc,
+        input: Box<Expr>,
+        #[serde(default)]
+        other: Option<Box<Expr>>,
+        #[serde(default)]
+        holidays: Vec<i32>,
+        #[serde(default)]
+        weekmask: Option<[bool; 7]>,
+        #[serde(default)]
+        roll: BusinessRoll,
     },
 
     /// `strptime(s, format)` — parse a Utf8 column into a Timestamp(microsecond)
@@ -618,9 +670,14 @@ pub enum Expr {
     /// `strptime`, Polars `to_date(strict=True)`), for a pipeline where a bad value must
     /// stop the query rather than become a null nobody looks at. `serde(default)` keeps
     /// every existing document meaning what it meant.
+    ///
+    /// `format` is one format or a list tried in order (DuckDB `strptime(s, [f1, f2])`):
+    /// each value takes the first that parses it, and `strict` raises only when every
+    /// format fails. A single format still travels as a plain string.
     Strptime {
         input: Box<Expr>,
-        format: String,
+        #[serde(deserialize_with = "one_or_many")]
+        format: Vec<String>,
         #[serde(default)]
         strict: bool,
     },
@@ -2667,6 +2724,69 @@ pub enum DateFunc {
     /// ISO 8601 week-numbering year (DuckDB `isoyear`), which can differ from the
     /// calendar year near January 1st. → Int64.
     IsoYear,
+    /// Nanoseconds since the Unix epoch at the input's own resolution (DuckDB
+    /// `epoch_ns`): a `Timestamp(ns)` keeps every digit, a coarser unit is scaled. An
+    /// overflowing scale is null. → Int64.
+    EpochNs,
+    /// The nanosecond within the second, 0–999,999,999 (Polars `dt.nanosecond`), read at the
+    /// input's resolution, so a `Timestamp(ns)` reports its last three digits. → Int64.
+    Nanosecond,
+}
+
+/// What `convert_timezone`/`replace_timezone` do with a wall clock a DST *overlap* makes
+/// ambiguous (it happens twice). Wire tags are snake_case.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ambiguous {
+    /// Null for that row (the historical behaviour).
+    #[default]
+    Null,
+    /// Error the query, naming the value.
+    Raise,
+    /// The first occurrence (the earlier instant, still on the pre-transition offset).
+    Earliest,
+    /// The second occurrence (the later instant).
+    Latest,
+}
+
+/// What `convert_timezone`/`replace_timezone` do with a wall clock a DST *gap* skips (it
+/// never happens). Wire tags are snake_case.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Nonexistent {
+    /// Null for that row (the historical behaviour).
+    #[default]
+    Null,
+    /// Error the query, naming the value.
+    Raise,
+    /// The first instant after the gap (pandas `nonexistent="shift_forward"`).
+    ShiftForward,
+}
+
+/// The operation an [`Expr::BusinessDay`] performs. Wire tags are snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessDayFunc {
+    /// Move `other` business days from `input` (numpy `busday_offset`). Type-preserving.
+    Add,
+    /// Business days in `[input, other)`, negative when `other < input` (numpy
+    /// `busday_count`). → Int64.
+    Count,
+    /// Whether `input` is a business day (numpy `is_busday`). → Boolean.
+    Is,
+}
+
+/// How `add_business_days` treats a start date that is not itself a business day.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessRoll {
+    /// Error the query (numpy's default).
+    #[default]
+    Raise,
+    /// Roll to the next business day first.
+    Forward,
+    /// Roll to the previous business day first.
+    Backward,
 }
 
 /// One `WHEN condition THEN value` branch of a `Case`.
@@ -2737,6 +2857,30 @@ pub enum BinaryOp {
     /// Add `right` calendar months to a Date32/Timestamp `left` (negative to
     /// subtract); used for `date + INTERVAL n MONTH/YEAR`.
     AddMonths,
+    /// Add `right` calendar days to a Date32/Timestamp `left` (negative to subtract), the
+    /// per-row form of `offset_by("Nd")`: a tz-aware timestamp moves by local days, so the
+    /// clock reads the same across a DST change.
+    AddDays,
+}
+
+/// Deserialize a field that is either one string or a list of them (`Strptime.format`).
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) if !v.is_empty() => Ok(v),
+        OneOrMany::Many(_) => Err(serde::de::Error::custom(
+            "strptime needs at least one format",
+        )),
+    }
 }
 
 /// Deserialize a float literal that may arrive as a JSON number (finite) or as a
@@ -3040,5 +3184,87 @@ mod str_date_tests {
         assert_eq!(out.value(0), 99.0); // 1 < 2 → then
         assert_eq!(out.value(1), 5.0); // 5 < 2 false → else
         assert!(out.is_null(2)); // null when → else (null), not 99
+    }
+}
+
+/// The temporal wire shapes exactly as Python's `to_ir()` emits them
+/// (`tests/unit/data/ir_snapshot_golden.json`): every optional field absent at its default,
+/// and a single parse format still a plain string.
+#[cfg(test)]
+mod temporal_wire_tests {
+    use super::*;
+
+    fn parse(json: &str) -> Expr {
+        serde_json::from_str(json).expect("the Python wire shape deserializes")
+    }
+
+    #[test]
+    fn zone_and_calendar_shapes_round_trip() {
+        let Expr::ConvertTimezone {
+            ambiguous,
+            nonexistent,
+            ..
+        } = parse(
+            r#"{"e":"convert_timezone","input":{"e":"col","name":"d"},"from_tz":"UTC",
+                "to_tz":"Asia/Tokyo"}"#,
+        )
+        else {
+            panic!("expected ConvertTimezone")
+        };
+        assert_eq!(
+            (ambiguous, nonexistent),
+            (Ambiguous::Null, Nonexistent::Null)
+        );
+        let Expr::ReplaceTimezone {
+            tz,
+            ambiguous,
+            nonexistent,
+            ..
+        } = parse(
+            r#"{"e":"replace_timezone","input":{"e":"col","name":"d"},"tz":"Europe/Paris",
+                "ambiguous":"latest","nonexistent":"shift_forward"}"#,
+        )
+        else {
+            panic!("expected ReplaceTimezone")
+        };
+        assert_eq!(tz.as_deref(), Some("Europe/Paris"));
+        assert_eq!(
+            (ambiguous, nonexistent),
+            (Ambiguous::Latest, Nonexistent::ShiftForward)
+        );
+        let Expr::BusinessDay {
+            func,
+            other,
+            holidays,
+            weekmask,
+            roll,
+            ..
+        } = parse(r#"{"e":"business_day","fn":"is","input":{"e":"col","name":"d"}}"#)
+        else {
+            panic!("expected BusinessDay")
+        };
+        assert_eq!(func, BusinessDayFunc::Is);
+        assert!(other.is_none() && holidays.is_empty() && weekmask.is_none());
+        assert_eq!(roll, BusinessRoll::Raise);
+    }
+
+    #[test]
+    fn strptime_takes_one_format_or_a_list() {
+        let formats = |json: &str| match parse(json) {
+            Expr::Strptime { format, .. } => format,
+            _ => panic!("expected Strptime"),
+        };
+        assert_eq!(
+            formats(r#"{"e":"strptime","input":{"e":"col","name":"s"},"format":"%Y"}"#),
+            vec!["%Y"]
+        );
+        assert_eq!(
+            formats(r#"{"e":"strptime","input":{"e":"col","name":"s"},"format":["%Y","%d"]}"#),
+            vec!["%Y", "%d"]
+        );
+        assert!(serde_json::from_str::<Expr>(
+            r#"{"e":"strptime","input":{"e":"col","name":"s"},"format":[]}"#
+        )
+        .is_err());
     }
 }

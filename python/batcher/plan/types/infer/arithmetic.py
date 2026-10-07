@@ -423,6 +423,11 @@ def binary_type(expr: Binary, schema: SchemaRef, infer: InferFn) -> pa.DataType 
         # `||` renders both operands as text whatever their types (the engine stringifies
         # a number, a date and a list alike), so the result is String unconditionally.
         return pa.string()
+    if op in ("add_months", "add_days"):
+        # A per-row calendar shift keeps the date or the zoned timestamp it shifts.
+        from batcher.plan.types.infer.temporal import calendar_shift_type
+
+        return calendar_shift_type(infer(expr.left, schema))
     if op not in _BINARY_ARITH and op not in ("div", "floor_div"):
         return None
 

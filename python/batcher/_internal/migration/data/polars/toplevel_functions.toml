@@ -26,7 +26,7 @@ arctan2d = { status = "gap", need = "arctan2d (degrees)", wave = "W3" }
 arg_sort_by = { status = "gap", need = "arg_sort_by", wave = "W8" }
 arg_where = { status = "gap", need = "arg_where", wave = "W8" }
 build_info = { status = "canonical", batcher = "bt.versions" }
-business_day_count = { status = "gap", need = "business_day_count", wave = "W6" }
+business_day_count = { status = "mismatch", batcher = "bt.business_day_count", note = "week_mask= is spelled weekmask=; holidays= matches and the range is the same half-open [start, end)", wave = "W6" }
 coalesce = { status = "canonical", batcher = "bt.coalesce" }
 col = { status = "canonical", batcher = "bt.col", template = 'col(name) <-> bt.col(name)' }
 collect_all = { status = "gap", need = "collect_all (execute several plans with shared subplans)", wave = "W8" }

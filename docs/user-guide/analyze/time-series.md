@@ -52,6 +52,19 @@ print(bucketed.to_pydict())
 
 Carry the count alongside the average. It is the difference between a bucket that was quiet and a bucket where the sensor was down, and the average alone cannot tell you which.
 
+The bucket grid starts at the Unix epoch unless you move it. `origin=` names a `datetime` the grid passes through and `offset=` slides it by a fixed duration, so half-hour buckets at :15 and :45 are `offset="15m"`. `closed="right"` makes each bucket `(start, end]` instead of `[start, end)`, so a reading exactly on a boundary belongs to the bucket it ends, and `label="right"` labels each bucket by its end. These match Polars `group_by_dynamic`'s `offset`, `closed` and `label`, and apply to tumbling windows.
+
+```python
+shifted = (
+    readings.filter(bt.col("sensor") == "a")
+    .group_by(bucket=bt.window(bt.col("at"), "30m", offset="15m", label="right"))
+    .agg(n=bt.col("celsius").count())
+    .sort("bucket")
+)
+print(shifted.to_pydict())
+# {'bucket': [datetime.datetime(2024, 5, 1, 9, 15), datetime.datetime(2024, 5, 1, 9, 45)], 'n': [3, 1]}
+```
+
 For overlapping windows, pass `slide`: `bt.window(col("at"), "1h", "15m")` returns the *list* of hour-wide windows a reading belongs to, hopping every fifteen minutes. Fan it out with {py:meth}`unnest <batcher.Dataset.unnest>` before grouping.
 
 ## Fill the buckets with no rows

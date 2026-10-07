@@ -671,6 +671,7 @@ fn engine_features() -> Vec<&'static str> {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     hardware::tune_allocator();
     m.add("__engine_version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__tzdata_version__", bc_expr::TZDB_VERSION)?;
     // The build profile, so the benchmark harness can refuse to report a timing taken
     // against an unoptimized engine. `just build` (the dev profile) sets no `opt-level`
     // and leaves `debug_assertions` on, while every comparator is an installed release

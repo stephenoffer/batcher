@@ -44,6 +44,7 @@ from batcher.plan.expr_ir.core import (
     Not,
 )
 from batcher.plan.expr_ir.func_nodes import (
+    BusinessDay,
     ConvertTimezone,
     DateFunc,
     DateOffset,
@@ -65,6 +66,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListZipStruct,
     MakeTemporal,
     MapFunc,
+    ReplaceTimezone,
     SpatialFunc,
     Strftime,
     StrFunc,
@@ -200,6 +202,23 @@ def _representatives() -> dict[str, Any]:
         "strftime": Strftime(Col("d"), "%Y-%m-%d"),
         "strptime": Strptime(Col("s"), "%Y-%m-%d"),
         "strptime_strict": Strptime(Col("s"), "%Y-%m-%d", strict=True),
+        "strptime_formats": Strptime(Col("s"), ["%Y-%m-%d", "%d/%m/%Y"]),
+        "convert_timezone_policies": ConvertTimezone(
+            Col("d"), "America/New_York", "UTC", ambiguous="earliest", nonexistent="shift_forward"
+        ),
+        "replace_timezone": ReplaceTimezone(Col("d"), "Europe/Paris", ambiguous="raise"),
+        "replace_timezone_strip": ReplaceTimezone(Col("d"), None),
+        "business_day_add": BusinessDay(
+            "add",
+            Col("d"),
+            Col("n"),
+            holidays=[19723],
+            weekmask=[True] * 4 + [False] * 3,
+            roll="forward",
+        ),
+        "business_day_is": BusinessDay("is", Col("d")),
+        "date_epoch_ns": DateFunc("epoch_ns", Col("d")),
+        "add_days": Binary("add_days", Col("d"), Col("n")),
         "window_start_min": WindowStart(Col("d"), 1000),
         "window_start_origin": WindowStart(Col("d"), 1000, 500),
         "window_buckets": WindowBuckets(Col("d"), 1000, 500),

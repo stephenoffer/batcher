@@ -52,6 +52,7 @@ from batcher.plan.expr_ir import (
 from batcher.plan.expr_ir.audio import AudioFunc
 from batcher.plan.expr_ir.core import Aliased, IsInf
 from batcher.plan.expr_ir.func_nodes import (
+    BusinessDay,
     ConvertTimezone,
     DateOffset,
     GeoFunc,
@@ -65,6 +66,7 @@ from batcher.plan.expr_ir.func_nodes import (
     ListZipStruct,
     MakeTemporal,
     MapFunc,
+    ReplaceTimezone,
     SpatialFunc,
     Strftime,
     Strptime,
@@ -181,12 +183,13 @@ def _derived(
 # field is a sub-expression over the enclosing relation, and every other field is a
 # parameter to carry across a rebuild unchanged.
 _REGULAR: tuple[type, ...] = (
-    Array, AudioFunc, Binary, Cast, Coalesce, ConvertTimezone, DateFunc, DateOffset,
+    Array, AudioFunc, Binary, BusinessDay, Cast, Coalesce, ConvertTimezone, DateFunc, DateOffset,
     DateTrunc, GeoFunc, Greatest, HashRows, ImageCrop, ImageFunc, IsInf, IsNan,
     IsNotNull, IsNull, Least, ListBinary, ListContains, ListFunc, ListGet, ListGetDyn,
     ListJoin, ListPosition, ListSet, ListSimhash, ListSlice, ListZip, MakeMap,
     MakeTemporal, JsonDoc, ListZipStruct, StructUpdate,
-    Math2Expr, MathExpr, MapFunc, Not, NullIf, SeqFunc, Sequence, SpatialFunc, Strftime,
+    Math2Expr, MathExpr, MapFunc, Not, NullIf, ReplaceTimezone, SeqFunc, Sequence, SpatialFunc,
+    Strftime,
     Strptime, StrFunc, StrFuncDyn, StructField, VideoFunc, WindowBuckets, WindowStart,
 )  # fmt: skip
 

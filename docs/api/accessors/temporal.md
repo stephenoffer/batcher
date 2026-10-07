@@ -66,6 +66,8 @@ Move a date or timestamp to a period boundary, or shift it by an offset.
    _DtNamespace.last_day
    _DtNamespace.next_day
    _DtNamespace.offset_by
+   _DtNamespace.add_months
+   _DtNamespace.add_business_days
 ```
 
 ## Calendar flags
@@ -95,7 +97,7 @@ Test where a date falls in its week, month, quarter, or year, and count the days
 
 ## Differences
 
-Count whole units elapsed between two dates or timestamps.
+Count whole units elapsed between two dates or timestamps, or read a duration's total. On a duration, `.hour()`, `.minute()`, `.second()` and `.day()` are its components, as DuckDB reads an interval: `hour()` of 49 hours and 5 minutes is 1, and `total("h")` is 49.
 
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.temporal
@@ -110,11 +112,12 @@ Count whole units elapsed between two dates or timestamps.
    _DtNamespace.minutes_between
    _DtNamespace.seconds_between
    _DtNamespace.weeks_between
+   _DtNamespace.total
 ```
 
 ## Epochs, names, formatting, and time zones
 
-Convert a date or timestamp to an epoch count or text, or move it between time zones.
+Convert a date or timestamp to an epoch count or text, or move it between time zones. `convert_timezone` keeps the instant and returns another zone's wall clock. `replace_timezone` keeps the wall clock and attaches a zone, which chooses a new instant. Fields of a tz-aware column are read in the column's own zone.
 
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.temporal
@@ -132,6 +135,7 @@ Convert a date or timestamp to an epoch count or text, or move it between time z
    _DtNamespace.monthname
    _DtNamespace.strftime
    _DtNamespace.convert_timezone
+   _DtNamespace.replace_timezone
 ```
 
 ## See also

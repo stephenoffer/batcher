@@ -8,7 +8,7 @@ string→string transforms are generated from `_STR_TRANSFORMS` (data, not code)
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from batcher._internal.errors import PlanError, require_bool, require_choice, require_int
@@ -17,6 +17,7 @@ from batcher.plan.expr_ir.constructors import lit, nullif, when
 from batcher.plan.expr_ir.core import AggExpr, Binary, Cast, Expr, Lit
 from batcher.plan.expr_ir.func_nodes import StrFunc, Strptime
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
+from batcher.plan.expr_ir.namespaces._calendar import strptime_formats
 from batcher.plan.expr_ir.namespaces._dialect import (
     UNICODE_WHITE_SPACE,
     check_regex,
@@ -349,7 +350,7 @@ class _StrNamespace:
         signed = seed - 2**64 if seed >= 2**63 else seed
         return StrFunc("xxhash64", self._e, start=signed or None)
 
-    def to_datetime(self, format: str, *, strict: bool = False) -> Strptime:
+    def to_datetime(self, format: str | Sequence[str], *, strict: bool = False) -> Strptime:
         """Parse the string into a Timestamp using a chrono/strftime format.
 
         Values that do not match the format become NULL (DuckDB ``try_strptime``)
@@ -360,9 +361,15 @@ class _StrNamespace:
         ``strict=True`` restores: a column that must parse fails the query rather than
         filling with nulls nobody looks at. A null input is null either way.
 
+        A list of formats is tried in order and each value takes the first that parses it
+        (DuckDB ``strptime(s, [f1, f2])``), so a column mixing two vendors' layouts parses
+        the same way every time: the list decides, nothing is guessed. ``strict`` then
+        raises only for a value no format parses.
+
         Args:
-            format: A chrono/strftime pattern, e.g. ``"%Y-%m-%d %H:%M:%S"``.
-            strict: Raise on a non-null value that does not match ``format``.
+            format: A chrono/strftime pattern, e.g. ``"%Y-%m-%d %H:%M:%S"``, or a list of
+                them tried in order.
+            strict: Raise on a non-null value that matches no format.
 
         Returns:
             A new Timestamp expression; unmatched values are null unless ``strict``.
@@ -376,9 +383,15 @@ class _StrNamespace:
                 ...     bt.col("s").str.to_datetime("%Y-%m-%d %H:%M:%S").alias("t")
                 ... ).to_pydict()
                 {'t': [datetime.datetime(2024, 1, 15, 10, 30), None]}
+
+                >>> mixed = bt.from_pydict({"s": ["2024-01-15", "15/01/2024"]})
+                >>> mixed.select(
+                ...     t=bt.col("s").str.to_datetime(["%Y-%m-%d", "%d/%m/%Y"])
+                ... ).to_pydict()
+                {'t': [datetime.datetime(2024, 1, 15, 0, 0), datetime.datetime(2024, 1, 15, 0, 0)]}
         """
         strict = require_bool(strict, func="str.to_datetime", arg="strict")
-        return Strptime(self._e, format, strict=strict)
+        return Strptime(self._e, strptime_formats(format), strict=strict)
 
     def to_date(self, format: str = "%Y-%m-%d", *, strict: bool = False) -> Cast:
         """Parse the string into a Date using a chrono/strftime format.
@@ -402,7 +415,9 @@ class _StrNamespace:
                 {'r': [datetime.date(2024, 2, 15)]}
         """
         strict = require_bool(strict, func="str.to_date", arg="strict")
-        return Cast(Strptime(self._e, format, strict=strict), "date", try_cast=True)
+        return Cast(
+            Strptime(self._e, strptime_formats(format), strict=strict), "date", try_cast=True
+        )
 
     def contains(self, pattern: str | Expr, *, literal: bool = True) -> Expr:
         """Test whether the string contains ``pattern`` (→ Bool).

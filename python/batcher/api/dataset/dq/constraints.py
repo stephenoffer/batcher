@@ -64,6 +64,12 @@ class RowConstraint:
     # you chose not to fail the run over, not a row that became valid.
     mostly: float = 1.0
     severity: Severity = "error"
+    # Window columns `valid` reads, as ``(name, expression)`` pairs, added to the relation
+    # before it is evaluated. A window expression cannot sit inside the counting aggregate,
+    # so a check that compares a row with its neighbour (`monotonic`) computes the
+    # neighbour as a column first. A constraint carrying helpers is never `total`, so the
+    # metadata prover, which has no such column, does not try to discharge it.
+    helpers: tuple[tuple[str, Expr], ...] = ()
 
     @property
     def enforced(self) -> bool:

@@ -99,8 +99,12 @@ def temporal_function(tr, node) -> Expr | None:
         # Spark's implicit "read this text as a timestamp" wrapper, which `date_format`
         # and friends wrap their argument in. A plain cast is what it means.
         return Cast(tr._scalar(node.this), "timestamp")
-    if isinstance(node, exp.StrToTime):  # strptime(s, fmt)
-        fmt = _const_str_arg(node.args.get("format"), "strptime()", "format")
+    if isinstance(node, exp.StrToTime):  # strptime(s, fmt) / strptime(s, [fmt, ...])
+        fmt_node = node.args.get("format")
+        if isinstance(fmt_node, exp.Array):  # formats tried in order, as DuckDB does
+            fmts = [_const_str_arg(f, "strptime()", "format") for f in fmt_node.expressions]
+            return tr._scalar(node.this).str.to_datetime(fmts)
+        fmt = _const_str_arg(fmt_node, "strptime()", "format")
         return tr._scalar(node.this).str.to_datetime(fmt)
 
     if isinstance(node, exp.UnixToTime):  # to_timestamp(n), epoch_ms(n)
@@ -183,7 +187,11 @@ def _query_now(tr):
 def _spark_temporal(tr, node) -> Expr | None:
     """The Spark temporal nodes: month shifts, epoch readings, and zone conversion."""
 
-    from batcher._sql.parser.expressions.literals import _const_int_arg, _const_str_arg
+    from batcher._sql.parser.expressions.literals import (
+        _const_int_arg,
+        _const_str_arg,
+        _int_literal,
+    )
 
     if isinstance(node, (exp.CurrentTimestamp, exp.Localtimestamp)):
         # `now()` / `current_timestamp()` / `localtimestamp()`. Engine timestamps are
@@ -206,9 +214,17 @@ def _spark_temporal(tr, node) -> Expr | None:
             Cast(tr._scalar(node.expression), "timestamp"), round_off=not exact
         )
     if isinstance(node, exp.AddMonths):
+        if _int_literal(node.expression) is None:  # a per-row month count
+            return Binary(
+                "add_months", Cast(tr._scalar(node.this), "date"), tr._scalar(node.expression)
+            )
         months = _const_int_arg(node.expression, "add_months(): months")
         return DateOffset(Cast(tr._scalar(node.this), "date"), months, 0, 0)
     if isinstance(node, exp.TsOrDsAdd):  # date_add(d, n) / date_sub(d, n)
+        if _int_literal(node.expression) is None:  # a per-row day count
+            return Binary(
+                "add_days", Cast(tr._scalar(node.this), "date"), tr._scalar(node.expression)
+            )
         days = _const_int_arg(node.expression, "date_add(): days")
         return DateOffset(Cast(tr._scalar(node.this), "date"), 0, days, 0)
     if isinstance(node, exp.UnixDate):

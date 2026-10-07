@@ -359,23 +359,59 @@ class Strptime(IRNode):
     chrono/strftime format (e.g. ``%Y-%m-%d %H:%M:%S``). Values that do not match
     become NULL (DuckDB ``try_strptime``), or raise when ``strict`` (DuckDB ``strptime``,
     Polars ``strict=True``). → Timestamp(us). ``strict`` is left out of the IR when false,
-    so a non-strict parse serializes exactly as it did before the field existed."""
+    so a non-strict parse serializes exactly as it did before the field existed.
+
+    ``format`` is one string or a list tried in order (DuckDB ``strptime(s, [f1, f2])``);
+    a single format serializes as the plain string it always was."""
 
     tag = ExprTag.STRPTIME
     input: Expr = child()
-    format: str = scalar()
+    format: str | list[str] = scalar()
     strict: bool = scalar(omit_falsy=True, default=False)
 
 
 @expr_node
 class ConvertTimezone(IRNode):
-    """`convert_timezone(from_tz, to_tz, ts)` — shift each naive timestamp's
-    wall-clock from `from_tz` to `to_tz` (DST-aware). Type-preserving (Timestamp)."""
+    """`convert_timezone(from_tz, to_tz, ts)` — the naive wall clock in `to_tz` of each
+    instant. A naive input is a wall clock in `from_tz`; a tz-aware one is read as the
+    instant it is. `ambiguous`/`nonexistent` resolve a DST overlap/gap; ``None`` (omitted
+    from the IR) is the engine's default, null."""
 
     tag = ExprTag.CONVERT_TIMEZONE
     input: Expr = child()
     from_tz: str = scalar()
     to_tz: str = scalar()
+    ambiguous: str | None = scalar(omit_none=True, default=None)
+    nonexistent: str | None = scalar(omit_none=True, default=None)
+
+
+@expr_node
+class ReplaceTimezone(IRNode):
+    """`replace_timezone(tz, ts)` — keep each wall clock and label it with `tz` (choosing a
+    new instant), or strip the zone when `tz` is ``None``. → `timestamp[us, tz]`."""
+
+    tag = ExprTag.REPLACE_TIMEZONE
+    input: Expr = child()
+    tz: str | None = scalar(omit_none=True, default=None)
+    ambiguous: str | None = scalar(omit_none=True, default=None)
+    nonexistent: str | None = scalar(omit_none=True, default=None)
+
+
+@expr_node
+class BusinessDay(IRNode):
+    """A business-day calendar op: ``add`` (`other` = per-row day count), ``count``
+    (`other` = end date, half-open) or ``is``. `holidays` are days since the epoch and
+    `weekmask` seven Monday-first flags; both are omitted from the IR at their defaults
+    (no holidays, Monday to Friday)."""
+
+    tag = ExprTag.BUSINESS_DAY
+    vocab = frozenset({"add", "count", "is"})
+    fn: str = scalar()
+    input: Expr = child()
+    other: Expr | None = child(omit_none=True, default=None)
+    holidays: list[int] = scalar(omit_falsy=True, default=())
+    weekmask: list[bool] | None = scalar(omit_none=True, default=None)
+    roll: str | None = scalar(omit_none=True, default=None)
 
 
 @expr_node

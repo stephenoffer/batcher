@@ -13,13 +13,15 @@ uses, and it is what keeps the answer identical single-node and distributed.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 
 from batcher._internal.errors import PlanError
 from batcher.api.dataset.dq.constraints import AggregateConstraint, RowConstraint
 from batcher.plan.expr_ir import Col, lit
 from batcher.plan.expr_ir.namespaces.temporal import parse_offset
+from batcher.plan.expr_ir.nodes import lag
 
-__all__ = ["fresh_within", "not_in_future", "seconds_of"]
+__all__ = ["fresh_within", "monotonic", "not_in_future", "seconds_of"]
 
 _DAY_SECONDS = 86_400
 
@@ -119,4 +121,50 @@ def not_in_future(column: str, *, tolerance: str | dt.timedelta | int | float = 
     label = "" if not slack else f", tolerance={slack:g}s"
     return RowConstraint(
         f"not_in_future({column}{label})", c.is_null() | (c.dt.epoch_ms() <= lit(cutoff))
+    )
+
+
+def monotonic(
+    column: str,
+    *,
+    order_by: str | list[str],
+    by: str | list[str] | None = None,
+    strict: bool = False,
+    decreasing: bool = False,
+) -> RowConstraint:
+    """`column` must not step backwards from one row to the next in `order_by` order.
+
+    A row violates the constraint when its value is below the previous row's (above it with
+    `decreasing`), or equal to it with `strict`. The comparison runs within each `by` group.
+    The first row of a group, a null value, and the row after a null all pass: there is no
+    previous value to be out of order with.
+
+    Args:
+        column: The column whose sequence is checked, typically an event timestamp.
+        order_by: The column(s) that define row order. Required, because a relation has no
+            order of its own; ties in it leave the order between tied rows undefined.
+        by: Optional grouping column(s), such as a device id, checked independently.
+        strict: Require each value to differ from the previous one, not merely not regress.
+        decreasing: Check for a non-increasing sequence instead.
+
+    Returns:
+        The row constraint.
+    """
+    if not order_by:
+        raise PlanError("monotonic(): order_by= names the row order to check; it is required")
+    keys = [order_by] if isinstance(order_by, str) else list(order_by)
+    groups = [] if by is None else ([by] if isinstance(by, str) else list(by))
+    c = Col(column)
+    kind = ("strictly " if strict else "") + ("decreasing" if decreasing else "increasing")
+    scope = f", by={groups}" if groups else ""
+    name = f"monotonic({column}, {kind}{scope})"
+    # The previous value is a window, which the counting aggregate cannot hold, so it is a
+    # helper column added first; its name is derived from the check so two checks differ.
+    helper = "__dq_prev_" + hashlib.sha1(f"{name}|{keys}".encode()).hexdigest()[:12]
+    prev = Col(helper)
+    ahead, behind = (prev, c) if decreasing else (c, prev)
+    ok = (ahead > behind) if strict else (ahead >= behind)
+    window = lag(c).over(partition_by=groups, order_by=keys)
+    return RowConstraint(
+        name, c.is_null() | prev.is_null() | ok, total=False, helpers=((helper, window),)
     )

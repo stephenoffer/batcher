@@ -342,13 +342,14 @@ _SERIES_ONLY: dict[str, str] = {
     ),
     # --- temporal: a calendar unit, a timezone, or a window ----------------------------
     "tz_localize": (
-        "Attaching a timezone is a cast, and the parametrized name uses parentheses: "
-        "bt.col('t').cast('timestamp(us, UTC)'). To move an already-aware timestamp "
-        "between zones use bt.col('t').dt.convert_timezone('UTC', 'Europe/Paris')."
+        "Attaching a timezone to a wall clock is bt.col('t').dt.replace_timezone("
+        "'Europe/Paris'), with ambiguous=/nonexistent= for DST overlaps and gaps; "
+        "replace_timezone(None) strips it again."
     ),
     "tz_convert": (
-        "Converting between timezones names both ends: "
-        "bt.col('t').dt.convert_timezone('UTC', 'Europe/Paris')."
+        "Reading an instant in another zone is "
+        "bt.col('t').dt.convert_timezone('UTC', 'Europe/Paris'), which returns that zone's "
+        "wall clock."
     ),
     "to_period": (
         "Period arithmetic is truncation to a calendar unit: "
@@ -479,10 +480,13 @@ DT_UNSUPPORTED: dict[str, str] = {
         "duration -- then group on it. For a fixed-width bucket use bt.window(col, '1h')."
     ),
     "total_seconds": (
-        "Seconds between two timestamps is bt.col('a').dt.seconds_between(bt.col('b'))."
+        "A duration's total is .dt.total('s') (or 'ms'/'m'/'h'/'d'); seconds between two "
+        "timestamps is bt.col('a').dt.seconds_between(bt.col('b'))."
     ),
-    "tz_convert": "Spelled .dt.convert_timezone('UTC') here.",
-    "tz_localize": "Attach or change a timezone with .dt.convert_timezone('UTC').",
+    "tz_convert": "Spelled .dt.convert_timezone(from_tz, to_tz) here.",
+    "tz_localize": "Attach a timezone to a wall clock with .dt.replace_timezone('UTC').",
+    "replace_time_zone": "Spelled .dt.replace_timezone(tz) here.",
+    "convert_time_zone": "Spelled .dt.convert_timezone(from_tz, to_tz) here.",
 }
 
 

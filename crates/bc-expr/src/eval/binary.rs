@@ -15,7 +15,7 @@ use crate::eval::cmp::{float_scalar_cmp, mirror_cmp};
 use crate::eval::coerce::{
     align_date_timestamp_for_cmp, align_decimals_for_cmp, as_bool, coerce_numeric,
 };
-use crate::eval::temporal::date::add_months;
+use crate::eval::temporal::shift::{add_days, add_months};
 use crate::{BinaryOp, Expr, ExprError, Literal};
 
 /// Whether comparing this type's values raw would disagree with the engine's float identity.
@@ -104,7 +104,7 @@ pub(crate) fn try_scalar_binary(
     use BinaryOp::{Add, Eq, Ge, Gt, Le, Lt, Mul, Ne, Sub};
 
     // Only arithmetic and comparison broadcast cleanly and share the array path's
-    // kernels. And/Or/Concat/bitwise/Div/Mod/AddMonths keep the array path.
+    // kernels. And/Or/Concat/bitwise/Div/Mod/AddMonths/AddDays keep the array path.
     if !matches!(op, Add | Sub | Mul | Eq | Ne | Lt | Le | Gt | Ge) {
         return Ok(None);
     }
@@ -279,8 +279,8 @@ pub(crate) fn scalar_operands(
 
 pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef, ExprError> {
     use BinaryOp::{
-        Add, AddMonths, And, BitAnd, BitOr, BitXor, Concat, Div, Eq, FloorDiv, Ge, Gt, Le, Lt, Mod,
-        Mul, Ne, Or, ShiftLeft, ShiftRight, Sub,
+        Add, AddDays, AddMonths, And, BitAnd, BitOr, BitXor, Concat, Div, Eq, FloorDiv, Ge, Gt, Le,
+        Lt, Mod, Mul, Ne, Or, ShiftLeft, ShiftRight, Sub,
     };
     // A list, struct or map compares element-wise through the nested path; the flat
     // kernels below refuse nested types, and every flat operand bypasses this check.
@@ -451,6 +451,7 @@ pub(crate) fn eval_binary(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<Ar
             }
         }
         AddMonths => add_months(l, r)?,
+        AddDays => add_days(l, r)?,
     };
     Ok(out)
 }
