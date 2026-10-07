@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1644 Python modules across 236 packages and 341 Rust files across 14 crates.
+Covering 1644 Python modules across 236 packages and 342 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -979,7 +979,7 @@ Window-function translation for the SQL front-end.
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1926 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1953 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 532 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 312 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 446 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -2878,7 +2878,7 @@ Configuration: one frozen, typed `Config` object.
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
 | `config.py` | 3448 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
-| `env.py` | 282 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
+| `env.py` | 283 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `option_types.py` | 110 | `Literal` aliases for the closed option vocabularies on the public signatures. |
@@ -3226,7 +3226,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg.rs` | 76 | The distributed aggregate's map and reduce steps: `partial_aggregate`, `combine` and `combine_finalize`, the mergeable folds the shuffle composes across… |
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
-| `chunked/mod.rs` | 611 | The FFI entry point for streaming one source into the engine chunk by chunk. |
+| `chunked/mod.rs` | 648 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
 | `flight.rs` | 728 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
@@ -3606,16 +3606,17 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
 | `late.rs` | 388 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
-| `lib.rs` | 800 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `lib.rs` | 783 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `mapped.rs` | 130 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |
 | `projection.rs` | 109 | Build a Parquet [`ProjectionMask`] that selects **exactly** the requested columns, and put a decoded batch's columns back in the order they were requested. |
 | `row_filter.rs` | 524 | Row-level predicate pushdown *into* the Parquet decode (`RowFilter`). |
-| `row_groups.rs` | 268 | Reading a Parquet relation one row group at a time, for a caller that schedules the row groups itself. |
+| `row_groups.rs` | 323 | Reading a Parquet relation one row group at a time, for a caller that schedules the row groups itself. |
 | `split_read/block_cache.rs` | 334 | A process-wide cache of remote object bytes, kept in fixed-size blocks: the warm path. |
-| `split_read/mod.rs` | 357 | Split an oversized object-store read into several concurrent range GETs. |
-| `store.rs` | 448 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
+| `split_read/mod.rs` | 403 | Split an oversized object-store read into several concurrent range GETs. |
+| `split_read/prefetch.rs` | 121 | Read-ahead for a caller that reads a remote Parquet file one row group at a time. |
+| `store.rs` | 502 | Resolve a URI to an `object_store` backend + in-store path, for every scheme the engine reads: `s3://` (and on-prem S3 like MinIO/Ceph via an endpoint… |
 
 ### `bc-geo`
 
