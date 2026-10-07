@@ -43,12 +43,12 @@ The SQL surface reads DuckDB syntax by default. Pass `dialect=` to parse another
 | `WITH` | Common table expressions (CTEs). |
 | Subqueries | Derived tables, `IN` / `NOT IN`, `EXISTS` / `NOT EXISTS`, `= ANY` / `= SOME` / `<> ALL` and the inequality quantifiers (`> ALL`, `<= ANY`, ...), correlated scalar subqueries. See [Subqueries](#subqueries) for the forms that don't translate. |
 | Window functions | `<fn> OVER (PARTITION BY ... ORDER BY ... [ROWS BETWEEN ...])`: ranking, aggregates, and `LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`, with explicit `ROWS` frames. |
-| `QUALIFY` | Filter on a window-function result (referenced by its output alias). |
+| `QUALIFY` | Filter on a window-function result, referenced by its output alias or spelled out in the `QUALIFY`, including beside `GROUP BY`, where it filters the grouped rows after `HAVING`. |
 | `TABLESAMPLE` | `BERNOULLI(p PERCENT)` (fraction) or `RESERVOIR(n ROWS)` (fixed count). |
 | `CASE` | `CASE WHEN ... THEN ... ELSE ... END`. |
 | `CAST` | `CAST(expr AS type)`. |
-| Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates, including the `DISTINCT` forms. See [DISTINCT aggregates](#distinct-aggregates) for what they may be mixed with. |
-| Scalar expressions | Arithmetic, comparison, boolean, and function calls (incl. registered Python functions). |
+| Aggregates | `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and the other supported aggregates, including the `DISTINCT` forms, `COUNT(DISTINCT (a, b))` over a row tuple, and `agg(...) FILTER (WHERE ...)`, which lowers through {py:meth}`AggExpr.filter <batcher.AggExpr.filter>`. See [DISTINCT aggregates](#distinct-aggregates). |
+| Scalar expressions | Arithmetic, comparison, boolean, and function calls, including registered Python functions. In an aggregate or window query a registered function may be a `GROUP BY` key, an aggregate's or a window's argument, or a `SELECT` item over the aggregates; over a grouped value in `HAVING`, `QUALIFY` or `ORDER BY` it raises. |
 | DDL | `CREATE [OR REPLACE] {TABLE,VIEW} ... AS ...` and `DROP TABLE` register/unregister a lazy table in the session. |
 | DML | `INSERT`, `UPDATE`, `DELETE`, and `MERGE INTO ... USING ... ON ... WHEN ...` rebind the target to its new state. `INSERT ... ON CONFLICT (k)`, `DELETE ... USING` and `RETURNING` are supported on session tables. |
 | Catalog | `SHOW TABLES` lists the session's tables; `DESCRIBE <table>` returns its columns; `information_schema.tables`, `.columns`, `.views` and `.schemata` answer in ANSI form. All come back as ordinary relations. |
@@ -149,10 +149,10 @@ print(out.to_pydict())
 
 `COUNT(DISTINCT x)` is a native aggregate and mixes with anything. The rest,
 `SUM(DISTINCT x)`, `AVG(DISTINCT x)` and `MIN`/`MAX(DISTINCT x)`, are answered by grouping on
-the group keys plus `x`, which dedups `x`, and then aggregating that. Any other aggregate in
-the same query has to survive that pre-aggregation, so it must combine from per-sub-group
-partials: `COUNT`, `SUM`, `MIN`, `MAX`, `BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR`,
-`BIT_XOR`, `PRODUCT`, and `ANY_VALUE`.
+the group keys plus `x`, which dedups `x`, and then aggregating that. When every other
+aggregate in the query combines from per-sub-group partials (`COUNT`, `SUM`, `MIN`, `MAX`,
+`BOOL_AND`, `BOOL_OR`, `BIT_AND`, `BIT_OR`, `BIT_XOR`, `PRODUCT`, and `ANY_VALUE`), that is one
+two-level aggregate.
 
 ```python
 sales = bt.from_pydict(
@@ -174,9 +174,30 @@ print(out.to_pydict())
 # {'region': ['e', 'w'], 'customers': [3, 3], 'total': [70, 40]}
 ```
 
-`AVG`, `STDDEV`, `VAR`, the quantiles, and a second `COUNT(DISTINCT ...)` over a *different*
-column cannot: an average needs a sum and a count, which one column cannot carry. Those raise
-rather than approximate. Compute them in a separate subquery and join.
+Several different `DISTINCT` arguments in one query, or a `DISTINCT` aggregate beside `AVG`,
+`STDDEV`, a quantile or a second `COUNT(DISTINCT ...)`, use Spark's *Expand* rewrite instead.
+The input is read once per `DISTINCT` argument plus once for the plain aggregates, each copy
+deduplicated on its own argument, and one aggregate over the union computes every output.
+That costs one scan of the input per copy, as it does in Spark.
+
+```python
+out = bt.sql(
+    """
+    SELECT region, SUM(DISTINCT customer) AS customers, AVG(DISTINCT amount) AS avg_amount,
+           COUNT(*) AS n
+    FROM sales GROUP BY region ORDER BY region
+    """,
+    sales=sales,
+)
+print(out.to_pydict())
+# {'region': ['e', 'w'], 'customers': [3, 3], 'avg_amount': [35.0, 15.0], 'n': [2, 3]}
+```
+
+`array_agg(DISTINCT x ORDER BY x)` and `string_agg(DISTINCT x, sep ORDER BY x)` keep each
+value once, sorted by it, through {py:meth}`array_agg(distinct=True) <batcher.plan.expr_ir.core.Expr.array_agg>`.
+As in DuckDB, the `ORDER BY` may only name `x`. `COUNT(DISTINCT (a, b))` counts distinct row
+tuples, and a tuple holding a NULL field is still a value. `COUNT(DISTINCT a, b)` raises, as
+it does in DuckDB.
 
 ### Which aggregates take a DISTINCT argument
 

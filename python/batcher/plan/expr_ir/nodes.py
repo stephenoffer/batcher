@@ -243,6 +243,11 @@ class MakeStruct(IRNode):
     tag = ExprTag.MAKE_STRUCT
     fields: list[tuple[str, Expr]]
 
+    def __repr__(self) -> str:
+        """``struct(name=value, ...)``. The generic rendering skips `fields`, which is not a
+        declared child, and aggregate leaves are deduplicated by their rendering."""
+        return "struct(" + ", ".join(f"{name}={value!r}" for name, value in self.fields) + ")"
+
     def to_ir(self) -> dict[str, Any]:
         # Irregular shape (named fields), so to_ir is hand-written.
         return {

@@ -113,18 +113,19 @@ rather than returning a wrong answer.
 | `ASOF JOIN` | **parsed** — `ON l.k = r.k AND l.t >= r.t` lowers to `join_asof` | the DataFrame form `left.join_asof(right, on="ts", by="symbol", tolerance="5m")` adds a staleness cap and `direction="nearest"`, which the SQL clause cannot express |
 | Non-equi / theta join (`ON a > b` only) | equi-only engine | equality conjunct + a `WHERE` residual, or pre-filter |
 | `PIVOT` / `UNPIVOT` | **parsed** with an explicit `IN (...)` value list | `ds.pivot(...)` / `ds.unpivot(...)` (`ds.melt`, `ds.crosstab`) when the values are discovered rather than listed |
-| `QUALIFY` on a window not in `SELECT` | partial | project the window with an alias, then `QUALIFY alias = 1` — or `.with_columns(rn=…over(…)).filter(bt.col("rn") == 1)` |
+| `QUALIFY` on a window not in `SELECT`, or beside `GROUP BY` | **supported** — the window rides the window pass as a hidden column; a grouped `QUALIFY` filters the grouped rows after `HAVING` | nothing; the DataFrame form is `.with_columns(rn=…over(…)).filter(bt.col("rn") == 1)` |
 | `LATERAL`, `UNNEST` in `FROM` | **parsed** — `FROM t, UNNEST(arr)` and `LATERAL (SELECT …)` both lower; `UNNEST` adds the element column (named `unnest`, or by `AS u(x)`) beside the list, as DuckDB does | `ds.explode("col")` / `ds.unnest("struct_col")` for the DataFrame form |
 | `WITH RECURSIVE` | body translated once — **wrong answer risk** | rewrite as an explicit loop of `Dataset` unions in Python |
 | `MERGE INTO` | **supported** on session and catalog tables; `ON` must be column equalities (names may differ); a catalog target is collected and overwritten; `RETURNING` rejected | `ds.write.delta(uri, merge_on=["id"])` for a transactional, incremental lakehouse write |
-| `array_agg(DISTINCT x)`, `string_agg(DISTINCT x)` | rejected — the list aggregates have no dedup form | pre-aggregate the distinct values in a subquery |
-| `SUM(DISTINCT x)` beside `AVG`/`STDDEV`/`VAR`/a quantile/a second `COUNT(DISTINCT y)` | rejected — those have no single-column mergeable partial to survive the dedup | compute them in a separate subquery and join (`SUM/AVG/MIN/MAX(DISTINCT x)` alone, or beside `COUNT`/`SUM`/`MIN`/`MAX`/`BOOL_*`/`BIT_*`/`PRODUCT`/`ANY_VALUE`, is fine) |
+| `array_agg(DISTINCT x [ORDER BY x])`, `string_agg(DISTINCT x, sep [ORDER BY x])` | **supported**; an `ORDER BY` over anything but `x` is rejected, as in DuckDB | `col("x").array_agg(distinct=True)` |
+| Several DISTINCT arguments, or `SUM(DISTINCT x)` beside `AVG`/a quantile/`COUNT(DISTINCT y)` | **supported** — Spark's Expand rewrite (one scan of the input per DISTINCT argument) | nothing |
+| `COUNT(DISTINCT a, b)` | rejected (DuckDB rejects it too) | the tuple form `COUNT(DISTINCT (a, b))`, which counts a tuple with NULL fields as a value |
 | Frame `EXCLUDE CURRENT ROW/GROUP/TIES` | **supported** for `sum`/`count`/`avg`/`min`/`max`/`bool_and`/`bool_or` over a `ROWS` (CURRENT ROW) or `GROUPS` frame; rejected under a bounded `ROWS` frame for GROUP/TIES and under a value-offset `RANGE` | use a `GROUPS` frame; never subtract the current row (wrong on NULL, empty remainder, inf) |
 | `x > ANY (subquery)`, `x >= ALL (subquery)` | **supported** — lowered to the exact three-valued answer (empty set, NULLs included), correlated or not | nothing; a row-valued `(a, b) > ALL (...)` is rejected — compare one column at a time |
 | `IN (subquery)` under `OR` | rejected — a semi-join drops the rows the `OR` keeps | write it as `EXISTS (SELECT 1 FROM s WHERE s.c = t.x)`, qualifying the outer column |
 | Non-column `PARTITION BY`/window `ORDER BY` | **supported** — a computed key is hoisted into a hidden column | nothing; `PARTITION BY date_trunc('month', ts)` works |
 | `INSERT … ON CONFLICT` / `RETURNING` / `DELETE … USING` | **supported** on session tables; `ON CONFLICT` needs an explicit `(key)` and rejects duplicate inserted keys; `RETURNING` rejected on `MERGE`, `ON CONFLICT` and catalog tables | name the conflict key; dedupe the inserted rows first |
-| Scalar UDF in `GROUP BY` / agg arg / `ORDER BY` | rejected | compute it as a projected alias in a subquery first |
+| Scalar UDF in a grouped or window query | **supported** in a `GROUP BY` key, an aggregate's argument, a window's arguments, and the `SELECT` list (`udf(SUM(x))`); rejected over a grouped value in `HAVING`/`QUALIFY`/`ORDER BY` | compute it as a projected alias in a subquery first |
 | Non-constant `LIKE`/`regexp_*`/`substr` arguments | constants only | restructure, or use the `.str` expression namespace |
 
 ## The DuckDB-specific shifts
@@ -210,8 +211,9 @@ DuckDB queries directly, and `bt.from_duckdb(rel)` is the way in.
 - **Do not port a DuckDB `PRAGMA`/`SET` into Batcher config one-for-one.** Threads,
   memory limits, and partition counts are chosen adaptively; `bt.Config` /
   `bt.config_context` exist, but set them only when a measurement says to.
-- **Do not leave a scalar UDF in a `GROUP BY` key.** It is rejected for a reason — project
-  it to a column in a subquery first.
+- **Do not expect a scalar UDF over a grouped value outside the `SELECT` list to work.**
+  `GROUP BY udf(x)`, `SUM(udf(x))` and `SELECT udf(SUM(x))` all run, but `HAVING udf(k) > 1`
+  is rejected — project it to a column in a subquery first.
 - **Do not read a file inside the SQL string.** There is no `read_parquet` here, and the
   error (`unknown table ''`) is confusing enough that it is worth checking first.
 

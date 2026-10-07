@@ -25,7 +25,7 @@ from typing import Any
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import AggExpr, Expr, WindowExpr
-from batcher.plan.expr_ir.core import FrameSpec, normalize_key_list
+from batcher.plan.expr_ir.core import FrameSpec, Lit, normalize_key_list
 from batcher.plan.expr_ir.nodes import Case, Col, NullIf
 from batcher.plan.expr_rewrite.traverse import transform_expr_up
 
@@ -120,6 +120,10 @@ def _bind_agg(
             "array_agg(order_by=...) has no window form; compute it with "
             "group_by(...).agg(...) and join the result back"
         )
+    if agg.func == "count_star":
+        # `count()` counts rows, nulls included; the window engine has no nullary count, so
+        # count a constant that is never null -- the plan SQL's `count(*) OVER` builds.
+        return WindowExpr("count", Lit(1), partition, order, frame)
     # `mean` is the DataFrame spelling; the window engine names the aggregate `avg`.
     func = "avg" if agg.func == "mean" else agg.func
     return WindowExpr(func, agg.input, partition, order, frame)

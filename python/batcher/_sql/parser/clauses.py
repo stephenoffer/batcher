@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from sqlglot import expressions as exp
 
-from batcher._internal.errors import PlanError
 from batcher._sql.parser import windowing
+from batcher._sql.parser.agg_rewrites import hoist_grouped_udfs, mark_filter, name_udf_items
 from batcher._sql.parser.core_utils import (
     _alias_of,
     _has_aggregate,
@@ -29,13 +29,18 @@ from batcher.plan.expr_ir import col
 
 
 def _filter_to_case(node):
-    """`agg(arg) FILTER (WHERE c)` → `agg(CASE WHEN c THEN arg END)`.
+    """`agg(arg) FILTER (WHERE c)` → `agg(CASE WHEN c THEN arg END)` for a window aggregate.
 
     `COUNT(*) FILTER (WHERE c)` becomes `COUNT(CASE WHEN c THEN 1 END)` — counting
-    the non-null CASE values is exactly counting the rows where `c` holds.
+    the non-null CASE values is exactly counting the rows where `c` holds. A grouped
+    aggregate's filter is instead carried to the aggregate builder (`mark_filter`), which
+    lowers it with the same `filter_aggregate` as `AggExpr.filter` — the masking above is
+    wrong for `array_agg`, which keeps the nulls it would introduce.
     """
     if not isinstance(node, exp.Filter):
         return node
+    if not isinstance(node.parent, exp.Window):
+        return mark_filter(node)
     agg = node.this.copy()
     cond = node.expression.this  # Where -> condition
     arg = agg.this
@@ -250,8 +255,11 @@ def _select(tr, node) -> Dataset:
     # A window nested inside a larger projection (`sum(x) OVER () + 1`) makes this a
     # window query just as much as a bare `sum(x) OVER ()` item does.
     has_window = any(windowing._has_window(p) for p in projections)
-    if has_agg or has_window:
-        _reject_udf_in_agg_window(tr, node, projections)
+    udf_hidden, finish_udfs = [], None
+    if (has_agg or has_window) and distinct_on is None:
+        # Registered Python functions run as `map_batches` stages, before the aggregate or
+        # window pass when they read input rows and after it when they read its results.
+        ds, udf_hidden, finish_udfs = hoist_grouped_udfs(tr, ds, node, projections, has_agg)
 
     if distinct_on is not None:
         # DISTINCT ON keeps one row per key set (chosen by ORDER BY); agg/window rejected.
@@ -279,20 +287,19 @@ def _select(tr, node) -> Dataset:
         # so `SELECT sum(v) OVER (...) FROM t ORDER BY row_number() OVER (...)` computes
         # both windows over the same relation.
         ordwins, order = _order_windows(order)
-        ds = tr._window(ds, [*projections, *nested, *ordwins])
-        # QUALIFY filters on the window-function results (named by their SELECT
-        # alias) — applied after the window columns exist, before the projection
-        # drops any not in the final SELECT.
-        if qualify is not None:
-            ds = ds.filter(tr._scalar(_retarget_window_aliases(tr, qualify.this)))
+        # QUALIFY filters on the window-function results (named by their SELECT alias, or
+        # spelled out in the QUALIFY itself, which then rides this pass as a hidden item) —
+        # applied after the window columns exist, before the projection drops any not in
+        # the final SELECT.
+        qualwins, pred = _qualify_items(qualify) if qualify is not None else ([], None)
+        ds = tr._window(ds, [*projections, *nested, *ordwins, *qualwins])
+        if pred is not None:
+            ds = ds.filter(tr._scalar(_retarget_window_aliases(tr, pred)))
+        # A registered function over a window's result runs now that the column exists.
+        ds, projections = tr._hoist_udfs(ds, projections)
         named = tr._projection_map(ds, projections, star_cols)
         ds = _project_ordered(tr, ds, named, order, projections)
-    elif qualify is not None:
-        if has_agg:
-            raise NotImplementedError(
-                "QUALIFY combined with GROUP BY / aggregates is not supported; compute "
-                "the aggregate in a subquery and QUALIFY over it"
-            )
+    elif qualify is not None and not has_agg:
         # QUALIFY whose window function appears ONLY in the QUALIFY clause — the usual
         # idiom (`... QUALIFY row_number() OVER (...) = 1`). The window column has to
         # exist before it can be filtered on, so it is computed under a hidden alias,
@@ -304,14 +311,24 @@ def _select(tr, node) -> Dataset:
     elif has_agg:
         # Any window here runs *after* the grouping, over the aggregated relation, so
         # the window items are handed to the aggregate path rather than computed first.
-        windows = None
+        windows = []
         if has_window:
             windowing.rewrite_ignore_nulls_navigation(projections)
             windowing.rewrite_frame_exclusions(projections)
             windowing.rewrite_offset_defaults(projections)
             projections, nested = windowing.hoist_nested_windows(projections)
             windows = [*(p for p in projections if tr._is_window(p)), *nested]
-        ds, named = tr._aggregate(ds, projections, group, node.args.get("having"), windows, order)
+        # A grouped QUALIFY filters the grouped rows on windows computed over them, so its
+        # own windows ride the grouped window pass as hidden items; see `_grouped_qualify`.
+        pred = None
+        if qualify is not None:
+            hidden, pred = _qualify_items(qualify)
+            windows.extend(hidden)
+        having = node.args.get("having")
+        ds, named = tr._aggregate(ds, [*projections, *udf_hidden], group, having, windows, order)
+        ds, named = finish_udfs(ds, named)
+        if pred is not None:
+            ds = _grouped_qualify(tr, ds, named, pred)
         # The aggregate has already dropped the input columns, so a sort key spelling a
         # grouped *expression* (`ORDER BY h %% 4`, or the ordinal that unwraps to it) has
         # nothing left to resolve against. Retarget both spellings onto the select-list alias,
@@ -326,6 +343,7 @@ def _select(tr, node) -> Dataset:
     else:
         # Registered scalar functions in the SELECT list become materialized
         # columns before the projection references them.
+        name_udf_items(tr, projections)
         ds, projections = tr._hoist_udfs(ds, projections)
         # `SELECT i FROM t ORDER BY row_number() OVER (...)` has no window in the SELECT
         # list at all, so it reaches here rather than the window branch above. Without the
@@ -427,41 +445,50 @@ def _qualify_windows(tr, ds: Dataset, qualify):
     Returns:
         The dataset with any window columns appended, and the rewritten predicate.
     """
+    synthetic, pred = _qualify_items(qualify)
+    return (tr._window(ds, synthetic) if synthetic else ds), pred
+
+
+def _qualify_items(qualify):
+    """Each window a QUALIFY reads as a hidden ``alias(window)`` item, and the predicate over them.
+
+    Args:
+        qualify: The `Qualify` node.
+
+    Returns:
+        The synthetic window items (empty when the predicate has no window) and the
+        predicate rewritten to read their columns.
+    """
     # A parent for the predicate, so a rewrite can replace a window that *is* the predicate.
     holder = exp.Paren(this=qualify.this.copy())
     windowing.rewrite_ignore_nulls_navigation([holder])
     windowing.rewrite_frame_exclusions([holder])
     windowing.rewrite_offset_defaults([holder])
     pred = holder.this
-    windows = list(pred.find_all(exp.Window))
-    if not windows:
-        return ds, pred
     synthetic = []
-    for i, win in enumerate(windows):
+    for i, win in enumerate(list(pred.find_all(exp.Window))):
         alias = f"__bc_qualify{i}"
         # Copy before replacing: `synthetic` must keep the window expression itself,
         # while `pred` keeps only the reference to its output column.
         synthetic.append(exp.alias_(win.copy(), alias))
         win.replace(exp.column(alias))
-    return tr._window(ds, synthetic), pred
+    return synthetic, pred
 
 
-def _reject_udf_in_agg_window(tr, node, projections) -> None:
-    """Reject a registered scalar function in an unsupported aggregate/window position."""
-    from batcher._sql.parser.udf import contains_registered_scalar
+def _grouped_qualify(tr, ds: Dataset, named, pred) -> Dataset:
+    """Filter a grouped relation on a QUALIFY predicate, after its windows are computed.
 
-    targets = [
-        *projections,
-        node.args.get("having"),
-        node.args.get("qualify"),
-        node.args.get("order"),
-    ]
-    if any(contains_registered_scalar(tr, t) for t in targets):
-        raise PlanError(
-            "a registered scalar function is not supported in an aggregate or window "
-            "query's SELECT / HAVING / ORDER BY / QUALIFY; compute it in a subquery or "
-            "a projected alias first, then aggregate over that column"
-        )
+    SQL evaluates QUALIFY after GROUP BY, HAVING and the window functions, over the grouped
+    rows. The windows are columns by now and an aggregate resolves to its grouped column
+    (`_agg_map` is still live). A select alias the predicate names is materialized first,
+    as DuckDB resolves one there; the projection that follows drops it again.
+    """
+    pred = _retarget_window_aliases(tr, pred)
+    names = {c.name for c in pred.find_all(exp.Column) if not c.table}
+    aliases = {n: named[n] for n in names if n in named and n not in ds.columns}
+    if aliases:
+        ds = ds.with_columns(**aliases)
+    return ds.filter(tr._scalar(pred))
 
 
 def _is_order_all(order) -> bool:

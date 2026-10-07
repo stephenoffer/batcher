@@ -141,9 +141,9 @@ Call an aggregate or a window function on an `Expr` and you get an `AggExpr` bac
    :no-members:
 ```
 
-## Windows, naming, and casting on an aggregate
+## Windows, filters, naming, and casting on an aggregate
 
-Bind an aggregate to a window, name or cast its result, or lower it to its JSON `AggregateItem`.
+Bind an aggregate to a window, restrict it to the rows a predicate keeps, name or cast its result, or lower it to its JSON `AggregateItem`.
 
 ```{eval-rst}
 .. autosummary::
@@ -151,6 +151,7 @@ Bind an aggregate to a window, name or cast its result, or lower it to its JSON 
    :nosignatures:
 
    AggExpr.over
+   AggExpr.filter
    AggExpr.alias
    AggExpr.cast
    AggExpr.to_ir

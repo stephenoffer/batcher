@@ -173,7 +173,7 @@ The public, fluent, lazy, expression-first API surface.
 | `executors.py` | 681 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 819 | Top-level expression constructors re-exported for the public API. |
 | `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
-| `groupby.py` | 1159 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
+| `groupby.py` | 1167 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 262 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `multi_group.py` | 431 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
@@ -219,7 +219,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 237 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7266 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 7275 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -868,12 +868,12 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 
 | module | lines | what it is |
 |---|---|---|
-| `agg_rewrites.py` | 156 | Aggregate pre-pass rewrites for the SQL translator. |
+| `agg_rewrites.py` | 523 | Aggregate pre-pass rewrites for the SQL translator. |
 | `ai_functions.py` | 297 | AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT`` / ``AI_EMBED``. |
-| `clauses.py` | 641 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
+| `clauses.py` | 668 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
 | `core_utils.py` | 691 | Small stateless AST helpers shared across translator theme modules. |
 | `from_clause.py` | 649 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
-| `grouping.py` | 538 | Grouping, aggregation, and projection mapping for the SQL translator. |
+| `grouping.py` | 560 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 321 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
 | `statements.py` | 328 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 331 | Built-in table functions in the FROM clause: the series generators and model scoring. |
@@ -886,7 +886,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregates.py` | 434 | DuckDB aggregate spellings → the Batcher aggregate surface. |
+| `aggregates.py` | 497 | DuckDB aggregate spellings → the Batcher aggregate surface. |
 | `anonymous.py` | 612 | DuckDB function names sqlglot leaves as `Anonymous` → the Batcher expression surface. |
 | `collections.py` | 594 | SQL list/array functions — the Spark-shaped half, including the lambda forms. |
 | `functions.py` | 414 | Named-function dispatch for the SQL translator's scalar path. |
@@ -2496,12 +2496,12 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 512 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 7092 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 7164 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 376 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 532 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 421 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
-| `nodes.py` | 709 | Leaf IR nodes the `Expr` base class does not construct. |
+| `nodes.py` | 714 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 278 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 385 | Structural traversals over the expression tree. |
@@ -2552,7 +2552,7 @@ Shared traversal for scalar `Expr` trees and for the expressions inside a node.
 | `algebra.py` | 193 | Boolean-connective algebra, column substitution, and window hoisting. |
 | `naming.py` | 96 | The output name a positional expression gets when nothing names it. |
 | `nodes.py` | 129 | Apply an expression rewrite to every expression a *plan node* carries. |
-| `over.py` | 212 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
+| `over.py` | 216 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
 | `subtrees.py` | 133 | Structural identity of an expression, and whole-subtree substitution. |
 | `traverse.py` | 288 | The structural ladder for scalar `Expr` trees — child access and rebuilding. |
 
@@ -2562,8 +2562,8 @@ The expression function library, grouped by family.
 
 | module | lines | what it is |
 |---|---|---|
-| `aggregate.py` | 541 | Aggregate free functions that compose existing mergeable aggregates. |
-| `aggregate_semantics.py` | 144 | The aggregate parameters that restore another engine's semantics by composition. |
+| `aggregate.py` | 548 | Aggregate free functions that compose existing mergeable aggregates. |
+| `aggregate_semantics.py` | 281 | The aggregate parameters that restore another engine's semantics by composition. |
 | `collection.py` | 201 | Collection-construction free functions (`struct`, `named_struct`, `map_from_arrays`, `sequence`). |
 | `horizontal.py` | 262 | Row-wise ("horizontal") reductions across several columns. |
 | `partitioning.py` | 204 | Lakehouse partition transforms — the derived value a partitioned table stores. |

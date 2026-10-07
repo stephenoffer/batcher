@@ -186,7 +186,7 @@ the accessor namespaces:
 ## Aggregation methods
 
 Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
-`.var()`, `.std()`, `.median()`, `.quantile(q)`, `.skew()` / `.kurtosis()`
+`.var()`, `.std()`, `.median()`, `.quantile(q)` (or {py:meth}`.quantile([q1, q2, ...]) <batcher.plan.expr_ir.core.Expr.quantile>`, one `List` of the quantiles in the order given, DuckDB `quantile_cont(x, [...])`, with a null list for a group with no value), `.skew()` / `.kurtosis()`
 (third / fourth standardized moment of each group; DuckDB `skewness` / `kurtosis`),
 `.histogram()` (a
 `Map<value, count>` of each group's values, DuckDB `histogram`), `.count()`,
@@ -194,9 +194,11 @@ Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
 `.bit_and()` / `.bit_or()` / `.bit_xor()` (bitwise reduction of the non-null
 `Int64` values in each group), `.array_agg(order_by=…)` (collect each group's values into a
 `List`; SQL `array_agg(x ORDER BY k)` /
-Spark `collect_list`), {py:meth}`.min_by(by) <batcher.plan.expr_ir.core.Expr.min_by>` / {py:meth}`.max_by(by) <batcher.plan.expr_ir.core.Expr.max_by>` (the value at the
+Spark `collect_list`; {py:meth}`distinct=True <batcher.plan.expr_ir.core.Expr.array_agg>` keeps each value once, sorted by the value, SQL `array_agg(DISTINCT x ORDER BY x)`), {py:meth}`.min_by(by) <batcher.plan.expr_ir.core.Expr.min_by>` / {py:meth}`.max_by(by) <batcher.plan.expr_ir.core.Expr.max_by>` (the value at the
 row with the extreme `by` key), {py:meth}`.arg_min(order_by=...) <batcher.plan.expr_ir.core.Expr.arg_min>` / {py:meth}`.arg_max(order_by=...) <batcher.plan.expr_ir.core.Expr.arg_max>` (the 0-based position of the group's extreme value along `order_by`, Polars `arg_min`/`arg_max`), and `.first(order_by=...)` / `.last(order_by=...)`
 (the value at the first or last row in `order_by` order). `order_by` is required for the positions, first and last, because an arrival-order position wouldn't be partition-independent. `array_agg` accepts no `order_by` too, and then returns each group's elements in an unspecified order: the same elements on every execution path, but not the same sequence. Rows that tie on every `order_by` key are ordered by their value, ascending with nulls last, so an ordered list is the same however the rows were partitioned. {py:obj}`bt.count() <batcher.count>` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
+
+{py:meth}`AggExpr.filter(predicate) <batcher.AggExpr.filter>` restricts one aggregate to the rows where `predicate` is true, SQL's `agg(...) FILTER (WHERE predicate)`, which lowers through the same code. The other aggregates in the same `agg(...)` still see every row, so `bt.count().filter(bt.col("x") > 1)` beside `bt.count()` counts a subset and the total in one pass. A group with no matching row counts `0` and sums to null, as a group with no rows does, and a filtered `array_agg` leaves the rejected rows out instead of collecting them as nulls.
 
 The assembly-contiguity aggregates measure how a set of lengths is distributed *by base*
 rather than by item, the measure genome-assembly quality is judged on:

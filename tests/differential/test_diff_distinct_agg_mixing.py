@@ -94,15 +94,16 @@ def test_any_value_beside_a_distinct_aggregate_returns_a_value_from_the_group(di
     "plain",
     ["AVG(y)", "STDDEV_SAMP(f)", "VAR_SAMP(f)", "MEDIAN(y)", "COUNT(DISTINCT y)"],
 )
-def test_an_aggregate_with_no_single_column_partial_is_still_refused(plain):
+def test_an_aggregate_with_no_single_column_partial_takes_the_expand_rewrite(plain, duck):
     """A mean needs a sum *and* a count, so one level-2 column cannot reconstruct it.
 
-    Refused rather than approximated, and the message names the aggregate at fault so the
-    subquery workaround is obvious.
+    It used to be refused. It is now computed by the Expand rewrite instead: a deduplicated
+    copy of the input for the DISTINCT argument, unioned with the raw rows the plain
+    aggregate reads, so no partial has to be reconstructed at all.
     """
     query = f"SELECT g, SUM(DISTINCT x) AS dv, {plain} AS pv FROM t GROUP BY g"
-    with pytest.raises(NotImplementedError, match="DISTINCT"):
-        bt.sql(query, t=_T).to_arrow()
+    duck.register("t", _T)
+    assert_same(bt.sql(query, t=_T).collect(), duck.sql(query))
 
 
 def test_several_self_combining_aggregates_at_once(duck):

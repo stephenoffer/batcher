@@ -441,7 +441,6 @@
 "peak_min" = "Expr"
 "pow" = "Expr"
 "qcut" = "Expr"
-"quantile" = "AggExpr"
 "quantile_disc" = "AggExpr"
 "radians" = "Expr"
 "rank" = "Expr"

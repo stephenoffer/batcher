@@ -179,6 +179,12 @@ class GroupBy:
         and distributed. A predicate that is null for a group drops the group, as in SQL.
         Calling `having` again adds predicates, all of which must hold.
 
+        `having` returns one row per surviving group. To keep the *original rows* of the
+        groups that pass, filter on a window aggregate instead, which broadcasts the
+        group's value to each of its rows: ``ds.filter(bt.count().over("g") >= 2)`` keeps
+        every row whose group has at least two rows (SQL ``QUALIFY count(*) OVER
+        (PARTITION BY g) >= 2``), counting the rows of a null key as one group.
+
         Args:
             *predicates: Boolean expressions over aggregates. A list of them is accepted too.
 
@@ -195,6 +201,8 @@ class GroupBy:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [1, 2, 3]})
                 >>> ds.group_by("g").having(bt.count() > 1).agg(s=bt.col("v").sum()).to_pydict()
                 {'g': ['a'], 's': [3]}
+                >>> ds.filter(bt.count().over("g") > 1).sort("v").to_pydict()
+                {'g': ['a', 'a'], 'v': [1, 2]}
         """
         from batcher.plan.expr_ir.walk import contains_aggregate
 
@@ -477,14 +485,17 @@ class GroupBy:
         return self._reduce("count", columns)
 
     def quantile(
-        self, q: float, *columns: str | Selector, interpolation: str = "linear"
+        self, q: float | Sequence[float], *columns: str | Selector, interpolation: str = "linear"
     ) -> Dataset:
         """The `q`-quantile of each column per group (every non-key numeric column by default).
 
         `interpolation` is as for :meth:`Expr.quantile`; Polars' default is ``"nearest"``.
+        A list of fractions answers one ``List`` column per column, the quantiles in the
+        order given, as :meth:`Expr.quantile` does.
 
         Args:
-            q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median).
+            q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median), or a list
+                of them.
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
             interpolation: How to resolve a rank that falls between two values.
@@ -499,17 +510,10 @@ class GroupBy:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "a", "b"], "x": [1.0, 2.0, 3.0, 9.0]})
                 >>> ds.group_by("g").quantile(0.5).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [2.0, 9.0]}
+                >>> ds.group_by("g").quantile([0.0, 1.0]).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [[1.0, 3.0], [9.0, 9.0]]}
         """
-        if not 0.0 <= q <= 1.0:
-            raise PlanError(f"quantile q must be in [0, 1], got {q}")
-        targets = self._resolve_columns(columns, numeric_only=True)
-        if not targets:
-            raise PlanError(
-                "group_by().quantile() has no numeric value columns to reduce — "
-                "name the columns to reduce explicitly"
-            )
-        specs = tuple(AggregateSpec(c, Col(c).quantile(q, interpolation)) for c in targets)
-        return self._finish(specs)
+        return self._reduce("quantile", columns, q=q, interpolation=interpolation)
 
     def sum(self, *columns: str | Selector, empty_value: int | float | None = None) -> Dataset:
         """Sum each value column per group (every non-key numeric column by default).
@@ -865,6 +869,7 @@ class GroupBy:
         descending: bool | Sequence[bool] = False,
         nulls_last: bool | Sequence[bool] = True,
         ignore_nulls: bool = False,
+        distinct: bool = False,
     ) -> Dataset:
         """Collect each value column's values into a list per group (all non-key by default).
 
@@ -883,6 +888,8 @@ class GroupBy:
                 per key.
             ignore_nulls: Whether to leave nulls out of the lists, as Spark's
                 ``collect_list`` does.
+            distinct: Whether to keep each value once, sorted by the value, as for
+                :meth:`Expr.array_agg <batcher.Expr.array_agg>`.
 
         Returns:
             A new `Dataset` of the group keys followed by a `List` column per collected column.
@@ -902,6 +909,7 @@ class GroupBy:
             descending=descending,
             nulls_last=nulls_last,
             ignore_nulls=ignore_nulls,
+            distinct=distinct,
         )
 
     def mode(self, *columns: str | Selector, all_modes: bool = False) -> Dataset:
@@ -973,7 +981,7 @@ class GroupBy:
     # mirroring pandas' `numeric_only`: averaging or summing a string column is an error,
     # so an explicit-columns call is required to attempt it.
     _NUMERIC_ONLY = frozenset(
-        {"sum", "mean", "median", "std", "var", "product", "skew", "kurtosis"}
+        {"sum", "mean", "median", "quantile", "std", "var", "product", "skew", "kurtosis"}
     )
 
     def _value_columns(self, numeric_only: bool) -> list[str]:
