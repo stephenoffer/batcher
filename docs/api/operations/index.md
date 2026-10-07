@@ -8,6 +8,7 @@ This section is the reference for running Batcher in production: the tunables an
 | {doc}`/api/operations/configuration-reference` | The full listing: every option function, config dataclass, and cache control |
 | {doc}`/api/operations/streaming` | Triggers, output modes, query progress, and listeners |
 | {doc}`/api/operations/governance` | Row filters, column masks, grants, and lineage |
+| {doc}`/api/operations/sql-clients` | The DB-API adapter, the Flight SQL service, and the Ibis bridge |
 | {doc}`/api/operations/exceptions` | The typed exceptions, and what raises them |
 
 ```{toctree}
@@ -17,5 +18,6 @@ configuration
 configuration-reference
 streaming
 governance
+sql-clients
 exceptions
 ```

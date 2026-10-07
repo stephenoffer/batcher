@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1568 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1584 Python modules across 227 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -2980,6 +2980,17 @@ What launched this process, and the shape of the job it belongs to.
 | `managed.py` | 194 | The managed job services — where a job is submitted rather than a cluster stood up. |
 | `orchestrator.py` | 183 | The container orchestrators and cluster managers, and Ray inside whatever they started. |
 
+### `batcher/dbapi/` — ?
+
+A PEP 249 (DB-API 2.0) adapter over a Batcher `Session`.
+
+| module | lines | what it is |
+|---|---|---|
+| `connection.py` | 249 | The PEP 249 connection: a handle on one Batcher `Session`, and the module's globals. |
+| `cursor.py` | 510 | The PEP 249 cursor: run one statement through a `Session`, then stream its rows. |
+| `errors.py` | 210 | The PEP 249 exception hierarchy, and the one mapping from Batcher's typed errors onto it. |
+| `typeobjects.py` | 232 | PEP 249 type objects and constructors, over the Arrow types a cursor describes. |
+
 ### `batcher/graph/` — ?
 
 Graph analytics and graph-ML features over an edge table.
@@ -3007,6 +3018,46 @@ Centrality: which nodes matter, by five different definitions of "matter".
 | `betweenness.py` | 269 | Betweenness: how much of the graph's shortest-path traffic flows through each node. |
 | `rank.py` | 281 | PageRank and the degree-based centralities. |
 | `spectral.py` | 299 | The eigen-family centralities: eigenvector, Katz, and HITS. |
+
+### `batcher/integrations/` — ?
+
+Adapters that let other tools drive Batcher: SQLAlchemy, dbt, Ibis, and Flight SQL clients.
+
+_(façade only — see the subpackages below)_
+
+### `batcher/integrations/dbt/` — ?
+
+A dbt adapter pilot: table and view materializations, ``dbt run`` and ``dbt test``.
+
+| module | lines | what it is |
+|---|---|---|
+| `adapter.py` | 249 | The dbt adapter classes: credentials, connection manager, relation, adapter, and plugin. |
+| `sessions.py` | 55 | The one `Session` per dbt target that every dbt thread's connection shares. |
+
+### `batcher/integrations/flightsql/` — ?
+
+A Flight SQL service pilot over a Batcher `Session`, built on pyarrow Flight.
+
+| module | lines | what it is |
+|---|---|---|
+| `proto.py` | 138 | The few Flight SQL protobuf messages the service reads and writes, encoded by hand. |
+| `server.py` | 356 | A Flight SQL service over a Batcher `Session`: statements, bound parameters, cancellation. |
+
+### `batcher/integrations/ibis/` — ?
+
+An Ibis bridge pilot: compile an Ibis expression with Ibis's public SQL compiler, run it here.
+
+| module | lines | what it is |
+|---|---|---|
+| `bridge.py` | 123 | Run an Ibis expression on Batcher, through Ibis's public SQL compiler and `Session.sql`. |
+
+### `batcher/integrations/sqlalchemy/` — ?
+
+A SQLAlchemy 2.0 dialect over `batcher.dbapi`, registered as the ``batcher://`` URL scheme.
+
+| module | lines | what it is |
+|---|---|---|
+| `dialect.py` | 326 | The SQLAlchemy dialect: Batcher's PEP 249 adapter, its SQL, and its catalog reflection. |
 
 ### `batcher/interop/` — ?
 

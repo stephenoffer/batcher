@@ -77,7 +77,7 @@ Each connector page opens with a capability table: what it reads and writes, the
 
 ## Libraries in your process
 
-Two more groups aren't connectors. {doc}`/integrations/dataframes/index` covers Polars, pandas, DuckDB, PyArrow, and NumPy, which share Arrow with Batcher, so a table crosses between them as a pointer rather than a copy. {doc}`/integrations/orchestration/index` covers Airflow, Dagster, and Prefect. Batcher has no daemon, so a scheduled task is a Python function that imports it.
+Two more groups aren't connectors. {doc}`/integrations/dataframes/index` covers Polars, pandas, DuckDB, PyArrow, and NumPy, which share Arrow with Batcher, so a table crosses between them as a pointer rather than a copy. {doc}`/integrations/orchestration/index` covers Airflow, Dagster, and Prefect. Batcher has no daemon, so a scheduled task is a Python function that imports it. {doc}`/integrations/sql-clients/index` covers the other direction, tools that drive Batcher: a DB-API client, SQLAlchemy, dbt, Ibis, and Flight SQL.
 
 ### Model runtimes
 
@@ -137,6 +137,12 @@ Prometheus and Grafana, OpenTelemetry traces, and OpenLineage.
 Polars, pandas, DuckDB, PyArrow, and NumPy, exchanged through Arrow at no copy cost.
 :::
 
+:::{grid-item-card} {octicon}`terminal;1.1em` SQL clients
+:link: /integrations/sql-clients/index
+:link-type: doc
+DB-API, SQLAlchemy, dbt, Ibis, and Flight SQL clients driving a Batcher session.
+:::
+
 :::{grid-item-card} {octicon}`workflow;1.1em` Orchestrators
 :link: /integrations/orchestration/index
 :link-type: doc
@@ -156,6 +162,7 @@ The following table maps each group to what it covers in full:
 | {doc}`/integrations/compute/index` | Ray, batch schedulers, PyTorch, Hugging Face, and MLflow |
 | {doc}`/integrations/observability/index` | Prometheus and Grafana, OpenTelemetry traces, and OpenLineage |
 | {doc}`/integrations/dataframes/index` | Polars, pandas, DuckDB, PyArrow, and NumPy, in the same process and over the same Arrow |
+| {doc}`/integrations/sql-clients/index` | The PEP 249 adapter, the SQLAlchemy dialect, and the dbt, Ibis, and Flight SQL pilots |
 | {doc}`/integrations/orchestration/index` | Airflow, Dagster, and Prefect, plus what makes a task safe to retry |
 
 Every connector is built on the same public contracts: {py:class}`Source <batcher.io.Source>`, {py:class}`Sink <batcher.io.Sink>`, {py:class}`Split <batcher.io.Split>`, and the format registry they register into. A system not listed here plugs in the same way, as {doc}`custom connectors </user-guide/moving-data/custom-connectors>` describes.
@@ -180,5 +187,6 @@ databases/index
 compute/index
 observability/index
 dataframes/index
+sql-clients/index
 orchestration/index
 ```
