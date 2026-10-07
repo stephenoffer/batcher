@@ -1130,7 +1130,7 @@ Multi-GPU *scheduling* for the translated GPU backend.
 | module | lines | what it is |
 |---|---|---|
 | `aggregate.py` | 513 | Run a translated GPU chain ending in an aggregate across every GPU in the cluster. |
-| `cudf_probe.py` | 340 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
+| `cudf_probe.py` | 405 | Whether this cluster's GPU workers already have cuDF, and what to do when they do not. |
 | `device_read.py` | 401 | Read a shard onto the device, instead of onto the host and then across the bus. |
 | `dispatch.py` | 355 | Get a single-device GPU run's *input* to the device without staging it on the driver. |
 | `groupby.py` | 242 | The single-key group-by fan-out that predates the plan translator. |
