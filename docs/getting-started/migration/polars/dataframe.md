@@ -230,7 +230,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `unpivot` | {py:obj}`Dataset.unpivot <batcher.Dataset.unpivot>` | canonical |  |
 | `unstack` | n/a | gap | Not yet: Dataset.unstack. Wave W8. |
 | `update` | {py:obj}`Dataset.update <batcher.Dataset.update>` | param | Missing: the key-less positional form: Batcher's update needs on=. Wave W8. |
-| `upsample` | n/a | gap | Not yet: Dataset.upsample (fill a regular time grid). Wave W5. |
+| `upsample` | {py:obj}`Dataset.upsample <batcher.Dataset.upsample>` | mismatch | Differs: Batcher keeps an observed row whose time is null or falls between grid points, where Polars' left join onto the grid drops it; the grouping keyword is by= rather than group\_by=, and rows come out in no defined order. Wave W5. |
 | `var` | {py:obj}`Dataset.var <batcher.Dataset.var>` | param | Missing: the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=. Wave W2. |
 | `vstack` | {py:obj}`Dataset.union <batcher.Dataset.union>` | canonical |  |
 | `width` | {py:obj}`Dataset.width <batcher.Dataset.width>` | canonical |  |

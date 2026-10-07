@@ -195,12 +195,6 @@ _NEEDS_ORDER: dict[str, str] = {
         "ds.group_by(bucket=bt.window(bt.col('t'), '1d')).agg(...). To emit the empty "
         "buckets too, left-join onto a bt.date_range grid -- see the time-series user guide."
     ),
-    "upsample": (
-        "Build the grid and left-join onto it: bt.date_range(lo, hi, interval='1h') gives the "
-        "rows, ds.join(..., how='left') attaches what you have, and "
-        "bt.col('x').interpolate() / .forward_fill() fills the gaps. See the time-series "
-        "user guide."
-    ),
     "group_by_dynamic": (
         "Time-window grouping is ds.group_by(bucket=bt.window(bt.col('t'), '1h')).agg(...); "
         "pass a slide to bt.window for overlapping windows, or use "

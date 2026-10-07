@@ -71,6 +71,21 @@ def test_reference_to_a_sibling_output_names_the_chained_fix(method: str) -> Non
     assert "chain a second .with_columns(...)" in message
 
 
+@pytest.mark.parametrize("method", ["with_columns", "select"])
+def test_an_aggregate_over_an_unknown_column_reports_the_column(method: str) -> None:
+    """The sibling check runs on the failure path, and must read an aggregate too.
+
+    It called `referenced_columns` on the raw aggregate, which raises for any `AggExpr`, so
+    ``select(col("missing").sum())`` failed with "an aggregate expression can only be used
+    inside group_by().agg()" -- the opposite of true -- instead of naming the column.
+    """
+    ds = bt.from_pydict({"a": [1, 2]})
+    with pytest.raises(ColumnNotFoundError) as err:
+        getattr(ds, method)(s=bt.col("missing").sum())
+    assert err.value.column == "missing"
+    assert getattr(ds, method)(s=bt.col("a").sum()).to_pydict()["s"][-1] == 3
+
+
 def test_an_ordinary_unknown_column_keeps_the_plain_message() -> None:
     ds = bt.from_pydict({"a": [1, 2]})
     with pytest.raises(ColumnNotFoundError) as err:

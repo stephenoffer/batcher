@@ -3,7 +3,7 @@
 This page states what Batcher knows about the databases it is most often pointed at: which route serves each one, the package that installs the route, the write modes the route carries, and what happens to the vendor types that do not map cleanly onto Arrow. A generic route reaching a database is not the same as that database being covered, and this page is where the difference is written down.
 
 :::{warning}
-Nothing on this page has run against a live server yet, which is what the `untested` status means. The rules marked "Batcher, unit-tested" are enforced by Batcher's own code and pinned by unit tests against fake drivers. The rules marked "Stated, not enforced" describe documented driver behaviour that Batcher passes through. See `tests/PENDING_VERIFICATION.md`.
+Nothing on this page has run against a live server yet, which is what the `untested` status means. The rules marked "Batcher, unit-tested" are enforced by Batcher's own code and pinned by unit tests against fake drivers. The rules marked "Stated, not enforced" describe documented driver behaviour that Batcher passes through. See [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md).
 :::
 
 ## Routes and write modes

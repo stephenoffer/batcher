@@ -220,7 +220,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 237 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7767 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 7776 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2995 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -266,8 +266,8 @@ Migration-error guidance: the traceback is the documentation.
 
 | module | lines | what it is |
 |---|---|---|
-| `_dataset_naming.py` | 285 | The Spark/pandas/Ray Data naming and foreign-format-exporter half of the redirect table. |
-| `_dataset_table.py` | 495 | The Dataset half of the migration-error table: what a migrant types, and why it is absent. |
+| `_dataset_naming.py` | 282 | The Spark/pandas/Ray Data naming and foreign-format-exporter half of the redirect table. |
+| `_dataset_table.py` | 489 | The Dataset half of the migration-error table: what a migrant types, and why it is absent. |
 | `_groupby_table.py` | 195 | The GroupBy half of the migration-error table. |
 | `dataset.py` | 57 | `Dataset.__getattr__`'s answer: an actionable error for a name Batcher does not have. |
 | `groupby.py` | 34 | `GroupBy.__getattr__`'s answer: an actionable error for a grouped API Batcher lacks. |
@@ -323,8 +323,8 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 344 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 2412 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2940 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `reader.py` | 2422 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `writer.py` | 2950 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -927,7 +927,7 @@ The scalar lowerings big enough to own a module, kept out of the `scalar` dispat
 | `membership.py` | 127 | ``IN``, ``BETWEEN`` and ``IS DISTINCT FROM`` — SQL's set and null-safe comparisons. |
 | `named.py` | 225 | Named SQL arguments (``name => value``): consume them, or refuse them by name. |
 | `nulls.py` | 164 | Typing a bare SQL ``NULL`` from the position it is written in. |
-| `signatures.py` | 350 | What a Python signature means to the SQL translator. |
+| `signatures.py` | 361 | What a Python signature means to the SQL translator. |
 
 ### `batcher/_sql/parser/joins/` — 6 · front-end
 
@@ -1953,11 +1953,11 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 
 | module | lines | what it is |
 |---|---|---|
-| `auth.py` | 242 | Auth providers for the HTTP sources: a static bearer token and OAuth2 client credentials. |
-| `graphql.py` | 171 | `graphql`: a GraphQL query, paged by a cursor variable, read as a lazy relation. |
+| `auth.py` | 244 | Auth providers for the HTTP sources: a static bearer token and OAuth2 client credentials. |
+| `graphql.py` | 179 | `graphql`: a GraphQL query, paged by a cursor variable, read as a lazy relation. |
 | `options.py` | 354 | Typed options for the HTTP JSON source: pagination styles and the retry policy. |
 | `records.py` | 157 | From a decoded API page to one Arrow batch, holding every page to one schema. |
-| `source.py` | 312 | `http_json`: a paginated HTTP JSON API read as a lazy relation. |
+| `source.py` | 320 | `http_json`: a paginated HTTP JSON API read as a lazy relation. |
 | `state.py` | 433 | Resumable incremental API ingestion: a durable watermark, a lookback, and dedup by key. |
 | `transport.py` | 314 | The HTTP request loop every API source shares: auth, retries, backoff and a concurrency cap. |
 
@@ -2878,7 +2878,7 @@ Configuration: one frozen, typed `Config` object.
 | `accelerator.py` | 345 | Accelerator and energy tunables — the facts about a GPU fleet only its operator knows. |
 | `config.py` | 3448 | The single frozen `Config` and its typed sections. |
 | `deadline.py` | 257 | The wall-clock deadline this process will be killed at, so it drains before that. |
-| `env.py` | 283 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
+| `env.py` | 282 | Every `BATCHER_*` environment variable the engine reads, declared in one place. |
 | `fault_tolerance.py` | 133 | Tunables for surviving an unstable fleet — quarantine and retry budgets. |
 | `logs.py` | 258 | One-line switches for logging, verbosity, and the progress bar. |
 | `option_types.py` | 110 | `Literal` aliases for the closed option vocabularies on the public signatures. |
@@ -3178,7 +3178,7 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 |---|---|---|
 | `arrays.py` | 389 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
 | `dask_frames.py` | 73 | Arrow partitions → a lazy ``dask.dataframe.DataFrame``. |
-| `diagnostics.py` | 266 | Why a Python value cannot become an Arrow column, and what to do about it. |
+| `diagnostics.py` | 269 | Why a Python value cannot become an Arrow column, and what to do about it. |
 | `formats.py` | 400 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
 | `huggingface.py` | 229 | Arrow → Hugging Face ``datasets`` conversion, with feature translation. |
 

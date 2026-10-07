@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import re
 
+import pyarrow as pa
 import pytest
 
 import batcher as bt
@@ -264,6 +265,7 @@ class TestAPinnedReadCannotStrandAPolicy:
 #: enforces.
 _CONNECTORS: dict[str, dict] = {
     "adbc": {"driver": "d", "table": "db.t"},
+    "airbyte": {"stream": "users", "image": "airbyte/source-faker:6"},
     "bigquery": {"project": "proj", "table": "ds.t"},
     "cassandra": {"contact_points": ["h"], "keyspace": "ks", "table": "t", "partition_key": "k"},
     "clickhouse": {"query": "select 1", "host": "h"},
@@ -281,6 +283,9 @@ _CONNECTORS: dict[str, dict] = {
     "dynamodb": {"table": "t"},
     "elasticsearch": {"hosts": ["http://h"], "index": "i"},
     "files_incremental": {"path": "/data/tbl", "format": "parquet"},
+    "github": {"repo": "o/n"},
+    "google_sheets": {"spreadsheet_id": "sid", "range": "Sheet1!A1:D"},
+    "graphql": {"url": "https://h/graphql?key=k", "query": "{ x }", "records_path": "x"},
     "hbase": {"host": "h", "table": "t"},
     "hdf5": {"path": "/data/tbl", "dataset": "ds"},
     "milvus": {"collection": "c", "uri": "./m.db"},
@@ -290,7 +295,13 @@ _CONNECTORS: dict[str, dict] = {
     "protobuf": {"path": "/data/tbl", "message_cls": object},
     "qdrant": {"collection": "c", "location": ":memory:"},
     "redis": {"host": "h"},
+    "salesforce": {
+        "sobject": "Account",
+        "instance_url": "https://o.my.salesforce.com",
+        "schema": pa.schema([("Id", pa.string())]),
+    },
     "scylla": {"contact_points": ["h"], "keyspace": "ks", "table": "t", "partition_key": "k"},
+    "sharepoint": {"drive_id": "d"},
     "snowflake": {"query": "select 1", "connection_kwargs": {"account": "a"}},
     "turbopuffer": {"namespace": "n", "region": "r"},
 }
@@ -300,6 +311,7 @@ _CONNECTORS: dict[str, dict] = {
 #: a name no operator could type into a policy, and the read was therefore ungoverned.
 _EXPECTED = {
     "adbc": "db.t",
+    "airbyte": "airbyte/source-faker:6:users",
     "bigquery": "ds.t",
     "cassandra": "ks.t",
     "clickhouse": "",
@@ -310,6 +322,9 @@ _EXPECTED = {
     "dynamodb": "default/t",
     "elasticsearch": "i",
     "files_incremental": "/data/tbl",
+    "github": "https://api.github.com/repos/o/n/issues",
+    "google_sheets": "sid:Sheet1!A1:D",
+    "graphql": "https://h/graphql",
     "hbase": "h:9090/t",
     "hdf5": "/data/tbl",
     "milvus": "c",
@@ -319,7 +334,9 @@ _EXPECTED = {
     "protobuf": "/data/tbl",
     "qdrant": "c",
     "redis": "h:6379/0",
+    "salesforce": "Account",
     "scylla": "ks.t",
+    "sharepoint": "drives/d",
     "snowflake": "",
     "turbopuffer": "n",
 }

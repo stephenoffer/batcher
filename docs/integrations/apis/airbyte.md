@@ -3,7 +3,7 @@
 This page covers {py:meth}`bt.read.airbyte <batcher.api.io_namespace.reader.Reader.airbyte>`, which reads one stream of an Airbyte source connector and keeps the connector's STATE checkpoints.
 
 :::{warning}
-Not yet verified against a live Airbyte connector; see `tests/PENDING_VERIFICATION.md`. The protocol handling is tested against a fake message stream and a fake connector program only.
+Not yet verified against a live Airbyte connector; see [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md). The protocol handling is tested against a fake message stream and a fake connector program only.
 :::
 
 | | |

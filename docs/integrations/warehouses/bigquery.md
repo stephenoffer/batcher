@@ -86,7 +86,7 @@ An explicit `selected_fields` replaces the pushed projection rather than interse
 ## Write a table
 
 :::{warning}
-The BigQuery sink is not yet verified against a live BigQuery project. See `tests/PENDING_VERIFICATION.md`.
+The BigQuery sink is not yet verified against a live BigQuery project. See [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md).
 :::
 
 {py:meth}`ds.write.bigquery <batcher.api.io_namespace.writer.Writer.bigquery>` serializes each shard to Parquet in memory and submits it as one `load_table_from_file` job. Parquet is what carries the nested shape: list inference is turned on in the job's `ParquetOptions`, so an Arrow list becomes a `REPEATED` field rather than a record wrapping `list.element`, and a struct becomes a `RECORD`.

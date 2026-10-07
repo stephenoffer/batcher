@@ -194,7 +194,11 @@ def parameter_kinds(fn: Any, *, skip_first: bool = False) -> list[Any] | None:
         if skip_first
         else list(signature.parameters.values())
     )
-    last = positional[-1] if positional else None
+    # The last parameter SQL fills positionally: a keyword-only option after it
+    # (`to_datetime(format, *, strict=False)`) takes no SQL argument, so it does not stop
+    # the trailing strings from being the rest of the call.
+    fillable = [p for p in positional if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    last = fillable[-1] if fillable else None
     for parameter in positional:
         if parameter.kind is parameter.KEYWORD_ONLY and parameter.default is not parameter.empty:
             # An optional keyword-only tuning parameter (`resize(..., *, format="png")`).
@@ -250,7 +254,14 @@ def _is_string_iterable(annotation: Any) -> bool:
     `contains_any(patterns)` takes a set of patterns, which SQL writes as trailing
     arguments -- ``str_contains_any(s, 'a', 'b')``. Only as the *last* parameter, where
     "the rest of the call" is unambiguous.
+
+    A union of `str` and a string iterable (`.str.to_datetime(format: str | Sequence[str])`)
+    is one too: the method takes one string or several, and the trailing arguments hand it
+    a list of however many were written. Declining it dropped the method from SQL entirely.
     """
+    members = union_members(annotation)
+    if len(members) > 1:
+        return all(m is str or _is_string_iterable(m) for m in members) and str in members
     origin = typing.get_origin(annotation)
     if origin is None or not isinstance(origin, type) or not issubclass(origin, Iterable):
         return False

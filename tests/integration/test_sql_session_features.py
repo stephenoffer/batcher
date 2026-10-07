@@ -44,8 +44,11 @@ def test_an_unknown_function_is_unsupported_and_located(t):
 @pytest.mark.parametrize(
     "query",
     [
-        "SELECT a FROM t QUALIFY row_number() OVER (ORDER BY sum(a)) = 1 GROUP BY a",
-        "SELECT sum(DISTINCT a), avg(DISTINCT s) FROM t",
+        # The two refusals that stood here, an aggregate inside a QUALIFY window and two
+        # DISTINCT aggregates in one SELECT, are now supported and answer as DuckDB does,
+        # so they no longer exercise a refusal. These two still do.
+        "SELECT a, lag(a IGNORE NULLS) OVER () FROM t",
+        "SELECT count(DISTINCT a, s) FROM t",
         "WITH RECURSIVE c(n) AS (SELECT 1 INTERSECT SELECT n FROM c) SELECT n FROM c",
     ],
 )

@@ -440,7 +440,7 @@ print(s.sql("SELECT inc(x) AS y FROM n").to_pydict())
 # {'y': [2, None, 4]}
 ```
 
-A registered function exists only inside a SQL query, run through `bt.sql`, `Session.sql`, or `Dataset.sql`. {py:func}`bt.call_function <batcher.call_function>` names the built-in function library and raises for it, because an expression has no relation for the function's `map_batches` stage to run over. In the DataFrame API, apply the same callable with `map_batches`.
+A registered function exists only inside a SQL query, run through {py:obj}`bt.sql <batcher.sql>`, `Session.sql`, or {py:obj}`Dataset.sql <batcher.Dataset.sql>`. {py:func}`bt.call_function <batcher.call_function>` names the built-in function library and raises for it, because an expression has no relation for the function's `map_batches` stage to run over. In the DataFrame API, apply the same callable with `map_batches`.
 
 ## Taking it to a cluster
 

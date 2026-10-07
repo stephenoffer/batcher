@@ -178,7 +178,7 @@ out = ds.ml.generate(engine, prompt_column="text").collect(distributed=True, num
 The actor outlives the job on purpose, so concurrent jobs share it. Call `quota.close()` when the quota is no longer wanted. A slot that a crashed worker never returned comes back after `lease_seconds`.
 
 :::{warning}
-The cluster path of `ProviderLimit` is not yet verified on a live multi-node Ray cluster; see `tests/PENDING_VERIFICATION.md`. The single-process path and the quota policy are tested.
+The cluster path of `ProviderLimit` is not yet verified on a live multi-node Ray cluster; see [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md). The single-process path and the quota policy are tested.
 :::
 
 (llm-engine-token-budget)=

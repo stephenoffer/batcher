@@ -386,4 +386,4 @@ and {py:meth}`Config.from_file <batcher.Config.from_file>` overlay `BATCHER_*` e
 - {doc}`/api/symbols/index`: the exhaustive listing, one page per object family.
 - {doc}`/user-guide/index`: the task-oriented guides behind these signatures.
 - {doc}`/getting-started/quickstart`: the same surface as a five-minute walkthrough.
-- {doc}`/cookbook/index`: 146 runnable recipes, when the signature is not enough.
+- {doc}`/cookbook/index`: 147 runnable recipes, when the signature is not enough.

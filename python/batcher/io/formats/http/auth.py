@@ -137,7 +137,9 @@ class OAuth2ClientCredentials:
         timeout: Seconds to wait for the token endpoint.
     """
 
-    token_url: str
+    # Kept out of the repr like the secret: a token endpoint can carry a tenant id in its
+    # path or credentials in its query or userinfo, and a repr lands in tracebacks and logs.
+    token_url: str = field(repr=False)
     client_id: str
     client_secret: str = field(repr=False)
     scope: str | None = None

@@ -63,7 +63,7 @@ report = bt.read.databricks(
 ```
 
 :::{warning}
-The session options, cancellation and query ids on this path, and the sink below, are not yet verified against a live Databricks workspace. See `tests/PENDING_VERIFICATION.md`.
+The session options, cancellation and query ids on this path, and the sink below, are not yet verified against a live Databricks workspace. See [`tests/PENDING_VERIFICATION.md`](https://github.com/stephenoffer/batcher/blob/main/tests/PENDING_VERIFICATION.md).
 :::
 
 `catalog=` and `schema=` set the session's defaults, so an unqualified table name resolves the way it does in the SQL editor. `session_configuration=` passes further warehouse settings, and `statement_timeout_s=` sets the session's `STATEMENT_TIMEOUT`. The options travel with the split, so a worker's session matches the driver's.

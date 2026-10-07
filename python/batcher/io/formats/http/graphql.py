@@ -163,6 +163,14 @@ class GraphQLSource(PagedJsonSource):
                 return
             variables = {**variables, self._cursor_variable: cursor}
 
+    def governed_name(self) -> str:
+        """The endpoint without its query or user info: the name a policy is written about.
+
+        `identity` folds in a digest of the query, which no operator could type, so a
+        policy keyed on it would never apply.
+        """
+        return redact_url(self._url)
+
     def identity(self) -> str:
         """The endpoint and a digest of the query and variables' names."""
         return (

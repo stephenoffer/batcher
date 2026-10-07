@@ -57,7 +57,13 @@ def _zero_argument(namespace: str, column: str) -> list[str]:
             signature = inspect.signature(function)
         except (TypeError, ValueError):
             continue
-        if [p for p in signature.parameters if not p.startswith("_")]:
+        # A keyword-only option with a default (`is_business_day(*, holidays=())`) leaves
+        # the accessor callable with no arguments, so it stays in the sweep.
+        if any(
+            p.kind is not p.KEYWORD_ONLY or p.default is p.empty
+            for n, p in signature.parameters.items()
+            if not n.startswith("_")
+        ):
             continue
         names.append(name)
     return names

@@ -210,7 +210,7 @@ unnest = { status = "param", batcher = "Dataset.unnest", need = "separator= (pre
 unpivot = { status = "canonical", batcher = "Dataset.unpivot" }
 unstack = { status = "gap", need = "Dataset.unstack", wave = "W8" }
 update = { status = "param", batcher = "Dataset.update", need = "the key-less positional form: Batcher's update needs on=", wave = "W8" }
-upsample = { status = "gap", need = "Dataset.upsample (fill a regular time grid)", wave = "W5" }
+upsample = { status = "mismatch", batcher = "Dataset.upsample", note = "Batcher keeps an observed row whose time is null or falls between grid points, where Polars' left join onto the grid drops it; the grouping keyword is by= rather than group_by=, and rows come out in no defined order", wave = "W5" }
 var = { status = "param", batcher = "Dataset.var", need = "the all-columns form returning a one-row Dataset (Batcher takes one column and returns a scalar); ddof=", wave = "W2" }
 vstack = { status = "canonical", batcher = "Dataset.union" }
 width = { status = "canonical", batcher = "Dataset.width" }

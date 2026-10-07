@@ -321,8 +321,8 @@ The site branches by what you are doing.
 | {doc}`User guide </user-guide/index>` | One page per capability: moving data, transforming, analyzing, trusting, and operating it |
 | {doc}`ML and inference </ml/index>` | Preparing data for models, batch inference, retrieval and generation, evaluation, and training loaders |
 | {doc}`Integrations </integrations/index>` | Kafka, Snowflake, BigQuery, Delta, Iceberg, Hudi, MongoDB, Elasticsearch, Ray, PyTorch, Hugging Face |
-| {doc}`Cookbook </cookbook/index>` | 146 runnable pages, from a one-method recipe to a complete pipeline, each executed on every test run |
-| {doc}`Example library </examples/index>` | 533 standalone scripts, indexed by what each one shows, run in CI |
+| {doc}`Cookbook </cookbook/index>` | 147 runnable pages, from a one-method recipe to a complete pipeline, each executed on every test run |
+| {doc}`Example library </examples/index>` | 534 standalone scripts, indexed by what each one shows, run in CI |
 | {doc}`API reference </api/index>` | Every public name three ways: a one-page lookup table, the area guides, and the full signature listing |
 | {doc}`Configuration </configuration/index>` | Profiles, options, environment variables, accelerators, and fault tolerance |
 | {doc}`Benchmarks </benchmarks/index>` | The full grid against DuckDB, Polars, Spark, and Daft, with hardware and reproduction commands |

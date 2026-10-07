@@ -3,7 +3,7 @@
 
 Source of truth: `docs/cookbook/index.md`. The groups are its four `{toctree}` captions, the
 domains are the entries under each, and the counts are its tables' "Recipes" column, which
-sum to the 146 the page opens with. Nothing here is counted independently of that page, so
+sum to the 147 the page opens with. Nothing here is counted independently of that page, so
 when a recipe is added the page's tables and this script move together.
 """
 
@@ -31,7 +31,7 @@ GROUPS = (
         ("BUILDING AND", "RUNNING PIPELINES"),
         "amber",
         (
-            ("Data engineering", "ingest, reconcile, repair", 11),
+            ("Data engineering", "ingest, reconcile, repair", 12),
             ("Analytics", "cohorts, funnels, sessions", 11),
             ("Streaming", "time and restarts", 7),
         ),
@@ -66,7 +66,7 @@ def count(x: float, y: float, n: int, kind: str) -> str:
 
 
 body: list[str] = [
-    hero(290, 20, 400, 74, "Cookbook", "146 runnable recipes, each asserting its own output")
+    hero(290, 20, 400, 74, "Cookbook", "147 runnable recipes, each asserting its own output")
 ]
 
 y = 120

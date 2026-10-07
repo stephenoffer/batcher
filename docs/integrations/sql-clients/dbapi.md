@@ -4,7 +4,7 @@
 
 ## How a connection relates to a session
 
-A *connection* wraps a session. It doesn't own a database. {py:func}`batcher.dbapi.connect` with no argument uses `bt.current_session()`, so a table you register through the Python API is visible to the cursor straight away. Pass a session to scope the connection to it. `conn.cursor()` returns a `Cursor`, which runs one statement at a time and holds its result until the next `execute`. Closing the connection closes its cursors and leaves the session untouched, because the session belongs to you.
+A *connection* wraps a session. It doesn't own a database. {py:func}`batcher.dbapi.connect` with no argument uses {py:obj}`bt.current_session() <batcher.current_session>`, so a table you register through the Python API is visible to the cursor straight away. Pass a session to scope the connection to it. `conn.cursor()` returns a `Cursor`, which runs one statement at a time and holds its result until the next `execute`. Closing the connection closes its cursors and leaves the session untouched, because the session belongs to you.
 
 ```python
 import batcher as bt

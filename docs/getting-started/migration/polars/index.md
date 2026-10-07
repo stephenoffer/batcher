@@ -56,9 +56,9 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 265 | 91 | 80 | 51 | 29 | 14 |
+| {doc}`dataframe` | 265 | 91 | 80 | 52 | 28 | 14 |
 | {doc}`expressions` | 218 | 90 | 30 | 22 | 73 | 3 |
-| {doc}`expression-namespaces` | 219 | 106 | 32 | 24 | 57 | 0 |
+| {doc}`expression-namespaces` | 219 | 106 | 34 | 24 | 55 | 0 |
 | {doc}`functions` | 163 | 40 | 29 | 21 | 66 | 7 |
 | {doc}`io` | 38 | 11 | 19 | 3 | 4 | 1 |
 | {doc}`types` | 37 | 16 | 6 | 1 | 9 | 5 |

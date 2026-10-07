@@ -1,6 +1,6 @@
 # SQL clients
 
-This section covers the tools that drive Batcher from the outside: a Python program written against the standard database API, SQLAlchemy, dbt, Ibis, and any client that speaks Arrow Flight SQL. Each one runs SQL through a {py:class}`Session <batcher.Session>`, the same object `bt.sql` uses, so the tables, views, functions, and catalogs you set up in Python are the ones the tool sees.
+This section covers the tools that drive Batcher from the outside: a Python program written against the standard database API, SQLAlchemy, dbt, Ibis, and any client that speaks Arrow Flight SQL. Each one runs SQL through a {py:class}`Session <batcher.Session>`, the same object {py:obj}`bt.sql <batcher.sql>` uses, so the tables, views, functions, and catalogs you set up in Python are the ones the tool sees.
 
 None of these adapters adds transactions. Batcher runs every statement to completion as it arrives, the way an autocommit connection behaves elsewhere, and each adapter states plainly what that means for its tool rather than pretending a rollback happened.
 

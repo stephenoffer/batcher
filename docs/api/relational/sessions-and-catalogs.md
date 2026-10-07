@@ -48,7 +48,7 @@ print(scratch.list(), "staging" in bt.current_session())
 
 ### Read-only sessions
 
-`bt.Session(read_only=True)` refuses every SQL statement that creates, drops or changes a table, view or schema, raising {py:exc}`PlanError <batcher.PlanError>` before anything runs. Queries, `SHOW`, `DESCRIBE` and an `EXPLAIN` of a query still run. It's a guard on SQL statements, not a sandbox: Python methods such as `session.register` still work, and a registered Python function runs whatever code it holds.
+{py:obj}`bt.Session(read_only=True) <batcher.Session>` refuses every SQL statement that creates, drops or changes a table, view or schema, raising {py:exc}`PlanError <batcher.PlanError>` before anything runs. Queries, `SHOW`, `DESCRIBE` and an `EXPLAIN` of a query still run. It's a guard on SQL statements, not a sandbox: Python methods such as `session.register` still work, and a registered Python function runs whatever code it holds.
 
 ```python
 reader = bt.Session(read_only=True)
@@ -104,10 +104,10 @@ print(session.sql("SELECT sum(amount) AS total FROM orders").to_pydict())
 
 ## Threads and concurrency
 
-The objects on this page differ in what they let threads share. The following list says which can be shared and which can't, and `tests/integration/test_thread_safety_contract.py` checks each statement:
+The objects on this page differ in what they let threads share. The following list says which can be shared and which can't, and [`tests/integration/test_thread_safety_contract.py`](https://github.com/stephenoffer/batcher/blob/main/tests/integration/test_thread_safety_contract.py) checks each statement:
 
 - A {py:class}`Dataset <batcher.Dataset>` is immutable. No method changes it, so threads can share one, build on it, and collect it at the same time.
-- A {py:class}`Session <batcher.Session>` and its catalogs are plain mutable registries with no locking. Don't register, drop, or `CREATE` in one session from several threads at once. Give each concurrent workload its own `bt.Session()` and call its `sql` and `table` directly.
+- A {py:class}`Session <batcher.Session>` and its catalogs are plain mutable registries with no locking. Don't register, drop, or `CREATE` in one session from several threads at once. Give each concurrent workload its own {py:obj}`bt.Session() <batcher.Session>` and call its `sql` and `table` directly.
 - The default session behind {py:func}`bt.sql <batcher.sql>` is process-global. {py:func}`bt.set_session <batcher.set_session>` in one thread changes it for every thread, so a multi-threaded program should pass sessions around rather than swap the default.
 - {py:func}`config_context <batcher.config_context>` is scoped to the calling thread's context, so a block in one thread doesn't affect a query running in another.
 - {py:func}`set_config <batcher.set_config>` also sets the calling context only. A thread started afterwards begins from the defaults, so call `set_config` or open a `config_context` inside each worker thread that needs the setting.

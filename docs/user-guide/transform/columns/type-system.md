@@ -253,7 +253,7 @@ print(
 | `a / b` | true division, always `double` | `-3.5` | `inf`, or NaN for `0 / 0` | Python, Polars, DuckDB |
 | `a // b` | floor division, rounds toward negative infinity; integers stay integers | `-4` | null | Python, Polars |
 | `a % b` | truncated remainder, takes the sign of the dividend | `-1` | null | SQL, DuckDB, Rust |
-| `bt.pmod(a, b)` | Spark's positive remainder | `1` | null | Spark |
+| {py:obj}`bt.pmod(a, b) <batcher.pmod>` | Spark's positive remainder | `1` | null | Spark |
 
 `//` and `%` come from different traditions, so Python's identity `a == (a // b) * b + a % b` does not hold when exactly one operand is negative: `(-7 // 2) * 2 + (-7 % 2)` is `-9`. DuckDB's integer `//` truncates, giving `-3`, so a query ported from DuckDB SQL gets a different quotient from `//` on negative operands. Batcher does not change either operator, because both are documented and either change would silently move results. Spell the other convention when you need it. The truncated quotient is `(a - a % b) // b`, which stays exact on integers, and Python's floor remainder is `a - (a // b) * b`:
 
@@ -274,7 +274,7 @@ print(
 
 ## Python values in an expression
 
-A Python value written into an expression becomes a literal with a fixed type. An `int` is `int64`, a `float` is `double`, a `bool` is `bool`, a `str` is `string`, and a `date`, `datetime`, or `time` is the matching temporal type. A `decimal.Decimal` is a `double` unless you ask for a decimal: `bt.lit(Decimal("1.25"), dtype="decimal(10,2)")` is exact, because the value never passes through a float. A list or tuple given to {py:func}`bt.lit <batcher.lit>` is a list literal, and a dict is a struct literal. A value with no literal form, such as `bytes` or a `timedelta`, raises where you wrote it.
+A Python value written into an expression becomes a literal with a fixed type. An `int` is `int64`, a `float` is `double`, a `bool` is `bool`, a `str` is `string`, and a `date`, `datetime`, or `time` is the matching temporal type. A `decimal.Decimal` is a `double` unless you ask for a decimal: {py:obj}`bt.lit(Decimal("1.25"), dtype="decimal(10,2)") <batcher.lit>` is exact, because the value never passes through a float. A list or tuple given to {py:func}`bt.lit <batcher.lit>` is a list literal, and a dict is a struct literal. A value with no literal form, such as `bytes` or a `timedelta`, raises where you wrote it.
 
 The literal then meets the column through the promotion lattice in the next section, so `bt.col("i") + 0.5` is a `double`. `None` is the one value with no type of its own, and SQL NULL has none either. Batcher gives it the type the operator needs, and the operators that do not need one do not ask:
 
@@ -282,7 +282,7 @@ The literal then meets the column through the promotion lattice in the next sect
 - `x.eq_missing(None)` is `x.is_null()`.
 - `coalesce(x, None)` and `x.fill_null(None)` are `x`, because a null fallback changes nothing.
 - `when(...).then(None)` and `.otherwise(None)` take the type of the other branches.
-- Anywhere else, such as `bt.col("x") + None`, a bare `None` is an `int64` null. Give it a type with `bt.lit(None, dtype="string")` when the other side is not a number.
+- Anywhere else, such as `bt.col("x") + None`, a bare `None` is an `int64` null. Give it a type with {py:obj}`bt.lit(None, dtype="string") <batcher.lit>` when the other side is not a number.
 
 ```python
 from decimal import Decimal

@@ -95,6 +95,15 @@ NOT_LOCALLY_WRITABLE: dict[str, str] = {
     "bed": "fixed record schema; round-tripped by tests/io/test_io_bed_gff_vcf.py",
     "gff": "fixed record schema; round-tripped by tests/io/test_io_bed_gff_vcf.py",
     "clickhouse": "needs a ClickHouse server; covered by tests/io/test_clickhouse_sink.py",
+    # The vector stores take an id column and a fixed-size float vector column, not an
+    # arbitrary relation, and write to a service rather than a file. Their writers are
+    # exercised against client doubles in tests/io/test_vector_connectors.py and against
+    # the live services in tests/integration/live/.
+    "qdrant": "needs a Qdrant service; covered by tests/io/test_vector_connectors.py",
+    "pinecone": "needs a Pinecone index; covered by tests/io/test_vector_connectors.py",
+    "milvus": "needs a Milvus collection; covered by tests/io/test_vector_connectors.py",
+    "turbopuffer": "needs a Turbopuffer namespace; covered by tests/io/test_vector_connectors.py",
+    "google_sheets": "writes into a Google Sheet; covered by tests/io/test_saas_connectors.py",
     # The next four take a *shape*, not an arbitrary relation, so this matrix's two-column
     # (id, type-class) table is not something they can be handed. Each was tried against it
     # and refused; the reason here is the refusal each one raises.
