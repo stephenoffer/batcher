@@ -116,7 +116,15 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
             // is unobservable too.
             let free = super::order::aggregates_ignore_order(aggregates)
                 && (group_keys.is_empty() || ctx.order_free);
-            let stream = build_with(input, ctx.with_order_free(free))?;
+            // The first morsel's schema, kept even when the morsel is empty: if nothing with rows
+            // arrives, it is what lets the empty-input answer be computed without the input.
+            let carrier = std::cell::OnceCell::new();
+            let stream: Morsels<'_> =
+                Box::new(build_with(input, ctx.with_order_free(free))?.inspect(|b| {
+                    if let Ok(b) = b {
+                        let _ = carrier.set(b.schema());
+                    }
+                }));
             let folded = if ctx.workers > 1 {
                 fold_partial_parallel(stream, group_keys, aggregates, &jit, ctx.workers)?
             } else {
@@ -165,7 +173,28 @@ pub(super) fn exec_breaker(plan: &RelOp, ctx: Ctx<'_>) -> Result<Vec<RecordBatch
                 // No rows reached the aggregate at all. That is not the same as "no output": a
                 // global `COUNT` over nothing is one row holding 0, and a `SUM` is one row holding
                 // NULL. The oracle already defines that; defer to it rather than reproduce it.
-                (None, _) => crate::execute(plan, ctx.sources),
+                //
+                // Over an empty input of the input's schema, not over the input itself: handing
+                // the oracle `plan` re-ran the whole subtree beneath the aggregate, serially, to
+                // rediscover that it is empty. `COUNT(*)` over an `EXCEPT` that removes every
+                // row spent 15 ms of its 35 there, recomputing a join the stream had already
+                // done. With no batch at all there is no schema to carry, and only then is the
+                // subtree run again.
+                (None, _) => match carrier.get() {
+                    Some(schema) => {
+                        let mut sources = ctx.sources.to_vec();
+                        sources.push(vec![RecordBatch::new_empty(schema.clone())]);
+                        let over_empty = RelOp::Aggregate {
+                            input: Box::new(RelOp::Scan {
+                                source_id: ctx.sources.len(),
+                            }),
+                            group_keys: group_keys.clone(),
+                            aggregates: aggregates.clone(),
+                        };
+                        crate::execute(&over_empty, &sources)
+                    }
+                    None => crate::execute(plan, ctx.sources),
+                },
             }
         }
 
