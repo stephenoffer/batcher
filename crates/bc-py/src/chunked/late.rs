@@ -16,7 +16,7 @@ use crate::normalize::normalize_batch;
 /// the scan, and the rest above it. TPC-H q12 is the shape: a `l_receiptdate` range under
 /// `l_shipmode IN (..) AND l_commitdate < l_receiptdate AND ...`, and with only the range as its
 /// stage the late read kept a seventh of `lineitem` where the whole clause keeps 0.5%.
-fn scan_filters(plan: &bc_ir::RelOp, driving: usize) -> Vec<&bc_expr::Expr> {
+pub(super) fn scan_filters(plan: &bc_ir::RelOp, driving: usize) -> Vec<&bc_expr::Expr> {
     let mut stack = Vec::new();
     let mut node = plan;
     while let bc_ir::RelOp::Filter { input, predicate } = node {
@@ -305,6 +305,94 @@ fn dictionary_mask(predicate: &bc_expr::Expr, batch: &RecordBatch) -> Option<Boo
         answers.value(slot)
     });
     Some(BooleanArray::new(mask, None))
+}
+
+/// `batch` with the rows `filters` remove, applied in order exactly as the stacked `Filter`s
+/// apply them (each over the rows the ones before it kept), by the engine's own mask
+/// ([`filter_mask`]), which keeps every row of a batch it cannot evaluate so the `Filter` above
+/// raises whatever it raises.
+pub(super) fn apply_filters(
+    filters: &[&bc_expr::Expr],
+    mut batch: RecordBatch,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
+    for predicate in filters {
+        if batch.num_rows() == 0 {
+            break;
+        }
+        let mask = filter_mask(predicate, &batch);
+        if mask.true_count() < batch.num_rows() {
+            batch = arrow::compute::filter_record_batch(&batch, &mask)?;
+        }
+    }
+    Ok(batch)
+}
+
+/// Restate the measured counts of `Scan(source)` and the `Filter`s stacked on it when the read
+/// removed rows before the scan emitted them, so the learning loop is taught the relation's
+/// size and the filters' selectivity rather than what the read left.
+///
+/// A read filtered while decoding (the late stages, or the stack applied as a resident scan is
+/// read) hands the scan only the rows the filters keep, so the scan reported the filtered count
+/// and the filter above it a selectivity of one. Kyber learned exactly that: on TPC-H q5 the
+/// `orders` date range was relearned as keeping all 150M rows, and the plan it chose next ran
+/// 1.6x slower. `rows` is what the scan read before any of it -- its surviving row groups'
+/// rows. One filter gets that as its input, which with its own output is its true selectivity;
+/// a stack of several has no measured count between its filters, so each is marked the way an
+/// operator under a runtime join filter is (`ExecMetrics::runtime_filtered`), and its counts
+/// stay out of the corrections.
+pub(super) fn restate_prefiltered(
+    metrics: &mut bc_interp::ExecMetrics,
+    plan: &bc_ir::RelOp,
+    source: usize,
+    rows: u64,
+) {
+    let mut nodes: Vec<&bc_ir::RelOp> = Vec::new();
+    preorder(plan, &mut nodes);
+    let is_scan =
+        |n: &bc_ir::RelOp| matches!(n, bc_ir::RelOp::Scan { source_id } if *source_id == source);
+    if nodes.iter().filter(|n| is_scan(n)).count() != 1 {
+        return;
+    }
+    // Each filter whose chain of filter inputs ends at the scan, with the scan itself.
+    let mut stack: Vec<u32> = Vec::new();
+    let mut scan_id = None;
+    for (id, node) in nodes.iter().enumerate() {
+        let mut cur = *node;
+        while let bc_ir::RelOp::Filter { input, .. } = cur {
+            cur = input;
+        }
+        if is_scan(cur) {
+            let id = u32::try_from(id).unwrap_or(u32::MAX);
+            if matches!(node, bc_ir::RelOp::Filter { .. }) {
+                stack.push(id);
+            } else {
+                scan_id = Some(id);
+            }
+        }
+    }
+    for op in &mut metrics.ops {
+        if Some(op.op_id) == scan_id {
+            op.rows_in = rows;
+            op.rows_out = rows;
+        } else if stack.len() == 1 && op.op_id == stack[0] {
+            op.rows_in = rows;
+        }
+    }
+    if stack.len() > 1 {
+        for id in stack {
+            if !metrics.runtime_filtered.contains(&id) {
+                metrics.runtime_filtered.push(id);
+            }
+        }
+    }
+}
+
+/// `plan`'s nodes in pre-order, the order `op_id`s number them.
+fn preorder<'a>(plan: &'a bc_ir::RelOp, out: &mut Vec<&'a bc_ir::RelOp>) {
+    out.push(plan);
+    for child in plan.children() {
+        preorder(child, out);
+    }
 }
 
 /// Whether `expr` evaluates to a boolean over one all-null row of `schema`'s columns.

@@ -553,7 +553,7 @@ pub(crate) fn execute_plan_parquet(
     let out = py.detach(|| {
         // The plan's other Parquet scans, which the control plane handed over as schema
         // carriers plus how to read them (`resident`).
-        resident::read_into(&resident, &mut sources, workers)?;
+        let prefiltered = resident::read_into(&plan, &resident, &mut sources, workers)?;
         // Pruned before the units are ranged across the workers, so a clustered predicate's
         // survivors are spread over them rather than left in the few ranges they fall in.
         let groups = bc_io::parquet_row_groups_surviving(&uris, predicate.as_deref())
@@ -570,7 +570,15 @@ pub(crate) fn execute_plan_parquet(
             driving,
             &sources[driving],
         );
-        bc_interp::execute_units_metered(&plan, &sources, driving, &src, workers, budget, &opts)
+        let late = src.late.is_some();
+        let (out, mut metrics) = bc_interp::execute_units_metered(
+            &plan, &sources, driving, &src, workers, budget, &opts,
+        )?;
+        let driving_read = late.then_some((driving, rows as u64));
+        for (id, read) in prefiltered.into_iter().chain(driving_read) {
+            late::restate_prefiltered(&mut metrics, &plan, id, read);
+        }
+        Ok((out, metrics))
     });
     let (out, metrics) = out.map_err(errors::interp_to_pyerr)?;
     let metrics = metrics.with_query(query_watch);
