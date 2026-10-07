@@ -61,7 +61,15 @@ def test_a_second_stage_cancels_the_pending_release(warm):
     assert armed
     with M._inference_pool_in_use():
         assert not M._INFER_IDLE_TIMER, "entering a stage must cancel the pending release"
+    # A cancelled `threading.Timer` sets its event and its thread then exits on its own
+    # schedule, so an `is_alive()` read straight after `cancel()` races that exit -- it failed
+    # once on a loaded 64-core gate. Give the threads time to finish, then hold both halves:
+    # every timer thread ended, and the release it guarded never ran.
+    for t in armed:
+        t.join(timeout=5.0)
     assert all(not t.is_alive() for t in armed)
+    assert warm == [], "the cancelled release fired anyway"
+    M._cancel_inference_idle_release()  # the second stage armed its own; do not leak it
 
 
 def test_zero_disables_the_release(warm, monkeypatch):

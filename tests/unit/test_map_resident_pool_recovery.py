@@ -144,6 +144,12 @@ def test_a_repacked_pool_replaces_the_old_one_instead_of_growing_past_it(monkeyp
         lambda plan0, opts, cpu_workers=None: f"actor@{opts['num_gpus']}",
     )
     monkeypatch.setattr(mapmod, "_healthy_actors", list)
+    # Free capacity is read from `ray._private.state`, which the fake `ray` does not replace:
+    # once any earlier test in the same xdist worker has imported the real Ray, that import
+    # resolves to it and reports the gate node's real free resources (no GPU), so the pool
+    # was clamped to one actor and this failed on the 64-core gate. Capacity is not what this
+    # test is about; "unreadable" is the fake cluster's honest answer.
+    monkeypatch.setattr(mapmod, "_free_actor_slots", lambda *_a, **_k: None)
 
     registry: dict = {}
     whole = mapmod._resident_pool_for(node, {"num_gpus": 1.0}, 4, registry)
