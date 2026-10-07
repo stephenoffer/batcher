@@ -142,3 +142,34 @@ def forward_fill(ctx: Context):
         f"{_OVER} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS f FROM {{t}})"
     )
     return frame_case(ctx, data=_gappy(ctx), batcher=batcher, polars=polars, sql=sql)
+
+
+@timeseries.case("op-ts-ewm-mean")
+def ewm_mean(ctx: Context):
+    """Exponentially weighted mean of price per order (`ewm_mean(alpha=0.5)`, adjusted)."""
+    import batcher as bt
+
+    def batcher(ds):
+        ewm = (
+            bt.col("l_extendedprice")
+            .ewm_mean(alpha=0.5)
+            .over("l_orderkey", order_by="l_linenumber")
+        )
+        e = bt.col("e")
+        return ds.with_columns(e=ewm).agg(total=e.sum(), n=e.count()).to_arrow()
+
+    def polars(lf):
+        import polars as pl
+
+        ewm = (
+            pl.col("l_extendedprice")
+            .ewm_mean(alpha=0.5)
+            .over("l_orderkey", order_by="l_linenumber")
+        )
+        return lf.select(ewm.alias("e")).select(
+            pl.col("e").sum().alias("total"), pl.col("e").count().alias("n")
+        )
+
+    # DuckDB and PyArrow have no exponentially weighted mean; this one is Batcher against
+    # Polars, whose `ewm_mean` it mirrors.
+    return frame_case(ctx, batcher=batcher, polars=polars)

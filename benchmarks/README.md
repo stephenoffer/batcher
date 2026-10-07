@@ -442,7 +442,8 @@ and PyArrow compute where it has the function:
 |---|---|
 | `ops-frame-temporal` | `dt.truncate`, `dt.strftime`, `dt.weekday`, `dt.days_between`, each feeding a group-by |
 | `ops-frame-text` | `str.split_part`, a regex `replace_all`, a regex `extract` capture group, `str.md5` |
-| `ops-frame-timeseries` | `cum_sum`, `diff`, `rolling_mean` and a forward fill, per order by line number |
+| `ops-frame-timeseries` | `cum_sum`, `diff`, `rolling_mean`, a forward fill and `ewm_mean`, per order by line number |
+| `ops-frame-joins` | `join_where` (inequality only) and `cross_join` |
 | `ops-frame-reshape` | `pivot`, `top_k`, `value_counts` |
 | `ops-frame-grouping` | `rollup`, `cube`, `max_by`, `corr` |
 | `ops-frame-lists` | `list.len`/`sum`/`max`, `list.contains`, `list.sort` + `get`, `list.unique` |
