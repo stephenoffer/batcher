@@ -30,8 +30,16 @@ def user_module(tmp_path, monkeypatch):
     sys.modules.pop("xai_user_models", None)
 
 
-def test_a_udf_from_a_local_module_is_flagged_before_anything_runs(user_module):
+def test_a_udf_from_a_local_module_is_flagged_before_anything_runs(user_module, monkeypatch):
     from xai_user_models import ident
+
+    # `covered` is `None` because no Ray job is attached, so pin that: a test earlier in the
+    # same xdist worker can leave Ray initialized, and inside a Ray job (the gate runs in
+    # one) the job's `working_dir` then answers `covered=False` -- correctly, but not the
+    # case this test is about. The attached case is the next test's.
+    ray = sys.modules.get("ray")
+    if ray is not None:
+        monkeypatch.setattr(ray, "is_initialized", lambda: False)
 
     ds = bt.from_pydict({"x": [1]}).map_batches(ident)
     report = _report(ds)

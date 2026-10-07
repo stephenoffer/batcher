@@ -180,19 +180,22 @@ def test_a_streamed_stage_is_timed_on_its_own_work_not_its_upstreams_wait() -> N
     invert `gpu-starved`, whose whole job is comparing a GPU stage against its feeders.
 
     Here the CPU stage sleeps 8x longer per batch than the GPU stage, so it must read as the
-    expensive one even though the GPU stage is downstream of it."""
+    expensive one even though the GPU stage is downstream of it. The sleeps are tens of
+    milliseconds rather than single ones so the ratio is the sleeps' and not the per-batch
+    bookkeeping's: at 4 ms against 0.5 ms a loaded 64-core gate measured 40.8 ms against
+    14.4 ms, and the GPU stage's fixed per-call cost alone nearly closed the 3x margin."""
     import time
 
     import pyarrow as pa
 
     class Decode:
         def __call__(self, batch):
-            time.sleep(0.004)
+            time.sleep(0.02)
             return batch
 
     class Model:
         def __call__(self, batch):
-            time.sleep(0.0005)
+            time.sleep(0.0025)
             return batch
 
     ds = (

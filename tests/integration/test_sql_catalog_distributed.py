@@ -152,22 +152,31 @@ class _Relation:
 
 
 def test_the_distributed_run_used_more_than_one_worker(warehouse):
-    """Positive control: without it, every comparison above is consistent with one worker."""
+    """Positive control: without it, every comparison above is consistent with one worker.
+
+    Each batch is tagged with the Ray task that mapped it, not the process: Ray reuses an
+    idle worker process for the next task, so on a busy node (the gate runs eight test
+    processes against one Ray cluster) two partitions mapped one after the other share a pid
+    while still being two tasks, and the pid check reported "one process" for a split run.
+    """
     orders_dir, _ = warehouse
 
     # Defined here, not at module level, so Ray pickles it by value: a worker cannot import
     # this test module by name.
-    def _tag_process(batch: pa.RecordBatch) -> pa.RecordBatch:
-        pid = pa.array([os.getpid()] * batch.num_rows, pa.int64())
-        return pa.RecordBatch.from_arrays([*batch.columns, pid], [*batch.schema.names, "pid"])
+    def _tag_task(batch: pa.RecordBatch) -> pa.RecordBatch:
+        import ray
+
+        task = ray.get_runtime_context().get_task_id() or f"pid-{os.getpid()}"
+        tag = pa.array([task] * batch.num_rows, pa.string())
+        return pa.RecordBatch.from_arrays([*batch.columns, tag], [*batch.schema.names, "task"])
 
     s = bt.Session()
-    columns = ["o_id", "cust", "region", "amount", "day", "pid"]
-    s.register(
-        "tagged", bt.read.parquet(orders_dir).map_batches(_tag_process, output_columns=columns)
+    columns = ["o_id", "cust", "region", "amount", "day", "task"]
+    s.register("tagged", bt.read.parquet(orders_dir).map_batches(_tag_task, output_columns=columns))
+    tasks = s.sql("SELECT DISTINCT task FROM tagged").collect(
+        distributed=True, num_workers=_WORKERS
     )
-    pids = s.sql("SELECT DISTINCT pid FROM tagged").collect(distributed=True, num_workers=_WORKERS)
-    assert pids.num_rows > 1, f"every batch ran in one process: {pids.to_pydict()}"
+    assert tasks.num_rows > 1, f"every batch ran in one Ray task: {tasks.to_pydict()}"
 
 
 def test_an_unordered_limit_is_where_the_paths_may_differ(warehouse):

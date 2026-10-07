@@ -72,9 +72,18 @@ class TestCollect:
         _assert_times_out(lambda: _slow_pipeline().collect(), stage="map_batches")
 
     def test_a_native_relational_query_is_cancelled_in_the_engine(self) -> None:
-        rows = 2_000_000
-        ds = bt.from_pydict({"a": [i % 500_000 for i in range(rows)], "b": [1.0] * rows})
-        query = ds.join(ds, on="a").group_by("a").agg(s=bt.col("b").sum())
+        # The query must outlast LIMIT_S on any box the gate runs on. The previous shape, a
+        # self-join grouped by its own key, finished in 60 ms on a 16-core node, so it never
+        # timed out. Here the aggregate reads both sides of every joined pair, 1.2 billion of
+        # them (200 rows on each side of each of 30,000 keys): 3.0 s uncancelled on 16 cores
+        # at a 0.7 GB peak. Do not raise the per-key fan-out to make it slower: at 400 rows a
+        # side the same join peaked at 49 GB, and at 800 it was OOM-killed before the
+        # cancellation landed.
+        rows = 6_000_000
+        ds = bt.from_pydict(
+            {"a": [i % 30_000 for i in range(rows)], "b": [i * 0.5 for i in range(rows)]}
+        )
+        query = ds.join(ds, on="a").agg(m=(bt.col("b") - bt.col("b_right")).abs().max())
         _assert_times_out(query.collect, stage="core.execute")
 
 
