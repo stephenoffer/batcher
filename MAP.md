@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1573 Python modules across 222 packages and 328 Rust files across 14 crates.
+Covering 1573 Python modules across 222 packages and 329 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -966,7 +966,7 @@ Window-function translation for the SQL front-end.
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
 | `flight_sort.py` | 578 | Distributed sort over an Arrow Flight shuffle (object store bypassed). |
 | `flight_window.py` | 383 | Keyed row shuffle over an Arrow Flight shuffle (object store bypassed). |
-| `flight_worker.py` | 1921 | The shared Arrow Flight shuffle worker actor. |
+| `flight_worker.py` | 1926 | The shared Arrow Flight shuffle worker actor. |
 | `shuffle_io.py` | 532 | Arrow IPC shuffle files — the object-store-bypassing data-plane transport. |
 | `shuffle_replication.py` | 312 | Shuffle-output replication: turn a worker loss into a re-fetch, not a recompute. |
 | `skew.py` | 446 | Learned join-skew: persist the hot join-key values measured by the detection |
@@ -3069,20 +3069,21 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 
 | file | lines | what it is |
 |---|---|---|
+| `agg.rs` | 76 | The distributed aggregate's map and reduce steps: `partial_aggregate`, `combine` and `combine_finalize`, the mergeable folds the shuffle composes across… |
 | `bloom.rs` | 197 | Bloom-filter FFI for the distributed runtime join reduction. |
 | `chunked/late.rs` | 270 | Late materialization for the Parquet driving scan: the plan's own `Filter`, and the runtime join filters the executor places on the scan, as… |
 | `chunked/mod.rs` | 611 | The FFI entry point for streaming one source into the engine chunk by chunk. |
 | `errors.rs` | 141 | Classified engine exceptions at the PyO3 boundary. |
-| `flight.rs` | 716 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
+| `flight.rs` | 728 | Flight FFI: the Arrow Flight shuffle transport surface exposed to Python. |
 | `hardware.rs` | 319 | What the engine's own process knows about its hardware and its allocator. |
-| `lib.rs` | 799 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
+| `lib.rs` | 754 | `bc-py` — the PyO3 boundary that assembles the Rust engine into the `batcher._native` extension module. |
 | `normalize.rs` | 787 | Boundary type normalization: the input/output type adaptations the FFI applies so the engine's kernels stay on a small, well-tested set of column types. |
 | `pool.rs` | 165 | The `MemoryPool` FFI surface — Carbonite's reserve-before-allocate primitive. |
 | `process.rs` | 106 | Process-wide singletons the FFI layer shares across calls. |
 | `route.rs` | 175 | Which executor a plan runs on, and the two different affordability tests behind that. |
 | `shuffle/gather.rs` | 433 | The reducer's gather: how a worker pulls its bucket from every mapper. |
 | `shuffle/mod.rs` | 554 | Shuffle FFI: partitioners and the concurrent reducer gather. |
-| `sketches.rs` | 584 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
+| `sketches.rs` | 622 | Sketch / statistics FFI: HyperLogLog distinct counts, KLL/TDigest quantiles, Misra-Gries heavy hitters, and reservoir sampling over Arrow batches. |
 | `tracing_init.rs` | 194 | Rust data-plane `tracing` → Python `logging` bridge. |
 
 ### `bc-interp`
@@ -3411,7 +3412,7 @@ Arrow Flight inter-node transport for Batcher's distributed shuffle.
 | `lib.rs` | 120 | Arrow Flight inter-node transport for Batcher's distributed shuffle. |
 | `peers.rs` | 409 | What each peer actually carried, so a slow shuffle can name the wire it was slow on. |
 | `shared.rs` | 442 | Same-node, cross-process partition transfer via memory-mapped Arrow IPC. |
-| `store.rs` | 610 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
+| `store.rs` | 619 | Internal partition store: the in-memory registry mapping a ticket string to the batches served under it, plus the per-exchange in-flight gauge used to prove… |
 | `ticket.rs` | 93 | The structured shuffle coordinate ([`ShuffleTicket`]) the distributed layer uses to build and parse the opaque ticket string carried on the wire. |
 | `tls.rs` | 207 | TLS configuration for the inter-node Flight shuffle. |
 | `tls_test_certs.rs` | 193 | Static PEM test material for the TLS transport tests, minted with openssl. |

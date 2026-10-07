@@ -32,6 +32,7 @@ use pyo3::prelude::*;
 #[global_allocator]
 static GLOBAL_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod agg;
 mod bloom;
 mod chunked;
 mod errors;
@@ -391,21 +392,6 @@ pub(crate) fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
     errors::execution_error(e.to_string())
 }
 
-/// Distributed map step: aggregate one partition into partial state.
-#[pyfunction]
-fn partial_aggregate(
-    group_keys_json: &str,
-    aggregates_json: &str,
-    batches: Vec<PyArrowType<RecordBatch>>,
-) -> PyResult<PyArrowType<RecordBatch>> {
-    let group_keys = parse_group_keys(group_keys_json)?;
-    let aggregates = parse_aggregates(aggregates_json)?;
-    let batches = unwrap_batches(batches)?;
-    let out =
-        bc_interp::dist::partial_aggregate(&group_keys, &aggregates, &batches).map_err(to_pyerr)?;
-    Ok(PyArrowType(rebase_batch(out)))
-}
-
 /// Execute `plan_json` and fold its output straight into partial-aggregate state,
 /// without ever handing the intermediate rows back to Python.
 ///
@@ -458,37 +444,6 @@ fn execute_plan_aggregated(
         }
     });
     Ok(PyArrowType(rebase_batch(out.map_err(to_pyerr)?)))
-}
-
-/// Distributed reduce step: merge partial-state batches and finalize.
-#[pyfunction]
-fn combine_finalize(
-    group_keys_json: &str,
-    aggregates_json: &str,
-    partials: Vec<PyArrowType<RecordBatch>>,
-) -> PyResult<PyArrowType<RecordBatch>> {
-    let group_keys = parse_group_keys(group_keys_json)?;
-    let aggregates = parse_aggregates(aggregates_json)?;
-    let partials = unwrap_batches(partials)?;
-    let out =
-        bc_interp::dist::combine_finalize(&group_keys, &aggregates, &partials).map_err(to_pyerr)?;
-    Ok(PyArrowType(rebase_batch(out)))
-}
-
-/// Combine step WITHOUT finalize: merge partial-state batches into a single partial
-/// batch (same wire format), so a streaming driver can keep one running state across
-/// micro-batches, bounded by the number of groups, and `combine_finalize` once.
-#[pyfunction]
-fn combine(
-    group_keys_json: &str,
-    aggregates_json: &str,
-    partials: Vec<PyArrowType<RecordBatch>>,
-) -> PyResult<PyArrowType<RecordBatch>> {
-    let group_keys = parse_group_keys(group_keys_json)?;
-    let aggregates = parse_aggregates(aggregates_json)?;
-    let partials = unwrap_batches(partials)?;
-    let out = bc_interp::dist::combine(&group_keys, &aggregates, &partials).map_err(to_pyerr)?;
-    Ok(PyArrowType(rebase_batch(out)))
 }
 
 /// Native Parquet read of one object's selected row-groups into pyarrow batches.
@@ -752,11 +707,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_parquet_many, m)?)?;
     m.add_function(wrap_pyfunction!(parquet_footer_stats, m)?)?;
     m.add_function(wrap_pyfunction!(parquet_file_manifest, m)?)?;
-    m.add_function(wrap_pyfunction!(partial_aggregate, m)?)?;
+    m.add_function(wrap_pyfunction!(agg::partial_aggregate, m)?)?;
     m.add_function(wrap_pyfunction!(execute_plan_aggregated, m)?)?;
     chunked::register(m)?;
-    m.add_function(wrap_pyfunction!(combine, m)?)?;
-    m.add_function(wrap_pyfunction!(combine_finalize, m)?)?;
+    m.add_function(wrap_pyfunction!(agg::combine, m)?)?;
+    m.add_function(wrap_pyfunction!(agg::combine_finalize, m)?)?;
     // The shuffle surface registers itself, because it is the one family that grows a pair of
     // entry points at a time (a routing and its sampler, once per key family) and this list is
     // at its size limit. `shuffle::register` keeps the growth beside the functions it names.

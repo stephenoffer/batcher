@@ -63,24 +63,31 @@ fn temporal_cols_as_i64(
 
 /// Estimate the number of distinct (non-null) values in a column across batches,
 /// using HyperLogLog++. Mergeable, so it can be computed per partition.
+///
+/// This and the other per-row sketch builds below release the GIL, like `column_ndv`: a
+/// fleet actor runs them on one of several concurrent threads, and holding the GIL for a
+/// whole column's worth of hashing stalled every other thread of the actor.
 #[pyfunction]
 pub(crate) fn estimate_distinct(
+    py: Python<'_>,
     column: &str,
     batches: Vec<PyArrowType<RecordBatch>>,
 ) -> PyResult<f64> {
-    let mut sketch: Option<bc_sketches::ColumnStats> = None;
-    for batch in batches {
-        let b = batch.0;
-        let col = b
-            .column_by_name(column)
-            .ok_or_else(|| PyRuntimeError::new_err(format!("no column {column:?}")))?;
-        let stats = bc_sketches::ColumnStats::from_array(col);
-        match &mut sketch {
-            Some(s) => s.merge(&stats),
-            None => sketch = Some(stats),
+    py.detach(|| {
+        let mut sketch: Option<bc_sketches::ColumnStats> = None;
+        for batch in batches {
+            let b = batch.0;
+            let col = b
+                .column_by_name(column)
+                .ok_or_else(|| PyRuntimeError::new_err(format!("no column {column:?}")))?;
+            let stats = bc_sketches::ColumnStats::from_array(col);
+            match &mut sketch {
+                Some(s) => s.merge(&stats),
+                None => sketch = Some(stats),
+            }
         }
-    }
-    Ok(sketch.map_or(0.0, |s| s.distinct_estimate()))
+        Ok(sketch.map_or(0.0, |s| s.distinct_estimate()))
+    })
 }
 
 /// Per-column distinct-count estimates (HLL only), computed in parallel across batches.
@@ -319,15 +326,24 @@ pub(crate) fn column_stats_full(
 /// non-numeric or empty columns return an empty list. Mergeable across batches.
 #[pyfunction]
 pub(crate) fn tail_quantiles(
+    py: Python<'_>,
     columns: Vec<String>,
     batches: Vec<PyArrowType<RecordBatch>>,
     probs: Vec<f64>,
 ) -> PyResult<std::collections::HashMap<String, Vec<f64>>> {
+    Ok(py.detach(|| tail_quantiles_native(&columns, &batches, &probs)))
+}
+
+fn tail_quantiles_native(
+    columns: &[String],
+    batches: &[PyArrowType<RecordBatch>],
+    probs: &[f64],
+) -> std::collections::HashMap<String, Vec<f64>> {
     let mut digests: std::collections::HashMap<String, bc_sketches::TDigest> =
         std::collections::HashMap::new();
-    for batch in &batches {
+    for batch in batches {
         let b = &batch.0;
-        for name in &columns {
+        for name in columns {
             if let Some(col) = b.column_by_name(name) {
                 let Ok(f) = cast(col, &DataType::Float64) else {
                     continue;
@@ -356,7 +372,7 @@ pub(crate) fn tail_quantiles(
             },
         );
     }
-    Ok(out)
+    out
 }
 
 /// Build a TDigest over `column`'s numeric values across `batches` and return its
@@ -366,14 +382,19 @@ pub(crate) fn tail_quantiles(
 /// merges them, so an approximate quantile never collects the column to one place.
 #[pyfunction]
 pub(crate) fn tdigest_partial(
+    py: Python<'_>,
     column: String,
     batches: Vec<PyArrowType<RecordBatch>>,
 ) -> PyResult<Option<Vec<u8>>> {
+    Ok(py.detach(|| tdigest_partial_native(&column, &batches)))
+}
+
+fn tdigest_partial_native(column: &str, batches: &[PyArrowType<RecordBatch>]) -> Option<Vec<u8>> {
     let mut digest = bc_sketches::TDigest::default();
     let mut any = false;
-    for batch in &batches {
+    for batch in batches {
         let b = &batch.0;
-        if let Some(col) = b.column_by_name(&column) {
+        if let Some(col) = b.column_by_name(column) {
             let Ok(f) = cast(col, &DataType::Float64) else {
                 continue;
             };
@@ -388,7 +409,7 @@ pub(crate) fn tdigest_partial(
             }
         }
     }
-    Ok(any.then(|| digest.to_bytes()))
+    any.then(|| digest.to_bytes())
 }
 
 /// Merge serialized TDigest `sketches` (from `tdigest_partial`) and return the value at
@@ -488,19 +509,28 @@ fn render_int_hits(hits: &[(i64, u64)], dtype: &DataType) -> Vec<(String, u64)> 
 /// path match on are byte-identical to what this always produced.
 #[pyfunction]
 pub(crate) fn heavy_hitters(
+    py: Python<'_>,
     columns: Vec<String>,
     batches: Vec<PyArrowType<RecordBatch>>,
     fraction: f64,
 ) -> PyResult<std::collections::HashMap<String, Vec<(String, u64)>>> {
+    Ok(py.detach(|| heavy_hitters_native(&columns, &batches, fraction)))
+}
+
+fn heavy_hitters_native(
+    columns: &[String],
+    batches: &[PyArrowType<RecordBatch>],
+    fraction: f64,
+) -> std::collections::HashMap<String, Vec<(String, u64)>> {
     // Misra-Gries capacity: 1/fraction guarantees all keys above `fraction` survive.
     let capacity = ((1.0 / fraction).ceil() as usize).max(1);
     let mut ints: std::collections::HashMap<String, (DataType, bc_sketches::FrequentItems<i64>)> =
         std::collections::HashMap::new();
     let mut strs: std::collections::HashMap<String, bc_sketches::FrequentItems<String>> =
         std::collections::HashMap::new();
-    for batch in &batches {
+    for batch in batches {
         let b = &batch.0;
-        for name in &columns {
+        for name in columns {
             let Some(col) = b.column_by_name(name) else {
                 continue;
             };
@@ -539,7 +569,7 @@ pub(crate) fn heavy_hitters(
         let hits = fi.heavy_hitters(fraction);
         out.insert(name, render_int_hits(&hits, &dtype));
     }
-    Ok(out)
+    out
 }
 
 /// A uniform random row sample (the reservoir sketch, Algorithm R) of size `k`
@@ -548,7 +578,15 @@ pub(crate) fn heavy_hitters(
 /// input has at most `k` rows, returns them all.
 #[pyfunction]
 pub(crate) fn reservoir_sample(
+    py: Python<'_>,
     batches: Vec<PyArrowType<RecordBatch>>,
+    k: usize,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    py.detach(|| reservoir_sample_native(&batches, k))
+}
+
+fn reservoir_sample_native(
+    batches: &[PyArrowType<RecordBatch>],
     k: usize,
 ) -> PyResult<PyArrowType<RecordBatch>> {
     use arrow::array::UInt64Array;
