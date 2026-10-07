@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1571 Python modules across 221 packages and 335 Rust files across 14 crates.
+Covering 1571 Python modules across 221 packages and 337 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -217,7 +217,7 @@ The `Dataset` builder package.
 | `_export.py` | 331 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
 | `_nulls.py` | 223 | Null handling behind `Dataset.fill_null` / `drop_nulls` / `isna` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
-| `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
+| `_window.py` | 237 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
 | `frame.py` | 7147 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
@@ -264,7 +264,7 @@ Migration-error guidance: the traceback is the documentation.
 | module | lines | what it is |
 |---|---|---|
 | `_dataset_naming.py` | 288 | The Spark/pandas/Ray Data naming and foreign-format-exporter half of the redirect table. |
-| `_dataset_table.py` | 498 | The Dataset half of the migration-error table: what a migrant types, and why it is absent. |
+| `_dataset_table.py` | 495 | The Dataset half of the migration-error table: what a migrant types, and why it is absent. |
 | `_groupby_table.py` | 195 | The GroupBy half of the migration-error table. |
 | `dataset.py` | 57 | `Dataset.__getattr__`'s answer: an actionable error for a name Batcher does not have. |
 | `groupby.py` | 34 | `GroupBy.__getattr__`'s answer: an actionable error for a grouped API Batcher lacks. |
@@ -382,7 +382,7 @@ Session entry points that create `Dataset`s.
 | `frames.py` | 760 | In-memory constructors: Python and Arrow objects to a lazy `Dataset`. |
 | `frameworks.py` | 492 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
-| `onboarding.py` | 149 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
+| `onboarding.py` | 147 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
 | `read.py` | 141 | The generic read dispatch behind the `bt.read` namespace. |
 | `sql.py` | 292 | The default session: `bt.sql`, `bt.register_function`, `bt.register_model` and its accessors. |
 | `versions.py` | 158 | Version and environment reporting (`engine_version`, `show_versions`). |
@@ -2412,7 +2412,7 @@ The Batcher UI — a local web dashboard for queries, plans, metrics, and logs.
 | `feedback.py` | 345 | Execution feedback contract: Core → Kyber. |
 | `ids.py` | 10 | Stable identifiers used across plans and feedback. |
 | `ir_specs.py` | 166 | The shared sub-document shapes of the JSON IR — group keys, aggregates, sort keys. |
-| `ir_tags.py` | 290 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
+| `ir_tags.py` | 295 | The JSON IR vocabulary — the single Python home for the wire-contract tags. |
 | `physical.py` | 234 | `PhysicalPlan` — what Kyber emits and Core executes. |
 | `schema.py` | 174 | `SchemaRef` — a thin wrapper making `pyarrow.Schema` the source of truth. |
 | `source_stats.py` | 442 | `plan.source_stats` — what a connector declares about a source, cheaply. |
@@ -2446,12 +2446,12 @@ The scalar expression algebra.
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
 | `constructors.py` | 512 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6874 | The scalar expression base class and its core IR nodes. |
+| `core.py` | 7092 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 376 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 532 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
 | `node_base.py` | 421 | Declarative base for the scalar `Expr` IR nodes — kills the `to_ir()` boilerplate. |
-| `nodes.py` | 661 | Leaf IR nodes the `Expr` base class does not construct. |
+| `nodes.py` | 709 | Leaf IR nodes the `Expr` base class does not construct. |
 | `render.py` | 278 | A readable ``repr`` for the scalar `Expr` tree. |
 | `video.py` | 232 | The `.video` expression namespace — lazy, batch-level video decode. |
 | `walk.py` | 385 | Structural traversals over the expression tree. |
@@ -2502,7 +2502,7 @@ Shared traversal for scalar `Expr` trees and for the expressions inside a node.
 | `algebra.py` | 193 | Boolean-connective algebra, column substitution, and window hoisting. |
 | `naming.py` | 96 | The output name a positional expression gets when nothing names it. |
 | `nodes.py` | 129 | Apply an expression rewrite to every expression a *plan node* carries. |
-| `over.py` | 211 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
+| `over.py` | 212 | Binding ``.over(...)`` onto any expression: the one implementation behind every `over`. |
 | `subtrees.py` | 133 | Structural identity of an expression, and whole-subtree substitution. |
 | `traverse.py` | 288 | The structural ladder for scalar `Expr` trees — child access and rebuilding. |
 
@@ -2650,7 +2650,7 @@ String free functions, in two halves: building text and reading structure out of
 | `relational.py` | 667 | Row-wise and set relational logical nodes. |
 | `reshape.py` | 227 | Row-reshaping logical nodes — `plan`, the neutral contract layer. |
 | `transforms.py` | 743 | Plan transforms and predicates over `LogicalPlan` trees. |
-| `window.py` | 522 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
+| `window.py` | 559 | Window-function logical nodes: `WindowFuncSpec` and `Window`. |
 
 ### `batcher/plan/profile/` — 1 · contract
 
@@ -2726,7 +2726,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 
 | module | lines | what it is |
 |---|---|---|
-| `arithmetic.py` | 364 | Output types for the arithmetic families: binary operators and the math functions. |
+| `arithmetic.py` | 390 | Output types for the arithmetic families: binary operators and the math functions. |
 | `collections.py` | 226 | Output types for the container accessors: `list`, `struct` and `map`. |
 | `dispatch.py` | 505 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `geospatial.py` | 107 | Output types for the `st_*` geometry and `quat_*`/`se3_*` rigid-body functions. |
@@ -3103,7 +3103,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/joins.rs` | 657 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
-| `ops/mod.rs` | 1897 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
+| `ops/mod.rs` | 1899 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
 | `ops/morsel.rs` | 486 | Morselization: splitting input batches into row- **and** byte-bounded morsels for the parallel scheduler. |
 | `ops/project_field.rs` | 128 | Output-field construction for [`super::project_batch_jit`]. |
 | `ops/quantile_spill/histogram.rs` | 219 | Bounded out-of-core `histogram(value)` — the `Map<value, count>` member of the value-list aggregate family (`super`), split out so the parent module stays within the file-size budget. |
@@ -3172,7 +3172,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/stats.rs` | 463 | Two-input covariance/correlation and single-input skewness/kurtosis. |
 | `agg/var.rs` | 335 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `byte_key.rs` | 261 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
-| `error.rs` | 131 | The crate's error type: how the stateful runtime structures report failure. |
+| `error.rs` | 138 | The crate's error type: how the stateful runtime structures report failure. |
 | `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 761 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `gather/spans.rs` | 136 | Copying a sequence of source byte spans into one output buffer, as few copies as possible. |
@@ -3203,12 +3203,13 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `window/fill.rs` | 53 | `forward_fill` / `backward_fill` — carry the nearest non-null value along an ordered partition. |
 | `window/frame/bounds.rs` | 439 | Which rows a window frame covers — the geometry, with no arithmetic over them. |
 | `window/frame/mod.rs` | 749 | Explicit window frames — the sliding aggregates computed over them. |
-| `window/mod.rs` | 1704 | Window functions — partition, order, and append one column per function. |
+| `window/mod.rs` | 1743 | Window functions — partition, order, and append one column per function. |
 | `window/packed_order.rs` | 225 | Window ordering for a key tuple narrow enough to pack into one `u64`. |
-| `window/parallel.rs` | 385 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
+| `window/parallel.rs` | 386 | Bucket-parallel window execution: hash-partition rows by the PARTITION BY keys so every window partition lands wholly inside one bucket, run the serial window kernel ([`crate::window::window_serial`]) on each bucket across rayon cores, and scatter each function's output column back to original row order. |
 | `window/partition_agg.rs` | 352 | Whole-partition window aggregates (`SUM`/`AVG`/`MIN`/`MAX`/`COUNT` with no ORDER BY and no frame): one value per partition, broadcast to every row of that… |
+| `window/qcut.rs` | 134 | `qcut`: bin every row by the quantiles of its own partition (pandas `qcut`). |
 | `window/running_par.rs` | 163 | Parallel prefix scan for *running* (frameless, ordered) window aggregates. |
-| `window/series.rs` | 311 | Series kernels over an ordered partition: EWM statistics, interpolation, run ids. |
+| `window/series.rs` | 413 | Series kernels over an ordered partition: EWM statistics, interpolation, run ids. |
 | `window/topk.rs` | 196 | `row_number() OVER (PARTITION BY … ORDER BY …) <= k` without ordering the partitions. |
 
 ### `bc-codegen`
@@ -3238,7 +3239,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `depth.rs` | 120 | How deep a plan document is, measured without recursing into it. |
 | `engine_config.rs` | 224 | Execution tunables shipped from the Python control plane alongside the plan. |
 | `error.rs` | 26 | The crate's error type: how a malformed plan IR is rejected at the wire boundary. |
-| `lib.rs` | 961 | `bc-ir` — the query intermediate representation. |
+| `lib.rs` | 973 | `bc-ir` — the query intermediate representation. |
+| `window_opts.rs` | 69 | Options of the series window functions (`ewm_*`, `interpolate`) and of `qcut`. |
 
 ### `bc-expr`
 
@@ -3263,7 +3265,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/cmp/prim.rs` | 522 | `<integer or temporal column> <cmp> <literal>`, and a two-sided range over one column, a word of mask bits at a time. |
 | `eval/cmp/string.rs` | 409 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
-| `eval/dispatch.rs` | 632 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 637 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 432 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/edge_tests.rs` | 276 | Row-local failure versus caller error, and the edge semantics fixed alongside it. |
@@ -3291,7 +3293,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/map_ops/make_map.rs` | 148 | Map construction for `Expr::MakeMap` — SQL `map(keys, values)`, Spark's `map_from_arrays` — pairing two `List` columns into one Arrow `Map` column. |
 | `eval/map_ops/mod.rs` | 11 | `Map`-column **construction**, as the counterpart to the read-side accessors in `eval/map.rs` (`map_keys`/`map_values`/`map_entries`/`element_at`). |
 | `eval/map_ops/struct_update.rs` | 94 | `Expr::StructUpdate`: add, replace, rename and drop a struct's fields without rebuilding it. |
-| `eval/math.rs` | 592 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
+| `eval/math.rs` | 702 | Numeric evaluation for `Expr::Math`/`Math2`/`Coalesce`/`Greatest`/`Least` (split out of `lib.rs`). |
 | `eval/media/audio.rs` | 559 | Audio-decode evaluation for `Expr::Audio` (the `.audio` namespace). |
 | `eval/media/image/hash.rs` | 159 | Perceptual hashes: the fingerprints that make image near-duplicate detection a join. |
 | `eval/media/image/mod.rs` | 705 | Image-decode evaluation for `Expr::Image` (the `.image` namespace). |

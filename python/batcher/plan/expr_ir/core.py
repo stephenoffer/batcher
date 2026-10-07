@@ -4730,7 +4730,12 @@ class Expr:
 
         return WindowExpr("backward_fill", self, [], [], None)
 
-    def interpolate(self) -> WindowExpr:
+    def interpolate(
+        self,
+        *,
+        max_gap: int | float | str | None = None,
+        by: IntoExpr | None = None,
+    ) -> WindowExpr:
         """Draw a straight line across each interior gap — Polars ``interpolate``.
 
         Where :meth:`forward_fill` holds the last reading flat across a gap, this
@@ -4744,12 +4749,32 @@ class Expr:
         The result is always floating point, because the value between two integers
         generally is not one.
 
-        A window expression, so it must be bound with ``.over(...)`` and ``order_by``
-        is required — interpolation follows a defined row order, and an unordered
-        relation has none.
+        By default the line is weighted by row position, which is right only when the
+        readings are evenly spaced. Pass `by` to weight it by the distance along that
+        column instead (Polars ``interpolate_by``): a reading two minutes into a
+        ten-minute gap then sits a fifth of the way along the line, however many rows the
+        gap holds. `by` becomes the window's order, so no ``.over(order_by=...)`` is
+        needed; chain ``.over(partition_by=...)`` to restart per group.
+
+        `max_gap` refuses to invent a long stretch of data: a gap wider than it stays
+        null as a whole. Without `by` it counts the null rows in the gap. With `by` it is
+        the distance between the two readings that bracket the gap, as a number in that
+        column's units or a duration such as ``"10m"`` for a temporal column. pandas'
+        ``interpolate(limit=n)`` differs: it fills the first `n` rows of a longer gap.
+
+        Without `by` this is a window expression, so it must be bound with
+        ``.over(...)`` and ``order_by`` is required — interpolation follows a defined row
+        order, and an unordered relation has none.
+
+        Args:
+            max_gap: The widest gap to fill, or ``None`` (the default) for no limit.
+            by: The single numeric or temporal column to measure distance along.
 
         Returns:
             A window expression carrying the interpolated column.
+
+        Raises:
+            PlanError: If `max_gap` is negative, or is a duration without `by`.
 
         Examples:
             .. doctest::
@@ -4758,10 +4783,22 @@ class Expr:
                 >>> ds = bt.from_pydict({"t": [1, 2, 3, 4], "x": [10.0, None, None, 40.0]})
                 >>> ds.with_columns(i=bt.col("x").interpolate().over(order_by=["t"])).to_pydict()
                 {'t': [1, 2, 3, 4], 'x': [10.0, None, None, 40.0], 'i': [10.0, 20.0, 30.0, 40.0]}
-        """
-        from batcher.plan.expr_ir.nodes import WindowExpr
 
-        return WindowExpr("interpolate", self, [], [], None)
+                >>> x = [0.0, None, 5.0, None, None, 8.0]
+                >>> gappy = bt.from_pydict({"t": [0, 1, 5, 6, 7, 8], "x": x})
+                >>> filled = bt.col("x").interpolate(by="t", max_gap=3)
+                >>> gappy.with_columns(i=filled).to_pydict()["i"]
+                [0.0, None, 5.0, 6.0, 7.0, 8.0]
+        """
+        from batcher.plan.expr_ir.nodes import WindowExpr, WindowOptions
+
+        gap = _interpolate_gap(max_gap, by_value=by is not None)
+        if by is None:
+            series = None if gap is None else WindowOptions(max_gap=gap)
+            return WindowExpr("interpolate", self, [], [], None, opts=series)
+        series = WindowOptions(max_gap=gap, by_value=True)
+        window = WindowExpr("interpolate", self, [], [], None, opts=series)
+        return window.over(order_by=[by])
 
     def rle_id(self) -> WindowExpr:
         """Number the runs of equal consecutive values — Polars ``rle_id``.
@@ -4797,16 +4834,24 @@ class Expr:
     def _ewm(
         self,
         func: str,
-        com: float | None,
-        span: float | None,
-        half_life: float | None,
-        alpha: float | None,
+        decay: tuple[float | None, float | None, float | None, float | None],
+        adjust: bool,
+        ignore_nulls: bool,
+        min_periods: int,
     ) -> WindowExpr:
-        """Resolve one of the four decay spellings to an alpha and build the window."""
-        from batcher.plan.expr_ir.nodes import WindowExpr
+        """Resolve the decay spelling to an alpha, validate the options, build the window."""
+        from batcher.plan.expr_ir.nodes import WindowExpr, WindowOptions
 
-        resolved = _ewm_alpha(func, com, span, half_life, alpha)
-        return WindowExpr(func, self, [], [], None, alpha=resolved)
+        resolved = _ewm_alpha(func, *decay)
+        for arg, flag in (("adjust", adjust), ("ignore_nulls", ignore_nulls)):
+            if not isinstance(flag, bool):
+                raise PlanError(f"{func}(): {arg} must be a bool, got {flag!r}")
+        # pandas' `min_periods=0` means "no minimum", which is what 1 means here.
+        minp = max(1, require_int(min_periods, func=func, arg="min_periods", minimum=0))
+        series = None if adjust and minp == 1 else WindowOptions(adjust=adjust, min_periods=minp)
+        return WindowExpr(
+            func, self, [], [], None, alpha=resolved, ignore_nulls=ignore_nulls, opts=series
+        )
 
     def ewm_mean(
         self,
@@ -4815,6 +4860,9 @@ class Expr:
         span: float | None = None,
         half_life: float | None = None,
         alpha: float | None = None,
+        adjust: bool = True,
+        ignore_nulls: bool = False,
+        min_periods: int = 1,
     ) -> WindowExpr:
         """Exponentially weighted moving average — Polars/pandas ``ewm_mean``.
 
@@ -4832,7 +4880,10 @@ class Expr:
 
         A null input row yields a null output and contributes no value, but still ages
         the decay — pandas' ``adjust=True, ignore_na=False`` and Polars'
-        ``adjust=True, ignore_nulls=False``, the default in both.
+        ``adjust=True, ignore_nulls=False``, the default in both. `adjust`,
+        `ignore_nulls` and `min_periods` follow those two libraries' meanings, so a
+        smoother ported from either keeps its numbers at every non-null row. pandas
+        carries the last value across a null row where Batcher and Polars return null.
 
         A window expression, so it must be bound with ``.over(...)`` and ``order_by``
         is required.
@@ -4842,6 +4893,12 @@ class Expr:
             span: Span, ``>= 1``.
             half_life: Half-life in rows, ``> 0``.
             alpha: The smoothing factor itself, in ``(0, 1]``.
+            adjust: Divide by the decayed sum of every weight (``True``, the default), or
+                use the recursive form ``y = (1 - alpha) * y_prev + alpha * x``.
+            ignore_nulls: Let a null row leave the decay alone, so weights follow the
+                position among the non-null values rather than among all rows.
+            min_periods: Non-null observations a partition must have seen before a row
+                gets a value; earlier rows are null.
 
         Returns:
             A window expression carrying the exponentially weighted mean.
@@ -4858,8 +4915,14 @@ class Expr:
                 >>> w = bt.col("x").ewm_mean(alpha=0.5).over(order_by=["t"])
                 >>> ds.with_columns(e=w).to_pydict()["e"]
                 [1.0, 1.6666666666666665, 2.4285714285714284]
+
+                >>> w = bt.col("x").ewm_mean(alpha=0.5, adjust=False, min_periods=2)
+                >>> ds.with_columns(e=w.over(order_by=["t"])).to_pydict()["e"]
+                [None, 1.5, 2.25]
         """
-        return self._ewm("ewm_mean", com, span, half_life, alpha)
+        return self._ewm(
+            "ewm_mean", (com, span, half_life, alpha), adjust, ignore_nulls, min_periods
+        )
 
     def ewm_mean_by(
         self,
@@ -4934,6 +4997,9 @@ class Expr:
         span: float | None = None,
         half_life: float | None = None,
         alpha: float | None = None,
+        adjust: bool = True,
+        ignore_nulls: bool = False,
+        min_periods: int = 1,
     ) -> WindowExpr:
         """Exponentially weighted moving standard deviation — Polars ``ewm_std``.
 
@@ -4951,6 +5017,12 @@ class Expr:
             span: Span, ``>= 1``.
             half_life: Half-life in rows, ``> 0``.
             alpha: The smoothing factor itself, in ``(0, 1]``.
+            adjust: Divide by the decayed sum of every weight (``True``, the default), or
+                use the recursive form ``y = (1 - alpha) * y_prev + alpha * x``.
+            ignore_nulls: Let a null row leave the decay alone, so weights follow the
+                position among the non-null values rather than among all rows.
+            min_periods: Non-null observations a partition must have seen before a row
+                gets a value; earlier rows are null.
 
         Returns:
             A window expression carrying the exponentially weighted standard deviation.
@@ -4968,7 +5040,9 @@ class Expr:
                 >>> ds.with_columns(e=w).to_pydict()["e"]
                 [None, 0.7071067811865477, 0.9636241116594317]
         """
-        return self._ewm("ewm_std", com, span, half_life, alpha)
+        return self._ewm(
+            "ewm_std", (com, span, half_life, alpha), adjust, ignore_nulls, min_periods
+        )
 
     def ewm_var(
         self,
@@ -4977,6 +5051,9 @@ class Expr:
         span: float | None = None,
         half_life: float | None = None,
         alpha: float | None = None,
+        adjust: bool = True,
+        ignore_nulls: bool = False,
+        min_periods: int = 1,
     ) -> WindowExpr:
         """Exponentially weighted moving variance — Polars ``ewm_var``.
 
@@ -4989,6 +5066,12 @@ class Expr:
             span: Span, ``>= 1``.
             half_life: Half-life in rows, ``> 0``.
             alpha: The smoothing factor itself, in ``(0, 1]``.
+            adjust: Divide by the decayed sum of every weight (``True``, the default), or
+                use the recursive form ``y = (1 - alpha) * y_prev + alpha * x``.
+            ignore_nulls: Let a null row leave the decay alone, so weights follow the
+                position among the non-null values rather than among all rows.
+            min_periods: Non-null observations a partition must have seen before a row
+                gets a value; earlier rows are null.
 
         Returns:
             A window expression carrying the exponentially weighted variance.
@@ -5006,7 +5089,9 @@ class Expr:
                 >>> ds.with_columns(e=w).to_pydict()["e"]
                 [None, 0.5000000000000002, 0.928571428571429]
         """
-        return self._ewm("ewm_var", com, span, half_life, alpha)
+        return self._ewm(
+            "ewm_var", (com, span, half_life, alpha), adjust, ignore_nulls, min_periods
+        )
 
     # --- rolling (fixed-size trailing window) aggregates --------------------
     def _rolling(
@@ -5685,6 +5770,88 @@ class Expr:
             builder = builder.when(below).then(lit(name))
         return builder.otherwise(lit(names[-1]))
 
+    def qcut(
+        self,
+        q: int | Iterable[float],
+        labels: Iterable[str] | None = None,
+        *,
+        duplicates: str = "raise",
+    ) -> Expr:
+        """Bin a numeric column by its own quantiles — pandas ``qcut``, Polars ``qcut``.
+
+        Where :meth:`cut` takes fixed breaks, this derives them from the data: ``q=4``
+        puts each row in the quartile it falls in, so every bin holds about the same
+        number of rows whatever the distribution. Pass a list of probabilities instead of
+        a count for uneven bins, such as ``[0, 0.9, 0.99, 1]`` for the bulk, the tail and
+        the extreme tail.
+
+        The edges are the column's quantiles under numpy's ``linear`` rule, which is what
+        pandas uses, and the bins are right-closed with the minimum in the first one. So a
+        value that sits exactly on an edge joins the lower bin, as in pandas. A null or NaN
+        input stays null. A value outside the outer probabilities, possible only when
+        they do not span 0 to 1, is null too.
+
+        Without `labels` the result is the 0-based bin number (pandas ``labels=False``),
+        an integer column. With `labels` it is that bin's label.
+
+        Tied input can make two edges equal: a column that is three quarters zeros has no
+        second quartile of its own. ``duplicates="raise"`` (the default) fails the query
+        with an error naming the edges. ``duplicates="drop"`` merges the equal edges, so
+        such a column gets fewer bins numbered consecutively, and a constant column gets
+        none, which leaves every row null.
+
+        The quantiles are computed over the whole column. Chain
+        ``.over(partition_by=...)`` to bin within each group by that group's quantiles.
+
+        Args:
+            q: The number of equal-probability bins, or the bin edges as probabilities in
+                ``[0, 1]``, strictly increasing.
+            labels: One name per bin. Defaults to the bin number.
+            duplicates: ``"raise"`` or ``"drop"`` when tied input makes two edges equal.
+
+        Returns:
+            An Int64 bin-number expression, or a Utf8 one when `labels` is given.
+
+        Raises:
+            PlanError: If `q` is not a count of at least 1 or an increasing list of at
+                least two probabilities, if `duplicates` is unknown, if `labels` has the
+                wrong length, or if `labels` is combined with ``duplicates="drop"``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [5, 1, 8, 2, 7, 3, 6, 4]})
+                >>> ds.select(b=bt.col("x").qcut(4)).to_pydict()
+                {'b': [2, 0, 3, 0, 3, 1, 2, 1]}
+
+                >>> halves = bt.col("x").qcut([0, 0.5, 1], ["low", "high"])
+                >>> ds.select(h=halves).to_pydict()["h"][:3]
+                ['high', 'low', 'high']
+        """
+        from batcher.plan.expr_ir.constructors import array, lit
+        from batcher.plan.expr_ir.func_nodes import ListGetDyn
+        from batcher.plan.expr_ir.nodes import WindowExpr, WindowOptions
+
+        probs = _qcut_probs(q)
+        if duplicates not in ("raise", "drop"):
+            raise PlanError(f"qcut(): duplicates must be 'raise' or 'drop', got {duplicates!r}")
+        opts = WindowOptions(probs=probs, drop_duplicates=duplicates == "drop")
+        codes = WindowExpr("qcut", self, [], [], None, opts=opts)
+        if labels is None:
+            return codes
+        names = [str(name) for name in labels]
+        if duplicates == "drop":
+            raise PlanError(
+                "qcut(): labels cannot be combined with duplicates='drop', because merged "
+                "edges leave fewer bins than labels; omit labels to get bin numbers"
+            )
+        if len(names) != len(probs) - 1:
+            raise PlanError(
+                f"qcut(): {len(probs) - 1} bins need {len(probs) - 1} labels, got {len(names)}"
+            )
+        return ListGetDyn(array(*(lit(name) for name in names)), codes)
+
     def rank(
         self,
         method: str = "min",
@@ -5816,6 +5983,57 @@ from batcher.plan.expr_ir.node_base import (  # noqa: E402
     expr_node,
     scalar,
 )
+
+
+def _qcut_probs(q: int | Iterable[float]) -> tuple[float, ...]:
+    """`qcut`'s bin edges as probabilities, computed the way pandas computes them.
+
+    An integer count becomes numpy's ``linspace(0, 1, q + 1)``; then, like pandas, each
+    probability goes through ``p * 100 / 100``, because pandas reaches the quantiles through
+    ``numpy.percentile``. Reproducing that arithmetic keeps every edge the same double
+    pandas uses, which is what decides a value lying exactly on an edge.
+    """
+    if isinstance(q, bool):
+        raise PlanError(f"qcut(): q must be a bin count or a list of probabilities, got {q!r}")
+    if hasattr(q, "__index__"):
+        count = require_int(q, func="qcut", arg="q", minimum=1)
+        step = 1.0 / count
+        raw = [float(i) * step + 0.0 for i in range(count)] + [1.0]
+    else:
+        raw = [require_float(p, func="qcut", arg="q") for p in q]  # type: ignore[union-attr]
+        if len(raw) < 2:
+            raise PlanError(f"qcut(): q needs at least two probabilities, got {raw}")
+        if any(not 0.0 <= p <= 1.0 for p in raw):
+            raise PlanError(f"qcut(): every probability in q must be in [0, 1], got {raw}")
+        if any(lo >= hi for lo, hi in itertools.pairwise(raw)):
+            raise PlanError(f"qcut(): the probabilities in q must strictly increase, got {raw}")
+    return tuple(p * 100.0 / 100.0 for p in raw)
+
+
+def _interpolate_gap(max_gap: int | float | str | None, *, by_value: bool) -> float | None:
+    """`interpolate`'s `max_gap` as the engine's number: null rows, or key distance under `by`.
+
+    A duration only means something against a temporal `by` column, where the engine
+    measures distance in microseconds, so it is resolved here; without `by` the gap is a
+    count of rows and must be an integer.
+    """
+    if max_gap is None:
+        return None
+    if not by_value:
+        if isinstance(max_gap, str):
+            raise PlanError(
+                f"interpolate(): max_gap={max_gap!r} is a duration, which needs by= a temporal "
+                "column; without by, max_gap counts null rows"
+            )
+        return float(require_int(max_gap, func="interpolate", arg="max_gap", minimum=0))
+    if isinstance(max_gap, str):
+        from batcher.plan.functions.temporal import _duration_micros
+
+        return float(_duration_micros(max_gap, arg="interpolate max_gap"))
+    gap = require_float(max_gap, func="interpolate", arg="max_gap")
+    if not gap >= 0:
+        raise PlanError(f"interpolate(): max_gap must be >= 0, got {max_gap!r}")
+    return gap
 
 
 def _ewm_alpha(

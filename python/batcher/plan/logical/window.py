@@ -13,9 +13,11 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Col, Expr
+from batcher.plan.expr_ir.nodes import WindowOptions
 from batcher.plan.ir_tags import (
     FRAME_UNITS,
     WINDOW_AGGREGATES,
+    WINDOW_BINNING,
     WINDOW_EWM,
     WINDOW_FRAMEABLE,
     WINDOW_FUNCS,
@@ -48,7 +50,7 @@ def _window_func_type(fn: WindowFuncSpec, input_schema: SchemaRef) -> pa.DataTyp
     # so they are Float64 — the plain-int64 ranking branch below would misreport the schema.
     if fn.func in ("percent_rank", "cume_dist"):
         return pa.float64()
-    if fn.func in WINDOW_RANKING or fn.func in ("count", "count_distinct", "rle_id"):
+    if fn.func in WINDOW_RANKING or fn.func in ("count", "count_distinct", "rle_id", "qcut"):
         return pa.int64()
     if fn.func in ("bool_and", "bool_or"):
         return pa.bool_()
@@ -244,16 +246,21 @@ class WindowFuncSpec:
     #: EWM half-life in the ORDER BY key's units (microseconds for a temporal key). Set
     #: instead of `alpha` to decay by elapsed key value; only `ewm_mean` takes it.
     half_life: float | None = None
-    #: `IGNORE NULLS`: pick among non-null values. Only the positional value functions
-    #: `first_value`/`last_value`/`nth_value` take it; omitted from the IR when false.
+    #: `IGNORE NULLS`: pick among non-null values. The positional value functions
+    #: `first_value`/`last_value`/`nth_value` take it, and the EWM functions read it as
+    #: pandas' ``ignore_na``; omitted from the IR when false.
     ignore_nulls: bool = False
+    #: EWM `adjust`/`min_periods`, `interpolate`'s `max_gap`/`by_value`, and `qcut`'s
+    #: `probs`/`drop_duplicates`; omitted from the IR when every option is a default.
+    opts: WindowOptions | None = None
 
     def __post_init__(self) -> None:
         if self.func not in WINDOW_FUNCS:
             raise PlanError(
                 f"unknown window function {self.func!r}; expected one of {sorted(WINDOW_FUNCS)}"
             )
-        if self.func in (WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW_SERIES) and self.input is None:
+        needs_input = WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW_SERIES | WINDOW_BINNING
+        if self.func in needs_input and self.input is None:
             raise PlanError(f"window function {self.func!r} requires an input column")
         if self.func in WINDOW_RANKING and self.input is not None:
             raise PlanError(f"window ranking function {self.func!r} takes no input")
@@ -288,10 +295,37 @@ class WindowFuncSpec:
                 )
         elif self.alpha is not None or self.half_life is not None:
             raise PlanError(f"window function {self.func!r} does not take a smoothing factor")
-        if self.ignore_nulls and self.func not in _IGNORE_NULLS_FUNCS:
+        if self.ignore_nulls and self.func not in _IGNORE_NULLS_FUNCS | WINDOW_EWM:
             raise PlanError(
                 f"window function {self.func!r} does not take ignore_nulls; only "
-                f"{sorted(_IGNORE_NULLS_FUNCS)} do"
+                f"{sorted(_IGNORE_NULLS_FUNCS | WINDOW_EWM)} do"
+            )
+        if self.ignore_nulls and self.half_life is not None:
+            raise PlanError(
+                "ewm_mean_by does not take ignore_nulls: a time-decayed mean already skips a "
+                "null row and decays the next reading by the real elapsed time"
+            )
+        self._check_opts()
+
+    def _check_opts(self) -> None:
+        """Refuse an option on a function that would silently ignore it, or a missing one."""
+        opts = self.opts or WindowOptions()
+        if self.func in WINDOW_BINNING and len(opts.probs) < 2:
+            raise PlanError(
+                f"window function {self.func!r} requires exactly one of a bin count or a list "
+                "of at least two probabilities; build it with col(x).qcut(q)"
+            )
+        if self.func not in WINDOW_BINNING and (opts.probs or opts.drop_duplicates):
+            raise PlanError(f"window function {self.func!r} does not take quantile probabilities")
+        ewm_only = not opts.adjust or opts.min_periods != 1
+        if ewm_only and (self.func not in WINDOW_EWM or self.half_life is not None):
+            raise PlanError(
+                f"window function {self.func!r} does not take adjust/min_periods; only the "
+                "row-decayed ewm_mean/ewm_var/ewm_std do"
+            )
+        if (opts.max_gap is not None or opts.by_value) and self.func != "interpolate":
+            raise PlanError(
+                f"window function {self.func!r} does not take max_gap/by; only interpolate does"
             )
 
     def to_ir(self) -> dict[str, Any]:
@@ -306,6 +340,9 @@ class WindowFuncSpec:
             item["half_life"] = self.half_life
         if self.ignore_nulls:
             item["ignore_nulls"] = True
+        opts = self.opts.to_ir() if self.opts is not None else {}
+        if opts:
+            item["opts"] = opts
         return item
 
 

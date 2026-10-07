@@ -213,7 +213,12 @@ WINDOW_VALUE: Final = WINDOW_OFFSET_VALUE | WINDOW_FILL
 # require an ORDER BY, exactly as the fills do.
 WINDOW_EWM: Final = frozenset({"ewm_mean", "ewm_var", "ewm_std"})
 WINDOW_SERIES: Final = WINDOW_EWM | frozenset({"interpolate", "rle_id"})
-WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW_SERIES
+# Binning by the partition's own quantiles (`bc_runtime::window::qcut`): the whole partition
+# is read to find the edges, so it takes no frame and ignores any ORDER BY.
+WINDOW_BINNING: Final = frozenset({"qcut"})
+WINDOW_FUNCS: Final = (
+    WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW_SERIES | WINDOW_BINNING
+)
 # Functions that honour an explicit frame: the reducing aggregates, plus the
 # positional value functions that pick the frame's first/last/nth row. `lag`/`lead`
 # and the fills carry no frame (theirs is fixed by their own offset / nullness).

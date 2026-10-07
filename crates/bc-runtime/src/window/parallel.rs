@@ -162,6 +162,7 @@ fn run_buckets(
                         alpha: c.alpha,
                         half_life: c.half_life,
                         ignore_nulls: c.ignore_nulls,
+                        opts: c.opts.clone(),
                         values: c.values.as_ref().map(g).transpose()?,
                     })
                 })
@@ -417,6 +418,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         };
         let n = 3_000usize;
         let spread: ArrayRef = Arc::new(Int64Array::from(
@@ -496,6 +498,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::LastValue,
@@ -505,6 +508,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Min,
@@ -514,6 +518,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -523,6 +528,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Min,
@@ -532,6 +538,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         for call in cases {
@@ -539,6 +546,113 @@ mod tests {
             let par = window_with(std::slice::from_ref(&part), &order, &f, n, 1, None).unwrap();
             let ser = window_serial(std::slice::from_ref(&part), &order, &f, n, None).unwrap();
             assert_eq!(par[0].as_ref(), ser[0].as_ref(), "{:?}", f[0].func);
+        }
+    }
+
+    /// The series options (EWM `adjust`/`ignore_nulls`/`min_periods`, `interpolate`'s
+    /// `max_gap` and key-distance `by_value`) give the same per-row answer on the parallel
+    /// buckets as on the serial kernel, nulls and gaps included.
+    #[test]
+    fn parallel_matches_serial_series_options() {
+        let n = 900usize;
+        let part = i64s(&(0..n as i64).map(|i| i % 23).collect::<Vec<_>>());
+        // Distinct, irregularly spaced order keys, so `by_value` has real distances to use.
+        let ord = i64s(
+            &(0..n as i64)
+                .map(|i| i * 3 + (i * i) % 7)
+                .collect::<Vec<_>>(),
+        );
+        let vals: ArrayRef = Arc::new(arrow::array::Float64Array::from(
+            (0..n)
+                .map(|i| (i % 5 != 1 && i % 11 > 2).then_some((i % 13) as f64))
+                .collect::<Vec<_>>(),
+        ));
+        let order = [asc(ord)];
+        let call = |func, alpha, ignore_nulls, series| WindowCall {
+            func,
+            values: Some(vals.clone()),
+            offset: 1,
+            frame: None,
+            alpha,
+            half_life: None,
+            ignore_nulls,
+            opts: series,
+        };
+        let base = bc_ir::WindowOpts::default();
+        let cases = [
+            call(
+                WindowFn::EwmMean,
+                Some(0.3),
+                true,
+                bc_ir::WindowOpts {
+                    adjust: false,
+                    ..base.clone()
+                },
+            ),
+            call(
+                WindowFn::EwmVar,
+                Some(0.3),
+                false,
+                bc_ir::WindowOpts {
+                    adjust: false,
+                    min_periods: 3,
+                    ..base.clone()
+                },
+            ),
+            call(
+                WindowFn::EwmStd,
+                Some(0.6),
+                true,
+                bc_ir::WindowOpts {
+                    min_periods: 2,
+                    ..base.clone()
+                },
+            ),
+            call(
+                WindowFn::Interpolate,
+                None,
+                false,
+                bc_ir::WindowOpts {
+                    max_gap: Some(2.0),
+                    ..base.clone()
+                },
+            ),
+            call(
+                WindowFn::Interpolate,
+                None,
+                false,
+                bc_ir::WindowOpts {
+                    by_value: true,
+                    ..base.clone()
+                },
+            ),
+            call(
+                WindowFn::Interpolate,
+                None,
+                false,
+                bc_ir::WindowOpts {
+                    by_value: true,
+                    max_gap: Some(200.0),
+                    ..base.clone()
+                },
+            ),
+            call(
+                WindowFn::Qcut,
+                None,
+                false,
+                bc_ir::WindowOpts {
+                    probs: vec![0.0, 0.25, 0.5, 0.75, 1.0],
+                    ..base.clone()
+                },
+            ),
+        ];
+        for call in cases {
+            let what = format!("{:?} {:?}", call.func, call.opts);
+            let f = [call];
+            let par = window_with(std::slice::from_ref(&part), &order, &f, n, 1, None).unwrap();
+            let ser = window_serial(std::slice::from_ref(&part), &order, &f, n, None).unwrap();
+            assert_eq!(par[0].as_ref(), ser[0].as_ref(), "{what}");
+            assert!(par[0].null_count() < n, "{what}: the case computed nothing");
         }
     }
 }

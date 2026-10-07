@@ -204,6 +204,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
             values: Some(values.clone()),
         }];
         let ok = [(order.clone(), SortOptions::default())];

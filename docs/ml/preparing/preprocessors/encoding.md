@@ -318,6 +318,16 @@ print(banded.to_pydict()["band"])
 # ['child', 'teen', 'adult', 'senior']
 ```
 
+When the edges should come from the data but there's nothing to fit and reuse, use {py:meth}`Expr.qcut <batcher.plan.expr_ir.core.Expr.qcut>`. It bins a column by its own quantiles, computed the way pandas' `qcut` computes them, so a value on an edge joins the *lower* bin, unlike `KBinsDiscretizer` above. The edges are recomputed on every run, so prefer the discretizer when a model must see the training data's edges at inference time.
+
+```python
+ds = bt.from_pydict({"x": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
+print(ds.select(q=bt.col("x").qcut(4)).to_pydict()["q"])
+# [0, 0, 1, 1, 2, 2, 3, 3]
+```
+
+Tied values can make two quantiles equal, such as a column that is mostly zeros. `qcut` then raises by default. `duplicates="drop"` merges the equal edges into fewer bins instead.
+
 ## See also
 
 - {doc}`/ml/preparing/preprocessors/scaling`: the numeric half of the same job.

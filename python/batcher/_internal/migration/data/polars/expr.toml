@@ -63,10 +63,10 @@ dt = { status = "canonical", batcher = "Expr.dt" }
 entropy = { status = "mismatch", batcher = "Expr.entropy", template = 'entropy(base=2.718281828459045, *, normalize=True) -> self.entropy(base, of="values", normalize=normalize)', note = "Polars entropy reads the values as a distribution in natural log; the template passes of=values and base e. Polars counts a null as a value", wave = "W0" }
 eq = { status = "canonical", batcher = "op:eq" }
 eq_missing = { status = "canonical", batcher = "Expr.eq_missing" }
-ewm_mean = { status = "param", batcher = "Expr.ewm_mean", need = "adjust=, bias=, min_samples=, ignore_nulls=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
+ewm_mean = { status = "param", batcher = "Expr.ewm_mean", need = "bias=, and min_samples= is spelled min_periods=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
 ewm_mean_by = { status = "param", batcher = "Expr.ewm_mean_by", need = "half_life as a duration string over a temporal by column", wave = "W2" }
-ewm_std = { status = "param", batcher = "Expr.ewm_std", need = "adjust=, bias=, min_samples=, ignore_nulls=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
-ewm_var = { status = "param", batcher = "Expr.ewm_var", need = "adjust=, bias=, min_samples=, ignore_nulls=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
+ewm_std = { status = "param", batcher = "Expr.ewm_std", need = "bias=, and min_samples= is spelled min_periods=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
+ewm_var = { status = "param", batcher = "Expr.ewm_var", need = "bias=, and min_samples= is spelled min_periods=; Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
 exclude = { status = "canonical", batcher = "Selector.exclude" }
 exp = { status = "canonical", batcher = "Expr.exp" }
 explode = { status = "gap", need = "Expr.explode (length-changing)", wave = "W8" }
@@ -94,7 +94,7 @@ implode = { status = "mismatch", batcher = "Expr.array_agg", note = "Polars impl
 index_of = { status = "gap", need = "Expr.index_of", wave = "W8" }
 inspect = { status = "gap", need = "Expr.inspect (print intermediate value)", wave = "W8" }
 interpolate = { status = "param", batcher = "Expr.interpolate", need = "method= ('linear','nearest'); Batcher requires an explicit order_by (explicit-order policy)", wave = "W2" }
-interpolate_by = { status = "gap", need = "Expr.interpolate_by", wave = "W5" }
+interpolate_by = { status = "mismatch", batcher = "Expr.interpolate", note = "Batcher spells it interpolate(by=col); by becomes the window order, and max_gap= bounds the distance filled", wave = "W0" }
 is_between = { status = "canonical", batcher = "Expr.between" }
 is_close = { status = "gap", need = "Expr.is_close (abs_tol/rel_tol/nans_equal)", wave = "W3" }
 is_duplicated = { status = "canonical", batcher = "Expr.is_duplicated" }
@@ -149,7 +149,7 @@ peak_min = { status = "canonical", batcher = "Expr.peak_min", template = 'peak_m
 pipe = { status = "canonical", batcher = "Expr.pipe" }
 pow = { status = "canonical", batcher = "op:pow" }
 product = { status = "canonical", batcher = "Expr.product", template = 'product() -> self.product(empty_value=1)' }
-qcut = { status = "gap", need = "Expr.qcut (quantile binning)", wave = "W3" }
+qcut = { status = "param", batcher = "Expr.qcut", need = "left_closed=, include_breaks=, and allow_duplicates= is spelled duplicates='drop'; without labels the result is the bin number, not an interval string", wave = "W3" }
 quantile = { status = "canonical", batcher = "Expr.quantile", template = 'quantile(quantile, interpolation="nearest") -> self.quantile(quantile, interpolation)' }
 radians = { status = "canonical", batcher = "Expr.radians" }
 rank = { status = "canonical", batcher = "Expr.rank", template = 'rank(method="average", *, descending=False, seed=None) -> self.rank(method, descending=descending, propagate_nulls=True)' }

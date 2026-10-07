@@ -12,10 +12,12 @@ being refused. They now promote to Float64, which is the same path integers alre
 
 **The result type is a stated trade, not an oversight.** For `sqrt`, `ln`, `exp` and the
 trig family, DOUBLE is exactly what DuckDB returns, so those agree outright. For `abs`,
-`floor`, `ceil`, `round` and `sign` DuckDB keeps DECIMAL, so Batcher's answer is the same
+`floor`, `ceil` and `sign` DuckDB keeps DECIMAL, so Batcher's answer is the same
 *number* in a different type, and loses exactness above 2^53. The census pinned that
 divergence for `ceil`/`floor` already; it now covers the family. A decimal-preserving path
-for that subset needs a scale-aware kernel per operation and is the follow-on.
+for that subset needs a scale-aware kernel per operation and is the follow-on. `round` has
+had its kernel since and keeps DECIMAL like DuckDB; `test_diff_decimal_round.py` holds it
+to DuckDB's value *and* type.
 
 This file therefore compares **values**, not types, for the DECIMAL-returning subset, and
 says so — an order-independent or type-tolerant comparison hiding the difference is
@@ -56,7 +58,6 @@ DECIMAL_IN_DUCKDB = [
     ("abs", lambda: col("n").abs(), "abs(n)"),
     ("floor", lambda: col("n").floor(), "floor(n)"),
     ("ceil", lambda: col("n").ceil(), "ceil(n)"),
-    ("round", lambda: col("n").round(), "round(n)"),
     ("sign", lambda: col("n").sign(), "sign(n)"),
 ]
 
@@ -115,8 +116,15 @@ def test_exact_decimal_paths_are_untouched(duck, money):
 
 @pytest.mark.differential
 def test_a_decimal_column_can_be_rounded_at_all(money):
-    """The headline regression, stated on its own: this raised before."""
-    assert bt.from_arrow(money).select(r=col("n").round()).to_pydict()["r"] == [4.0, -1.0, 2.0]
+    """The headline regression, stated on its own: this raised before. It now also stays a
+    decimal, at scale 0, as DuckDB's `round(n)` does."""
+    out = bt.from_arrow(money).select(r=col("n").round()).collect()
+    assert out.schema.field("r").type == pa.decimal128(12, 0)
+    assert out.column("r").to_pylist() == [
+        decimal.Decimal("4"),
+        decimal.Decimal("-1"),
+        decimal.Decimal("2"),
+    ]
 
 
 @pytest.mark.differential

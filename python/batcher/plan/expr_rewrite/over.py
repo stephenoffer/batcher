@@ -140,6 +140,7 @@ def _bind_window(
         we.alpha,
         we.half_life,
         we.ignore_nulls,
+        we.opts,
     )
 
 

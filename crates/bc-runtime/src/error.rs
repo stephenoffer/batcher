@@ -43,6 +43,13 @@ pub enum RuntimeError {
     #[error("window function {func} is not supported for column type {dtype}")]
     UnsupportedWindow { func: String, dtype: String },
 
+    #[error(
+        "qcut(): the bin edges {edges} are not unique, because the input has too many \
+         tied values for that many quantiles; pass duplicates=\"drop\" to merge the empty \
+         bins, or ask for fewer quantiles"
+    )]
+    QcutDuplicateEdges { edges: String },
+
     #[error("window function {func} requires an input column")]
     MissingWindowInput { func: String },
 
