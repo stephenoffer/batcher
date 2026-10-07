@@ -10,6 +10,8 @@ A package may import anything **strictly below** its line, never above or sidewa
 
 | Layer | Package | May import |
 |---|---|---|
+| 7 · clients | `integrations` — SQLAlchemy, dbt, Ibis and Flight SQL adapters; nothing imports it | `dbapi` + everything below |
+| 6 · DB-API | `dbapi` — the PEP 249 adapter over a `Session`; `api` never imports it | everything below |
 | 5 · surface | `api` · `ml` · `graph` · `_sql` · `migrate` — the public API, the libraries it composes, and the codemod. **One layer**: they import each other by design (`ml` uses `Dataset`, `ds.ml` calls `ml`). `api` is still the only one that imports the subsystems. | everything below |
 | 4 · backend | `dist` — distributed *scheduling* of the same operators | layers 0–3. **MUST NOT import `api`** (a cycle) |
 | 3 · subsystems | `kyber` (decides) · `carbonite` (protects) · `core` (measures/executes) · `governance` (policy) | layers 0–2 |

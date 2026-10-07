@@ -218,6 +218,16 @@ spark = ["pyspark>=3.5"]
 dask = ["dask[dataframe]>=2024.1"]
 # `bt.from_daft` and `Dataset.to_daft`.
 daft = ["daft>=0.3"]
+# --- SQL clients driving Batcher (batcher.integrations; batcher.dbapi needs nothing) ---
+# The `batcher://` SQLAlchemy dialect.
+sqlalchemy = ["sqlalchemy>=2.0"]
+# The dbt adapter pilot, written against dbt-adapters 1.x and dbt-common's exceptions.
+dbt = ["dbt-core>=1.8", "dbt-adapters>=1.0"]
+# The Ibis bridge: `ibis.to_sql` plus `Session.sql`; no Ibis backend class is subclassed.
+ibis = ["ibis-framework>=9"]
+# The Flight SQL service. pyarrow's PyPI wheels include Flight; some other builds (conda's
+# minimal `pyarrow-core`) do not, so the guard names this extra rather than a bare package.
+flightsql = ["pyarrow>=16"]
 # --- Convenience bundles (self-referencing extras use the distribution name) ---
 lakehouse = ["batcher-engine[delta,iceberg,hudi,delta-sharing]"]
 warehouse = ["batcher-engine[sql,connectorx,snowflake,databricks,bigquery,clickhouse,odbc]"]
@@ -286,6 +296,12 @@ all = [
     "batcher-engine[lakehouse,warehouse,nosql,vector,streaming,multimodal,pandas,huggingface,gsheets]",
 ]
 
+# `create_engine("batcher://")`, and `batcher+dbapi://`, which SQLAlchemy looks up as
+# `batcher.dbapi`. Both name the one dialect.
+[project.entry-points."sqlalchemy.dialects"]
+batcher = "batcher.integrations.sqlalchemy:BatcherDialect"
+"batcher.dbapi" = "batcher.integrations.sqlalchemy:BatcherDialect"
+
 [tool.maturin]
 # src-layout: the importable Python package lives under python/.
 python-source = "python"
@@ -294,6 +310,9 @@ module-name = "batcher._native"
 # Only bc-py links PyO3; it is the workspace member we build into the wheel.
 manifest-path = "crates/bc-py/Cargo.toml"
 features = ["pyo3/extension-module"]
+# The dbt adapter's import shim (`python/dbt/adapters/batcher`): dbt-core finds an adapter by
+# importing `dbt.adapters.<type>`, not by entry point, so the module must exist at that path.
+python-packages = ["dbt"]
 
 # --- Layer separation (enforced in CI) ---------------------------------------
 # The three subsystems are fully independent: Kyber (optimization), Carbonite
@@ -328,6 +347,11 @@ layers = [
     # one-way, which it is not (`ml` imports `api` 77 times, `api` imports `ml` 17). `:` is
     # import-linter's "these siblings may import each other" — the accurate statement.
     # Everything BELOW still may not reach up into any of them, which is the part that matters.
+    # The SQL-client adapters sit above the surface they drive and nothing imports them:
+    # `integrations` (SQLAlchemy, dbt, Ibis, Flight SQL) is built on `dbapi`, the PEP 249
+    # adapter, which is built on `api`'s `Session`.
+    "integrations",
+    "dbapi",
     "api : ml : graph : _sql : migrate",
     "dist",
     "kyber | carbonite | core | governance",
