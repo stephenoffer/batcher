@@ -61,6 +61,10 @@ from batcher.kyber.rules.extra.join_elim.rules import (
     self_semi_join_to_filter,
     semi_join_of_nonempty_cartesian,
 )
+from batcher.kyber.rules.extra.join_elim.semi_build import (
+    semi_build_inner_to_semi,
+    semi_build_self_neq_to_minmax,
+)
 
 __all__ = [
     "anti_join_of_nonempty_cartesian_to_empty",
@@ -72,5 +76,7 @@ __all__ = [
     "self_anti_join_to_null_keys",
     "self_join_elimination",
     "self_semi_join_to_filter",
+    "semi_build_inner_to_semi",
+    "semi_build_self_neq_to_minmax",
     "semi_join_of_nonempty_cartesian",
 ]

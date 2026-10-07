@@ -267,6 +267,8 @@
   "inner_join_to_semi_when_right_unique@5",
   "join_disjoint_keys_to_empty@2",
   "no_match_join_to_preserved_side@3",
+  "semi_build_inner_to_semi@3",
+  "semi_build_self_neq_to_minmax@3",
   "qualify_to_partition_topn@5",
   "rank1_window_to_distinct_on@5",
   "count_over_filter_to_count_if@5",

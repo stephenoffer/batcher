@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1644 Python modules across 236 packages and 345 Rust files across 14 crates.
+Covering 1646 Python modules across 236 packages and 345 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -890,7 +890,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `grouping_sets.py` | 319 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
 | `statements.py` | 328 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 331 | Built-in table functions in the FROM clause: the series generators and model scoring. |
-| `translator.py` | 671 | The `_Translator` skeleton plus the public `sql()` entry point. |
+| `translator.py` | 674 | The `_Translator` skeleton plus the public `sql()` entry point. |
 | `udf.py` | 265 | Registered-Python-function support for the SQL translator. |
 
 ### `batcher/_sql/parser/expressions/` — 6 · front-end
@@ -906,7 +906,7 @@ SQL scalar-expression translation — a sqlglot value node becomes an `Expr` (la
 | `json.py` | 259 | SQL JSON functions — extraction (``json_extract`` / ``->`` / ``->>``) and inspection. |
 | `literals.py` | 556 | Literals, temporal handling, dtype mapping, and SQL dispatch tables. |
 | `maps.py` | 98 | SQL → `.map` accessor dispatch. |
-| `scalar.py` | 547 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
+| `scalar.py` | 501 | Scalar expression dispatch — translate a sqlglot value node into an `Expr`. |
 | `spark.py` | 258 | Spark SQL names whose translation is a composition rather than a rename. |
 | `strings.py` | 220 | SQL string functions whose translation is more than a name lookup. |
 | `temporal.py` | 500 | SQL temporal *construction* — parsing text, reading epoch counts, and bucketing time. |
@@ -955,6 +955,7 @@ Subquery handling and decorrelation for the SQL translator.
 | `scalar_sub.py` | 311 | Correlated scalar subqueries as keyed LEFT JOINs. |
 | `shape.py` | 245 | The clauses that decide *how many rows per key* a correlated subquery yields. |
 | `specialized.py` | 180 | The correlated `EXISTS` shapes that are not a plain equi-semi-join, and their order. |
+| `uncorrelated.py` | 87 | Uncorrelated scalar subqueries, evaluated once each and inlined as literals. |
 
 ### `batcher/_sql/parser/windowing/` — 6 · front-end
 
@@ -1466,6 +1467,7 @@ Join elimination — removing a join outright, and the proofs that make it legal
 |---|---|---|
 | `evidence.py` | 147 | The proofs a join elimination must clear before it may delete or degenerate a join. |
 | `rules.py` | 367 | The join-elimination rewrites — outer, self, cartesian, inner-reduction, disjoint-key. |
+| `semi_build.py` | 190 | Rewrites a semi join's build side admits because it is read as a set of keys. |
 
 ### `batcher/kyber/rules/extra/runtime_filters/` — 3 · subsystem
 
@@ -2328,7 +2330,7 @@ Source connectors — the façade over the source implementation modules.
 | module | lines | what it is |
 |---|---|---|
 | `base.py` | 208 | The `Source` protocol — the contract every connector satisfies. |
-| `inmemory.py` | 684 | `InMemorySource` — a relation already materialized as Arrow record batches. |
+| `inmemory.py` | 704 | `InMemorySource` — a relation already materialized as Arrow record batches. |
 | `inmemory_aggregates.py` | 285 | Exact aggregate answers over an immutable in-memory Arrow relation. |
 | `inmemory_stats.py` | 513 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 213 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
@@ -3292,11 +3294,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
 | `stream/chunked/units.rs` | 83 | The driving relation as a sequence of units read on demand by the workers that scan it. |
 | `stream/fanout.rs` | 76 | Slicing the input of a row-*multiplying* pipeline operator, so its output stays morsel-scale. |
-| `stream/folds.rs` | 646 | The mergeable folds a streaming breaker reduces its input with. |
+| `stream/folds.rs` | 654 | The mergeable folds a streaming breaker reduces its input with. |
 | `stream/meter.rs` | 429 | Per-operator metrics for the streaming executor. |
 | `stream/mod.rs` | 786 | Tier-0 **streaming** executor: pull morsels through the linear runs, materialize only at breakers. |
 | `stream/order.rs` | 103 | Whether anything above a stream stage can observe the *order* of its output rows. |
-| `stream/parallel.rs` | 1696 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
+| `stream/parallel.rs` | 1795 | Streaming, across cores: one pipeline instance per worker over a shard of the driving scan. |
 | `stream/pipeline.rs` | 284 | The lazy pipeline adapters: scan, the per-morsel transforms, and the early-exiting limit. |
 | `stream/probe_chunks.rs` | 190 | Emitting one probed morsel as however many output morsels its fan-out needs. |
 | `stream/runtime_filter.rs` | 733 | Sink each hash join's build-side key set down its probe pipeline, to the scan. |
