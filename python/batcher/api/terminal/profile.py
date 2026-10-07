@@ -9,6 +9,8 @@ subsystems, and is split out of `terminal.core` to keep that module within size 
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from batcher.api.orchestration.logical_profile import (
     _logical_estimates,
     _logical_op_profiles,
@@ -22,6 +24,9 @@ from batcher.plan.profile import (
     merge_metric_ops,
 )
 
+if TYPE_CHECKING:
+    import pyarrow as pa
+
 __all__ = [
     "admission_decision",
     "build_side_decisions",
@@ -31,6 +36,7 @@ __all__ = [
     "record_spill",
     "resource_decision",
     "run_profiled",
+    "run_profiled_with_result",
     "verdict_summary",
 ]
 
@@ -469,6 +475,22 @@ def run_profiled(
 ) -> QueryProfile:
     """Execute the plan through the real (single-node/spill/distributed) path, profiled.
 
+    The profile alone; `run_profiled_with_result` also hands back the table the run made.
+    """
+    return run_profiled_with_result(plan, sources, columns, query_id)[1]
+
+
+def run_profiled_with_result(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    query_id: str = "",
+) -> tuple[pa.Table, QueryProfile]:
+    """Execute the plan through the real (single-node/spill/distributed) path, profiled.
+
+    Returns the result table alongside the profile, so `stats(keep_result=True)` gets the
+    data and its measurements from one run rather than executing twice.
+
     Always executes (no metadata short-circuit — the point is to measure) with a
     `ProfileCollector` attached, then assembles a `QueryProfile`. Runs the *same* path the
     query would (`distributed="auto"` resolves to the live cluster), under the sensed
@@ -567,7 +589,7 @@ def run_profiled(
     except Exception:  # pragma: no cover - a missing budget just omits the memory-% line
         budget = 0
     if core.has_map_batches(plan):
-        return _udf_measured_profile(
+        return table, _udf_measured_profile(
             plan,
             sources,
             collector,
@@ -576,7 +598,7 @@ def run_profiled(
             query_id=query_id,
             memory_budget_bytes=budget,
         )
-    return collector.to_profile(
+    return table, collector.to_profile(
         total_ms=total_ms, rows=table.num_rows, query_id=query_id, memory_budget_bytes=budget
     )
 

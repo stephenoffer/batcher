@@ -16,7 +16,7 @@ eighteen upward edges the layered-architecture contract found.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 from batcher._internal.optional import require
@@ -25,7 +25,17 @@ if TYPE_CHECKING:
     import numpy as np
     import pyarrow as pa
 
-__all__ = ["arrays_to_torch", "to_numpy_batches"]
+__all__ = [
+    "DTYPE_BACKENDS",
+    "arrays_to_torch",
+    "column_to_masked",
+    "pandas_types_mapper",
+    "to_numpy_batches",
+]
+
+#: `Dataset.to_pandas(dtype_backend=...)`'s values: ``"numpy"`` is pyarrow's own default
+#: conversion, and the other two are pandas' names for its nullable and Arrow-backed dtypes.
+DTYPE_BACKENDS = ("numpy", "numpy_nullable", "pyarrow")
 
 
 def _require_torch() -> Any:
@@ -308,3 +318,72 @@ def uniform_list_to_matrix(array: pa.Array) -> np.ndarray | None:
     if child.dtype.kind not in "biufc":
         return None
     return child.reshape(rows, width)
+
+
+def column_to_masked(column: pa.Array | pa.ChunkedArray) -> np.ma.MaskedArray:
+    """One Arrow column as a NumPy masked array, the validity bitmap as its mask.
+
+    The ``nulls="mask"`` form of `Dataset.to_numpy`. A plain conversion has to put
+    *something* where a null was: NaN for a number, which widens an integer column to
+    float64 and makes a float column's nulls indistinguishable from its genuine NaNs. A mask
+    keeps both. A numeric or Boolean column keeps its own dtype (its masked slots hold a
+    zero, never read), and a genuine NaN stays an unmasked NaN. Any other column converts as
+    `to_numpy` would and is masked on top, with a tensor column's row mask broadcast over
+    each row's elements.
+    """
+    import warnings
+
+    import numpy as np
+    import pyarrow as pa
+
+    arr = column.combine_chunks() if isinstance(column, pa.ChunkedArray) else column
+    if not arr.null_count:
+        data = _column_to_numpy(arr)
+        return np.ma.MaskedArray(data, mask=np.zeros(data.shape, dtype=bool))
+    mask = arr.is_null().to_numpy(zero_copy_only=False)
+    kind = arr.type
+    if pa.types.is_boolean(kind):
+        data = arr.fill_null(False).to_numpy(zero_copy_only=False)
+    elif pa.types.is_integer(kind) or pa.types.is_floating(kind):
+        data = arr.fill_null(pa.scalar(0, kind)).to_numpy(zero_copy_only=False)
+    else:
+        with warnings.catch_warnings():
+            # The mask is exactly what the NaN-widening warning says is lost.
+            warnings.simplefilter("ignore", UserWarning)
+            data = _column_to_numpy(arr)
+    if data.ndim > 1:
+        mask = np.broadcast_to(mask.reshape(-1, *([1] * (data.ndim - 1))), data.shape)
+    return np.ma.MaskedArray(data, mask=mask)
+
+
+def pandas_types_mapper(dtype_backend: str) -> Callable[[pa.DataType], Any] | None:
+    """The pyarrow ``types_mapper`` for one of `DTYPE_BACKENDS`, or ``None`` for numpy.
+
+    ``"numpy_nullable"`` maps each integer, float, Boolean and string type to pandas' own
+    nullable extension dtype, so an ``int64`` column with a null stays ``Int64`` (exact above
+    2**53) rather than widening to float64. ``"pyarrow"`` keeps every column Arrow-backed
+    (``pd.ArrowDtype``). Types without a nullable pandas dtype keep the default conversion.
+    """
+    import pandas as pd
+    import pyarrow as pa
+
+    if dtype_backend == "numpy":
+        return None
+    if dtype_backend == "pyarrow":
+        return pd.ArrowDtype
+    nullable = {
+        pa.int8(): pd.Int8Dtype(),
+        pa.int16(): pd.Int16Dtype(),
+        pa.int32(): pd.Int32Dtype(),
+        pa.int64(): pd.Int64Dtype(),
+        pa.uint8(): pd.UInt8Dtype(),
+        pa.uint16(): pd.UInt16Dtype(),
+        pa.uint32(): pd.UInt32Dtype(),
+        pa.uint64(): pd.UInt64Dtype(),
+        pa.bool_(): pd.BooleanDtype(),
+        pa.float32(): pd.Float32Dtype(),
+        pa.float64(): pd.Float64Dtype(),
+        pa.string(): pd.StringDtype(),
+        pa.large_string(): pd.StringDtype(),
+    }
+    return nullable.get

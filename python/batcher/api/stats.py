@@ -23,6 +23,8 @@ from batcher.plan.profile import QueryUsage
 from batcher.plan.profile.render.cells import share_bar
 
 if TYPE_CHECKING:
+    import pyarrow as pa
+
     from batcher.plan.profile import QueryProfile
 
 __all__ = ["OpStat", "RunStats"]
@@ -146,9 +148,12 @@ class RunStats:
     #: this one holds on every tier, including the streaming default, and is summed across
     #: workers on a distributed run.
     usage: QueryUsage = field(default_factory=QueryUsage)
+    #: The run's result table, kept only by ``stats(keep_result=True)`` and otherwise
+    #: ``None``. Left out of the repr and of equality: it is the data, not a measurement.
+    result: pa.Table | None = field(default=None, repr=False, compare=False)
 
     @classmethod
-    def from_profile(cls, profile: QueryProfile) -> RunStats:
+    def from_profile(cls, profile: QueryProfile, result: pa.Table | None = None) -> RunStats:
         """Build from a `QueryProfile` — the measured operators with planned estimates joined.
 
         Covers the single-node, out-of-core spill, and distributed paths uniformly (the
@@ -191,6 +196,7 @@ class RunStats:
             rows=profile.rows,
             findings=tuple(_findings(profile)),
             usage=profile.usage,
+            result=result,
         )
 
     @property

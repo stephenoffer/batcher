@@ -80,10 +80,17 @@ def test_the_footer_pluralizes():
     assert "[2 rows x 1 column]" in _rendered({"a": [1, 2]})
 
 
-def test_the_footer_says_first_only_when_the_limit_was_reached():
-    """Saying "first 3 rows" about a complete result sends the reader looking for more."""
+def test_the_footer_says_first_only_when_rows_were_left_out():
+    """Saying "first 3 rows" about a complete result sends the reader looking for more.
+
+    `show()` fetches one row past its limit, so a table longer than `limit` is the signal.
+    A result of *exactly* `limit` rows used to be labelled "first 3 rows" too (AP-174).
+    """
     assert "first" not in _rendered({"a": [1, 2, 3]}, limit=10)
-    assert "first 3 rows" in _rendered({"a": [1, 2, 3]}, limit=3)
+    assert "first" not in _rendered({"a": [1, 2, 3]}, limit=3)
+    text = _rendered({"a": [1, 2, 3, 4]}, limit=3)
+    assert "first 3 rows" in text
+    assert "| 4 " not in text  # the extra row is fetched to count, never printed
 
 
 def test_a_binary_column_is_summarized_not_dumped():

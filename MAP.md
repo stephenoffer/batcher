@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1566 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1567 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -177,7 +177,7 @@ The public, fluent, lazy, expression-first API surface.
 | `history.py` | 262 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
 | `multi_group.py` | 431 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
-| `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
+| `stats.py` | 543 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 | `subplan_reuse.py` | 669 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
 ### `batcher/api/adaptive/` — 5 · conductor
@@ -212,14 +212,15 @@ The `Dataset` builder package.
 
 | module | lines | what it is |
 |---|---|---|
+| `_compare.py` | 91 | Tolerant result comparison for `Dataset.equals(rtol=, atol=, check_dtypes=)`. |
 | `_dedup.py` | 326 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 244 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
-| `_export.py` | 331 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
+| `_export.py` | 365 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
 | `_nulls.py` | 195 | Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 6716 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 6875 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -431,14 +432,14 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 736 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1520 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1549 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 829 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
 | `map_stream.py` | 190 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 215 | Emit a query's execution profile as OpenTelemetry spans. |
-| `preview.py` | 186 | Render a small result as a readable table for `Dataset.show`. |
-| `profile.py` | 654 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
+| `preview.py` | 198 | Render a small result as a readable table for `Dataset.show`. |
+| `profile.py` | 676 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
 | `routing.py` | 369 | The `distributed="auto"` routing decision for terminal operations. |
 
 ### `batcher/api/terminal/gpu_backend/` — 5 · conductor
@@ -2442,8 +2443,8 @@ The scalar expression algebra.
 | module | lines | what it is |
 |---|---|---|
 | `audio.py` | 900 | The `.audio` expression namespace — lazy, batch-level audio decode. |
-| `constructors.py` | 512 | Module-level expression constructors (the user-facing entry points). |
-| `core.py` | 6874 | The scalar expression base class and its core IR nodes. |
+| `constructors.py` | 603 | Module-level expression constructors (the user-facing entry points). |
+| `core.py` | 6948 | The scalar expression base class and its core IR nodes. |
 | `fn_names.py` | 371 | The scalar-function vocabulary — the documented home for `fn` discriminators. |
 | `func_nodes.py` | 476 | IR node classes built by the accessor namespaces (`.str`/`.dt`/`.list`/…). |
 | `image.py` | 1540 | The `.image` expression namespace — lazy, batch-level image decode. |
@@ -2473,7 +2474,7 @@ Accessor namespaces (`.str`/`.dt`/`.list`/`.struct`/`.json`) — package façade
 | `_dialect.py` | 54 | Plan-time constants for the `.str` parameters that select another engine's semantics. |
 | `_temporal_units.py` | 137 | The truncation-unit vocabulary shared by `.dt.truncate`/`floor`/`ceil`/`round`. |
 | `collections.py` | 1910 | The `.list`, `.struct`, `.json`, and `.map` accessor namespaces. |
-| `meta.py` | 276 | The `.meta` accessor: questions about an expression's *shape*, answered without data. |
+| `meta.py` | 317 | The `.meta` accessor: questions about an expression's *shape*, answered without data. |
 | `sequence.py` | 776 | The `.seq` expression namespace — genomics and proteomics over a text column. |
 | `strings.py` | 4441 | The `.str` accessor namespace. |
 | `temporal.py` | 1427 | The `.dt` accessor namespace plus the Polars-style offset-string parser. |
@@ -2721,7 +2722,7 @@ Per-expression output-type inference — a column's Arrow type before the engine
 
 | module | lines | what it is |
 |---|---|---|
-| `arithmetic.py` | 364 | Output types for the arithmetic families: binary operators and the math functions. |
+| `arithmetic.py` | 422 | Output types for the arithmetic families: binary operators and the math functions. |
 | `collections.py` | 224 | Output types for the container accessors: `list`, `struct` and `map`. |
 | `dispatch.py` | 386 | The node-by-node dispatcher: which rule answers for which `Expr` class. |
 | `geospatial.py` | 107 | Output types for the `st_*` geometry and `quat_*`/`se3_*` rigid-body functions. |
@@ -3012,7 +3013,7 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 
 | module | lines | what it is |
 |---|---|---|
-| `arrays.py` | 310 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
+| `arrays.py` | 389 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
 | `diagnostics.py` | 149 | Why a Python value cannot become an Arrow column, and what to do about it. |
 | `formats.py` | 394 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
 

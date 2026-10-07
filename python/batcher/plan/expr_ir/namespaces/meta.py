@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import pyarrow as pa
+
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import AggExpr, Aliased, Expr, Lit
 from batcher.plan.expr_ir.node_base import IRNode, scalar_fields_of
@@ -244,6 +246,45 @@ class _MetaNamespace:
                 return True
             stack.extend(_children(node))
         return False
+
+    def output_type(self, schema: pa.Schema) -> pa.DataType | None:
+        """The Arrow type the expression produces over `schema`, worked out without data.
+
+        This is the analysis `Dataset.schema` is answered from, reachable from a bare
+        expression: no `Dataset`, no rows, no engine. The schema's columns are widened the
+        way the engine widens them on the way in (an ``int32`` reads as ``int64``), so the
+        answer is the type the engine would return.
+
+        ``None`` means "not certain", never a guess: an expression whose type depends on a
+        rule the control plane does not reproduce is left for the engine to decide. A type
+        error the engine always makes, such as arithmetic on a string, raises here.
+
+        Args:
+            schema: The input columns' names and types, such as ``ds.schema``.
+
+        Returns:
+            The output type, or ``None`` when it cannot be decided without executing.
+
+        Raises:
+            PlanError: If the expression cannot type-check against `schema`, such as
+                ``col("s") + 1`` over a string column.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> schema = pa.schema({"a": pa.int32(), "b": pa.float64()})
+                >>> (bt.col("a") + bt.col("b")).meta.output_type(schema)
+                DataType(double)
+                >>> (bt.col("a") // 2).meta.output_type(schema)
+                DataType(int64)
+        """
+        from batcher.plan.schema import SchemaRef
+        from batcher.plan.types import infer_type, widen
+
+        widened = pa.schema([field.with_type(widen(field.type)) for field in schema])
+        return infer_type(self._e, SchemaRef.from_arrow(widened))  # type: ignore[arg-type]
 
     def tree_format(self, *, return_as_string: bool = False) -> str | None:
         """Draw the expression as a tree, one node per line, children indented beneath.
