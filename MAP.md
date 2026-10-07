@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1568 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1576 Python modules across 222 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -214,12 +214,12 @@ The `Dataset` builder package.
 |---|---|---|
 | `_dedup.py` | 326 | Fuzzy matching — MinHash/SimHash signatures + LSH banding, as relational algebra. |
 | `_describe.py` | 244 | Descriptive-statistics helpers behind `Dataset.describe` / `Dataset.null_count`. |
-| `_export.py` | 331 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
+| `_export.py` | 491 | Export helpers: `iter_batches` stream shaping and the hand-offs to other frames. |
 | `_nulls.py` | 223 | Null handling behind `Dataset.fill_null` / `drop_nulls` / `isna` (the `api` layer). |
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7134 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 7253 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -263,7 +263,7 @@ Migration-error guidance: the traceback is the documentation.
 
 | module | lines | what it is |
 |---|---|---|
-| `_dataset_naming.py` | 288 | The Spark/pandas/Ray Data naming and foreign-format-exporter half of the redirect table. |
+| `_dataset_naming.py` | 285 | The Spark/pandas/Ray Data naming and foreign-format-exporter half of the redirect table. |
 | `_dataset_table.py` | 498 | The Dataset half of the migration-error table: what a migrant types, and why it is absent. |
 | `_groupby_table.py` | 195 | The GroupBy half of the migration-error table. |
 | `dataset.py` | 57 | `Dataset.__getattr__`'s answer: an actionable error for a name Batcher does not have. |
@@ -321,7 +321,7 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
 | `reader.py` | 1872 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2282 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `writer.py` | 2487 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -2092,7 +2092,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `dev.py` | 372 | Development streaming sources — `rate`, `rate_micro_batch`, and `socket` (Spark parity). |
 | `eventhubs.py` | 370 | Azure Event Hubs broker source — one Split per partition, via ``azure-eventhub``. |
 | `kafka.py` | 720 | Kafka broker source — one Split per topic-partition, exactly-once commits. |
-| `kafka_sink.py` | 323 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
+| `kafka_sink.py` | 179 | Kafka streaming sink — publish each micro-batch to a topic (Spark ``format("kafka")``). |
 | `kinesis.py` | 516 | Kinesis broker source — one Split per shard, via ``boto3`` shard iterators. |
 | `pubsub.py` | 244 | Google Cloud Pub/Sub broker source — subscription pull batches. |
 | `pulsar.py` | 422 | Apache Pulsar broker source — one Split per partition, via ``pulsar-client``. |
@@ -2108,6 +2108,18 @@ Shared base for row/message-based streaming brokers (Kafka, Kinesis, ...).
 | `schema.py` | 292 | The fixed broker message schema, the message record, and option redaction. |
 | `source.py` | 669 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
 | `split.py` | 204 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
+
+### `batcher/io/formats/streaming/broker_sinks/` — 2 · neutral IO
+
+Message-broker streaming sinks on one capability contract (`contract.BrokerStreamSink`).
+
+| module | lines | what it is |
+|---|---|---|
+| `contract.py` | 377 | The one capability contract every message-broker streaming sink implements. |
+| `eventhubs.py` | 168 | Azure Event Hubs streaming sink — publish each micro-batch through ``azure-eventhub``. |
+| `kinesis.py` | 213 | Amazon Kinesis Data Streams sink — publish each micro-batch through ``boto3``. |
+| `pubsub.py` | 144 | Google Cloud Pub/Sub streaming sink — publish each micro-batch through ``google-cloud-pubsub``. |
+| `pulsar.py` | 202 | Apache Pulsar streaming sink — publish each micro-batch through ``pulsar-client``. |
 
 ### `batcher/io/formats/streaming/checkpoint/` — 2 · neutral IO
 
@@ -3015,8 +3027,10 @@ Arrow ↔ framework conversion — NumPy, PyTorch, pandas, polars, JAX.
 | module | lines | what it is |
 |---|---|---|
 | `arrays.py` | 310 | Arrow columns as NumPy / PyTorch arrays — the primitives every framework bridge shares. |
+| `dask_frames.py` | 73 | Arrow partitions → a lazy ``dask.dataframe.DataFrame``. |
 | `diagnostics.py` | 266 | Why a Python value cannot become an Arrow column, and what to do about it. |
 | `formats.py` | 394 | `batch_format` conversion for `map_batches` — Arrow ↔ numpy / pandas / torch. |
+| `huggingface.py` | 229 | Arrow → Hugging Face ``datasets`` conversion, with feature translation. |
 
 ### `batcher/migrate/` — ?
 

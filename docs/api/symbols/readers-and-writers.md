@@ -276,6 +276,10 @@ These run each micro-batch of a streaming query into a topic, a callback, memory
    :nosignatures:
 
    Writer.kafka
+   Writer.pulsar
+   Writer.kinesis
+   Writer.pubsub
+   Writer.eventhubs
    Writer.for_each_batch
    Writer.for_each
    Writer.memory

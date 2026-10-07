@@ -217,8 +217,12 @@ WRITERS = [
     ("clickhouse", lambda ds: ds.write.clickhouse("t", host="localhost")),
     ("dynamodb", lambda ds: ds.write.dynamodb("t")),
     ("elasticsearch", lambda ds: ds.write.elasticsearch("i")),
+    ("eventhubs", lambda ds: ds.write.eventhubs("hub", connection_str="Endpoint=sb://x/")),
     ("hbase", lambda ds: ds.write.hbase("t")),
     ("kafka", lambda ds: ds.write.kafka("t")),
+    ("kinesis", lambda ds: ds.write.kinesis("s")),
+    ("pubsub", lambda ds: ds.write.pubsub("projects/p/topics/t")),
+    ("pulsar", lambda ds: ds.write.pulsar("t")),
     ("redis", lambda ds: ds.write.redis("prefix")),
     ("snowflake", lambda ds: ds.write.snowflake("t")),
 ]

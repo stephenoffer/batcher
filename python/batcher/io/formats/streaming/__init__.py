@@ -11,6 +11,9 @@ optional extra, deferred until construction.
 `codecs` turns those raw payload bytes into typed columns — Avro, JSON, Protobuf, text —
 including Confluent Schema Registry framing, so a stream's real schema is known to the
 plan rather than hidden inside a `map_batches`.
+
+`broker_sinks` is the write side: Pulsar, Kinesis, Pub/Sub and Event Hubs sinks on the one
+`BrokerStreamSink` capability contract the Kafka sink (`kafka_sink`) also implements.
 """
 
 from __future__ import annotations
@@ -21,6 +24,14 @@ from batcher.io.formats.streaming.broker import (
     BrokerSource,
     BrokerSplit,
     broker_schema,
+)
+from batcher.io.formats.streaming.broker_sinks import (
+    BrokerStreamSink,
+    EventHubsStreamSink,
+    KinesisStreamSink,
+    PubSubStreamSink,
+    PulsarStreamSink,
+    SinkCapabilities,
 )
 from batcher.io.formats.streaming.codecs import (
     CODECS,
@@ -56,21 +67,27 @@ __all__ = [
     "BrokerMessage",
     "BrokerSource",
     "BrokerSplit",
+    "BrokerStreamSink",
     "DeltaStreamSink",
     "EventHubsSource",
+    "EventHubsStreamSink",
     "FileStreamSink",
     "ForeachWriter",
     "IncrementalFileSource",
     "KafkaSource",
     "KafkaStreamSink",
     "KinesisSource",
+    "KinesisStreamSink",
     "NoopStreamSink",
     "PayloadCodec",
     "PubSubSource",
+    "PubSubStreamSink",
     "PulsarSource",
+    "PulsarStreamSink",
     "RateMicroBatchSource",
     "RateSource",
     "SchemaRegistry",
+    "SinkCapabilities",
     "SocketSource",
     "StreamSink",
     "TransactionalStreamSink",
