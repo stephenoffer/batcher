@@ -13,7 +13,10 @@
 //!    a chain of joins it is the dominant term. They are cached by plan-node identity and handed
 //!    to every worker.
 //! 2. **The driving scan is sharded** into contiguous row ranges, one per worker. Contiguous and
-//!    in-order is what lets the outputs concatenate back into the oracle's row order.
+//!    in-order is what lets the outputs concatenate back into the oracle's row order. A root
+//!    aggregate that reads only a multiset of its input combines rather than concatenates, so it
+//!    takes interleaved morsel-sized pieces instead ([`interleaved_shards`]), which keeps a
+//!    clustered selective range from landing on one worker.
 //! 3. **Each worker runs the whole streaming pipeline** over its shard, holding one morsel.
 //! 4. **The root combines**: an aggregate folds each worker's `Partial` (mergeable algebra, the
 //!    same `combine` the distributed path uses); anything else concatenates the workers' output
@@ -629,10 +632,21 @@ fn run_with_cache(
     // partitioned. `shard` yields fewer pieces than asked for when a relation is smaller than
     // the split, so short lists are padded with empty shards rather than silently shortening
     // the worker count for every other source.
+    //
+    // A root aggregate that reads a multiset takes its shards *interleaved* instead (see
+    // [`interleaved_shards`]): it combines partials, so it never needed the shards contiguous, and
+    // a contiguous cut hands a clustered selective range to one worker.
+    let interleave = matches!(plan, RelOp::Aggregate { aggregates, .. }
+        if super::order::aggregates_ignore_order(aggregates));
     let per_source: Vec<Vec<Vec<RecordBatch>>> = driving
         .iter()
         .map(|d| {
-            let mut sh = shard(d.batches(sources, mats), shard_workers);
+            let batches = d.batches(sources, mats);
+            let mut sh = if interleave {
+                interleaved_shards(batches, shard_workers)
+            } else {
+                shard(batches, shard_workers)
+            };
             sh.resize_with(shard_workers, Vec::new);
             sh
         })
@@ -1110,10 +1124,67 @@ impl Shard {
     }
 }
 
+/// Pieces per worker that [`interleaved_shards`] cuts a relation into, before dealing them out.
+///
+/// The piece count decides how fine a clustered range is spread: a selective run covering a
+/// fraction `f` of the relation lands on about `f x workers x PIECES` pieces, so every worker gets
+/// a share of it once that is at least `workers`. TPC-DS's `inventory` is stored in date order and
+/// a two-month predicate keeps ~3% of it, which needs ~33 pieces per worker; 64 leaves room.
+/// Pieces are never cut below a morsel, so a small relation gets fewer.
+const INTERLEAVE_PIECES_PER_WORKER: usize = 64;
+
+/// `workers` shards that each take every `workers`-th morsel-sized piece of the relation.
+///
+/// The contiguous cut [`shard`] makes is what an order-preserving root needs, and it is fragile
+/// against data stored in the order a predicate selects on: the surviving rows of a date-sorted
+/// fact table under a date-range join sit in one contiguous run, so they fall to one or two
+/// shards and the rest of the pool idles while those finish. Measured on TPC-DS sf10 `inventory`
+/// joined to two months of `date_dim` and grouped, a 16-core worker sat at one busy core for most
+/// of the query. Dealing out pieces round-robin spreads any run longer than `workers` pieces
+/// over every worker.
+///
+/// Only for a root aggregate whose result is a function of the multiset of its input
+/// ([`super::order::aggregates_ignore_order`]): each worker still folds its own pieces in
+/// relation order into one partial, and the partials combine in worker order, so a float
+/// reduction's order is still fixed by the plan and the machine — never by timing — and the
+/// number of partials, which is what the combine pays for, is unchanged.
+pub(super) fn interleaved_shards(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let pieces = workers
+        .saturating_mul(INTERLEAVE_PIECES_PER_WORKER)
+        .min(total / bc_arrow::DEFAULT_MORSEL_ROWS);
+    if pieces <= workers {
+        return shard(batches, workers);
+    }
+    let mut out: Vec<Vec<RecordBatch>> = vec![Vec::new(); workers];
+    for (i, piece) in morsel_pieces(batches, pieces).into_iter().enumerate() {
+        out[i % workers].extend(piece);
+    }
+    out
+}
+
+/// About `pieces` contiguous, in-order pieces of whole morsels.
+///
+/// A piece that is not a whole number of morsels ends in a short one, and the scan then hands
+/// the pipeline more, smaller morsels than the relation holds: cut into ~1.7-morsel pieces, a
+/// sharded scan ran ~20% more morsels, and TPC-DS's short scan-bound aggregates (q28, q90,
+/// q96) measured ~10% slower for it. Rounding the piece up to a morsel multiple keeps every
+/// morsel full except where an input batch itself ends.
+pub(super) fn morsel_pieces(batches: &[RecordBatch], pieces: usize) -> Vec<Vec<RecordBatch>> {
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let m = bc_arrow::DEFAULT_MORSEL_ROWS;
+    cut(batches, total.div_ceil(pieces.max(1)).div_ceil(m) * m)
+}
+
 pub(super) fn shard(batches: &[RecordBatch], workers: usize) -> Vec<Vec<RecordBatch>> {
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
-    let per = total.div_ceil(workers).max(1);
-    let mut out: Vec<Vec<RecordBatch>> = Vec::with_capacity(workers);
+    cut(batches, total.div_ceil(workers))
+}
+
+/// `batches` cut into contiguous, in-order pieces of `per` rows (the last may be shorter).
+fn cut(batches: &[RecordBatch], per: usize) -> Vec<Vec<RecordBatch>> {
+    let per = per.max(1);
+    let mut out: Vec<Vec<RecordBatch>> = Vec::new();
     let mut cur: Vec<RecordBatch> = Vec::new();
     let mut cur_rows = 0usize;
 
@@ -2121,5 +2192,160 @@ mod tests {
             0,
             "a key from a node that has since moved must not match"
         );
+    }
+
+    /// `interleaved_shards` deals whole pieces out round-robin: every row lands in exactly one
+    /// shard, each shard keeps its rows in relation order, and a clustered run of morsels -- the
+    /// survivors of a date-range join over a date-sorted fact table -- is spread over every
+    /// worker instead of landing on one, which is the whole point of it.
+    #[test]
+    fn interleaved_shards_spread_a_clustered_run_over_every_worker() {
+        use arrow::array::{Array, ArrayRef, AsArray, Int64Array, RecordBatch};
+        use arrow::datatypes::Int64Type;
+
+        let m = bc_arrow::DEFAULT_MORSEL_ROWS;
+        let rows = 64 * m;
+        // Two input batches with a boundary that is not a morsel multiple, as a Parquet read is.
+        let batch = |lo: usize, hi: usize| {
+            let col: ArrayRef = Arc::new(Int64Array::from_iter_values(lo as i64..hi as i64));
+            RecordBatch::try_from_iter(vec![("r", col)]).expect("batch")
+        };
+        let input = vec![batch(0, 3 * m + 7), batch(3 * m + 7, rows)];
+        let workers = 8;
+        let shards = interleaved_shards(&input, workers);
+        assert_eq!(shards.len(), workers);
+        let mut seen: Vec<i64> = Vec::with_capacity(rows);
+        // Rows 10 morsels .. 18 morsels stand in for the clustered survivors.
+        let hot = (10 * m) as i64..(18 * m) as i64;
+        for (k, sh) in shards.iter().enumerate() {
+            let vals: Vec<i64> = sh
+                .iter()
+                .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+                .collect();
+            assert!(
+                vals.windows(2).all(|w| w[0] < w[1]),
+                "shard {k} must keep its rows in relation order"
+            );
+            assert!(
+                vals.iter().any(|v| hot.contains(v)),
+                "shard {k} got none of the clustered run"
+            );
+            assert!(sh.iter().all(|b| b.column(0).null_count() == 0));
+            seen.extend(vals);
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..rows as i64).collect::<Vec<_>>(),
+            "rows lost or duplicated"
+        );
+
+        // Too few morsels to cut finer than one piece per worker: the contiguous cut stands.
+        let small = vec![batch(0, 6 * m)];
+        let a = interleaved_shards(&small, workers);
+        let b = shard(&small, workers);
+        let len = |s: &[Vec<RecordBatch>]| -> Vec<usize> {
+            s.iter()
+                .map(|v| v.iter().map(|x| x.num_rows()).sum())
+                .collect()
+        };
+        assert_eq!(len(&a), len(&b));
+    }
+
+    /// A root aggregate over a clustered selective run gives the oracle's groups when it is
+    /// sharded interleaved: a filter keeps four adjacent morsels of a 64-morsel relation, which
+    /// a contiguous cut would hand to one worker, and the grouped `SUM`/`COUNT`/`MIN` over them
+    /// must equal the sequential oracle's group for group.
+    #[test]
+    fn an_interleaved_aggregate_over_a_clustered_run_matches_the_oracle() {
+        use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
+        use bc_expr::{BinaryOp, Expr, Literal};
+        use bc_ir::{AggFunc, AggregateItem, ProjectionItem};
+
+        let m = bc_arrow::DEFAULT_MORSEL_ROWS as i64;
+        let n = 64 * m;
+        let cluster: ArrayRef = Arc::new(Int64Array::from_iter_values((0..n).map(|i| i / m)));
+        let v: ArrayRef = Arc::new(Int64Array::from_iter(
+            (0..n).map(|i| (i % 11 != 0).then_some(i)),
+        ));
+        let k: ArrayRef = Arc::new(Int64Array::from_iter_values((0..n).map(|i| i % 7)));
+        let sources = vec![vec![RecordBatch::try_from_iter(vec![
+            ("c", cluster),
+            ("k", k),
+            ("v", v),
+        ])
+        .expect("batch")]];
+        let lit = |x: i64| {
+            Box::new(Expr::Lit {
+                value: Literal::Int(x),
+            })
+        };
+        let col = |c: &str| Expr::Col { name: c.into() };
+        let pred = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Binary {
+                op: BinaryOp::Ge,
+                left: Box::new(col("c")),
+                right: lit(20),
+            }),
+            right: Box::new(Expr::Binary {
+                op: BinaryOp::Lt,
+                left: Box::new(col("c")),
+                right: lit(24),
+            }),
+        };
+        let agg = |func, input: Option<Expr>, alias: &str| AggregateItem {
+            func,
+            input,
+            input2: None,
+            param: None,
+            interpolation: None,
+            order_by: vec![],
+            alias: alias.into(),
+        };
+        let plan = RelOp::Sort {
+            input: Box::new(RelOp::Aggregate {
+                input: Box::new(RelOp::Filter {
+                    input: Box::new(RelOp::Scan { source_id: 0 }),
+                    predicate: pred,
+                }),
+                group_keys: vec![ProjectionItem {
+                    expr: col("k"),
+                    alias: "k".into(),
+                }],
+                aggregates: vec![
+                    agg(AggFunc::Sum, Some(col("v")), "s"),
+                    agg(AggFunc::Count, Some(col("v")), "n"),
+                    agg(AggFunc::CountStar, None, "all"),
+                    agg(AggFunc::Min, Some(col("v")), "lo"),
+                ],
+            }),
+            keys: vec![bc_ir::SortKey {
+                expr: col("k"),
+                descending: false,
+                nulls_first: false,
+            }],
+            limit: None,
+        };
+        let oracle = crate::execute(&plan, &sources).expect("oracle");
+        let got = super::super::execute_streaming_parallel(&plan, &sources, 8, 0, None)
+            .expect("streaming parallel");
+        let flat = |b: &[RecordBatch]| {
+            let t = crate::ops::materialize(b).expect("materialize");
+            (0..t.num_columns())
+                .map(|c| {
+                    let a = t
+                        .column(c)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("i64");
+                    (0..a.len())
+                        .map(|i| a.is_valid(i).then(|| a.value(i)))
+                        .collect()
+                })
+                .collect::<Vec<Vec<Option<i64>>>>()
+        };
+        assert_eq!(flat(&oracle)[0].len(), 7, "every key survives the filter");
+        assert_eq!(flat(&oracle), flat(&got));
     }
 }

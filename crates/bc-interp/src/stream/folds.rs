@@ -637,11 +637,19 @@ pub(crate) fn combine_and_finalize(
     // grouped relation (on a high-cardinality string key, the largest term in the merge), and
     // the next operator gets a batch per partition to fan back out over instead of one.
     let merged = agg::combine_partitioned(partials, &funcs, 0)?;
-    let mut out = Vec::with_capacity(merged.len());
-    for part in &merged {
-        out.extend(finalize_partial(part, group_keys, aggregates)?);
+    // Finalized across the pool, one radix partition per task: the partitions are key-disjoint
+    // and finalize is per group, so this is the same rows in the same (partition) order. Serial,
+    // it was the one step of a million-group `stddev`/`avg` left on a single core after a
+    // parallel combine (TPC-DS q39's `finalize_var`/`push_mean` showed in the single-threaded
+    // windows of a 16-core profile).
+    if let [only] = merged.as_slice() {
+        return finalize_partial(only, group_keys, aggregates);
     }
-    Ok(out)
+    let per: Vec<Vec<RecordBatch>> = merged
+        .par_iter()
+        .map(|part| finalize_partial(part, group_keys, aggregates))
+        .collect::<Result<_, _>>()?;
+    Ok(per.into_iter().flatten().collect())
 }
 
 #[cfg(test)]
