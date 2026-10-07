@@ -304,6 +304,14 @@ class HttpJsonSource(PagedJsonSource):
                 return
             request = self._pagination._follow(request, document, response.headers, len(records))
 
+    def governed_name(self) -> str:
+        """The endpoint without its query or user info: the name a policy is written about.
+
+        `identity` folds in a digest of the pagination and parameters, which no operator
+        could type, so a policy keyed on it would never apply.
+        """
+        return redact_url(self._url)
+
     def identity(self) -> str:
         """The API endpoint and the read's shape; never a header, token or query value."""
         return (
