@@ -163,6 +163,23 @@ def _unit_slots(workers: int, want: int = _UNIT_CPUS) -> tuple[int, int]:
     return want, max(1, workers)
 
 
+def _pruned(body: LogicalPlan, cut: AlignedCut) -> LogicalPlan:
+    """`body` with every join emitting only the columns something above it reads.
+
+    Moving a broadcast join down (`group_broadcast_joins`) carries the moved side's columns
+    up under fresh names, and a join above that nothing reads them through still emits them.
+    They are then part of what a hoisted broadcast holds: on warm runs of TPC-H q9 at SF1000
+    `partsupp`, joined to `supplier JOIN nation`, was held with four such columns, 2.6 GB where
+    the cold plan held 1.0 GB, and packing it took 9 s on the driver. The cut's own output
+    is what is needed above it: the aggregate's inputs when it feeds one, else every column.
+    """
+    from batcher.kyber.rules.projections import rewrite_projection
+
+    if cut.aggregate is None:
+        return rewrite_projection(body)
+    return rewrite_projection(dataclasses.replace(cut.aggregate, input=body)).input
+
+
 def _aligned_units_task(calls: list[tuple], held: dict, empties: dict) -> list[tuple]:
     """`run_units_here` as a Ray task (the lifecycle wraps this name, not that one)."""
     return run_units_here(calls, held, empties)
@@ -328,8 +345,11 @@ def run_cut(
     local: dict[int, LogicalPlan] = {}
     from batcher.dist.executors.aligned.route import unbroadcastable
 
-    grouped = group_broadcast_joins(
-        cut.body, cut.aligned, reduce=lambda side: unbroadcastable(side, sources)
+    grouped = _pruned(
+        group_broadcast_joins(
+            cut.body, cut.aligned, reduce=lambda side: unbroadcastable(side, sources)
+        ),
+        cut,
     )
     body = hoist_broadcasts(grouped, cut, sources, held_tables, workers, local, oversized)
     if body is None:

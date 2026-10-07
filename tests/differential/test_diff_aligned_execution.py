@@ -236,6 +236,37 @@ def test_a_residual_top_n_is_kept_per_unit(tables, monkeypatch):
     assert tops and all(t.limit == 7 for t in tops)
 
 
+def test_a_cut_body_emits_only_what_its_aggregate_reads(tables):
+    """Columns a cut never reads are pruned from its joins before broadcasts are hoisted.
+
+    A held broadcast carrying them costs the driver its packing and every node its copy:
+    warm TPC-H q9 held `partsupp` with four such columns, 2.6 GB against 1.0 GB.
+    """
+    from batcher.dist.executors.aligned.run import _pruned
+
+    li, orders, cust = _read(tables, "lineitem"), _read(tables, "orders"), _read(tables, "customer")
+    ds = (
+        li.join(orders, left_on="l_ok", right_on="o_ok")
+        .join(cust, left_on="o_ck", right_on="c_ck")
+        .group_by("l_flag")
+        .agg(rev=col("l_price").sum())
+    )
+    found = choose_plan(ds._plan, ds._sources, strict=False)
+    (cut,) = [c for c in found.cuts if c.aggregate is not None]
+    pruned = _pruned(cut.body, cut)
+    emitted = {o.alias for n in _walk(pruned) if isinstance(n, Join) for o in n.output}
+    before = {o.alias for n in _walk(cut.body) if isinstance(n, Join) for o in n.output}
+    # Positive control: the plan as written emits columns nothing reads (`o_prio`, `c_seg`).
+    assert {"o_prio", "c_seg"} <= before
+    assert not ({"o_prio", "c_seg"} & emitted)
+    query = (
+        "SELECT l_flag, sum(l_price) AS rev FROM lineitem JOIN orders ON l_ok = o_ok "
+        "JOIN customer ON o_ck = c_ck GROUP BY l_flag"
+    )
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert_same_for_query(got, _duck(tables, query), query)
+
+
 def test_left_join_keeps_unmatched_rows(tables):
     """Fact keys 2900-2999 have no order, so the left join emits them null-padded."""
     li, orders = _read(tables, "lineitem"), _read(tables, "orders")
