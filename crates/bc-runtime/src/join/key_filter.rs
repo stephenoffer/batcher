@@ -218,10 +218,7 @@ impl KeyFilter {
         // digest loop, because they decide *which* digest to run — and because a build side
         // that turns out to be sparse should not have paid for a hash-set insert per row on
         // the way to finding that out. `None` here is an empty or all-null key column.
-        let (lo, hi) = match (arrow_min(a), arrow_max(a)) {
-            (Some(lo), Some(hi)) => (lo, hi),
-            _ => return None,
-        };
+        let (lo, hi) = extremes(a)?;
         // `i128` because `hi - lo` overflows `i64` on the extremes, and a span that wide is
         // refused rather than wrapped into a small one.
         let span = (i128::from(hi) - i128::from(lo) + 1) as u128;
@@ -233,7 +230,13 @@ impl KeyFilter {
     }
 
     /// The bitmap digest: one bit per key in `[lo, hi]`, set from the build side in one pass.
+    ///
+    /// A build side past [`PAR_DIGEST_MIN_ROWS`] sets its bits from every core instead
+    /// ([`Self::dense_parallel`]): the same bits, so the same filter.
     fn dense(a: &arrow::array::Int64Array, lo: i64, hi: i64, span: u128) -> Self {
+        if a.len() >= PAR_DIGEST_MIN_ROWS && rayon::current_num_threads() > 1 {
+            return Self::dense_parallel(a, lo, hi, span);
+        }
         let mut bits = vec![0u64; span.div_ceil(64) as usize];
         let mut distinct = 0usize;
         let mut set = |v: i64| {
@@ -254,6 +257,57 @@ impl KeyFilter {
                 }
             }
         }
+        Self {
+            lo,
+            hi,
+            keys: KeySet::Dense(bits),
+            distinct,
+        }
+    }
+
+    /// [`Self::dense`] with the bits set from every core of the current pool.
+    ///
+    /// A bit is only ever set, never cleared, so concurrent `fetch_or`s commute and the bitmap
+    /// they leave is the one the sequential loop leaves, whatever the interleaving. `Relaxed` is
+    /// enough for the same reason, and the `collect` that ends the fan-out is the join that
+    /// publishes every write before the bits are read. The distinct count is the bitmap's
+    /// population count, which is what the sequential loop's per-insert tally sums to.
+    ///
+    /// This is the build-side digest of a join whose probe side is large, which is exactly the
+    /// join where the build side is large too: TPC-H q5 at sf100 spent ~200 ms here on one core
+    /// with every other core idle, between the build-side reads and the probe stream.
+    fn dense_parallel(a: &arrow::array::Int64Array, lo: i64, hi: i64, span: u128) -> Self {
+        use rayon::prelude::*;
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let words = span.div_ceil(64) as usize;
+        let shared: Vec<AtomicU64> = (0..words)
+            .into_par_iter()
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        let set = |v: i64| {
+            // In range by construction: `lo <= v <= hi` for every non-null build key.
+            let offset = (i128::from(v) - i128::from(lo)) as usize;
+            let word = &shared[offset >> 6];
+            let mask = 1u64 << (offset & 63);
+            // A plain load first: a set bit is common (duplicate keys, a dense run) and skipping
+            // its read-modify-write keeps the line shared rather than bouncing it between cores.
+            if word.load(Relaxed) & mask == 0 {
+                word.fetch_or(mask, Relaxed);
+            }
+        };
+        let values = a.values();
+        match a.nulls() {
+            None => values
+                .par_chunks(PAR_DIGEST_CHUNK)
+                .for_each(|chunk| chunk.iter().copied().for_each(set)),
+            Some(nulls) => (0..a.len())
+                .into_par_iter()
+                .with_min_len(PAR_DIGEST_CHUNK)
+                .filter(|&i| nulls.is_valid(i))
+                .for_each(|i| set(values[i])),
+        }
+        let bits: Vec<u64> = shared.into_par_iter().map(AtomicU64::into_inner).collect();
+        let distinct = bits.par_iter().map(|w| w.count_ones() as usize).sum();
         Self {
             lo,
             hi,
@@ -365,6 +419,39 @@ impl KeyFilter {
 /// "is it an amount of memory worth naming?", which the relative bound alone cannot: at
 /// [`MAX_BUILD_ROWS`] the ratio would admit 32 GiB. [`MIN_DENSE_SPAN`] gives any build side whose
 /// span fits a cache-resident map that map, however sparse its keys.
+/// Build rows past which a digest's passes over its keys fan out across the current pool.
+///
+/// Below this a pass is a few milliseconds on one core and a fan-out's scheduling is the larger
+/// cost; above it the pass is the one serial step between a join's build and its probe.
+const PAR_DIGEST_MIN_ROWS: usize = 1 << 20;
+
+/// Keys each parallel digest task takes at once: large enough that a task's scheduling is
+/// noise against its loop, small enough to balance across a pool of a hundred threads.
+const PAR_DIGEST_CHUNK: usize = 1 << 16;
+
+/// The non-null extremes of `a`, or `None` for an empty or all-null column.
+///
+/// Arrow's null-skipping SIMD reduction, per chunk on every core once the column is past
+/// [`PAR_DIGEST_MIN_ROWS`]: on the build side of a large join this pass and the bitmap fill
+/// were the whole of the digest, and both ran on one core.
+fn extremes(a: &arrow::array::Int64Array) -> Option<(i64, i64)> {
+    use rayon::prelude::*;
+    if a.len() < PAR_DIGEST_MIN_ROWS || rayon::current_num_threads() <= 1 {
+        return Some((arrow_min(a)?, arrow_max(a)?));
+    }
+    let chunks: Vec<(usize, usize)> = (0..a.len())
+        .step_by(PAR_DIGEST_CHUNK * 4)
+        .map(|start| (start, (PAR_DIGEST_CHUNK * 4).min(a.len() - start)))
+        .collect();
+    chunks
+        .into_par_iter()
+        .filter_map(|(start, len)| {
+            let part = a.slice(start, len);
+            Some((arrow_min(&part)?, arrow_max(&part)?))
+        })
+        .reduce_with(|(l1, h1), (l2, h2)| (l1.min(l2), h1.max(h2)))
+}
+
 fn dense_span_budget(rows: usize, span_per_row: u128, max_dense_span: u128) -> u128 {
     ((rows as u128).saturating_mul(span_per_row)).clamp(MIN_DENSE_SPAN, max_dense_span)
 }
@@ -434,6 +521,37 @@ mod tests {
         let a: ArrayRef = Arc::new(Int64Array::from(probe));
         let m = f.mask(&a).unwrap();
         (0..m.len()).map(|i| m.value(i)).collect()
+    }
+
+    /// The parallel digest is the sequential one: the same extremes, the same bits and the same
+    /// distinct count, over a build side large enough to fan out, with duplicates and with
+    /// nulls. One pool of one thread forces the sequential loop; the other fans out.
+    #[test]
+    fn the_parallel_digest_is_the_sequential_digest() {
+        let rows = 3 * PAR_DIGEST_MIN_ROWS;
+        // A scattered, duplicated key over a span the bitmap admits (~4x the rows).
+        let key = |i: usize| ((i as i64).wrapping_mul(2_654_435_761) % (4 * rows as i64)).abs() - 9;
+        for with_nulls in [false, true] {
+            let keys: Vec<Option<i64>> = (0..rows)
+                .map(|i| (!with_nulls || i % 11 != 0).then(|| key(i / 2)))
+                .collect();
+            let a: ArrayRef = Arc::new(Int64Array::from(keys));
+            let digest = |threads: usize| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| KeyFilter::build_within(&a, ONCE_LIMITS))
+                    .expect("a dense key digests")
+            };
+            let (seq, par) = (digest(1), digest(8));
+            assert_eq!((seq.lo, seq.hi), (par.lo, par.hi), "nulls={with_nulls}");
+            assert_eq!(seq.distinct, par.distinct, "nulls={with_nulls}");
+            match (&seq.keys, &par.keys) {
+                (KeySet::Dense(x), KeySet::Dense(y)) => assert!(x == y, "nulls={with_nulls}"),
+                _ => panic!("both digests must be bitmaps over this span"),
+            }
+        }
     }
 
     /// The property the whole module rests on: a key that IS in the build side always passes.

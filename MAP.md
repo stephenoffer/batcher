@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1644 Python modules across 236 packages and 344 Rust files across 14 crates.
+Covering 1644 Python modules across 236 packages and 345 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -3286,7 +3286,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `stream/breaker.rs` | 634 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 775 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/chunked/drive.rs` | 147 | The chunk-driven entry points: [`execute_chunked`] and its metered twin. |
-| `stream/chunked/mod.rs` | 726 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
+| `stream/chunked/mod.rs` | 752 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
 | `stream/chunked/orient.rs` | 151 | Put the driving scan on the probe spine, and map the metrics of the re-oriented plan back. |
 | `stream/chunked/partial.rs` | 99 | The map side of a distributed aggregate, with the workers reading their own units. |
 | `stream/chunked/top_n.rs` | 182 | A top-N over the driving scan, materialized late: sort the narrow columns, fetch the winners. |
@@ -3337,14 +3337,15 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `agg/var.rs` | 335 | Variance / standard-deviation / mean finalizers and their shared (sum, sum_of_squares, count) partial-state producer. |
 | `byte_key.rs` | 261 | The one reading of a **byte-lexicographic** key column: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `error.rs` | 138 | The crate's error type: how the stateful runtime structures report failure. |
+| `gather/concat_fixed.rs` | 63 | The fixed-width arm of [`super::concat_columns`]: one output buffer, filled across cores. |
 | `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
-| `gather/mod.rs` | 761 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
+| `gather/mod.rs` | 770 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `gather/spans.rs` | 136 | Copying a sequence of source byte spans into one output buffer, as few copies as possible. |
 | `join/asof.rs` | 539 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 237 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 487 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
-| `join/key_filter.rs` | 419 | The build side's key set, digested into a filter the probe side applies *before* the join. |
+| `join/key_filter.rs` | 506 | The build side's key set, digested into a filter the probe side applies *before* the join. |
 | `join/mod.rs` | 2242 | Hash join — produces match index-pairs, built to distribute. |
 | `join/probe_par.rs` | 113 | The flat hash join's probe, across cores, emitting exactly what the serial probe emits. |
 | `join/radix.rs` | 123 | Parallel radix partitioning — the scatter pass shared by both radix joins. |
