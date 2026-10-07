@@ -57,7 +57,7 @@ The table maps each type to the failure that raises it.
 | {py:exc}`CompileError <batcher.CompileError>` | JIT compilation of a pipeline fails. The interpreter remains as a fallback, so this is rare. |
 | {py:exc}`ResourceError <batcher.ResourceError>` | The resource manager cannot satisfy a memory or credit request. |
 | {py:exc}`IOError <batcher.IOError>` | A source or sink fails to read, write, list, or open a path. |
-| `DataQualityError` | A `ds.dq...fail()` expectation has violating rows. Carries the per-constraint counts. |
+| `DataQualityError` | A `ds.dq...fail()` expectation has violating rows, or a `join`/`update` `validate=` check found a repeated key. Carries the per-constraint counts. |
 | `AccessDeniedError` | A principal may select no column of a governed table. A *column* it cannot select is instead absent, surfacing as `PlanError`. |
 | {py:exc}`FormatError <batcher.FormatError>`, {py:exc}`BackendError <batcher.BackendError>`, {py:exc}`CommitError <batcher.CommitError>`, {py:exc}`TransportError <batcher.TransportError>` | Lower-level IO, backend, write-commit, and shuffle failures. |
 

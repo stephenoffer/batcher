@@ -49,7 +49,7 @@ The following table maps the 89 names on `LazyFrame`, sorted alphabetically.
 | `head` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | canonical |  |
 | `inspect` | n/a | gap | Not yet: Dataset.inspect (print the frame mid-plan). Wave W8. |
 | `interpolate` | n/a | gap | Not yet: Dataset.interpolate (every numeric column). Wave W5. |
-| `join` | {py:obj}`Dataset.join <batcher.Dataset.join>` | mismatch | Differs: on how='full' Polars keeps both key columns (key, key\_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=. Wave W0. |
+| `join` | {py:obj}`Dataset.join <batcher.Dataset.join>` | mismatch | Differs: Polars' coalesce=None keeps both key columns (key, key\_right) only on a full join; Batcher's coalesce= defaults to merging them, so the port passes coalesce= explicitly. A coalescing right join is left unported: Polars puts the key after the left payload columns. Wave W0. |
 | `join_asof` | {py:obj}`Dataset.join_asof <batcher.Dataset.join_asof>` | param | Missing: strategy= ('backward'/'forward'/'nearest'), coalesce=, check\_sortedness=. Wave W2. |
 | `join_where` | {py:obj}`Dataset.join_where <batcher.Dataset.join_where>` | canonical |  |
 | `last` | {py:obj}`Dataset.last <batcher.Dataset.last>` | mismatch | Differs: Polars LazyFrame.last() is a one-row LazyFrame; Batcher's last() executes and returns a tuple. Wave W0. |
@@ -159,7 +159,7 @@ The following table maps the 136 names on `DataFrame`, sorted alphabetically.
 | `iter_columns` | {py:obj}`Dataset.select <batcher.Dataset.select>` | mismatch | Differs: returns a one-column Dataset rather than a Series (Batcher has no Series type); the Batcher has no Series, so Series-bound code needs a manual port. Wave W8. |
 | `iter_rows` | {py:obj}`Dataset.iter_rows <batcher.Dataset.iter_rows>` | canonical |  |
 | `iter_slices` | {py:obj}`Dataset.iter_slices <batcher.Dataset.iter_slices>` | mismatch | Differs: yields pyarrow RecordBatch rather than a DataFrame. Wave W0. |
-| `join` | {py:obj}`Dataset.join <batcher.Dataset.join>` | mismatch | Differs: on how='full' Polars keeps both key columns (key, key\_right) unless coalesce=True; Batcher coalesces them into one key column. Param: coalesce=. Wave W0. |
+| `join` | {py:obj}`Dataset.join <batcher.Dataset.join>` | mismatch | Differs: Polars' coalesce=None keeps both key columns (key, key\_right) only on a full join; Batcher's coalesce= defaults to merging them, so the port passes coalesce= explicitly. A coalescing right join is left unported: Polars puts the key after the left payload columns. Wave W0. |
 | `join_asof` | {py:obj}`Dataset.join_asof <batcher.Dataset.join_asof>` | param | Missing: strategy= ('backward'/'forward'/'nearest'), coalesce=, check\_sortedness=. Wave W2. |
 | `join_where` | {py:obj}`Dataset.join_where <batcher.Dataset.join_where>` | canonical |  |
 | `lazy` | {py:obj}`Dataset <batcher.Dataset>` | canonical |  |

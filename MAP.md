@@ -219,7 +219,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7134 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 7139 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -2830,7 +2830,7 @@ Datacenter accelerator specifications — the hardware facts a cluster cannot re
 
 | module | lines | what it is |
 |---|---|---|
-| `hierarchy.py` | 794 | The Batcher exception hierarchy. |
+| `hierarchy.py` | 795 | The Batcher exception hierarchy. |
 | `suggest.py` | 401 | The one "did you mean ...?" engine, and the one unknown-name message shape. |
 | `validate.py` | 125 | Turning a wrong-typed user argument into a typed error, at the API edge. |
 
@@ -3044,7 +3044,7 @@ The `sem.<name>` transforms registry templates call for what the template DSL ca
 | `base.py` | 199 | The transform registry, the context a transform reads, and the node helpers they share. |
 | `columns.py` | 241 | Transforms over column references, argument checks, positions and date patterns. |
 | `ordering.py` | 224 | Transforms over sort and window keys, whose null placement differs per engine. |
-| `relational.py` | 220 | Transforms over relational spellings: joins, writes, sessions, constructors, aggregates. |
+| `relational.py` | 242 | Transforms over relational spellings: joins, writes, sessions, constructors, aggregates. |
 
 ## Rust data plane — `crates/`
 

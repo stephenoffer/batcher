@@ -569,8 +569,9 @@ class SchemaError(IOError):
 class DataQualityError(BatcherError, ValueError):
     """A data-quality expectation failed.
 
-    Raised by ``ds.dq...fail()`` when one or more constraints have violating rows.
-    Carries the per-constraint violation counts.
+    Raised by ``ds.dq...fail()`` when one or more constraints have violating rows, and by
+    ``join(validate=...)`` / ``update(validate=...)`` when a side that must be unique repeats
+    a key. Carries the per-constraint violation counts.
 
     Examples:
         .. doctest::

@@ -534,6 +534,11 @@ class Dataset:
         ``ds[ds["a"] > 1]`` returns the rows matching a boolean expression, the
         pandas/Polars ``df[df.a > 1]`` idiom (equivalent to `filter`).
 
+        The `Expr` from ``ds["x"]`` is the name ``"x"``, the same as ``bt.col("x")``; it is
+        not bound to ``ds``. Across a join, ``L["k"]`` and ``R["k"]`` therefore name the same
+        column, so `join_where` refuses that comparison and asks for the suffixed name
+        (``bt.col("k_right")``) instead.
+
         Args:
             key: A column name, a list of names, a slice, or a boolean `Expr` mask.
 

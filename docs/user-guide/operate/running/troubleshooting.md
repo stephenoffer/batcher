@@ -178,7 +178,7 @@ reachable as `bt.<Name>`:
 | {py:exc}`bt.FormatError <batcher.FormatError>` | an unknown format, or a file malformed for its format | |
 | {py:exc}`bt.CommitError <batcher.CommitError>` | an atomic write commit failing (a concurrent-writer conflict) | |
 | {py:exc}`bt.SchemaError <batcher.SchemaError>` | schemas that can't be reconciled across files or against an expected one | |
-| {py:exc}`bt.DataQualityError <batcher.DataQualityError>` | a `ds.dq...fail()` expectation with violating rows (carries the counts) | `ValueError` |
+| {py:exc}`bt.DataQualityError <batcher.DataQualityError>` | a `ds.dq...fail()` expectation with violating rows, or a `join`/`update` `validate=` cardinality check (carries the counts) | `ValueError` |
 | {py:exc}`bt.BackendError <batcher.BackendError>` | a specific execution backend failing | `RuntimeError` |
 | {py:exc}`bt.TransportError <batcher.TransportError>` | the distributed data plane (shared memory / Flight) failing | |
 
