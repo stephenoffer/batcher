@@ -291,7 +291,15 @@ class GroupBy:
             raise PlanError("agg() requires at least one aggregate")
         return self._source._derive(self._lower_aggregates(resolved))
 
-    def map_groups(self, fn: Callable, **options: Any) -> Dataset:
+    def map_groups(
+        self,
+        fn: Callable,
+        *,
+        output_schema: pa.Schema | None = None,
+        max_group_rows: int | None = None,
+        max_group_bytes: int | None = None,
+        **options: Any,
+    ) -> Dataset:
         """Apply a Python function to each group as one whole batch.
 
         `fn` receives a `pyarrow.RecordBatch` holding every row of one group, in the
@@ -314,6 +322,18 @@ class GroupBy:
         relational breaker, whether `collect(distributed=True)` accepts the plan is the same
         question as for ``group_by(...).agg(...).map_batches(fn)``.
 
+        Declare `output_schema` whenever the input can have no groups. With no group there
+        is no call to `fn` and nothing to learn the result's columns from, so without it an
+        empty input yields a result with **no columns**, which then fails to union with a
+        non-empty one. With it, an empty input yields an empty table of that schema, every
+        result is cast to it (a missing or extra column raises), and it also sets
+        ``output_columns``.
+
+        `max_group_rows` and `max_group_bytes` refuse a group over either limit before `fn`
+        is called, raising `ExecutionError` naming the group's key, its size and the limit.
+        The engine has already assembled the group by then, so they protect the Python side
+        (the conversion to `batch_format` and what `fn` builds), not engine memory.
+
         Examples:
             .. doctest::
 
@@ -327,8 +347,17 @@ class GroupBy:
                 >>> out.sort("k").to_pydict()
                 {'k': ['a', 'b'], 'spread': [2, 0]}
 
+                >>> schema = pa.schema([("k", pa.string()), ("spread", pa.int64())])
+                >>> empty = ds.filter(bt.col("v") > 100)
+                >>> empty.group_by("k").map_groups(spread, output_schema=schema).collect().schema
+                k: string
+                spread: int64
+
         Args:
             fn: Called once per group with that group's rows as a `pyarrow.RecordBatch`.
+            output_schema: The result's schema, and the result of an input with no groups.
+            max_group_rows: Refuse a group with more rows than this before calling `fn`.
+            max_group_bytes: Refuse a group larger than this many bytes before calling `fn`.
             **options: `map_batches` options for the per-group stage, such as
                 ``output_columns``, ``batch_format``, ``num_gpus``, or ``concurrency``.
 
@@ -336,7 +365,10 @@ class GroupBy:
             A new lazy `Dataset` holding what `fn` returned for each group, concatenated.
 
         Raises:
-            PlanError: if every column is a group key, leaving nothing to hand `fn`.
+            PlanError: if every column is a group key, leaving nothing to hand `fn`, or
+                an option is malformed.
+            ExecutionError: If a group exceeds a size limit, or a result does not match
+                `output_schema`.
         """
         from batcher.api.group_apply import build_map_groups
 
@@ -348,7 +380,8 @@ class GroupBy:
                 f"({sorted(self._named)}). Add the derived column with with_columns first, "
                 "then group by its name."
             )
-        return build_map_groups(self._source, self._keys, fn, options)
+        limits = {"max_group_rows": max_group_rows, "max_group_bytes": max_group_bytes}
+        return build_map_groups(self._source, self._keys, fn, options, output_schema, **limits)
 
     def _spec_to_aggs(self, spec: dict[str, Any]) -> dict[str, AggExpr]:
         """Expand a pandas ``{column: "sum"}`` / ``{column: ["min", "max"]}`` agg spec.
