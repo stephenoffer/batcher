@@ -118,13 +118,17 @@ def _referenced_columns_impl(expr: Expr) -> frozenset[str] | set[str]:
     if isinstance(expr, InList):
         return referenced_columns(expr.input)  # `values` are literals, not sub-expressions
     if isinstance(expr, (ListTransform, ListFilter)):
-        # A higher-order list op reads its input list column. Its body (`func`/`pred`) is
-        # evaluated in a *scope of its own* over the list's flattened elements, where the
-        # only free name is the `element()` placeholder — a bound variable, not a column
-        # read from this operator's input. The generic field-walk below would descend into
-        # that body and surface `element` as an unknown column, which is exactly what
-        # failed the list-HOF differential tests. Column references stop at the input.
-        return referenced_columns(expr.input)
+        # A higher-order list op reads its input list column and whatever its captures
+        # read. Its body (`func`/`pred`) is evaluated in a *scope of its own* over the
+        # list's flattened elements, where `element()`/`element_index()` are bound
+        # variables and every outer column arrives as a capture -- so the body names
+        # nothing from this operator's input. The generic field-walk below would descend
+        # into it and surface `element` as an unknown column, which is exactly what failed
+        # the list-HOF differential tests.
+        cols = set(referenced_columns(expr.input))
+        for capture in expr.captures:
+            cols |= referenced_columns(capture)
+        return cols
     if isinstance(expr, Case):
         cols = referenced_columns(expr.otherwise)
         for cond, then in expr.branches:
@@ -175,14 +179,16 @@ def remap_columns(expr: Expr, mapping: dict[str, str]) -> Expr:
         return Aliased(rewrite(expr.inner), expr.name)
     if isinstance(expr, InList):
         return InList(rewrite(expr.input), expr.values)
-    if isinstance(expr, ListTransform):
-        # Only the input list column is a column reference (see `_referenced_columns_impl`).
-        # The body binds `element()` in its own scope, so rewriting it under a join's
-        # output→source mapping is at best a no-op and at worst rebinds the placeholder;
-        # leave it intact, exactly as the reference walk refuses to read columns from it.
-        return ListTransform(rewrite(expr.input), expr.func)
-    if isinstance(expr, ListFilter):
-        return ListFilter(rewrite(expr.input), expr.pred)
+    if isinstance(expr, (ListTransform, ListFilter)):
+        # The input and the captures are column references over the enclosing relation
+        # (see `_referenced_columns_impl`). The body reads only its own bindings and the
+        # capture *names*, so rewriting it under a join's output→source mapping is at best
+        # a no-op and at worst rebinds a placeholder; leave it intact.
+        return dataclasses.replace(
+            expr,
+            input=rewrite(expr.input),
+            captures=tuple(rewrite(c) for c in expr.captures),
+        )
     if isinstance(expr, Case):
         return Case(
             [(rewrite(cond), rewrite(then)) for cond, then in expr.branches],

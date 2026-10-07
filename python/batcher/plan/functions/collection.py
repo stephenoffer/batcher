@@ -11,19 +11,20 @@ from __future__ import annotations
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.core import Expr, IntoExpr, _wrap
+from batcher.plan.expr_ir.func_nodes import ELEMENT_COL, ELEMENT_INDEX_COL
 from batcher.plan.expr_ir.nodes import Col, MakeMap, MakeStruct, Sequence
 
 __all__ = [
     "element",
+    "element_index",
     "map_from_arrays",
     "named_struct",
     "sequence",
     "struct",
 ]
 
-#: The reserved column name the list higher-order ops bind each element to. Must
-#: match the Rust `eval/list_hof.rs` ELEMENT constant.
-_ELEMENT_COL = "element"
+#: The reserved column name the list higher-order ops bind each element to.
+_ELEMENT_COL = ELEMENT_COL
 
 
 def struct(**fields: IntoExpr) -> Expr:
@@ -130,6 +131,11 @@ def sequence(start: IntoExpr, stop: IntoExpr, step: IntoExpr = 1) -> Expr:
     argument yields a null list, and a ``step`` of 0 raises. Pair with ``explode`` to
     fan a range out into rows.
 
+    The series is always integers. A date, timestamp, duration or text operand is a
+    `PlanError` when the plan is typed, rather than the epoch-unit integers (or, for a
+    text step such as ``'1 day'``, the nulls) it used to produce: a date range stepped by
+    an interval is not supported.
+
     Args:
         start: The first value of the range (column or literal, cast to Int64).
         stop: The inclusive last value of the range.
@@ -154,7 +160,8 @@ def element() -> Expr:
 
     Use it to build the per-element expression: ``col("a").list.transform(element() * 2)``
     doubles each element, ``col("a").list.filter(element() > 0)`` keeps the positives.
-    Outside a list higher-order op it has no binding.
+    Outside a list higher-order op it has no binding. Inside one, a column other than
+    ``element()`` and :func:`element_index` is the enclosing row's value.
 
     Returns:
         An expression referencing the current list element.
@@ -168,3 +175,27 @@ def element() -> Expr:
             {'d': [[2, 4, 6]]}
     """
     return Col(_ELEMENT_COL)
+
+
+def element_index() -> Expr:
+    """The current element's 0-based position inside ``list.transform`` / ``list.filter``.
+
+    The position is within the element's own list, so it restarts at 0 on every row. It is
+    Int64 and never null, even where the element is. DuckDB's two-parameter lambda
+    ``(x, i) -> ...`` numbers from 1, so its ``i`` is ``element_index() + 1``. Outside a
+    list higher-order op it has no binding.
+
+    Returns:
+        An expression referencing the current element's position.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> ds = bt.from_pydict({"a": [[5, 6, 7], [8]]})
+            >>> ds.select(r=bt.col("a").list.filter(bt.element_index() > 0)).to_pydict()
+            {'r': [[6, 7], []]}
+            >>> ds.select(r=bt.col("a").list.transform(bt.element_index())).to_pydict()
+            {'r': [[0, 1, 2], [0]]}
+    """
+    return Col(ELEMENT_INDEX_COL)

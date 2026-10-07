@@ -57,7 +57,13 @@ def _int_methods():
             annotations = {
                 p.name: (p.annotation if isinstance(p.annotation, str) else "") for p in required
             }
-            targets = [p.name for p in required if annotations[p.name].strip() == "int"]
+            # `int | Expr` takes a per-row expression too, but a non-int *literal* must still
+            # be refused, so it is swept like a plain `int`.
+            targets = [
+                p.name
+                for p in required
+                if annotations[p.name].replace(" ", "") in ("int", "int|Expr")
+            ]
             if not targets:
                 continue
             for target in targets:

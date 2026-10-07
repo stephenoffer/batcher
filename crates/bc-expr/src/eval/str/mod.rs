@@ -16,7 +16,7 @@ mod dialect;
 mod dynamic;
 mod html;
 mod jaro;
-mod json;
+pub(super) mod json;
 mod like;
 mod minhash;
 mod numfmt;
@@ -379,7 +379,7 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::JsonExtractString => {
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             // Nullable result: null where input is not valid JSON or path is absent.
             Arc::new(
                 s.iter()
@@ -388,7 +388,7 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::JsonExtractInt => {
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             Arc::new(
                 s.iter()
                     .map(|o| o.and_then(|v| json::extract_int(v, &path)))
@@ -397,7 +397,7 @@ pub(crate) fn eval_str(
         }
         StrFunc::JsonExtractFloat => {
             use arrow::array::Float64Array;
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             Arc::new(
                 s.iter()
                     .map(|o| o.and_then(|v| json::extract_float(v, &path)))
@@ -405,7 +405,7 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::JsonExtractBool => {
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             Arc::new(
                 s.iter()
                     .map(|o| o.and_then(|v| json::extract_bool(v, &path)))
@@ -413,7 +413,7 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::JsonArrayLength => {
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             Arc::new(
                 s.iter()
                     .map(|o| o.and_then(|v| json::array_length(v, &path)))
@@ -421,7 +421,7 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::JsonType => {
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             Arc::new(
                 s.iter()
                     .map(|o| o.and_then(|v| json::value_type(v, &path)))
@@ -429,7 +429,7 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::JsonExtract => {
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             Arc::new(
                 s.iter()
                     .map(|o| o.and_then(|v| json::extract_json(v, &path)))
@@ -437,7 +437,7 @@ pub(crate) fn eval_str(
             )
         }
         StrFunc::JsonValue => {
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             Arc::new(
                 s.iter()
                     .map(|o| o.and_then(|v| json::json_value(v, &path)))
@@ -480,16 +480,30 @@ pub(crate) fn eval_str(
             })
         }
         StrFunc::JsonExists => {
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             Arc::new(
                 s.iter()
                     .map(|o| o.map(|v| json::path_exists(v, &path)))
                     .collect::<BooleanArray>(),
             )
         }
+        StrFunc::JsonExtractAll | StrFunc::JsonExtractStringAll => {
+            use arrow::array::{ListBuilder, StringBuilder};
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
+            let as_json = matches!(func, StrFunc::JsonExtractAll);
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for o in s {
+                let elements = o.and_then(|v| json::extract_all(v, &path, as_json));
+                for e in elements.iter().flatten() {
+                    builder.values().append_option(e.as_deref());
+                }
+                builder.append(elements.is_some());
+            }
+            Arc::new(builder.finish())
+        }
         StrFunc::JsonObjectKeys | StrFunc::JsonArrayValues => {
             use arrow::array::{Array, ListBuilder, StringBuilder};
-            let path = json::parse_path(require_pattern(pattern, func)?);
+            let path = json::parse_path(require_pattern(pattern, func)?)?;
             let keys = matches!(func, StrFunc::JsonObjectKeys);
             // Both shapes emit one `List<Utf8>` per row; the extracted text is a subset
             // of the document, so the input's value bytes bound the output's.

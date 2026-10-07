@@ -477,6 +477,48 @@
       "name": "x"
     }
   },
+  "json_doc_decode": {
+    "dtype": [
+      "struct",
+      [
+        [
+          "a",
+          [
+            "list",
+            "int64"
+          ]
+        ]
+      ]
+    ],
+    "e": "json_doc",
+    "fn": "decode",
+    "input": {
+      "e": "col",
+      "name": "j"
+    }
+  },
+  "json_doc_encode": {
+    "e": "json_doc",
+    "fn": "encode",
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
+  "json_doc_merge_patch": {
+    "e": "json_doc",
+    "fn": "merge_patch",
+    "input": {
+      "e": "col",
+      "name": "j"
+    },
+    "other": {
+      "e": "lit",
+      "value": {
+        "str": "{}"
+      }
+    }
+  },
   "least": {
     "e": "least",
     "inputs": [
@@ -545,6 +587,36 @@
       }
     }
   },
+  "list_filter_captures": {
+    "capture_names": [
+      "th"
+    ],
+    "captures": [
+      {
+        "e": "col",
+        "name": "th"
+      }
+    ],
+    "e": "list_filter",
+    "input": {
+      "e": "col",
+      "name": "a"
+    },
+    "pred": {
+      "e": "binary",
+      "left": {
+        "e": "col",
+        "name": "x"
+      },
+      "op": "gt",
+      "right": {
+        "e": "lit",
+        "value": {
+          "int": 0
+        }
+      }
+    }
+  },
   "list_func": {
     "e": "list",
     "fn": "sum",
@@ -556,6 +628,14 @@
   "list_func_nulls_first": {
     "e": "list",
     "fn": "sort_desc_nulls_first",
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "list_func_var_pop": {
+    "e": "list",
+    "fn": "var_pop",
     "input": {
       "e": "col",
       "name": "a"
@@ -680,6 +760,29 @@
       "e": "col",
       "name": "a"
     },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
+  "list_zip_struct": {
+    "e": "list_zip_struct",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
+  "list_zip_struct_pad": {
+    "e": "list_zip_struct",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "pad": true,
     "right": {
       "e": "col",
       "name": "b"
@@ -1120,6 +1223,43 @@
   "struct_field": {
     "e": "struct_field",
     "field": "field",
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
+  "struct_update_full": {
+    "drop": [
+      "a"
+    ],
+    "e": "struct_update",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "names": [
+      "x"
+    ],
+    "rename": [
+      [
+        "b",
+        "c"
+      ]
+    ],
+    "values": [
+      {
+        "e": "lit",
+        "value": {
+          "int": 1
+        }
+      }
+    ]
+  },
+  "struct_update_min": {
+    "drop": [
+      "a"
+    ],
+    "e": "struct_update",
     "input": {
       "e": "col",
       "name": "s"

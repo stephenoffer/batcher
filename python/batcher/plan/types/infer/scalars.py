@@ -167,6 +167,9 @@ _STR_STR_LIST = frozenset(
         # renders one. Both were declaring `null`.
         "json_object_keys",
         "json_array_values",
+        # SQL's `json_extract(j, '$.a[*]')` / `json_extract_string(...)`: every element.
+        "json_extract_all",
+        "json_extract_string_all",
     }
 )
 

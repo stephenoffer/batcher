@@ -200,6 +200,10 @@ impl Expr {
             | Expr::ListTransform { .. }
             | Expr::ListFilter { .. }
             | Expr::MakeStruct { .. }
+            // A strict decode raises on a value, and a zip raises on a length mismatch.
+            | Expr::ListZipStruct { .. }
+            | Expr::StructUpdate { .. }
+            | Expr::JsonDoc { .. }
             // `MakeTemporal` validates ranges per row and answers null on an impossible
             // date, so it never raises — but it is grouped here rather than with the
             // infallible ops because a predicate built on a constructed date is not a
@@ -463,13 +467,21 @@ impl Expr {
                 visit(left);
                 visit(right);
             }
-            Expr::ListTransform { input, func } => {
-                visit(input);
-                visit(func);
+            Expr::ListTransform {
+                input,
+                func: body,
+                captures,
+                ..
             }
-            Expr::ListFilter { input, pred } => {
+            | Expr::ListFilter {
+                input,
+                pred: body,
+                captures,
+                ..
+            } => {
                 visit(input);
-                visit(pred);
+                visit(body);
+                captures.iter().for_each(visit);
             }
             Expr::Sequence { start, stop, step } => {
                 visit(start);
@@ -487,6 +499,20 @@ impl Expr {
             Expr::Spatial { args, .. } => args.iter().for_each(visit),
             Expr::MakeTemporal { args, .. } => args.iter().for_each(visit),
             Expr::MakeStruct { fields } => fields.iter().for_each(|f| visit(&f.value)),
+            Expr::ListZipStruct { left, right, .. } => {
+                visit(left);
+                visit(right);
+            }
+            Expr::StructUpdate { input, values, .. } => {
+                visit(input);
+                values.iter().for_each(visit);
+            }
+            Expr::JsonDoc { input, other, .. } => {
+                visit(input);
+                if let Some(o) = other {
+                    visit(o);
+                }
+            }
             // Both operands are read, so a column referenced only by the value list must
             // not be pruned away — the failure mode here is a missing column at execution,
             // not a wrong answer.

@@ -8,27 +8,37 @@ from __future__ import annotations
 
 from typing import Any
 
+import pyarrow as pa
+
 from batcher._internal.errors import PlanError, require_int
 from batcher.plan.expr_ir.compat.guidance import LIST_UNSUPPORTED, accessor_attribute_error
 from batcher.plan.expr_ir.core import Coalesce, Expr, IntoExpr, Lit, _wrap
 from batcher.plan.expr_ir.func_nodes import (
+    LAMBDA_BOUND,
+    JsonDoc,
     ListBinary,
     ListContains,
     ListFilter,
     ListFunc,
     ListGet,
+    ListGetDyn,
     ListPosition,
     ListSet,
     ListSimhash,
     ListSlice,
     ListTransform,
     ListZip,
+    ListZipStruct,
     MapFunc,
     StrFunc,
     StructField,
+    StructUpdate,
 )
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
-from batcher.plan.expr_ir.nodes import ListJoin
+from batcher.plan.expr_ir.namespaces._json_path import check_json_path
+from batcher.plan.expr_ir.nodes import Col, ListJoin, NullIf
+from batcher.plan.expr_ir.walk import referenced_columns
+from batcher.plan.types.registry import dtype_to_wire, resolve_dtype
 
 
 class _StructNamespace:
@@ -118,6 +128,87 @@ class _StructNamespace:
         """
         return MapFunc("element_at", self._e, key=name)
 
+    def with_fields(self, **fields: IntoExpr) -> StructUpdate:
+        """Add or replace fields, keeping the rest of the struct as it is (→ Struct).
+
+        DuckDB ``struct_update`` and ``struct_insert`` in one: a name the struct already
+        has is replaced in place, and a new name is appended after the existing fields.
+        Each value is an expression over the row, so it can read the struct's own fields.
+        A null struct row stays null, as in Spark and Polars; DuckDB instead builds a
+        struct holding only the new values. Untouched fields keep their type, nullability
+        and Arrow field metadata.
+
+        Args:
+            fields: The fields to set, as ``name=expr`` keyword arguments.
+
+        Returns:
+            A new Struct expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"x": 1, "y": "a"}, None]})
+                >>> s = bt.col("s")
+                >>> r = s.struct.with_fields(x=s.struct.field("x") * 10, z=True)
+                >>> ds.select(r=r).to_pydict()
+                {'r': [{'x': 10, 'y': 'a', 'z': True}, None]}
+        """
+        if not fields:
+            raise PlanError("struct.with_fields() needs at least one name=expr field")
+        return StructUpdate(
+            self._e,
+            names=tuple(fields),
+            values=tuple(_wrap(v) for v in fields.values()),
+        )
+
+    def rename_fields(self, mapping: dict[str, str]) -> StructUpdate:
+        """Rename fields by ``{old: new}``, keeping their order, values and metadata (→ Struct).
+
+        Naming a field the struct does not have is a `PlanError` when the plan is typed.
+
+        Args:
+            mapping: Old field name to new field name.
+
+        Returns:
+            A new Struct expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"x": 1, "y": "a"}]})
+                >>> ds.select(r=bt.col("s").struct.rename_fields({"x": "id"})).to_pydict()
+                {'r': [{'id': 1, 'y': 'a'}]}
+        """
+        if not mapping:
+            raise PlanError("struct.rename_fields() needs at least one {old: new} entry")
+        return StructUpdate(self._e, rename=tuple((str(o), str(n)) for o, n in mapping.items()))
+
+    def drop_fields(self, *names: str) -> StructUpdate:
+        """Remove the named fields, keeping the others in order (→ Struct).
+
+        Naming a missing field, or dropping every field, is a `PlanError` when the plan
+        is typed: a struct needs at least one field.
+
+        Args:
+            names: The fields to remove.
+
+        Returns:
+            A new Struct expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"x": 1, "y": "a"}]})
+                >>> ds.select(r=bt.col("s").struct.drop_fields("y")).to_pydict()
+                {'r': [{'x': 1}]}
+        """
+        if not names:
+            raise PlanError("struct.drop_fields() needs at least one field name")
+        return StructUpdate(self._e, drop=tuple(names))
+
 
 class _JsonNamespace:
     """JSON accessors on a string column: ``col("j").json.extract_string("$.a.b")``.
@@ -161,7 +252,7 @@ class _JsonNamespace:
                 >>> ds.select(bt.col("j").json.extract_string("$.a").alias("r")).to_pydict()
                 {'r': ['{"b":7}', None]}
         """
-        return StrFunc("json_extract_string", self._e, pattern=path)
+        return StrFunc("json_extract_string", self._e, pattern=check_json_path(path))
 
     def extract_int(self, path: str) -> StrFunc:
         """Read the value at a JSON path as an integer (→ Int64), casting as DuckDB does.
@@ -191,7 +282,7 @@ class _JsonNamespace:
                 >>> ds.select(bt.col("j").json.extract_int("$.a.b").alias("r")).to_pydict()
                 {'r': [7, 8, None]}
         """
-        return StrFunc("json_extract_int", self._e, pattern=path)
+        return StrFunc("json_extract_int", self._e, pattern=check_json_path(path))
 
     def extract_float(self, path: str) -> StrFunc:
         """Read the value at a JSON path as a float (→ Float64), casting as DuckDB does.
@@ -214,7 +305,7 @@ class _JsonNamespace:
                 >>> ds.select(bt.col("j").json.extract_float("$.p").alias("r")).to_pydict()
                 {'r': [3.5, 1.0, None]}
         """
-        return StrFunc("json_extract_float", self._e, pattern=path)
+        return StrFunc("json_extract_float", self._e, pattern=check_json_path(path))
 
     def extract_bool(self, path: str) -> StrFunc:
         """Read the value at a JSON path as a boolean (→ Boolean), casting as DuckDB does.
@@ -243,7 +334,7 @@ class _JsonNamespace:
                 >>> ds.select(bt.col("j").json.extract_bool("$.active").alias("r")).to_pydict()
                 {'r': [True, True, None, None]}
         """
-        return StrFunc("json_extract_bool", self._e, pattern=path)
+        return StrFunc("json_extract_bool", self._e, pattern=check_json_path(path))
 
     def array_length(self, path: str = "$") -> StrFunc:
         """Count the elements of the JSON array at `path` (→ Int64).
@@ -266,7 +357,7 @@ class _JsonNamespace:
                 >>> ds.select(r=bt.col("j").json.array_length("$.xs")).to_pydict()
                 {'r': [3, None]}
         """
-        return StrFunc("json_array_length", self._e, pattern=path)
+        return StrFunc("json_array_length", self._e, pattern=check_json_path(path))
 
     def keys(self, path: str = "$") -> StrFunc:
         """List the keys of the JSON object at `path`, in source order (→ List<Utf8>).
@@ -296,7 +387,7 @@ class _JsonNamespace:
                 >>> ds.select(r=bt.col("j").json.keys("$.absent")).to_pydict()
                 {'r': [None, None, None]}
         """
-        return StrFunc("json_object_keys", self._e, pattern=path)
+        return StrFunc("json_object_keys", self._e, pattern=check_json_path(path))
 
     def values(self, path: str = "$") -> StrFunc:
         """Read the JSON array at `path` as a list of texts (→ List<Utf8>).
@@ -321,7 +412,7 @@ class _JsonNamespace:
                 >>> ds.select(r=bt.col("j").json.values("$.xs")).to_pydict()
                 {'r': [['a', '1', '{"b":2}']]}
         """
-        return StrFunc("json_array_values", self._e, pattern=path)
+        return StrFunc("json_array_values", self._e, pattern=check_json_path(path))
 
     def type_of(self, path: str = "$") -> StrFunc:
         """Name the JSON type at `path` (→ Utf8).
@@ -344,7 +435,7 @@ class _JsonNamespace:
                 >>> ds.select(r=bt.col("j").json.type_of("$.v")).to_pydict()
                 {'r': ['array', 'string', None]}
         """
-        return StrFunc("json_type", self._e, pattern=path)
+        return StrFunc("json_type", self._e, pattern=check_json_path(path))
 
     def value(self, path: str) -> StrFunc:
         """The **scalar** at `path` as its JSON token, null for a container (→ Utf8).
@@ -368,7 +459,7 @@ class _JsonNamespace:
                 >>> ds.select(r=bt.col("j").json.value("$.b")).to_pydict()
                 {'r': ['"x"']}
         """
-        return StrFunc("json_value", self._e, pattern=path)
+        return StrFunc("json_value", self._e, pattern=check_json_path(path))
 
     def contains(self, value: str) -> StrFunc:
         """Whether the document contains `value` as an element or field value (→ Boolean).
@@ -418,7 +509,8 @@ class _JsonNamespace:
 
         DuckDB ``json_structure``: the schema-on-read summary to group by when you are
         finding out what shapes a JSON column actually holds. An array is described by
-        its first element, as in DuckDB.
+        the unification of every element's structure, as in DuckDB: ``[null, 1]`` is
+        ``["UBIGINT"]``.
 
         Returns:
             A new Utf8 expression: the structure document.
@@ -454,7 +546,89 @@ class _JsonNamespace:
                 >>> ds.select(r=bt.col("j").json.exists("$.v")).to_pydict()
                 {'r': [True, False]}
         """
-        return StrFunc("json_exists", self._e, pattern=path)
+        return StrFunc("json_exists", self._e, pattern=check_json_path(path))
+
+    def decode(self, dtype: pa.DataType | str, *, strict: bool = False) -> JsonDoc:
+        """Parse JSON text into a typed value: a struct, list, map or scalar (→ `dtype`).
+
+        DuckDB ``json_transform``. The parse policy is explicit. By default a key the
+        document lacks, a JSON ``null``, a value of the wrong shape and a document that
+        does not parse all decode to null, and a key `dtype` does not name is ignored.
+        Leaves convert as DuckDB's casts do: a float rounds into an integer, ``true``
+        reads as ``1``, a numeric string parses, and a text field takes a string as-is and
+        anything else as its compact JSON. ``strict=True`` is ``json_transform_strict``:
+        every one of those nulls raises instead. A JSON ``null`` stays null either way.
+
+        A decoded null cannot tell a missing key from a JSON ``null``; pair this with
+        :meth:`exists` when that difference matters. Map keys must be strings.
+
+        Args:
+            dtype: The target Arrow type, or a flat type name such as ``"int64"``.
+            strict: Raise on any value that does not fit, rather than nulling it.
+
+        Returns:
+            A new expression of type `dtype`.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import pyarrow as pa
+                >>> ds = bt.from_pydict({"j": ['{"id": 1.5, "tags": ["a"], "x": 0}', "nope"]})
+                >>> t = pa.struct([("id", pa.int64()), ("tags", pa.list_(pa.string()))])
+                >>> ds.select(r=bt.col("j").json.decode(t)).to_pydict()
+                {'r': [{'id': 2, 'tags': ['a']}, None]}
+        """
+        target = _decode_target(dtype)
+        fn = "decode_strict" if strict else "decode"
+        return JsonDoc(fn, self._e, dtype=dtype_to_wire(target))
+
+    def encode(self) -> JsonDoc:
+        """Render any value, typically a struct or list, as compact JSON text (→ Utf8).
+
+        DuckDB ``to_json``: a null field is written ``null`` and a null row is SQL null.
+        A NaN or infinite float has no JSON spelling and is written ``null``, where DuckDB
+        writes ``NaN``. A date or timestamp is written as a string.
+
+        Returns:
+            A new Utf8 expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"s": [{"a": 1, "b": [1.5, None]}, None]})
+                >>> ds.select(r=bt.col("s").json.encode()).to_pydict()
+                {'r': ['{"a":1,"b":[1.5,null]}', None]}
+        """
+        return JsonDoc("encode", self._e)
+
+    def merge_patch(self, patch: IntoExpr) -> JsonDoc:
+        """Apply an RFC 7386 JSON Merge Patch to each document (→ Utf8).
+
+        DuckDB ``json_merge_patch``. A ``null`` in the patch deletes that key, an object
+        merges recursively, and an array or scalar replaces the value. A patch that is not
+        an object replaces the whole document. Keys the patch touches move to the end, as
+        in DuckDB. A null patch is null, and text that does not parse on either side is
+        null where DuckDB raises.
+
+        Args:
+            patch: The patch document: a JSON string, or a column of them.
+
+        Returns:
+            A new Utf8 expression holding the patched document.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"j": ['{"a": 1, "b": {"c": 2, "d": 3}}']})
+                >>> patch = '{"b": {"c": null}, "e": [1]}'
+                >>> ds.select(r=bt.col("j").json.merge_patch(patch)).to_pydict()
+                {'r': ['{"a":1,"b":{"d":3},"e":[1]}']}
+        """
+        other = Lit(patch) if isinstance(patch, str) else _wrap(patch)
+        return JsonDoc("merge_patch", self._e, other=other)
 
 
 class _MapNamespace:
@@ -664,14 +838,21 @@ class _ListNamespace:
             raise AttributeError(name)
         raise accessor_attribute_error(self, "'.list' accessor", name, LIST_UNSUPPORTED)
 
-    def get(self, index: int) -> ListGet:
+    def get(self, index: int | Expr) -> ListGet | ListGetDyn:
         """Return the element at ``index`` of each list; null if out of range.
 
         Negative indices count from the end, ``get(-1)`` being the last element
         (Polars/Python indexing). A null or empty list yields null.
 
+        ``index`` may be an expression, which reads a different position on every row.
+        The rules are the same per row: 0-based, a negative index counts from the end, an
+        index past either end is null, and a null index or a null list is null. DuckDB's
+        ``list_extract`` is 1-based, so ``list.get(i)`` answers what ``list_extract(a, i + 1)``
+        does for a non-negative ``i``.
+
         Args:
-            index: 0-based position; negatives index from the end.
+            index: 0-based position, or an integer expression giving one per row;
+                negatives index from the end.
 
         Returns:
             A new expression: the element at ``index``, or null.
@@ -683,7 +864,12 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[3, 1, 2], [], None]})
                 >>> ds.select(bt.col("a").list.get(-1).alias("r")).to_pydict()
                 {'r': [2, None, None]}
+                >>> ds = bt.from_pydict({"a": [[3, 1, 2], [3, 1, 2], [3, 1]], "i": [0, -1, 5]})
+                >>> ds.select(r=bt.col("a").list.get(bt.col("i"))).to_pydict()
+                {'r': [3, 2, None]}
         """
+        if isinstance(index, Expr):
+            return ListGetDyn(self._e, index)
         return ListGet(self._e, require_int(index, func="list.get", arg="index"))
 
     def first(self) -> ListGet:
@@ -814,7 +1000,11 @@ class _ListNamespace:
     def intersect(self, other: IntoExpr) -> ListSet:
         """The distinct elements present in both this list and ``other`` (→ List).
 
-        Spark ``array_intersect``, in this list's order.
+        Spark ``array_intersect``, in this list's order: duplicates collapse to one.
+
+        A null element is a value like any other and equals another null, as in Spark;
+        DuckDB's ``list_intersect`` drops nulls instead. Call :meth:`drop_nulls` on both
+        sides first for DuckDB's answer. Null if either list is null.
 
         Args:
             other: The other list column (or an ``array(...)`` literal).
@@ -829,6 +1019,9 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [[2, 3, 4]]})
                 >>> ds.select(bt.col("a").list.intersect(bt.col("b")).alias("r")).to_pydict()
                 {'r': [[2, 3]]}
+                >>> ds = bt.from_pydict({"a": [[1, 1, None, 2]], "b": [[1, None, 3]]})
+                >>> ds.select(r=bt.col("a").list.intersect(bt.col("b"))).to_pydict()
+                {'r': [[1, None]]}
         """
         return ListSet("array_intersect", self._e, _wrap(other))
 
@@ -1070,7 +1263,10 @@ class _ListNamespace:
     def difference(self, other: IntoExpr) -> ListSet:
         """The distinct elements in this list but not in ``other`` (→ List).
 
-        Spark ``array_except``, in this list's order.
+        Spark ``array_except``, in this list's order: duplicates collapse to one.
+
+        A null element is a value like any other, so a null in ``other`` removes a null
+        here, as in Spark. Null if either list is null.
 
         Args:
             other: The other list column (or an ``array(...)`` literal).
@@ -1085,6 +1281,9 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [[2, 3, 4]]})
                 >>> ds.select(bt.col("a").list.difference(bt.col("b")).alias("r")).to_pydict()
                 {'r': [[1]]}
+                >>> ds = bt.from_pydict({"a": [[1, 1, None, 2]], "b": [[1, None, 3]]})
+                >>> ds.select(r=bt.col("a").list.difference(bt.col("b"))).to_pydict()
+                {'r': [[2]]}
         """
         return ListSet("array_except", self._e, _wrap(other))
 
@@ -1093,6 +1292,10 @@ class _ListNamespace:
 
         Spark ``array_union``: this list's distinct elements followed by the new ones
         from ``other``.
+
+        A null element is a value like any other and is kept once, as in Spark; DuckDB's
+        ``list_distinct(list_concat(a, b))`` drops nulls instead. Call :meth:`drop_nulls`
+        on the result for DuckDB's answer. Null if either list is null.
 
         Args:
             other: The other list column (or an ``array(...)`` literal).
@@ -1107,6 +1310,9 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[1, 2]], "b": [[2, 3]]})
                 >>> ds.select(bt.col("a").list.union(bt.col("b")).alias("r")).to_pydict()
                 {'r': [[1, 2, 3]]}
+                >>> ds = bt.from_pydict({"a": [[1, 1, None, 2]], "b": [[1, None, 3]]})
+                >>> ds.select(r=bt.col("a").list.union(bt.col("b"))).to_pydict()
+                {'r': [[1, None, 2, 3]]}
         """
         return ListSet("array_union", self._e, _wrap(other))
 
@@ -1178,6 +1384,36 @@ class _ListNamespace:
         return ListZip("list_multiply", self._e, _wrap(other))
 
     # --- embedding / vector helpers -------------------------------------------------
+
+    def zip(self, other: IntoExpr, *, pad: bool = False) -> ListZipStruct:
+        """Pair this list with ``other`` element by element (→ List<Struct<left, right>>).
+
+        Each row becomes a list of ``{"left": a[i], "right": b[i]}`` structs, ready for
+        ``explode`` and :meth:`~batcher.Expr.struct` access; rename the two fields with
+        ``.list.transform(bt.element().struct.rename_fields(...))``. Two lists of different
+        lengths raise, naming both lengths. ``pad=True`` extends the shorter with nulls
+        instead, which is DuckDB ``list_zip``. A null list on either side is null; DuckDB
+        pads a null list as if it were empty.
+
+        Args:
+            other: The list column to pair with this one.
+            pad: Extend the shorter list with nulls rather than raising.
+
+        Returns:
+            A new List<Struct> expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"a": [[1, 2]], "b": [["x", "y"]]})
+                >>> ds.select(r=bt.col("a").list.zip(bt.col("b"))).to_pydict()
+                {'r': [[{'left': 1, 'right': 'x'}, {'left': 2, 'right': 'y'}]]}
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3]], "b": [["x"]]})
+                >>> ds.select(r=bt.col("a").list.zip(bt.col("b"), pad=True)).to_pydict()["r"][0][2]
+                {'left': 3, 'right': None}
+        """
+        return ListZipStruct(self._e, _wrap(other), pad=bool(pad))
 
     def is_unit_norm(self, tolerance: float = 1e-6) -> Expr:
         """True where the vector's magnitude is 1 within `tolerance`.
@@ -1273,6 +1509,11 @@ class _ListNamespace:
         DuckDB ``list_transform`` / Polars ``list.eval``. ``func`` is an expression over
         ``element()`` (the current element), e.g. ``col("a").list.transform(element() * 2)``.
 
+        Inside ``func``, ``element()`` is the element, ``element_index()`` its 0-based
+        position in its own list, and any other column is the enclosing row's value, the
+        same for every element of that row. A column named ``element`` or
+        ``element_index`` cannot be read from inside, because those names are bound.
+
         Args:
             func: An expression over ``element()`` applied to each list element.
 
@@ -1286,8 +1527,12 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[1, 2, 3]]})
                 >>> ds.select(bt.col("a").list.transform(bt.element() * 2).alias("r")).to_pydict()
                 {'r': [[2, 4, 6]]}
+                >>> ds = bt.from_pydict({"a": [[1, 2, 3], [10]], "k": [100, 7]})
+                >>> body = bt.element() * bt.col("k") + bt.element_index()
+                >>> ds.select(r=bt.col("a").list.transform(body)).to_pydict()
+                {'r': [[100, 201, 302], [70]]}
         """
-        return ListTransform(self._e, _wrap(func))
+        return _lambda(ListTransform, self._e, _wrap(func))
 
     def drop_nulls(self) -> ListFilter:
         """Drop the null elements of each list (Polars ``list.drop_nulls``, → List).
@@ -1312,7 +1557,9 @@ class _ListNamespace:
         """Keep the elements where ``predicate`` is true (→ List).
 
         DuckDB ``list_filter``. ``predicate`` is an expression over ``element()`` (the
-        current element), e.g. ``col("a").list.filter(element() > 0)``.
+        current element), e.g. ``col("a").list.filter(element() > 0)``. It is scoped as
+        :meth:`transform`'s ``func`` is: ``element_index()`` is the element's position and
+        any other column is the enclosing row's value.
 
         Args:
             predicate: A boolean expression over ``element()`` selecting elements to keep.
@@ -1327,8 +1574,11 @@ class _ListNamespace:
                 >>> ds = bt.from_pydict({"a": [[-1, 2, -3, 4]]})
                 >>> ds.select(bt.col("a").list.filter(bt.element() > 0).alias("r")).to_pydict()
                 {'r': [[2, 4]]}
+                >>> ds = bt.from_pydict({"a": [[1, 5, 9], [4, 6]], "th": [4, 5]})
+                >>> ds.select(r=bt.col("a").list.filter(bt.element() > bt.col("th"))).to_pydict()
+                {'r': [[5, 9], [6]]}
         """
-        return ListFilter(self._e, _wrap(predicate))
+        return _lambda(ListFilter, self._e, _wrap(predicate))
 
     def simhash(self, num_bits: int = 64, *, seed: int = 0) -> ListSimhash:
         """A random-hyperplane (SimHash) signature of an embedding → List<Int64> of bits.
@@ -1476,7 +1726,7 @@ class _ListNamespace:
         from batcher.plan.functions.collection import element
 
         filled = element().cast("utf8").fill_null(Lit(null_replacement))
-        return ListJoin(ListTransform(self._e, filled), separator)
+        return ListJoin(self.transform(filled), separator)
 
     def flatten(self, *, propagate_nulls: bool = False) -> Expr:
         """Concatenate a list-of-lists into one list per row, preserving order.
@@ -1529,7 +1779,7 @@ class _ListNamespace:
         """
         return ListBinary("dot", self._e, _wrap(other))
 
-    def jaccard(self, other: IntoExpr, *, mode: str = "positional") -> ListBinary:
+    def jaccard(self, other: IntoExpr, *, mode: str = "positional") -> Expr:
         """The fraction of positions where this list and `other` hold the same value.
 
         Over two `str.minhash` signatures this is the unbiased estimator of the two
@@ -1542,12 +1792,19 @@ class _ListNamespace:
         ``-0.0`` and null do not). The lists must be the same length, and two lists with
         no non-zero position are null.
 
+        `mode="set"` is the Jaccard index of the two lists read as *sets*: the distinct
+        values both hold over the distinct values either holds.
+        Order, repeats and length do not matter, null elements are ignored (as DuckDB's
+        ``list_intersect`` ignores them), and two lists with no non-null value are null.
+        It equals DuckDB's ``len(list_intersect(a, b)) / len(list_distinct(list_concat(a, b)))``.
+
         Args:
-            other: The other equal-length list column to compare position-by-position.
-            mode: ``"positional"`` (the agreement rate) or ``"nonzero"``.
+            other: The other list column. Equal length for ``"positional"`` and
+                ``"nonzero"``; any length for ``"set"``.
+            mode: ``"positional"`` (the agreement rate), ``"nonzero"``, or ``"set"``.
 
         Returns:
-            A new Float64 expression: the fraction of agreeing positions.
+            A new Float64 expression: the similarity in ``[0, 1]``.
 
         Examples:
             .. doctest::
@@ -1562,9 +1819,20 @@ class _ListNamespace:
                 >>> vec = bt.from_pydict({"a": [[1.0, 2.0, 0.0]], "b": [[3.0, 0.0, 5.0]]})
                 >>> vec.select(j=bt.col("a").list.jaccard(bt.col("b"), mode="nonzero")).to_pydict()
                 {'j': [0.3333333333333333]}
+
+                >>> tags = bt.from_pydict({"a": [["x", "y", "y", None]], "b": [["y", "z"]]})
+                >>> tags.select(j=bt.col("a").list.jaccard(bt.col("b"), mode="set")).to_pydict()
+                {'j': [0.3333333333333333]}
         """
+        if mode == "set":
+            left, right = self.drop_nulls(), _wrap(other).list.drop_nulls()
+            shared = ListSet("array_intersect", left, right).list.len()
+            either = ListSet("array_union", left, right).list.len()
+            return shared / NullIf(either, Lit(0))
         if mode not in ("positional", "nonzero"):
-            raise PlanError(f"list.jaccard(): mode must be 'positional' or 'nonzero', got {mode!r}")
+            raise PlanError(
+                f"list.jaccard(): mode must be 'positional', 'nonzero' or 'set', got {mode!r}"
+            )
         fn = "jaccard" if mode == "positional" else "jaccard_nonzero"
         return ListBinary(fn, self._e, _wrap(other))
 
@@ -1596,6 +1864,59 @@ class _ListNamespace:
         if not empty_as_zero:
             return total
         return Coalesce([total, self._zero_unless_null()])
+
+    def std(self, *, ddof: int = 1) -> ListFunc:
+        """The standard deviation of the elements of each list (→ Float64).
+
+        ``ddof`` sets the variance divisor to ``n - ddof`` over the ``n`` non-null
+        elements, as :meth:`batcher.Expr.std` does: ``1`` (the default) is the sample
+        deviation, DuckDB ``list_stddev_samp``, and ``0`` is the population deviation,
+        ``list_stddev_pop``. Those are the two the engine computes; another ``ddof`` is a
+        `PlanError`. A list with no more than ``ddof`` non-null elements is null, and a
+        NaN element makes the answer NaN.
+
+        Args:
+            ddof: Delta degrees of freedom, ``0`` or ``1``.
+
+        Returns:
+            A new Float64 expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"xs": [[1, 2, 3], [5], []]})
+                >>> ds.select(r=bt.col("xs").list.std()).to_pydict()
+                {'r': [1.0, None, None]}
+                >>> ds.select(r=bt.col("xs").list.std(ddof=0).round(4)).to_pydict()
+                {'r': [0.8165, 0.0, None]}
+        """
+        return ListFunc(_moment_fn("std", ddof), self._e)
+
+    def var(self, *, ddof: int = 1) -> ListFunc:
+        """The variance of the elements of each list (→ Float64).
+
+        The same ``ddof`` rule as :meth:`std`: ``1`` (the default) is DuckDB
+        ``list_var_samp`` and ``0`` is ``list_var_pop``; another ``ddof`` is a `PlanError`.
+        A list with no more than ``ddof`` non-null elements is null.
+
+        Args:
+            ddof: Delta degrees of freedom, ``0`` or ``1``.
+
+        Returns:
+            A new Float64 expression.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"xs": [[1, 2, 3], [5]]})
+                >>> ds.select(r=bt.col("xs").list.var()).to_pydict()
+                {'r': [1.0, None]}
+                >>> ds.select(r=bt.col("xs").list.var(ddof=0).round(4)).to_pydict()
+                {'r': [0.6667, 0.0]}
+        """
+        return ListFunc(_moment_fn("var", ddof), self._e)
 
     def sort(self, *, descending: bool = False, nulls_last: bool = True) -> ListFunc:
         """Each list sorted, NaN as the largest value and nulls last by default (→ list).
@@ -1681,7 +2002,7 @@ class _ListNamespace:
         """How many of this list's elements `other` accounts for, counting repeats (→ Float64).
 
         The clipped multiset intersection size ``Σ min(count_here(v), count_there(v))``. It
-        differs from ``set_intersection(other).len()`` in exactly one way, and that way is the
+        differs from ``intersect(other).len()`` in exactly one way, and that way is the
         point: a value repeated four times here against one occurrence there contributes 1,
         not 4. That clip is how BLEU's modified n-gram precision refuses to reward a
         degenerate ``the the the the``, and it is ROUGE-N's numerator read from the other
@@ -1866,8 +2187,6 @@ _LIST_FUNCS = {
     "mean": "mean",
     "reverse": "reverse",  # → list
     "product": "product",
-    "std": "std",
-    "var": "var",
     "median": "median",
     "arg_min": "arg_min",  # index of min element (→ Int64)
     "arg_max": "arg_max",  # index of max element (→ Int64)
@@ -1882,6 +2201,49 @@ _LIST_FUNCS = {
     "cum_sum": "cum_sum",  # cumulative sum per row (→ list)
     "diff": "diff",  # first difference xᵢ−xᵢ₋₁ per row, leading null (→ list)
 }
+
+
+def _lambda(node: type[ListTransform | ListFilter], target: Expr, body: Expr) -> Expr:
+    """Build a list lambda node, capturing every outer column its body reads.
+
+    The body is evaluated per element, where only ``element()``/``element_index()`` are
+    bound; each other column it names is lifted into a capture evaluated over the
+    enclosing row. A nested lambda's own captures are ordinary children, so they count
+    as reads of this body's scope, which is what makes an outer column reachable two
+    levels in.
+    """
+    names = tuple(sorted(referenced_columns(body) - LAMBDA_BOUND))
+    return node(target, body, tuple(Col(n) for n in names), names)
+
+
+def _decode_target(dtype: pa.DataType | str) -> pa.DataType:
+    """`json.decode`'s target as an Arrow type, refusing map keys that are not text."""
+    target = resolve_dtype(dtype) if isinstance(dtype, str) else dtype
+    if not isinstance(target, pa.DataType):
+        raise PlanError(f"json.decode(): unknown dtype {dtype!r}")
+    pending = [target]
+    while pending:
+        t = pending.pop()
+        if pa.types.is_map(t) and not pa.types.is_string(t.key_type):
+            raise PlanError(f"json.decode(): a map's keys are JSON object keys, so text; got {t}")
+        if pa.types.is_struct(t):
+            pending.extend(f.type for f in t)
+        elif pa.types.is_list(t) or pa.types.is_large_list(t):
+            pending.append(t.value_type)
+        elif pa.types.is_map(t):
+            pending.append(t.item_type)
+    return target
+
+
+def _moment_fn(name: str, ddof: int) -> str:
+    """The `ListFunc` tag for `name` (``std``/``var``) at `ddof`: the sample or population form."""
+    ddof = require_int(ddof, func=f"list.{name}", arg="ddof")
+    if ddof not in (0, 1):
+        raise PlanError(
+            f"list.{name}(ddof={ddof}) is not supported: the engine computes the sample "
+            "(ddof=1) and population (ddof=0) forms"
+        )
+    return name if ddof == 1 else f"{name}_pop"
 
 
 def _list_reduction_doc(name: str) -> str:

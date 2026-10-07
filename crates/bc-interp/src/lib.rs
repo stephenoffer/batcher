@@ -47,7 +47,7 @@ pub use bc_expr::sniff_mime;
 // and one policy is the point.
 pub use bc_runtime::agg::spill::SpillCodec;
 pub use coalesce::coalesce_small_batches;
-pub use error::InterpError;
+pub use error::{InterpError, SetOpConflict};
 pub use metrics::{ExecMetrics, OpMetric, QueryMetrics, QueryStopwatch};
 pub use par::{
     auto_width, execute_parallel, execute_parallel_with, execute_parallel_with_metrics,

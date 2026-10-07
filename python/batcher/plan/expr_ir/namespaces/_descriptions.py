@@ -250,24 +250,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds.select(r=bt.col("xs").list.product()).to_pydict()\n'
         "        {'r': [24.0]}"
     ),
-    "std": (
-        "The sample standard deviation of the elements of each list (→ Float64).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.std()).to_pydict()\n'
-        "        {'r': [1.0]}"
-    ),
-    "var": (
-        "The sample variance of the elements of each list (→ Float64).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.var()).to_pydict()\n'
-        "        {'r': [1.0]}"
-    ),
     "median": (
         "The median of the elements of each list (→ Float64).\n\n"
         "Examples:\n"

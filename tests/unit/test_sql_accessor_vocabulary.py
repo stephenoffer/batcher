@@ -202,6 +202,10 @@ _CURATED_CALLS: dict[tuple[str, str], tuple[str, str]] = {
     ("json", "extract_string"): ("json_extract_string(c, '$.a')", "extract_string('$.a')"),
     ("json", "keys"): ("json_keys(c, '$.a')", "keys('$.a')"),
     ("json", "value"): ("json_value(c, '$.a')", "value('$.a')"),
+    # A type structure, DuckDB's; a flat name decodes the whole document as that type.
+    ("json", "decode"): ("""json_transform(c, '"BIGINT"')""", "decode('int64')"),
+    # The `{old: new}` mapping as trailing name pairs.
+    ("struct", "rename_fields"): ("struct_rename_fields(c, 'x', 'y')", "rename_fields({'x': 'y'})"),
     # DuckDB's `list_unique` counts; the list itself is `list_distinct`.
     ("list", "unique"): ("list_distinct(l)", "unique()"),
     # DuckDB's bounds are inclusive and 1-based; the accessor's are an offset and a length.
