@@ -9,22 +9,18 @@ so they add no new IR — the sugar lowers to existing `select`/`with_columns`/`
 
 from __future__ import annotations
 
-import random
-from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import PlanError, require_float
+from batcher._internal.errors import PlanError
 from batcher.api._join_helpers import _as_key_expr
-from batcher.plan.expr_ir import Col, nullif, when
+from batcher.plan.expr_ir import Col
 from batcher.plan.expr_ir.selectors import Selector, expand_selectors
-from batcher.plan.ir_tags import RUNNING_AGGREGATES, WINDOW_AGGREGATES, WINDOW_FRAMEABLE
+from batcher.plan.ir_tags import WINDOW_AGGREGATES, WINDOW_FRAMEABLE
 from batcher.plan.logical import (
     Distinct,
-    Sample,
     SortKeySpec,
     Unnest,
-    Unpivot,
     Window,
     WindowFrame,
     WindowFuncSpec,
@@ -374,120 +370,6 @@ def build_explode(
     if column not in ds.columns:
         raise PlanError(f"explode(): unknown column {column!r}")
     return ds._derive(Unnest(ds._plan, column, alias or column, outer, index))
-
-
-def build_unnest(ds: Dataset, columns: str | list[str]) -> Dataset:
-    """Expand each struct `column` into its fields as top-level columns (Polars
-    ``unnest``; Spark ``select("s.*")``). Composes ``struct.field`` extraction — no
-    new IR. See `Dataset.unnest` for the contract."""
-    import pyarrow as pa
-
-    from batcher.plan.expr_ir import col
-
-    names = [columns] if isinstance(columns, str) else list(columns)
-    schema = ds.schema
-    fields_of: dict[str, list[str]] = {}
-    for name in names:
-        if name not in ds.columns:
-            raise PlanError(f"unnest(): unknown column {name!r}")
-        ftype = schema.field(name).type
-        if not pa.types.is_struct(ftype):
-            raise PlanError(f"unnest(): column {name!r} is not a struct (got {ftype})")
-        fields_of[name] = [ftype.field(i).name for i in range(ftype.num_fields)]
-
-    # Output column order: each struct expands in place to its fields; others stay.
-    final: list[str] = []
-    for c in ds.columns:
-        final.extend(fields_of[c]) if c in fields_of else final.append(c)
-    if len(final) != len(set(final)):
-        # One counting pass rather than a `list.count()` per column: a struct-heavy
-        # relation can expand to thousands of output names, and the error message is
-        # not the place to spend quadratic time.
-        dup = sorted(n for n, k in Counter(final).items() if k > 1)
-        raise PlanError(f"unnest(): output columns collide: {dup} (rename before unnesting)")
-
-    derived = {
-        fname: col(sname).struct.field(fname)
-        for sname, fnames in fields_of.items()
-        for fname in fnames
-    }
-    return ds.with_columns(**derived).select(*final)
-
-
-def build_pivot(
-    ds: Dataset,
-    index: list[str],
-    on: str,
-    values: str,
-    aggregate: str,
-    columns: list[Any] | None,
-) -> Dataset:
-    """Reshape long → wide (SQL ``PIVOT`` / pandas ``pivot_table``).
-
-    Lowers to ``group_by(index).agg(...)`` with one conditional aggregate per pivot
-    value: ``<agg>(values) WHERE on == v``, expressed as
-    ``when(on == v).then(values).otherwise(<typed null>).<agg>()`` — so it reuses the
-    tested grouping/aggregation engine with no new operator. The else-branch uses
-    ``nullif(values, values)`` (a value-typed null) so non-matching rows are ignored
-    by the aggregate. With `columns` omitted, the distinct pivot values are discovered
-    by an eager pre-pass over `on` (like DuckDB's auto-`PIVOT`).
-    """
-    if aggregate not in RUNNING_AGGREGATES:
-        raise PlanError(
-            f"pivot(): aggregate must be one of {RUNNING_AGGREGATES}, got {aggregate!r}"
-        )
-    for c in (*index, on, values):
-        if c not in ds.columns:
-            raise PlanError(f"pivot(): unknown column {c!r}")
-    if columns is None:
-        seen = ds.select(on).distinct().to_pydict()[on]
-        cols = sorted(v for v in seen if v is not None)
-    else:
-        cols = list(columns)
-    if not cols:
-        raise PlanError("pivot(): no pivot column values to spread")
-    typed_null = nullif(Col(values), Col(values))
-    aggs: dict[str, Any] = {}
-    for v in cols:
-        masked = when(Col(on) == v).then(Col(values)).otherwise(typed_null)
-        aggs[str(v)] = getattr(masked, aggregate)()
-    return ds.group_by(*index).agg(**aggs)
-
-
-def build_sample(
-    ds: Dataset, fraction: float | None, seed: int | None, n: int | None = None
-) -> Dataset:
-    """Construct a `Sample` node — a fraction sample (`fraction`) or a fixed-count
-    sample (`n`). Exactly one of `fraction`/`n` is set. `seed=None` bakes a fresh
-    random seed at plan-build so the sample is reproducible within a run and
-    consistent across workers."""
-    if (fraction is None) == (n is None):
-        raise PlanError("sample() takes exactly one of `fraction` or `n`")
-    if seed is None:
-        seed = random.randrange(2**63)
-    # The fraction field is required by the node; for count mode it is unused (1.0).
-    rate = 1.0 if n is not None else require_float(fraction, func="sample", arg="fraction")
-    return ds._derive(Sample(ds._plan, rate, int(seed), n))
-
-
-def build_unpivot(
-    ds: Dataset,
-    index: list[str] | None,
-    on: list[str] | None,
-    variable_name: str,
-    value_name: str,
-) -> Dataset:
-    """Construct an `Unpivot` node (see `Dataset.unpivot` for the contract).
-
-    With `on` omitted, every column not in `index` is melted; with `index` omitted,
-    every column not in `on` becomes an identifier.
-    """
-    cols = ds.columns
-    if index is None and on is None:
-        raise PlanError("unpivot() requires `index` or `on`")
-    idx = list(index) if index is not None else [c for c in cols if c not in set(on or ())]
-    vals = list(on) if on is not None else [c for c in cols if c not in set(idx)]
-    return ds._derive(Unpivot(ds._plan, tuple(idx), tuple(vals), variable_name, value_name))
 
 
 def _bounded_interval_join(

@@ -511,8 +511,14 @@ def _apply_pivots(ds: Dataset, pivots) -> Dataset:
             raise NotImplementedError("UNPIVOT supports a single value column")
         on = [c.name for c in field.expressions]
         index = [c for c in ds.columns if c not in set(on)]
+        # sqlglot sets `include_nulls` True for `INCLUDE NULLS` and leaves it unset for a
+        # bare UNPIVOT, whose standard default (and DuckDB's) is EXCLUDE NULLS.
         return ds.unpivot(
-            index=index, on=on, variable_name=field.this.name, value_name=exprs[0].name
+            index=index,
+            on=on,
+            variable_name=field.this.name,
+            value_name=exprs[0].name,
+            include_nulls=bool(piv.args.get("include_nulls")),
         )
 
     if len(exprs) != 1 or not isinstance(exprs[0], exp.AggFunc):
@@ -523,7 +529,10 @@ def _apply_pivots(ds: Dataset, pivots) -> Dataset:
     values = agg.this.name
     on = field.this.name
     # Every listed value becomes an output column; the rest of the relation is the index.
-    columns = [str(v.this) if hasattr(v, "this") else str(v) for v in field.expressions]
+    # The values stay typed literals: stringifying them compared an integer `k` against
+    # '1', which the engine refuses ("Int64 == Utf8"). The output column is still named
+    # by the value's text, as DuckDB names it.
+    columns = [_values_literal(v) for v in field.expressions]
     index = [c for c in ds.columns if c not in {on, values}]
     return ds.pivot(
         index=index,

@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1563 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1565 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -172,10 +172,10 @@ The public, fluent, lazy, expression-first API surface.
 | `_varargs.py` | 69 | Sequence flattening for the `Dataset` verbs' varargs positions. |
 | `executors.py` | 681 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 817 | Top-level expression constructors re-exported for the public API. |
-| `group_apply.py` | 177 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
-| `groupby.py` | 1159 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
+| `group_apply.py` | 285 | Per-group Python callbacks: the machinery behind `GroupBy.map_groups`. |
+| `groupby.py` | 1192 | `GroupBy` — an in-progress grouped aggregation produced by `Dataset.group_by`. |
 | `history.py` | 259 | `query_history()` — the queries this deployment has run, as a `Dataset`. |
-| `multi_group.py` | 431 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
+| `multi_group.py` | 473 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
 | `stats.py` | 537 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
 | `subplan_reuse.py` | 669 | Compute a repeated subplan once and read it back (control plane, `api`). |
@@ -219,8 +219,8 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 6691 | `Dataset` — the lazy, immutable, fluent entry point. |
-| `ml.py` | 2760 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
+| `frame.py` | 6911 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `ml.py` | 2776 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
 ### `batcher/api/dataset/_build/` — 5 · conductor
@@ -231,7 +231,9 @@ Plan-construction helpers behind the thinner `Dataset` methods.
 |---|---|---|
 | `combine.py` | 296 | Bodies of the `Dataset` verbs that combine two or more relations over existing operators. |
 | `conform.py` | 153 | Bodies of the `Dataset` verbs that hold a relation to a shape: `match_to_schema`, `drop_nans`. |
-| `core.py` | 563 | Plan-construction helpers behind the thinner `Dataset` methods. |
+| `core.py` | 445 | Plan-construction helpers behind the thinner `Dataset` methods. |
+| `pivot.py` | 251 | Bodies of the `Dataset` verbs that turn long data wide and back: `pivot`, `unpivot`, `unnest`. |
+| `resample.py` | 244 | Bodies of `Dataset.sample` and `Dataset.upsample`: choosing rows, and adding the missing ones. |
 | `reshape.py` | 226 | Bodies of the `Dataset` verbs that cut or turn a relation: `transpose`, `partition_by`, `split`. |
 | `sessions.py` | 136 | Session windows: grouping a partition's events into runs separated by an idle gap. |
 
@@ -531,7 +533,7 @@ ML data plane — actor-pool batch inference, training ingest, and preprocessing
 | `sampling.py` | 368 | Resampling for imbalanced learning — reshaping the class balance without leaving the engine. |
 | `selection.py` | 390 | Deciding which features to keep, before a model ever sees them. |
 | `sparse_linear.py` | 551 | L1-regularized linear models — sparse coefficient selection by coordinate descent. |
-| `splitting.py` | 392 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
+| `splitting.py` | 396 | Cross-validation splits as filters — k-fold, stratified, grouped, and time-series. |
 
 ### `batcher/ml/compose/` — 6 · front-end
 
@@ -868,9 +870,9 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `ai_functions.py` | 297 | AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT`` / ``AI_EMBED``. |
 | `clauses.py` | 641 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
 | `core_utils.py` | 691 | Small stateless AST helpers shared across translator theme modules. |
-| `from_clause.py` | 635 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
+| `from_clause.py` | 644 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 538 | Grouping, aggregation, and projection mapping for the SQL translator. |
-| `grouping_sets.py` | 321 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
+| `grouping_sets.py` | 319 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
 | `statements.py` | 328 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
 | `table_functions.py` | 331 | Built-in table functions in the FROM clause: the series generators and model scoring. |
 | `translator.py` | 647 | The `_Translator` skeleton plus the public `sql()` entry point. |

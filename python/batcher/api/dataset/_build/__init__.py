@@ -6,8 +6,9 @@ methods (`window`) and the frame-level convenience sugar (`fill_null`/`drop_null
 These functions take the `Dataset` and return a new one via its own public methods,
 so they add no new IR — the sugar lowers to existing `select`/`with_columns`/`filter`.
 
-Two modules: `sessions` for session windows, `core` for everything else. The import
-path `batcher.api.dataset._build` is unchanged.
+`sessions` holds session windows, `pivot` the long/wide reshapes, `resample` the sampling
+and upsampling verbs, and `core` the rest. The import path `batcher.api.dataset._build` is
+unchanged.
 """
 
 from __future__ import annotations
@@ -18,18 +19,16 @@ from batcher.api.dataset._build.core import (
     build_cast,
     build_distinct,
     build_explode,
-    build_pivot,
     build_random_split,
-    build_sample,
     build_train_test_split,
-    build_unnest,
-    build_unpivot,
     build_window,
     build_with_random,
     expand_selector_expr,
     selector_columns,
     split_key,
 )
+from batcher.api.dataset._build.pivot import build_pivot, build_unnest, build_unpivot
+from batcher.api.dataset._build.resample import build_sample, build_upsample
 from batcher.api.dataset._build.sessions import (
     build_session_window,
     mark_sessions,
@@ -49,6 +48,7 @@ __all__ = [
     "build_train_test_split",
     "build_unnest",
     "build_unpivot",
+    "build_upsample",
     "build_window",
     "build_with_random",
     "expand_selector_expr",
