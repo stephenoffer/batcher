@@ -2445,8 +2445,8 @@ Migration-error guidance for `Expr` and its typed accessors.
 
 | module | lines | what it is |
 |---|---|---|
-| `guidance.py` | 510 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
-| `namespaces.py` | 313 | Ecosystem-compatible spellings on the typed accessor namespaces. |
+| `guidance.py` | 506 | The migration-error table for expression idioms Batcher does not have on `Expr`. |
+| `namespaces.py` | 311 | Ecosystem-compatible spellings on the typed accessor namespaces. |
 
 ### `batcher/plan/expr_ir/namespaces/` — 1 · contract
 
