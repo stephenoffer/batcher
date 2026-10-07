@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, PrimitiveArray};
 use arrow::compute::cast;
-use arrow::datatypes::{ArrowPrimitiveType, DataType, Field};
+use arrow::datatypes::{ArrowPrimitiveType, DataType, Field, FieldRef};
 
 use crate::ExprError;
 
@@ -49,7 +49,7 @@ use crate::ExprError;
 /// message stays actionable.
 pub(crate) fn as_var_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprError> {
     match arr.data_type() {
-        DataType::List(_) => Ok(Arc::clone(arr)),
+        DataType::List(field) => Ok(compact_list(arr, field)),
         DataType::FixedSizeList(field, _) | DataType::LargeList(field) => {
             let target = DataType::List(Arc::new(Field::new(
                 field.name(),
@@ -75,6 +75,36 @@ pub(crate) fn as_var_list(arr: &ArrayRef, func: &str) -> Result<ArrayRef, ExprEr
             got: crate::error::type_name(other),
         }),
     }
+}
+
+/// `arr` (a `List<i32>`) with its child cut to exactly the elements its rows reference.
+///
+/// `ListArray::slice` slices the offsets and keeps the **whole** child, and the morsel
+/// scheduler hands every kernel a slice of one large list column. The kernels cast,
+/// compare, hash or sort `values()` in bulk, so each morsel paid for the entire column: work
+/// quadratic in the column's length. Measured on `op-list-contains` (one 15M-row list column
+/// at TPC-H sf10, 64 cores): 10.1 s against DuckDB's 12 ms, and 76x the sf1 time for 10x the
+/// rows; `op-list-sort-unique` went from 324 ms to 23.7 s the same way. An unsliced list (the
+/// first offset 0 and the last the child's length) passes through as a refcount bump; a
+/// sliced one costs one rebased offset buffer, `n + 1` integers, and a zero-copy child slice.
+fn compact_list(arr: &ArrayRef, field: &FieldRef) -> ArrayRef {
+    use arrow::array::{AsArray, ListArray};
+    use arrow::buffer::OffsetBuffer;
+
+    let list = arr.as_list::<i32>();
+    let offsets = list.value_offsets();
+    let (first, last) = (offsets[0], offsets[offsets.len() - 1]);
+    if first == 0 && last as usize == list.values().len() {
+        return Arc::clone(arr);
+    }
+    let child = list.values().slice(first as usize, (last - first) as usize);
+    let rebased: Vec<i32> = offsets.iter().map(|o| o - first).collect();
+    Arc::new(ListArray::new(
+        Arc::clone(field),
+        OffsetBuffer::new(rebased.into()),
+        child,
+        list.nulls().cloned(),
+    ))
 }
 
 /// The four running sums every vector-distance kernel needs, plus the minhash
@@ -201,6 +231,54 @@ mod tests {
         ]));
         let out = as_var_list(&src, "list.Dot").unwrap();
         assert_eq!(out.data_type(), src.data_type());
+    }
+
+    /// A sliced list keeps its parent's whole child; the kernels must see only the slice's.
+    #[test]
+    fn a_sliced_list_is_compacted_to_the_elements_it_references() {
+        let src: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(1.0), Some(2.0)]),
+            None,
+            Some(vec![Some(3.0)]),
+            Some(vec![Some(4.0), Some(5.0), Some(6.0)]),
+            Some(vec![]),
+        ]));
+        let sliced = src.slice(1, 3); // [null, [3], [4, 5, 6]]
+        assert_eq!(
+            sliced.as_list::<i32>().values().len(),
+            6,
+            "the slice keeps the child"
+        );
+        let out = as_var_list(&sliced, "list.Contains").unwrap();
+        let list = out.as_list::<i32>();
+        assert_eq!(
+            list.values().len(),
+            4,
+            "only [3] and [4, 5, 6] are referenced"
+        );
+        assert_eq!(list.value_offsets(), &[0, 0, 1, 4]);
+        assert!(list.is_null(0));
+        let rows: Vec<Option<Vec<f64>>> = (0..list.len())
+            .map(|i| {
+                (!list.is_null(i)).then(|| {
+                    list.value(i)
+                        .as_primitive::<Float64Type>()
+                        .values()
+                        .to_vec()
+                })
+            })
+            .collect();
+        assert_eq!(rows, vec![None, Some(vec![3.0]), Some(vec![4.0, 5.0, 6.0])]);
+    }
+
+    #[test]
+    fn an_unsliced_list_is_not_copied() {
+        let src: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(vec![
+            Some(vec![Some(1.0)]),
+            Some(vec![Some(2.0), Some(3.0)]),
+        ]));
+        let out = as_var_list(&src, "list.Len").unwrap();
+        assert!(Arc::ptr_eq(&src, &out));
     }
 
     #[test]

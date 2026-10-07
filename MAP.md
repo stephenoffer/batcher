@@ -3442,7 +3442,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/hash/mod.rs` | 232 | `Expr::Hash` — a deterministic, typed 64-bit row hash. |
 | `eval/in_list.rs` | 408 | `x IN (lit, lit, …)` — hash-set membership. |
 | `eval/list.rs` | 794 | List/struct evaluation for `Expr::List`/`ListGet`/`ListContains`/`StructField` (split out of `lib.rs`). |
-| `eval/list_ops/coerce.rs` | 161 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
+| `eval/list_ops/coerce.rs` | 191 | Input coercion and the numeric inner loop shared by the vector-distance kernels. |
 | `eval/list_ops/gather.rs` | 175 | `list.gather` — reorder or select from a list by a second list of indices. |
 | `eval/list_ops/jaccard_str.rs` | 126 | `list.jaccard` over string element types, and the non-zero-set Jaccard of two vectors. |
 | `eval/list_ops/lcs.rs` | 173 | `list.lcs_length` — the longest common subsequence length of two lists. |
