@@ -74,8 +74,12 @@ Each of these splits the keyspace so the store reads in parallel:
 | {py:meth}`bt.read.elasticsearch(...) <batcher.api.io_namespace.reader.Reader.elasticsearch>` | Elasticsearch via ES\|QL Arrow / sliced scroll |
 | {py:meth}`bt.read.redis(...) <batcher.api.io_namespace.reader.Reader.redis>` | a Redis keyspace as `(key, value)` rows, by hash-slot range |
 | {py:meth}`bt.read.hbase(...) <batcher.api.io_namespace.reader.Reader.hbase>` | an HBase table, one split per region key range |
+| {py:meth}`bt.read.qdrant(collection) <batcher.api.io_namespace.reader.Reader.qdrant>` | a Qdrant collection, by scroll |
+| {py:meth}`bt.read.pinecone(index) <batcher.api.io_namespace.reader.Reader.pinecone>` | a Pinecone namespace, by list and fetch (serverless) |
+| {py:meth}`bt.read.milvus(collection, uri=) <batcher.api.io_namespace.reader.Reader.milvus>` | a Milvus collection, one split per partition |
+| {py:meth}`bt.read.turbopuffer(namespace) <batcher.api.io_namespace.reader.Reader.turbopuffer>` | a Turbopuffer namespace, paged by id |
 
-A parallel scan is the right shape for reading a *table* and the wrong shape for reading one row. When a filter pins the partition key to a single value, DynamoDB and Cassandra skip the fan-out entirely and read the one partition that can hold a match. See {doc}`Key-value stores </integrations/databases/key-value-stores>`.
+A parallel scan is the right shape for reading a *table* and the wrong shape for reading one row. When a filter pins the partition key to a single value, DynamoDB and Cassandra skip the fan-out entirely and read the one partition that can hold a match. See {doc}`Key-value stores </integrations/databases/key-value-stores>`. The four vector stores are covered in {doc}`Vector stores </integrations/databases/vector-stores>`, untested against live services.
 
 ### Streaming
 
@@ -173,6 +177,10 @@ These load the result into an external system. `mode` says what the write does t
 | {py:meth}`ds.write.redis(key_prefix, host=) <batcher.api.io_namespace.writer.Writer.redis>` | a Redis keyspace, one pipeline per batch | `upsert` / `delete` |
 | {py:meth}`ds.write.elasticsearch(index, hosts=) <batcher.api.io_namespace.writer.Writer.elasticsearch>` | an Elasticsearch index, via `_bulk` | `upsert` / `append` / `overwrite` / `delete` |
 | {py:meth}`ds.write.hbase(table, host=) <batcher.api.io_namespace.writer.Writer.hbase>` | an HBase table, one happybase batch per Arrow batch | `upsert` / `delete` |
+| {py:meth}`ds.write.qdrant(collection) <batcher.api.io_namespace.writer.Writer.qdrant>` | a Qdrant collection | `upsert` / `delete` |
+| {py:meth}`ds.write.pinecone(index, api_key=) <batcher.api.io_namespace.writer.Writer.pinecone>` | a Pinecone index namespace | `upsert` / `delete` |
+| {py:meth}`ds.write.milvus(collection, uri=) <batcher.api.io_namespace.writer.Writer.milvus>` | a Milvus collection | `upsert` / `append` / `delete` |
+| {py:meth}`ds.write.turbopuffer(namespace, region=) <batcher.api.io_namespace.writer.Writer.turbopuffer>` | a Turbopuffer namespace | `upsert` / `delete` |
 
 A mode a store cannot express is refused by name rather than approximated. DynamoDB has no `append`, because `PutItem` replaces the item holding the same key and no batch operation inserts only when the key is absent; Cassandra and HBase have none for the same reason, since a CQL `INSERT` and an HBase `Put` are both upserts. None of the four has `overwrite`, because emptying those stores is a scan-and-delete, a `TRUNCATE`, a `FLUSHDB`, or a disable-and-truncate through an admin API rather than a write.
 

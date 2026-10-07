@@ -111,7 +111,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `write_snowflake` | `Dataset.write.snowflake` | mismatch | Differs: Ray write\_snowflake appends rows to the table; Batcher write.snowflake defaults mode='overwrite'. Pass mode='append'. Wave W0. |
 | `write_sql` | `Dataset.write.sql` | mismatch | Differs: Ray write\_sql(sql, connection\_factory) executes a user INSERT statement per row batch through a DB-API connection factory; Batcher write.sql(table, mode=, key\_columns=) writes a table by name. Wave W13. |
 | `write_tfrecords` | `Dataset.write.tfrecord` | param | Missing: tf\_schema=. Wave W13. |
-| `write_turbopuffer` | n/a | gap | Not yet: Turbopuffer vector-namespace writer. Wave W13. |
+| `write_turbopuffer` | `Dataset.write.turbopuffer` | mismatch | Differs: unverified: not yet run against a live Turbopuffer (tests/PENDING\_VERIFICATION.md). The namespace is the positional argument and there is no namespace\_column= routing; vector\_column defaults to 'embedding' rather than 'vector'; a null or repeated id refuses the write and names the point where Ray drops null-id rows; metric= takes 'cosine'/'euclidean' (sent as cosine\_distance/euclidean\_squared). Wave W13. |
 | `write_webdataset` | `Dataset.write.webdataset` | mismatch | Differs: cells are written as raw bytes, UTF-8 text or decimal numbers rather than through Ray's encoders; a repeated \_\_key\_\_ is refused. Wave W13. |
 | `zip` | {py:obj}`Dataset.zip <batcher.Dataset.zip>` | param | Missing: implicit row order: Batcher's zip needs order\_by. Wave W8. |
 

@@ -149,6 +149,11 @@ nosql-redis = ["redis>=5"]
 dynamodb = ["boto3>=1.34"]
 neo4j = ["neo4j>=5.18"]
 hbase = ["happybase>=1.2"]
+# --- Vector stores (io.formats.vector) ---
+qdrant = ["qdrant-client>=1.10"]
+pinecone = ["pinecone>=5"]
+milvus = ["pymilvus>=2.5"]
+turbopuffer = ["turbopuffer>=0.5"]
 # --- Streaming brokers ---
 kafka = ["confluent-kafka>=2.3"]
 kinesis = ["boto3>=1.34"]
@@ -214,6 +219,7 @@ daft = ["daft>=0.3"]
 lakehouse = ["batcher-engine[delta,iceberg,hudi,delta-sharing]"]
 warehouse = ["batcher-engine[sql,connectorx,snowflake,databricks,bigquery,clickhouse,odbc]"]
 nosql = ["batcher-engine[mongo,elasticsearch,couchbase,cassandra,nosql-redis,dynamodb,neo4j,hbase]"]
+vector = ["batcher-engine[qdrant,pinecone,milvus,turbopuffer]"]
 streaming = ["batcher-engine[kafka,kinesis,eventhubs,pubsub,pulsar]"]
 multimodal = ["batcher-engine[image,audio,video,pdf]"]
 robotics = ["batcher-engine[mcap,ros2,hdf5]"]
@@ -274,7 +280,7 @@ docs = [
 all = [
     "batcher-engine[ray,polars,duckdb,redis,rocksdb,cloud,torch,tensorflow,nvml]",
     "batcher-engine[lance,avro,excel,xml,protobuf,msgpack,hdf5,zarr,tfrecord,pdf]",
-    "batcher-engine[lakehouse,warehouse,nosql,streaming,multimodal,pandas,huggingface]",
+    "batcher-engine[lakehouse,warehouse,nosql,vector,streaming,multimodal,pandas,huggingface]",
 ]
 
 [tool.maturin]

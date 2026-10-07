@@ -50,6 +50,12 @@ Arrow built directly off the wire, `_id` range splits, and bulk upserts back.
 ES|QL results as an Arrow stream, sliced scroll for bulk pulls, and `_bulk` indexing with every item checked.
 :::
 
+:::{grid-item-card} {octicon}`telescope;1.1em` Vector stores
+:link: /integrations/databases/vector-stores
+:link-type: doc
+Qdrant, Pinecone, Milvus and Turbopuffer behind one contract, with every point checked before the first request.
+:::
+
 ::::
 
 A few more stores have readers without a page of their own. ClickHouse reads Arrow natively through {py:meth}`bt.read.clickhouse <batcher.api.io_namespace.reader.Reader.clickhouse>`. DB2, Teradata, SAP HANA, Vertica and other ODBC-reachable systems read through `bt.read.table("odbc", ...)`. Couchbase Columnar and Neo4j read through `bt.read.table("couchbase", ...)` and `bt.read.table("neo4j", ...)`. {doc}`/api/symbols/readers-and-writers` lists the reader surface they share.
@@ -62,4 +68,5 @@ writing
 key-value-stores
 mongodb
 elasticsearch
+vector-stores
 ```
