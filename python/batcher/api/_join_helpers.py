@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from batcher.api.dataset.frame import Dataset
 
 __all__ = [
+    "KeySpec",
     "_as_expr",
     "_as_key_expr",
     "_broadcast",
@@ -27,6 +28,7 @@ __all__ = [
     "_empty_schema",
     "_join_output",
     "_resolve_join_keys",
+    "_resolve_key_specs",
 ]
 
 
@@ -52,11 +54,34 @@ def _as_key_expr(value: str | Expr) -> Expr:
     raise PlanError(f"expected a column name or expression, got {type(value).__name__}")
 
 
-def _resolve_join_keys(
-    on: str | list[str] | None,
-    left_on: str | list[str] | None,
-    right_on: str | list[str] | None,
-) -> tuple[list[str], list[str]]:
+#: A join key as `join` accepts it: a column name, or an expression evaluated on its side.
+KeySpec = str | Expr
+
+
+def _resolve_key_specs(
+    on: KeySpec | list[KeySpec] | None,
+    left_on: KeySpec | list[KeySpec] | None,
+    right_on: KeySpec | list[KeySpec] | None,
+) -> tuple[list[KeySpec], list[KeySpec]]:
+    """Pair up the left and right join keys, each a column name or an expression.
+
+    A bare column reference (``bt.col("k")``) is read as the name ``"k"``, so it behaves
+    exactly like the string: it is a named key whose two sides coalesce into one output
+    column. Any other expression is a computed key, evaluated on its own side. An
+    expression given as `on` is evaluated on both sides.
+
+    Args:
+        on: Key(s) shared by both sides.
+        left_on: The left key(s), when they differ from the right's.
+        right_on: The right key(s).
+
+    Returns:
+        The left and right keys, positionally paired.
+
+    Raises:
+        PlanError: For a selector, for `on` given with `left_on`/`right_on`, for a missing
+            side, or for key lists of different lengths.
+    """
     for keys in (on, left_on, right_on):
         if has_selector(keys) or (isinstance(keys, list) and any(map(has_selector, keys))):
             raise PlanError(
@@ -67,15 +92,52 @@ def _resolve_join_keys(
     if on is not None:
         if left_on is not None or right_on is not None:
             raise PlanError("pass either `on` or `left_on`/`right_on`, not both")
-        keys = [on] if isinstance(on, str) else list(on)
-        return keys, keys
+        keys = _key_list(on, "on")
+        return keys, list(keys)
     if left_on is None or right_on is None:
         raise PlanError("join requires `on`, or both `left_on` and `right_on`")
-    lk = [left_on] if isinstance(left_on, str) else list(left_on)
-    rk = [right_on] if isinstance(right_on, str) else list(right_on)
+    lk = _key_list(left_on, "left_on")
+    rk = _key_list(right_on, "right_on")
     if len(lk) != len(rk):
         raise PlanError("left_on and right_on must have the same length")
     return lk, rk
+
+
+def _key_list(value: KeySpec | list[KeySpec], arg: str) -> list[KeySpec]:
+    """One key argument as a list, a bare `Col` read as its name.
+
+    The list is built here rather than with ``list(value)``: an `Expr` refuses iteration
+    with a message about ``over(partition_by=...)``, which is how ``join(on=bt.col("k"))``
+    used to fail -- a sentence about a window for a mistake in a join.
+    """
+    items = [value] if isinstance(value, (str, Expr)) else list(value)
+    out: list[KeySpec] = []
+    for item in items:
+        if isinstance(item, Col):
+            out.append(item.name)
+        elif isinstance(item, (str, Expr)):
+            out.append(item)
+        else:
+            raise PlanError(
+                f"join {arg}= takes column names or expressions, got {type(item).__name__}"
+            )
+    return out
+
+
+def _resolve_join_keys(
+    on: str | list[str] | None,
+    left_on: str | list[str] | None,
+    right_on: str | list[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Pair up named join keys, for the verbs that do not take expression keys."""
+    lk, rk = _resolve_key_specs(on, left_on, right_on)
+    computed = [k for k in (*lk, *rk) if not isinstance(k, str)]
+    if computed:
+        raise PlanError(
+            f"this join takes column names as keys, not the expression {computed[0]!r}; "
+            "add the computed key with with_columns(...) on each side and join on its name"
+        )
+    return [str(k) for k in lk], [str(k) for k in rk]
 
 
 def _join_output(
@@ -85,8 +147,16 @@ def _join_output(
     right_keys: list[str],
     how: str,
     suffix: str,
+    *,
+    coalesce: bool = True,
 ) -> list[JoinOutputCol]:
-    """Compute the join output column list (key cols, then left, then right)."""
+    """Compute the join output column list (key cols, then left, then right).
+
+    With ``coalesce=False`` each key pair is not merged: the left key keeps its leading
+    position under its own name, read from the left side, and the right key stays among the
+    right columns under its own name (with `suffix` on a collision), null-extended on its
+    own side like any other right column.
+    """
     # Semi/anti joins return only the left relation's columns.
     if how in {"semi", "anti"}:
         return [JoinOutputCol("left", c, c) for c in left_cols]
@@ -99,13 +169,21 @@ def _join_output(
     left_key_set = set(left_keys)
     right_key_set = set(right_keys)
 
-    if how == "full":
+    if not coalesce:
+        for lk in left_keys:
+            out.append(JoinOutputCol("left", lk, lk))
+            used.add(lk)
+        right_key_set = set()
+    elif how == "full":
         # In a full outer join a key is null on whichever side didn't match, so
         # neither side alone carries it. Emit *both* sides as temp columns; the
         # caller coalesces them into the final key.
         for i, (lk, rk) in enumerate(zip(left_keys, right_keys, strict=True)):
             out.append(JoinOutputCol("left", lk, f"__fk_l_{i}"))
             out.append(JoinOutputCol("right", rk, f"__fk_r_{i}"))
+            # The coalesced key takes `lk` as its name, so a right column called `lk` must
+            # be suffixed here exactly as on every other join type.
+            used.add(lk)
     else:
         # The key value is carried by the side always present for kept rows: the
         # right side for a right join, otherwise the left.
@@ -176,7 +254,7 @@ def _broadcast(flag: bool | list[bool], n: int, name: str) -> list[bool]:
     # iterating it is exactly the misreading above.
     if isinstance(flag, str) or not isinstance(flag, Iterable):
         raise PlanError(
-            f"{name} must be a bool, or a list of bools with one entry per sort key; "
+            f"{name} must be a bool, or a list of bools with one entry per key; "
             f"got {type(flag).__name__} {flag!r}"
         )
     values = list(flag)
@@ -185,8 +263,7 @@ def _broadcast(flag: bool | list[bool], n: int, name: str) -> list[bool]:
     bad = [v for v in values if not isinstance(v, bool)]
     if bad:
         raise PlanError(
-            f"{name} must contain only bools, one per sort key; got {bad[0]!r} "
-            f"({type(bad[0]).__name__})"
+            f"{name} must contain only bools, one per key; got {bad[0]!r} ({type(bad[0]).__name__})"
         )
     return values
 

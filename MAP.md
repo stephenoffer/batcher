@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1567 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1568 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -168,7 +168,7 @@ The public, fluent, lazy, expression-first API surface.
 
 | module | lines | what it is |
 |---|---|---|
-| `_join_helpers.py` | 245 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
+| `_join_helpers.py` | 322 | Module-level helpers for `Dataset`: argument coercion and join wiring. |
 | `_varargs.py` | 69 | Sequence flattening for the `Dataset` verbs' varargs positions. |
 | `executors.py` | 681 | Execution strategies and their registry (the conductor's wiring). |
 | `functions.py` | 817 | Top-level expression constructors re-exported for the public API. |
@@ -219,7 +219,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7067 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 7134 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -229,9 +229,10 @@ Plan-construction helpers behind the thinner `Dataset` methods.
 
 | module | lines | what it is |
 |---|---|---|
-| `combine.py` | 296 | Bodies of the `Dataset` verbs that combine two or more relations over existing operators. |
+| `combine.py` | 347 | Bodies of the `Dataset` verbs that combine two or more relations over existing operators. |
 | `conform.py` | 159 | Bodies of the `Dataset` verbs that hold a relation to a shape: `match_to_schema`, `drop_nans`. |
 | `core.py` | 574 | Plan-construction helpers behind the thinner `Dataset` methods. |
+| `join.py` | 361 | The body of `Dataset.join`: key resolution, the opt-in keywords, and the `Join` node. |
 | `reshape.py` | 226 | Bodies of the `Dataset` verbs that cut or turn a relation: `transpose`, `partition_by`, `split`. |
 | `sessions.py` | 136 | Session windows: grouping a partition's events into runs separated by an idle gap. |
 
@@ -871,7 +872,7 @@ Translate a SQL query (sqlglot AST) into a Batcher `Dataset`.
 | `ai_functions.py` | 297 | AI table functions: ``AI_GENERATE`` / ``AI_CLASSIFY`` / ``AI_EXTRACT`` / ``AI_EMBED``. |
 | `clauses.py` | 641 | SELECT / FROM / JOIN / ORDER clause building for the SQL translator. |
 | `core_utils.py` | 691 | Small stateless AST helpers shared across translator theme modules. |
-| `from_clause.py` | 635 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
+| `from_clause.py` | 649 | FROM / JOIN / UNNEST / VALUES translation for the SQL translator. |
 | `grouping.py` | 538 | Grouping, aggregation, and projection mapping for the SQL translator. |
 | `grouping_sets.py` | 321 | ROLLUP / CUBE / GROUPING SETS expansion for the SQL translator. |
 | `statements.py` | 328 | SQL that describes rather than queries: EXPLAIN, SHOW, DESCRIBE, information_schema. |
