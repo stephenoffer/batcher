@@ -129,14 +129,14 @@ pub fn canon_float_array(a: &ArrayRef) -> ArrayRef {
             let f = a.as_primitive::<Float64Type>();
             // Null slots' payloads never matter (they compare/order as null either way), so
             // scanning `values()` wholesale can only over-trigger, never miss.
-            if !f.values().iter().any(|v| needs_canon_f64(*v)) {
+            if !any_needs_canon_f64(f.values()) {
                 return Arc::clone(a);
             }
             Arc::new(f.unary::<_, Float64Type>(canon_f64))
         }
         DataType::Float32 => {
             let f = a.as_primitive::<Float32Type>();
-            if !f.values().iter().any(|v| needs_canon_f32(*v)) {
+            if !any_needs_canon_f32(f.values()) {
                 return Arc::clone(a);
             }
             Arc::new(f.unary::<_, Float32Type>(canon_f32))
@@ -157,6 +157,36 @@ pub fn needs_canon_f64(v: f64) -> bool {
 #[must_use]
 pub fn needs_canon_f32(v: f32) -> bool {
     v.is_nan() || v.to_bits() == 0x8000_0000
+}
+
+/// Values per block of [`any_needs_canon_f64`]'s scan: long enough that the branch-free inner
+/// fold vectorizes and the per-block exit test is noise, short enough to stop soon after a hit.
+const SCAN_BLOCK: usize = 1024;
+
+/// Whether any of `values` is a NaN or a negative zero -- the test every canonicalizing caller
+/// makes before deciding whether to rewrite a column at all.
+///
+/// `iter().any(needs_canon_f64)` exits on the first hit, and that early exit is what kept it
+/// scalar: a whole 6M-row `ORDER BY` key took ~8 ms on one core, measured as the one serial
+/// stretch of a windowed top-k. Here each block is OR-folded without a branch, which
+/// vectorizes, and only the block boundary tests for a hit. The answer is the same.
+#[must_use]
+pub fn any_needs_canon_f64(values: &[f64]) -> bool {
+    values.chunks(SCAN_BLOCK).any(|block| {
+        block.iter().fold(false, |hit, &v| {
+            hit | v.is_nan() | (v.to_bits() == 0x8000_0000_0000_0000)
+        })
+    })
+}
+
+/// [`any_needs_canon_f64`] for 32-bit floats.
+#[must_use]
+pub fn any_needs_canon_f32(values: &[f32]) -> bool {
+    values.chunks(SCAN_BLOCK).any(|block| {
+        block.iter().fold(false, |hit, &v| {
+            hit | v.is_nan() | (v.to_bits() == 0x8000_0000)
+        })
+    })
 }
 
 /// [`canon_float_array`] applied at every depth of a nested array.
@@ -218,6 +248,33 @@ fn has_float_leaf(dt: &DataType) -> bool {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    /// The blocked scan answers exactly what `iter().any` does, wherever the one value that
+    /// needs folding sits relative to the block boundaries -- and on +0.0, which must not.
+    #[test]
+    fn the_blocked_scan_agrees_with_the_per_value_test() {
+        let n = SCAN_BLOCK * 3 + 7;
+        for odd in [
+            f64::NAN,
+            -f64::NAN,
+            -0.0,
+            0.0,
+            f64::INFINITY,
+            f64::MIN_POSITIVE,
+        ] {
+            for at in [0, 1, SCAN_BLOCK - 1, SCAN_BLOCK, 2 * SCAN_BLOCK + 3, n - 1] {
+                let mut v: Vec<f64> = (0..n).map(|i| i as f64 + 1.0).collect();
+                v[at] = odd;
+                let want = v.iter().any(|x| needs_canon_f64(*x));
+                assert_eq!(any_needs_canon_f64(&v), want, "{odd} at {at}");
+                let w: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+                let want32 = w.iter().any(|x| needs_canon_f32(*x));
+                assert_eq!(any_needs_canon_f32(&w), want32, "{odd} at {at} (f32)");
+            }
+        }
+        assert!(!any_needs_canon_f64(&[]));
+        assert!(!any_needs_canon_f32(&[]));
+    }
 
     /// The bit patterns that make raw-bit reasoning disagree with SQL.
     fn awkward() -> Vec<f64> {
