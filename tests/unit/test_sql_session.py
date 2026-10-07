@@ -156,14 +156,29 @@ def test_scalar_udf_in_from_raises():
 @pytest.mark.parametrize(
     "query",
     [
-        "SELECT g, SUM(udf(v)) AS s FROM t GROUP BY g",
-        "SELECT g, SUM(v) AS s FROM t GROUP BY g HAVING SUM(udf(v)) > 0",
         "SELECT g, COUNT(*) AS n FROM t GROUP BY g ORDER BY udf(g)",
+        "SELECT g, SUM(v) AS s FROM t GROUP BY g HAVING udf(g) > 'a'",
     ],
 )
-def test_scalar_udf_rejected_in_agg_positions(query):
+def test_scalar_udf_over_a_grouped_value_outside_select_is_rejected(query):
     s = bt.Session()
     s.register("t", bt.from_pydict({"g": ["a", "b"], "v": [1, 2]}))
     s.register_function("udf", lambda a: a)
     with pytest.raises(PlanError, match="registered scalar function"):
         s.sql(query)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("query", "want"),
+    [
+        ("SELECT g, SUM(udf(v)) AS s FROM t GROUP BY g ORDER BY g", [3, 2]),
+        ("SELECT g, SUM(v) AS s FROM t GROUP BY g HAVING SUM(udf(v)) > 2 ORDER BY g", [3]),
+    ],
+)
+def test_scalar_udf_over_input_rows_in_an_aggregate_query(query, want):
+    """A UDF inside an aggregate reads input rows, so it runs before the aggregate."""
+    s = bt.Session()
+    s.register("t", bt.from_pydict({"g": ["a", "a", "b"], "v": [1, 2, 2]}))
+    s.register_function("udf", lambda a: a)
+    assert s.sql(query).to_pydict()["s"] == want
