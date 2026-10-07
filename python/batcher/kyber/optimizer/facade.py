@@ -18,6 +18,7 @@ from batcher.kyber.optimizer.driver import (
 )
 from batcher.kyber.optimizer.plan_deps import dependencies_hold, dependency_snapshot
 from batcher.kyber.pass_base import OptimizerContext
+from batcher.kyber.plan_cache import normalized
 from batcher.kyber.registry import DEFAULT_REGISTRY
 from batcher.kyber.rule import Phase, Rule
 from batcher.kyber.rules.projections import (
@@ -32,13 +33,27 @@ from batcher.kyber.rules.source_limits import (
 from batcher.kyber.spill_rates import learned_spill_factor
 from batcher.metadata import MetadataHub
 from batcher.metadata.io_stats import relative_read_cost
-from batcher.plan.logical import LogicalPlan
+from batcher.plan.logical import Aggregate, LogicalPlan, MapBatches
 from batcher.plan.physical import PhysicalPlan
 from batcher.plan.resource import HardwareProfile
 from batcher.plan.source_stats import source_identity
 from batcher.plan.visitor import children, walk
 
 __all__ = ["Optimizer", "optimize", "optimize_full", "optimize_logical", "optimize_traced"]
+
+
+def _normalize_keyable(plan: LogicalPlan) -> bool:
+    """Whether `plan`'s content key determines its NORMALIZE output.
+
+    Two things a plan carries are not in its IR, so the key cannot see them. A `map_batches`
+    node has no IR at all and is keyed by object identity, which a freed plan's recycled `id()`
+    could match. An aggregate's streaming watermark is driver-only state, so a watermarked and
+    an unwatermarked aggregate key equal and the memo would hand one the other's.
+    """
+    return not any(
+        isinstance(n, MapBatches) or (isinstance(n, Aggregate) and n.watermark is not None)
+        for n in walk(plan)
+    )
 
 
 class Optimizer:
@@ -73,6 +88,9 @@ class Optimizer:
         # because it has no registry to memoize against and is not on the per-query path.
         # The cleanup round's rules come from the registry for the same list-identity reason
         # the phase partition does — see `_run_cleanup`.
+        # A caller-chosen rule set normalizes differently from the default, so only the
+        # default registry's NORMALIZE output is memoized (`_normalize`).
+        self._rules_given = rules is not None
         if rules is None:
             self._by_phase: dict[Phase, list[Rule]] = DEFAULT_REGISTRY.by_phase()
             self._cleanup: list[Rule] = DEFAULT_REGISTRY.recanonicalize_rules()
@@ -153,7 +171,13 @@ class Optimizer:
         present = _present(plan)
         for phase in Phase:  # IntEnum iterates in declared (ascending) order
             max_iter = fixpoint if phase in _FIXPOINT_PHASES else 1
-            plan, ir = _run_phase(plan, self._by_phase[phase], ctx, max_iter, present)
+            if phase is Phase.NORMALIZE:
+                before = plan
+                plan, ir = self._normalize(plan, ctx, max_iter, present)
+                if ir is None and plan is not before:  # served: refresh what a change would
+                    present = _present(plan)
+            else:
+                plan, ir = _run_phase(plan, self._by_phase[phase], ctx, max_iter, present)
             if ir is not None:  # a no-op phase leaves the plan (and its IR) unchanged
                 last_ir = ir
                 present = _present(plan)  # refresh once for the next phase
@@ -162,6 +186,39 @@ class Optimizer:
                 if ir is not None:
                     last_ir = ir
         return plan, last_ir
+
+    def _normalize(
+        self,
+        plan: LogicalPlan,
+        ctx: OptimizerContext,
+        max_iter: int,
+        present: frozenset[type],
+    ) -> tuple[LogicalPlan, dict | None]:
+        """NORMALIZE, served from `plan_cache.normalized` when this plan was normalized before.
+
+        The phase reads no statistics (see that module), so its output is keyed without the
+        learned fields and a re-plan of the same plan skips it. A hit returns `None` for the
+        IR, the "unchanged" signal: `_run` then refreshes nothing it needs and the final plan
+        is lowered from the plan itself, never from an IR dict shared with another run.
+        """
+        max_entries = self._config.optimizer.plan_cache_entries
+        if max_entries <= 0 or self._rules_given or not _normalize_keyable(plan):
+            return _run_phase(plan, self._by_phase[Phase.NORMALIZE], ctx, max_iter, present)
+        key = plan_cache.cache_key(
+            plan.content_key(),
+            self._sources,
+            self._config,
+            self._hub,
+            kind="normalize",
+            hardware=self._hardware,
+            learned=False,
+        )
+        cached = normalized.lookup(key)
+        if cached is not None:
+            return cached, None
+        out, ir = _run_phase(plan, self._by_phase[Phase.NORMALIZE], ctx, max_iter, present)
+        normalized.store(key, out, self._sources, max_entries)
+        return out, ir
 
     def _run_cleanup(
         self,
