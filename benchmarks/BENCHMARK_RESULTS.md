@@ -1,5 +1,83 @@
 # Batcher CPU benchmark results
 
+## Shuffle files published by rename, a recorded four-node run, and the DataFrame API raced on its own spelling (2026-10-07)
+
+### A speculative backup truncated a shuffle file under its reader
+
+Both full gates of this round and the last (64-core `m6id.16xlarge`, eight xdist processes
+on one Ray node) failed the skewed-sort integration tests the same way: a reducer read a
+zero-byte bucket, `ArrowInvalid: Tried reading schema message, was null or length 0`.
+Shuffle tasks are speculated (`gather_with_backups`, one backup by default) and a map task
+writes deterministic paths (`m{w}_r{r}.arrow`). The barrier hands the first finisher's paths
+to the reducers while the other copy is still running, and that copy re-opened every path
+with `O_TRUNC`. On an idle box no task is slow enough to be backed up, which is why a 16-core
+worker never reproduced it.
+
+`IpcWriter` now writes `<path>.<uuid>.partial` beside the target and renames it onto the
+path only on a clean close; an exception inside the `with` block, or `abort()`, deletes it.
+`tests/unit/test_shuffle_publication.py` fails three of six cases at `43d507d5`: one with the
+gate's exact `ArrowInvalid`, and one where a rewrite interrupted after ten rows left a
+1,000-row bucket holding ten rows, with no error.
+
+**The recorded cluster run.** Anyscale job `c5g-distt1`, four `m5d.4xlarge` workers and an
+`m5.2xlarge` head with no CPUs, code `dfa7bb01`, the shuffle scratch on
+`/mnt/cluster_storage`, run serially:
+
+| Suite | Result |
+|---|---|
+| `test_distributed.py`, `_skewed_sort`, `_spilling`, `_sort_key_type_collision`, `_temporal_sort`, `_empty_partition`, `_merge`, `_sample_and_range_join`, `_write`, `test_flight_shuffle.py`, `test_artifact_permissions.py`, `test_shuffle_publication.py` | all pass |
+| `test_sql_catalog_distributed.py` | 6 fail, all `MissingDependencyError: Delta Lake support requires delta-rs` raised on the workers, whose base interpreter has no `deltalake`. The same file passes on one node. |
+
+203 passed, 6 failed (environment), 1 skipped, in 7 min 42 s.
+
+### The DataFrame API against Polars, DuckDB and PyArrow
+
+Every operator-mix family timed Batcher through `bt.Session().sql(...)`, so the `.dt`,
+`.str` and `.list` namespaces, the `cum_sum`/`diff`/`rolling_mean`/`ewm_mean` expressions,
+and `pivot`, `top_k`, `value_counts`, `rollup`, `cube`, `max_by`, `corr`, `join_where` and
+`cross_join` had never been timed the way a user writes them. The `ops-frame-*` families in
+`suites/operators/frame/` do that. Measured with `python benchmarks/run.py --benchmark
+operators --scale 1 --engines batcher,duckdb,polars,pyarrow --only <cases>` on one
+`m6id.16xlarge` (64 cores, Anyscale job `c5g-frame64b`, code `7c212f71`), best of 5, every
+case correctness-checked against DuckDB first:
+
+| case | Batcher ms | DuckDB ms | Polars ms | PyArrow ms | b/DuckDB |
+|---|--:|--:|--:|--:|--:|
+| op-dt-truncate-month | 24.2 | 11.9 | 235.6 | 140.3 | 2.04x |
+| op-dt-strftime | 41.5 | 26.2 | 843.6 | 2484.5 | 1.58x |
+| op-dt-weekday | 10.6 | 3.9 | 40.1 | 49.7 | 2.69x |
+| op-dt-days-between | 11.9 | 12.7 | 57.6 | 94.7 | 0.94x |
+| op-str-split-part | 15.7 | 24.4 | 577.7 | 448.6 | 0.64x |
+| op-str-regex-replace-all | 107.7 | 388.9 | 2775.1 | 6991.5 | 0.28x |
+| op-str-regex-extract | 815.4 | 157.9 | 899.5 | 1778.5 | 5.17x |
+| op-str-md5 | 148.3 | 76.7 | n/a | n/a | 1.93x |
+| op-ts-cum-sum | 45.9 | 180.1 | 543.9 | n/a | 0.25x |
+| op-ts-diff | 60.2 | 122.4 | 3004.0 | n/a | 0.49x |
+| op-ts-rolling-mean | 58.5 | 190.2 | 547.8 | n/a | 0.31x |
+| op-ts-forward-fill | 51.9 | 132.2 | 247.1 | n/a | 0.39x |
+| op-ts-ewm-mean | 39.1 | n/a | 553.0 | n/a | (0.07x Polars) |
+| op-pivot | 61.7 | 20.4 | 125.7 | n/a | 3.03x |
+| op-top-k | 7.1 | 7.1 | 179.8 | 438.4 | 1.00x |
+| op-value-counts | 18.0 | 20.5 | 170.5 | 88.6 | 0.88x |
+| op-rollup | 18.2 | 25.5 | n/a | n/a | 0.72x |
+| op-cube | 61.3 | 78.8 | n/a | n/a | 0.78x |
+| op-max-by | 28.9 | 12.0 | 89.2 | n/a | 2.41x |
+| op-corr | 9.0 | 11.5 | 99.5 | n/a | 0.78x |
+| op-list-reduce | 20.4 | 10.6 | 27.4 | 6.5 | 1.92x |
+| op-list-contains | 132.5 | 3.7 | 44.7 | n/a | 35.78x |
+| op-list-sort-unique | 323.8 | 94.8 | 2575.6 | n/a | 3.42x |
+| op-join-where | 13.7 | 76.2 | 27.2 | n/a | 0.18x |
+| op-cross-join | 2.9 | 5.2 | 8.4 | n/a | 0.56x |
+
+Two readings matter more than the geomean. `op-list-contains` is 36x DuckDB and 3x Polars,
+at 16 cores and at 64 alike.
+`op-str-regex-extract` gets **slower** with more cores: 485 ms on a 16-core worker, 815 ms
+on 64, where DuckDB went from 646 ms to 158 ms. Both are open.
+
+The Polars column is Polars' own lazy API over `pl.from_arrow`. On several cases its CPU time
+roughly equals its wall time (`op-top-k` 254.7 ms wall, 265.6 ms CPU on 16 cores), so those
+operations ran on one thread in this setup.
+
 ## The public-API review: a recorded cluster run, and no regression on TPC-H or the operator mix (2026-10-06)
 
 The public-API review (`feat/public-api-review`, against the base `4686ea63`) changed `dist/`

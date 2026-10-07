@@ -65,9 +65,11 @@ def top_k(ctx: Context):
         idx = pc.select_k_unstable(t, k=10, sort_keys=[(k, "descending") for k in _TOP_KEYS])
         return t.take(idx)
 
+    # The ORDER BY picks the ten; the outer SELECT says the set is the answer, not an order,
+    # which is all `top_k` (and Polars' `top_k`) promise.
     sql = (
-        "SELECT * FROM {t} ORDER BY l_extendedprice DESC, l_orderkey DESC, "
-        "l_linenumber DESC LIMIT 10"
+        "SELECT * FROM (SELECT * FROM {t} ORDER BY l_extendedprice DESC, l_orderkey DESC, "
+        "l_linenumber DESC LIMIT 10) AS top"
     )
     return frame_case(ctx, batcher=batcher, polars=polars, sql=sql, pyarrow=pyarrow)
 
