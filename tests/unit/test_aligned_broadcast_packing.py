@@ -62,6 +62,8 @@ def test_units_never_ask_for_more_cores_than_a_node_has(monkeypatch):
         {"Alive": True, "Resources": {"CPU": 8.0}},
     ]
     assert aligned_run._unit_slots(2) == (8, 3)
+    # A wide task (large held broadcasts) takes a whole node; a node narrower than it runs none.
+    assert aligned_run._unit_slots(2, 16) == (16, 1)
 
 
 def test_a_node_read_broadcast_is_evaluated_once_per_process(monkeypatch):
