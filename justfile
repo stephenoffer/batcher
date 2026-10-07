@@ -137,6 +137,11 @@ gen-exports:
 gen-decls:
     python tools/gen_bound_decls.py
 
+# Regenerate docs/api/return-types.md from the live return annotations. Run after changing a
+# public signature's return type; `tests/docs/test_return_types_fresh.py` gates the drift.
+return-types-doc:
+    python tools/gen_return_types_doc.py
+
 # Regenerate MAP.md — the file-level index of what every module is for. It is derived
 # from each module's own docstring and each crate's manifest, so it cannot drift; run
 # this after adding, moving, or re-documenting a module. `--check` runs in CI.
