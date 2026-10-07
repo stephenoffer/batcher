@@ -136,7 +136,7 @@ These compute (or read) a small result and so are eager.
 | {py:meth}`.corr_matrix(columns=None) <batcher.Dataset.corr_matrix>` | pairwise Pearson correlation matrix over numeric columns (one scan) |
 | {py:meth}`.cov_matrix(columns=None) <batcher.Dataset.cov_matrix>` | pairwise sample covariance matrix over numeric columns (PCA/whitening input) |
 | `.approx_quantile(column, q)` | a sketch-based quantile estimate |
-| {py:meth}`.stats() <batcher.Dataset.stats>` | the last run's measured `RunStats` |
+| {py:meth}`.stats() <batcher.Dataset.stats>` | runs the query and returns its measured `RunStats` |
 | `__arrow_c_stream__()` | Arrow PyCapsule export, so `pl.DataFrame(ds)`, `duckdb.sql("... FROM ds")`, and `pa.table(ds)` consume a `Dataset` directly, lazily and zero-copy |
 
 ```python

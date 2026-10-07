@@ -109,7 +109,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `write_parquet` | `Dataset.write.parquet` | mismatch | Differs: Daft write\_parquet defaults to write\_mode='append' and returns a DataFrame of written paths; Batcher ds.write.parquet defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks; Daft compresses with snappy by default, Batcher with zstd. Wave W13. |
 | `write_sink` | n/a | gap | Not yet: a user DataSink protocol adapter. Wave W13. |
 | `write_sql` | `Dataset.write.sql` | param | Missing: a connection factory callable and write\_mode='fail'. Wave W13. |
-| `write_turbopuffer` | n/a | gap | Not yet: Turbopuffer vector-store sink. Wave W13. |
+| `write_turbopuffer` | `Dataset.write.turbopuffer` | mismatch | Differs: unverified: not yet run against a live Turbopuffer (tests/PENDING\_VERIFICATION.md). The namespace is the positional argument; vector\_column defaults to 'embedding'; a null or repeated id refuses the write and names the point. Wave W13. |
 
 ## `GroupedDataFrame`
 

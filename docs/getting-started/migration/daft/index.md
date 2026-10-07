@@ -59,7 +59,7 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 115 | 58 | 18 | 29 | 8 | 2 |
+| {doc}`dataframe` | 115 | 58 | 18 | 30 | 7 | 2 |
 | {doc}`module` | 130 | 48 | 27 | 10 | 33 | 12 |
 | {doc}`functions-numeric` | 160 | 134 | 23 | 1 | 2 | 0 |
 | {doc}`functions-strings` | 121 | 52 | 46 | 18 | 5 | 0 |

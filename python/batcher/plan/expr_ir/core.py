@@ -311,7 +311,7 @@ class Expr:
 
     # --- arithmetic operators ---------------------------------------------
     def __add__(self, other: IntoExpr) -> Expr:
-        """Element-wise addition (``a + b``); also the string-concat operator on Utf8."""
+        """Element-wise numeric addition (``a + b``); join strings with ``bt.concat`` instead."""
         return Binary("add", self, _wrap(other))
 
     def __sub__(self, other: IntoExpr) -> Expr:

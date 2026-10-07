@@ -93,7 +93,7 @@ write_paimon = { status = "gap", need = "Apache Paimon sink", wave = "W13" }
 write_parquet = { status = "mismatch", batcher = "Dataset.write.parquet", note = "Daft write_parquet defaults to write_mode='append' and returns a DataFrame of written paths; Batcher ds.write.parquet defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks; Daft compresses with snappy by default, Batcher with zstd", wave = "W13" }
 write_sink = { status = "gap", need = "a user DataSink protocol adapter", wave = "W13" }
 write_sql = { status = "param", batcher = "Dataset.write.sql", need = "a connection factory callable and write_mode='fail'", wave = "W13" }
-write_turbopuffer = { status = "gap", need = "Turbopuffer vector-store sink", wave = "W13" }
+write_turbopuffer = { status = "mismatch", batcher = "Dataset.write.turbopuffer", note = "unverified: not yet run against a live Turbopuffer (tests/PENDING_VERIFICATION.md). The namespace is the positional argument; vector_column defaults to 'embedding'; a null or repeated id refuses the write and names the point", wave = "W13" }
 
 [GroupedDataFrame]
 agg = { status = "canonical", batcher = "GroupBy.agg" }
