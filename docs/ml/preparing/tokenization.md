@@ -113,6 +113,27 @@ A tokenizer you construct yourself has to be constructed **once per worker**, wh
 
 The parallelism knobs live on {py:meth}`map_batches <batcher.Dataset.map_batches>`, not on the preprocessor. `num_workers` defaults to `"auto"`, which fans the calls across every local core. A fast tokenizer releases the GIL, so threads are the right pool, while a pure-Python tokenizer needs `multiprocessing=True` for real parallelism. `Tokenizer.transform` calls `map_batches` with the defaults, so write the UDF yourself when you need to change them.
 
+## Exact token counts
+
+{py:meth}`ds.ml.token_count <batcher.api.dataset.ml.DatasetML.token_count>` appends each text's token count under a real tokenizer as an `int64` column. The budget helpers such as `filter_by_token_budget` divide characters by a constant, which needs no model and can be off by a wide margin on code or a script the vocabulary covers poorly. Filter on the exact count instead, and nothing reaches the model that doesn't fit.
+
+```python
+import batcher as bt
+
+docs = bt.from_pydict({"text": ["one two three", None, "four"]})
+counted = docs.ml.token_count("text", tokenizer=str.split)
+print(counted.filter(bt.col("text_tokens") <= 2).to_pydict())
+# {'text': ['four'], 'text_tokens': [1]}
+```
+
+Pass a HuggingFace model id or local path as `tokenizer` and each worker loads it once with `AutoTokenizer`, then counts a whole Arrow batch per call. `add_special_tokens` decides whether a BOS or `[CLS]` counts. Engines that group requests by a {py:class}`TokenBudget <batcher.ml.TokenBudget>` count through the same code under the same policy, so a row this kept is counted the same way there. See {ref}`the token-budget section <llm-engine-token-budget>`.
+
+```python
+# docs: skip
+counted = ds.ml.token_count("text", tokenizer="meta-llama/Llama-3.1-8B-Instruct", add_special_tokens=False)
+fits = counted.filter(bt.col("text_tokens") <= 8000)
+```
+
 ## Token ids are a list column
 
 The output is `List<Int64>`, an ordinary Arrow column. The whole expression surface applies, so length statistics are one aggregate instead of a Python pass over the corpus.

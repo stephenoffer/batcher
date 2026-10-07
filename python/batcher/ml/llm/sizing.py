@@ -216,7 +216,14 @@ def fit_to_window(
 
 
 def _truncate_to_window(
-    prompts: list, tokenizer: object, max_tokens: int, *, policy: str = "head"
+    prompts: list,
+    tokenizer: object,
+    max_tokens: int,
+    *,
+    policy: str = "head",
+    setting: str = "vllm_engine(truncation=...)",
+    add_special_tokens: bool | None = None,
+    encoded: list[list[int]] | None = None,
 ) -> list:
     """Each over-length prompt cut to `max_tokens` tokens, warning once if any was cut.
 
@@ -225,17 +232,33 @@ def _truncate_to_window(
     than the question. ``"tail"`` keeps the last `max_tokens`, for a prompt whose question
     comes after a long document. ``"error"`` cuts nothing and raises instead, naming how
     many prompts did not fit.
+
+    The ids come from `tokens.encode_texts`, the one encoding `ds.ml.token_count` and
+    `TokenBudget` also use, so a prompt is measured the same way wherever it is measured.
+    `setting` names the option that chose `policy`, for the messages; `encoded` passes ids
+    a caller already computed, so a prompt is not tokenized twice.
     """
-    encoded = [tokenizer.encode(str(prompt)) for prompt in prompts]
+    from batcher.ml.llm.tokens import encode_texts
+
+    if encoded is None:
+        encoded = encode_texts(
+            tokenizer, [str(p) for p in prompts], add_special_tokens=add_special_tokens
+        )
     over = sum(len(ids) > max_tokens for ids in encoded)
+    owner = setting.split("(", 1)[0]
+    if owner == "vllm_engine":
+        limit = "the model's context window"
+        remedy = "raise vllm_engine(max_model_len=...)"
+    else:
+        limit = f"the {max_tokens}-token budget"
+        remedy = f"raise {owner}(max_batch_tokens=...)"
     if over and policy == "error":
         from batcher._internal.errors import DataQualityError
 
         raise DataQualityError(
-            f"{over} of {len(prompts)} prompts exceed the model's {max_tokens}-token context "
-            "window and vllm_engine(truncation='error') refuses to cut them. Shorten the "
-            "prompts, raise vllm_engine(max_model_len=...), or choose truncation='head' or "
-            "'tail'.",
+            f"{over} of {len(prompts)} prompts exceed {limit} ({max_tokens} tokens) and "
+            f"{setting.replace('...', repr('error'))} refuses to cut them. Shorten the "
+            f"prompts, {remedy}, or choose 'head' or 'tail'.",
             violations={"context_window": over},
         )
     out = []
@@ -250,9 +273,9 @@ def _truncate_to_window(
 
         lost = "heads" if policy == "tail" else "tails"
         warnings.warn(
-            f"{over} of {len(prompts)} prompts exceeded the model's context window "
-            f"and were truncated to {max_tokens} tokens (truncation={policy!r}). Shorten the "
-            f"prompts, or raise vllm_engine(max_model_len=...), to avoid losing their {lost}.",
+            f"{over} of {len(prompts)} prompts exceeded {limit} "
+            f"and were truncated to {max_tokens} tokens ({setting.replace('...', repr(policy))})."
+            f" Shorten the prompts, or {remedy}, to avoid losing their {lost}.",
             UserWarning,
             stacklevel=3,
         )

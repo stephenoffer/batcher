@@ -17,11 +17,14 @@ read and the sink is what `generate` prefers.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher.ml.llm.channels import finish_reason_sink, usage_sink
 
-__all__ = ["Engine", "EngineFactory", "batched_engine", "unpack_request"]
+if TYPE_CHECKING:
+    from batcher.ml.llm.tokens import TokenBudget
+
+__all__ = ["Engine", "EngineFactory", "batched_engine", "request_id_of", "unpack_request"]
 
 Engine = Callable[[list[str]], Sequence[str]]
 """Maps a list of prompts to a list of generated strings (one per prompt, in order)."""
@@ -55,12 +58,26 @@ def unpack_request(request: Any, override_keys: Sequence[str]) -> tuple[str, Any
     return prompt, image, overrides
 
 
+def request_id_of(request: Any) -> str | None:
+    """The stable request id `ds.ml.generate(request_id_column=...)` attached, or `None`.
+
+    Carried on the request dict under ``"request_id"``. An engine whose provider honours a
+    client-supplied id sends it with the request; every attempt of that request, retries
+    included, sends the same one, because it is computed from the row rather than per call.
+    """
+    if isinstance(request, dict):
+        value = request.get("request_id")
+        return None if value is None else str(value)
+    return None
+
+
 def batched_engine(
     call_one: Callable[[Any], Any],
     pool: Any,
     concurrency: int,
     *,
     report: Callable[[list], None] | None = None,
+    token_budget: TokenBudget | None = None,
 ) -> Engine:
     """The batch loop every served-endpoint engine runs: overlap the calls, report, unpack.
 
@@ -76,6 +93,11 @@ def batched_engine(
     * **Every signal is reported.** Token usage and finish reason go to the per-call sinks
       in `llm.channels`, and `engine.last_usage` is still set for the documented legacy
       channel.
+    * **A token budget groups, it does not reorder.** With `token_budget` the batch is
+      split into consecutive groups whose prompt tokens fit the budget, and the groups are
+      sent one after another, each overlapped across the pool. Consecutive groups keep the
+      input order, so the order contract above holds unchanged. The tokenizer loads on the
+      first batch, on the worker.
 
     `report` is the hook for a signal only some providers return — OpenAI's per-token
     logprobs — so an engine that has one does not need its own copy of the loop to report
@@ -92,16 +114,30 @@ def batched_engine(
         concurrency: How many requests may be in flight; 1 runs inline.
         report: Called with the batch's results after the shared sinks, for a provider
             signal the shared loop does not know about.
+        token_budget: Group each batch so the prompt tokens in flight together stay under
+            a budget, cutting or refusing a prompt that exceeds it alone.
 
     Returns:
         An `Engine` over the prompts.
     """
 
-    def engine(prompts: list) -> list[str]:
+    budgeted: list = []
+
+    def send(prompts: list) -> list:
         if concurrency <= 1 or len(prompts) <= 1:
-            replies = [call_one(p) for p in prompts]
+            return [call_one(p) for p in prompts]
+        return list(pool.map(call_one, prompts))
+
+    def engine(prompts: list) -> list[str]:
+        if token_budget is None:
+            replies = send(prompts)
         else:
-            replies = list(pool.map(call_one, prompts))
+            if not budgeted:
+                from batcher.ml.llm.tokens import BudgetedBatches
+
+                budgeted.append(BudgetedBatches(token_budget))
+            prompts, groups = budgeted[0].plan(list(prompts))
+            replies = [r for group in groups for r in send([prompts[i] for i in group])]
         usage = [r.usage for r in replies]
         usage_sink().report(usage)
         finish_reason_sink().report([r.finish_reason for r in replies])

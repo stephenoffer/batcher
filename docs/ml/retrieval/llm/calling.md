@@ -29,6 +29,27 @@ print(bt.from_pydict({"q": ["hi"]}).ml.generate(shout, prompt_column="q").to_pyd
 # {'q': ['hi'], 'response': ['HI']}
 ```
 
+## Trace each request to its row
+
+`request_id_column=` gives every request a stable id and records it beside the output, so a remote call stays traceable to the row that produced it through retries and reconciliation. When the data already has a column of that name, its values are the ids. Otherwise each id is derived from what the row sends, a SHA-256 of the rendered prompt, its per-row overrides and its image, and appended. The derivation depends on nothing about the run, so a retried batch or a re-run job sends the same id for the same row. Two rows that send identical requests share an id, which is what an idempotency key means. Fold a source key into the hash with `request_id_key=` when they should differ.
+
+```python
+import batcher as bt
+
+echo = lambda: lambda requests: [r["prompt"].upper() for r in requests]
+ds = bt.from_pydict({"order": [7, 8], "q": ["refund?", "refund?"]})
+out = ds.ml.generate(echo, prompt_column="q", request_id_column="rid", request_id_key="order")
+rows = out.to_pydict()
+print(rows["response"], rows["rid"][0] != rows["rid"][1])
+# ['REFUND?', 'REFUND?'] True
+```
+
+`http_engine` sends the id in the `X-Client-Request-Id` header, the one OpenAI documents for a client-supplied request id, and every retry of the request carries the same value. Set `request_id_header="Idempotency-Key"` for a gateway that deduplicates on one. The other engines record the id without sending it. With ids on, each request reaches the engine as a `{"prompt": ..., "request_id": ...}` dict, so a hand-written engine must accept the dict form, as it must for any per-row column.
+
+:::{warning}
+The request-id header is not yet verified against a live OpenAI-compatible provider; see `tests/PENDING_VERIFICATION.md`. It is tested against a local HTTP server, retries included.
+:::
+
 ## Chat models need the chat template
 
 `vllm_engine(chat=True)` sends each row as a conversation through `LLM.chat`, so vLLM applies the model's own chat template. Set it for any instruction-tuned or chat model.
@@ -99,7 +120,7 @@ udf = llm_udf(
 answered = ds.map_batches(udf, num_gpus=1, concurrency=4)
 ```
 
-It takes the same row-level options as `llm_generate`: `template`, `image_column`, `adapter_column`, `max_tokens_column`, `temperature_column`, `few_shot`, `parse_json`, `usage`, `finish_reason`, `logprobs`, `dedup`, and `skip_null_prompts`. It doesn't take `num_workers` or `target_batch_rows`, because `map_batches` supplies the pool.
+It takes the same row-level options as `llm_generate`: `template`, `image_column`, `adapter_column`, `max_tokens_column`, `temperature_column`, `few_shot`, `parse_json`, `usage`, `finish_reason`, `logprobs`, `dedup`, `skip_null_prompts`, `request_id_column`, and `request_id_key`. It doesn't take `num_workers` or `target_batch_rows`, because `map_batches` supplies the pool.
 
 ## See also
 

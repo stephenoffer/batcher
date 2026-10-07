@@ -13,16 +13,21 @@ a malformed one.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher.ml.llm.channels import logprob_sink
 from batcher.ml.llm.engines.base import (
     Engine,
     EngineFactory,
     batched_engine,
+    request_id_of,
     unpack_request,
 )
-from batcher.ml.llm.engines.limits import _estimated_tokens, build_limiter
+from batcher.ml.llm.engines.limits import _estimated_tokens, admitted, build_limiter
+
+if TYPE_CHECKING:
+    from batcher.ml.llm.engines.limits import ProviderLimit
+    from batcher.ml.llm.tokens import TokenBudget
 
 __all__ = ["http_engine"]
 
@@ -51,6 +56,9 @@ def http_engine(
     concurrency: int = 8,
     requests_per_minute: float | None = None,
     tokens_per_minute: float | None = None,
+    shared_limit: ProviderLimit | None = None,
+    token_budget: TokenBudget | None = None,
+    request_id_header: str = "X-Client-Request-Id",
 ) -> EngineFactory:
     """An `EngineFactory` calling an OpenAI-compatible HTTP endpoint — a *served* model.
 
@@ -108,6 +116,19 @@ def http_engine(
             retrying a 429 only re-sends the burst that caused it.
         tokens_per_minute: client-side cap on tokens per minute, per worker, counting the
             prompt plus the reply the request reserved. Unset means unlimited.
+        shared_limit: a `ProviderLimit` every worker obeys together — one rate and
+            concurrency quota for the whole fleet rather than per worker. Composes with the
+            two per-worker caps above; a request waits for both.
+        token_budget: a `TokenBudget` grouping each batch so the prompt tokens in flight
+            together stay under a budget, counted with a real tokenizer. A prompt over the
+            whole budget is cut or refused by the budget's `oversized` policy.
+        request_id_header: the header a row's stable request id is sent in, when
+            ``ds.ml.generate(request_id_column=...)`` attached one. The default is the header
+            OpenAI documents for a client-supplied request id (ASCII, at most 512
+            characters), which it logs for tracing; set ``"Idempotency-Key"`` for a gateway
+            that deduplicates on one. Every retry of a request sends the same id. Nothing is
+            sent for a request without an id. Not yet verified against a live
+            OpenAI-compatible provider; see tests/PENDING_VERIFICATION.md.
 
     Returns:
         A zero-arg factory building the HTTP-backed `Engine` once per worker.
@@ -149,19 +170,21 @@ def http_engine(
                 request, ("max_tokens", "temperature", "stop")
             )
             body = _openai_body(model, prompt, chat, system, defaults, overrides, image)
-            if limiter is not None:
-                # Charged before the call, not after: waiting for capacity is what keeps the
-                # send rate at the quota. Retrying a 429 only re-sends the burst that caused it.
-                limiter.acquire(_estimated_tokens(prompt, body))
-            try:
-                # Retries with jittered backoff handle the 429 rate limits hosted APIs return.
-                resp = post_json(
-                    url, body, headers=headers, timeout=timeout, retries=retries, backoff=backoff
-                )
-            except Exception:
-                if on_error == "raise":
-                    raise
-                return _Result("", (None, None), None, None)
+            request_id = request_id_of(request)
+            sent = headers if request_id is None else {**headers, request_id_header: request_id}
+            # Admission is charged before the call, not after: waiting for capacity is what
+            # keeps the send rate at the quota. Retrying a 429 only re-sends the burst.
+            with admitted(limiter, shared_limit, lambda: _estimated_tokens(prompt, body)):
+                try:
+                    # Jittered retries handle the 429s hosted APIs return; each attempt carries
+                    # the same headers, so the same request id.
+                    resp = post_json(
+                        url, body, headers=sent, timeout=timeout, retries=retries, backoff=backoff
+                    )
+                except Exception:
+                    if on_error == "raise":
+                        raise
+                    return _Result("", (None, None), None, None)
             return _Result(
                 _openai_text(resp, chat),
                 _openai_usage(resp),
@@ -184,6 +207,7 @@ def http_engine(
             pool,
             concurrency,
             report=lambda results: logprob_sink().report([r.logprob for r in results]),
+            token_budget=token_budget,
         )
 
         # The pool lives as long as the worker, which is the point — but nothing was ever

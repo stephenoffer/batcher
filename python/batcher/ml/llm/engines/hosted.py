@@ -22,7 +22,7 @@ them by swapping one factory and nothing columnar changes.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from batcher.ml.llm.engines.base import (
     Engine,
@@ -30,7 +30,11 @@ from batcher.ml.llm.engines.base import (
     batched_engine,
     unpack_request,
 )
-from batcher.ml.llm.engines.limits import _estimated_tokens, build_limiter
+from batcher.ml.llm.engines.limits import _estimated_tokens, admitted, build_limiter
+
+if TYPE_CHECKING:
+    from batcher.ml.llm.engines.limits import ProviderLimit
+    from batcher.ml.llm.tokens import TokenBudget
 
 __all__ = ["bedrock_engine", "gemini_engine"]
 
@@ -77,6 +81,8 @@ def bedrock_engine(
     concurrency: int = 8,
     requests_per_minute: float | None = None,
     tokens_per_minute: float | None = None,
+    shared_limit: ProviderLimit | None = None,
+    token_budget: TokenBudget | None = None,
 ) -> EngineFactory:
     """An `EngineFactory` calling AWS Bedrock's Converse API (requires ``boto3``).
 
@@ -117,6 +123,10 @@ def bedrock_engine(
         concurrency: in-flight requests per batch. Set to 1 to serialize.
         requests_per_minute: client-side cap on requests per minute, **per worker**.
         tokens_per_minute: client-side cap on tokens per minute, per worker.
+        shared_limit: a `ProviderLimit` every worker obeys together, composing with the
+            per-worker caps above.
+        token_budget: a `TokenBudget` grouping each batch so the prompt tokens in flight
+            together stay under a budget.
 
     Returns:
         A zero-arg factory building the Bedrock-backed `Engine` once per worker.
@@ -160,14 +170,17 @@ def bedrock_engine(
                 overrides,
                 image,
             )
-            if limiter is not None:
-                limiter.acquire(_estimated_tokens(prompt, _limiter_view(body, prompt)))
-            try:
-                response = _converse_with_retry(client, body, retries)
-            except Exception:
-                if on_error == "raise":
-                    raise
-                return _Reply("", (None, None), None)
+            with admitted(
+                limiter,
+                shared_limit,
+                lambda: _estimated_tokens(prompt, _limiter_view(body, prompt)),
+            ):
+                try:
+                    response = _converse_with_retry(client, body, retries)
+                except Exception:
+                    if on_error == "raise":
+                        raise
+                    return _Reply("", (None, None), None)
             return _Reply(
                 _converse_text(response),
                 _converse_usage(response),
@@ -175,7 +188,7 @@ def bedrock_engine(
             )
 
         pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
-        engine = batched_engine(call_one, pool, concurrency)
+        engine = batched_engine(call_one, pool, concurrency, token_budget=token_budget)
         engine.close = lambda: pool.shutdown(wait=False)
         return engine
 
@@ -202,6 +215,8 @@ def gemini_engine(
     concurrency: int = 8,
     requests_per_minute: float | None = None,
     tokens_per_minute: float | None = None,
+    shared_limit: ProviderLimit | None = None,
+    token_budget: TokenBudget | None = None,
 ) -> EngineFactory:
     """An `EngineFactory` calling Google's Gemini ``generateContent`` API.
 
@@ -242,6 +257,10 @@ def gemini_engine(
         concurrency: in-flight requests per batch. Set to 1 to serialize.
         requests_per_minute: client-side cap on requests per minute, **per worker**.
         tokens_per_minute: client-side cap on tokens per minute, per worker.
+        shared_limit: a `ProviderLimit` every worker obeys together, composing with the
+            per-worker caps above.
+        token_budget: a `TokenBudget` grouping each batch so the prompt tokens in flight
+            together stay under a budget.
 
     Returns:
         A zero-arg factory building the Gemini-backed `Engine` once per worker.
@@ -283,22 +302,30 @@ def gemini_engine(
                 overrides,
                 image,
             )
-            if limiter is not None:
-                limiter.acquire(_estimated_tokens(prompt, _limiter_view(body, prompt)))
-            try:
-                response = post_json(
-                    url, body, headers=headers, timeout=timeout, retries=retries, backoff=backoff
-                )
-            except Exception:
-                if on_error == "raise":
-                    raise
-                return _Reply("", (None, None), None)
+            with admitted(
+                limiter,
+                shared_limit,
+                lambda: _estimated_tokens(prompt, _limiter_view(body, prompt)),
+            ):
+                try:
+                    response = post_json(
+                        url,
+                        body,
+                        headers=headers,
+                        timeout=timeout,
+                        retries=retries,
+                        backoff=backoff,
+                    )
+                except Exception:
+                    if on_error == "raise":
+                        raise
+                    return _Reply("", (None, None), None)
             return _Reply(
                 _gemini_text(response), _gemini_usage(response), _gemini_finish_reason(response)
             )
 
         pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
-        engine = batched_engine(call_one, pool, concurrency)
+        engine = batched_engine(call_one, pool, concurrency, token_budget=token_budget)
         engine.close = lambda: pool.shutdown(wait=False)
         return engine
 

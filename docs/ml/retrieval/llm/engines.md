@@ -153,7 +153,56 @@ engine = http_engine(
 )
 ```
 
-The limit is per worker on purpose: a fleet-wide limiter would put a synchronous round trip in front of every request. Divide the account quota by the number of workers and leave headroom, because a provider measures arrival at its edge, where two workers' bursts can coincide. Keep `retries` on as well. A limiter smooths your own send rate and can't see the other traffic on the account.
+That limit is per worker, so it costs nothing per request. Divide the account quota by the number of workers and leave headroom, because a provider measures arrival at its edge, where two workers' bursts can coincide. Keep `retries` on as well. A limiter smooths your own send rate and can't see the other traffic on the account.
+
+Dividing by a worker count stops working when nobody knows the count in advance: an autoscaling actor pool, several jobs on one account, or a provider that caps requests in flight rather than per minute. For those, pass a {py:class}`ProviderLimit <batcher.ml.ProviderLimit>` as `shared_limit=`. Every worker naming the same limit draws from one bucket and one pool of concurrency slots. On a Ray cluster the quota lives in a named, detached actor that every worker and every job naming it reaches, for one small actor round trip per request. Without Ray it is shared by the threads of the process. Both limits can be set at once, and a request waits for both.
+
+```python
+import batcher as bt
+
+quota = bt.ml.ProviderLimit("example-account", requests_per_minute=600, max_concurrency=32)
+with quota.lease(estimated_tokens=100) as waited:
+    print(waited)  # a custom client can hold the same quota around its own call
+quota.close()
+# 0.0
+```
+
+```python
+# docs: skip
+engine = bt.ml.http_engine(
+    "https://api.example.com/v1", "some-model", concurrency=16, shared_limit=quota
+)
+out = ds.ml.generate(engine, prompt_column="text").collect(distributed=True, num_workers=8)
+```
+
+The actor outlives the job on purpose, so concurrent jobs share it. Call `quota.close()` when the quota is no longer wanted. A slot that a crashed worker never returned comes back after `lease_seconds`.
+
+:::{warning}
+The cluster path of `ProviderLimit` is not yet verified on a live multi-node Ray cluster; see `tests/PENDING_VERIFICATION.md`. The single-process path and the quota policy are tested.
+:::
+
+(llm-engine-token-budget)=
+### Keeping a batch inside a token budget
+
+A served engine sends a batch's requests concurrently. On ragged text that is 64 short prompts one moment and 64 long documents the next, and a server's KV cache or a gateway's tokens-in-flight ceiling only sees the second. Pass a {py:class}`TokenBudget <batcher.ml.TokenBudget>` as `token_budget=` to `http_engine`, `anthropic_engine`, `bedrock_engine` or `gemini_engine`, and the engine splits each batch into consecutive groups whose prompt tokens stay under `max_batch_tokens`, sending one group at a time. The grouping happens inside the engine's own request loop, so nothing outside it second-guesses what the engine sends.
+
+The counts come from a real tokenizer, through the same code {py:meth}`ds.ml.token_count <batcher.api.dataset.ml.DatasetML.token_count>` uses, under the same `add_special_tokens` policy. `padding="longest"` charges a group its longest prompt times its size, for a server that pads every sequence in a step. A prompt larger than the whole budget follows `oversized`: `"head"` keeps its first tokens, `"tail"` its last, and `"error"` raises before anything is sent, the same vocabulary as `vllm_engine(truncation=...)`.
+
+```python
+import batcher as bt
+
+budget = bt.ml.TokenBudget(str.split, max_batch_tokens=8)
+print(budget.groups([5, 3, 4, 4, 1]))
+# [[0, 1], [2, 3], [4]]
+```
+
+```python
+# docs: skip
+budget = bt.ml.TokenBudget("meta-llama/Llama-3.1-8B-Instruct", max_batch_tokens=32_000)
+engine = bt.ml.http_engine("http://vllm:8000/v1", "llama", concurrency=64, token_budget=budget)
+```
+
+`vllm_engine` takes no `TokenBudget`, because vLLM already schedules by tokens. Its own budget is the `max_num_batched_tokens` engine argument, which passes straight through `engine_kwargs`.
 
 ## Throughput
 

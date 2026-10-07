@@ -5701,7 +5701,14 @@ class Dataset:
             for alias, origins in lineage.items()
         }
 
-    def explain(self, analyze: bool = False, *, format: str = "text", backend: str = "cpu") -> str:
+    def explain(
+        self,
+        analyze: bool = False,
+        *,
+        format: str = "text",
+        backend: str = "cpu",
+        requirements: bool = False,
+    ) -> str:
         """Return the query plan as a tree, optionally with measured execution profile.
 
         With ``analyze=False`` (the default) it renders the *planned* operator tree —
@@ -5723,12 +5730,27 @@ class Dataset:
         runs on a device still depends on a visible GPU and, under ``"auto"``, the cost
         policy.
 
+        ``requirements=True`` adds a preflight of what the plan's **remote workers** need,
+        so a missing module is found before a cluster scales up or a model loads. Every UDF
+        stage (`map_batches`, `map`, `flat_map`, `filter(fn)`, and the ``ds.ml`` model
+        stages built on them) is serialized here exactly as a worker would receive it, and
+        the report lists its installed packages with versions, any *local* module (a file
+        no installed package provides, which a worker has only if it is shipped), and its
+        serialized size. The status is ``error`` for a stage that cannot be serialized,
+        ``warn`` for an unshipped local module, a module the driver cannot import, or a
+        closure carrying data, and ``ok`` otherwise. The text form ends with a
+        ``worker requirements`` section; the JSON form gains a ``"requirements"`` object.
+        Nothing runs: whether the workers' images carry those packages is still the
+        cluster's to answer. Not yet verified against a failing run on a live Ray cluster;
+        see tests/PENDING_VERIFICATION.md.
+
         Args:
             analyze: Execute the query and include measured per-operator metrics.
             format: ``"text"`` (or its alias ``"tree"``, as Polars and Spark spell it)
                 for the rendered tree, ``"json"`` for the profile as a JSON string.
             backend: ``"cpu"`` (default) for the plan alone, or ``"gpu"`` (or ``"auto"``)
                 to add the device-tier verdict.
+            requirements: Add the worker-requirements preflight described above.
 
         Returns:
             The plan (and, when ``analyze``, the measured profile) as a text tree or a
@@ -5745,16 +5767,22 @@ class Dataset:
                 True
                 >>> ds.filter(bt.col("x") > 1).explain(backend="gpu").splitlines()[-1]
                 "device tier (backend='gpu'): eligible"
+                >>> ds.map_batches(lambda b: b).explain(requirements=True).splitlines()[-2]
+                'worker requirements: ok'
         """
         if backend not in ("cpu", "gpu", "auto"):
             raise PlanError(f"explain(backend=...) must be 'cpu', 'gpu' or 'auto', got {backend!r}")
         fmt = "text" if format == "tree" else format
         rendered = _explain(self._plan, self._sources, self.columns, analyze=analyze, fmt=fmt)
-        if backend == "cpu":
-            return rendered
-        from batcher.api.terminal.gpu_backend.eligibility import annotate_explain
+        if backend != "cpu":
+            from batcher.api.terminal.gpu_backend.eligibility import annotate_explain
 
-        return annotate_explain(rendered, self._plan, self._sources, fmt)
+            rendered = annotate_explain(rendered, self._plan, self._sources, fmt)
+        if requirements:
+            from batcher.api.terminal.requirements import annotate_requirements
+
+            rendered = annotate_requirements(rendered, self._plan, fmt)
+        return rendered
 
     def stats(self) -> RunStats:
         """Execute the query and return its measured per-operator `RunStats`.

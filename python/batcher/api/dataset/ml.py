@@ -279,6 +279,29 @@ def _require_llm_columns(
         _require_column(ds, image_column, param=f"{method}(image_column=)")
 
 
+def _require_request_id_columns(
+    ds: Dataset, column: str | None, key: str | list[str] | None
+) -> None:
+    """Refuse request-id options that name missing columns or mix supplied and derived ids.
+
+    Raises:
+        PlanError: If a `key` column is missing, or `key` is set while `column` already
+            exists (supplied ids are used verbatim, so a key would be silently ignored).
+    """
+    if column is None or key is None:
+        return
+    from batcher._internal.errors import PlanError
+
+    keys = [key] if isinstance(key, str) else list(key)
+    _require_columns(ds, keys, param="request_id_key")
+    if column in ds.columns:
+        raise PlanError(
+            f"generate(request_id_column={column!r}) names an existing column, whose values "
+            "are used as the ids verbatim, so request_id_key would be ignored. Drop "
+            "request_id_key, or name a new column to derive the ids into."
+        )
+
+
 def _require_columns(ds: Dataset, columns: list[str] | None, *, param: str) -> None:
     """`_require_column` for a whole selection, checked eagerly and left alone when ``None``.
 
@@ -2226,6 +2249,8 @@ class DatasetML:
         logprobs: bool = False,
         dedup: bool = False,
         skip_null_prompts: bool = False,
+        request_id_column: str | None = None,
+        request_id_key: str | list[str] | None = None,
         batch_size: int | None = None,
         num_gpus: float = 0.0,
         concurrency: int | tuple[int, int] | None = None,
@@ -2290,6 +2315,17 @@ class DatasetML:
                 turn it on to stop spending a decode slot (GPU engine) or a billed request
                 (hosted engine) on a row that has no prompt. Ignored when `template` or
                 `image_column` is set.
+            request_id_column: Give every request a stable id and record it in this column,
+                so a remote call stays traceable to its source row. A column of this name in
+                the data supplies the ids; otherwise each is derived from the row's request
+                content (a SHA-256 of the prompt, per-row overrides and image, plus any
+                `request_id_key` columns) and appended. A retried request resends the same id.
+                `http_engine` sends it as a header; engines that take no client id record it
+                only. Requests become ``{"prompt": ..., "request_id": ...}`` dicts, so a
+                custom engine must accept the dict form.
+            request_id_key: Column(s) folded into a derived id, such as a source primary key,
+                so two rows sending identical requests get distinct ids. Not allowed when
+                the ids are supplied by an existing column.
             batch_size: Rebatch before each engine call; leave unset for the engine's own.
             num_gpus: GPUs to reserve per worker.
             concurrency: Size of the distributed actor pool.
@@ -2320,6 +2356,7 @@ class DatasetML:
             template=template,
             image_column=image_column,
         )
+        _require_request_id_columns(self._ds, request_id_column, request_id_key)
         from batcher.ml.llm import llm_udf
 
         udf = llm_udf(
@@ -2339,6 +2376,8 @@ class DatasetML:
             logprobs=logprobs,
             dedup=dedup,
             skip_null_prompts=skip_null_prompts,
+            request_id_column=request_id_column,
+            request_id_key=request_id_key,
         )
         # Order must match GenerateSpec.appended_columns: output, raw, usage, finish_reason,
         # logprob.
@@ -2348,6 +2387,7 @@ class DatasetML:
             *(["prompt_tokens", "completion_tokens"] if usage else []),
             *(["finish_reason"] if finish_reason else []),
             *(["logprob"] if logprobs else []),
+            *([request_id_column] if request_id_column is not None else []),
         ]
         new = [c for c in appended if c not in self._ds.columns]
         return self._ds.map_batches(
@@ -2363,6 +2403,71 @@ class DatasetML:
             max_retries=max_retries,
             retry_backoff=retry_backoff,
             retry_on=retry_on,
+        )
+
+    def token_count(
+        self,
+        column: str,
+        *,
+        tokenizer: object,
+        output_column: str | None = None,
+        add_special_tokens: bool | None = None,
+        batch_size: int | None = None,
+        concurrency: int | tuple[int, int] | None = None,
+    ) -> Dataset:
+        """Append each text's exact token count under a real tokenizer.
+
+        The estimates elsewhere (`truncate_to_token_budget`, `filter_by_token_budget`) divide
+        characters by a constant, which needs no model and is deliberately approximate. This
+        is the exact count, from the tokenizer the model uses, for when the approximation is
+        not close enough: filter on the column before generation, and nothing reaches the
+        model that does not fit.
+
+        The tokenizer loads **once per worker** and each Arrow batch is one tokenizer call,
+        the batched path a HuggingFace fast tokenizer runs in Rust. Counting goes through
+        the same code `TokenBudget` uses to group engine requests, under the same
+        `add_special_tokens` policy, so a row this kept is counted the same way there.
+
+        Args:
+            column: The text column to count. A null text stays null.
+            tokenizer: A HuggingFace model id or local path (loaded on each worker with
+                ``transformers.AutoTokenizer``), a tokenizer object with ``.encode``, or a
+                ``str -> list`` callable.
+            output_column: The appended ``int64`` column; defaults to ``"<column>_tokens"``.
+            add_special_tokens: Whether counts include the tokenizer's special tokens (BOS,
+                EOS, ``[CLS]``). `None` keeps the tokenizer's own default.
+            batch_size: Rebatch before each tokenizer call; unset keeps the batches as they
+                arrive.
+            concurrency: Size of the distributed actor pool.
+
+        Returns:
+            A new `Dataset` with the count column appended.
+
+        Raises:
+            PlanError: If `column` is missing or not text, or `tokenizer` is not usable.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"t": ["a b c", None, "d"]})
+                >>> ds.ml.token_count("t", tokenizer=str.split).to_pydict()
+                {'t': ['a b c', None, 'd'], 't_tokens': [3, None, 1]}
+        """
+        from batcher.ml.llm.tokens import check_tokenizer_spec, token_count_udf
+
+        _require_text_column(self._ds, column, method="token_count")
+        check_tokenizer_spec(tokenizer, method="ds.ml.token_count")
+        output = output_column or f"{column}_tokens"
+        udf = token_count_udf(
+            column, tokenizer, output_column=output, add_special_tokens=add_special_tokens
+        )
+        new = [] if output in self._ds.columns else [output]
+        return self._ds.map_batches(
+            udf,
+            output_columns=[*self._ds.columns, *new] if new else None,
+            batch_size=batch_size,
+            concurrency=concurrency,
         )
 
     def extract(
