@@ -26,9 +26,13 @@ from batcher.io.formats.sql.uri import quote_identifier
 __all__ = [
     "apply_predicate",
     "apply_projection",
+    "bound_params",
     "connection_fingerprint",
     "count_query",
+    "execute_bound",
     "identifier_quoter",
+    "params_suffix",
+    "percent_escaped",
     "probe_is_typed",
     "push_down",
     "pushed_sql",
@@ -414,3 +418,86 @@ def _ordered(
 def _capped(sql: str, limit: int | None) -> str:
     """`sql` with a trailing row cap, when the plan asked for one."""
     return sql if limit is None else f"{sql} LIMIT {int(limit)}"
+
+
+def bound_params(params: Any, *, query: str | None) -> tuple[Any, ...] | dict[str, Any] | None:
+    """`params` normalized to what a split carries: a tuple, a dict, or None.
+
+    Bound parameters are the driver's own placeholders (``?``, ``%s``, ``:name``,
+    ``$1``), passed to ``cursor.execute(sql, params)`` exactly as written, so a value never
+    has to be spliced into the SQL text. Normalized to a tuple or a dict so the split stays
+    picklable and its identity stable.
+
+    Args:
+        params: A sequence (positional placeholders), a mapping (named placeholders), or
+            None.
+        query: The read's query. A ``table=`` read has no placeholders to bind.
+
+    Returns:
+        The parameters to bind, or None when there are none.
+
+    Raises:
+        BackendError: When `params` is set on a ``table=`` read, or is a bare string.
+    """
+    from batcher._internal.errors import BackendError
+
+    if params is None:
+        return None
+    if query is None:
+        raise BackendError(
+            "params= binds the placeholders of query=; a table= read has none. Pass the "
+            "SQL as query= with its placeholders, or drop params=."
+        )
+    if isinstance(params, Mapping):
+        return dict(params)
+    if isinstance(params, (str, bytes)):
+        raise BackendError(
+            f"params= must be a sequence or a mapping of values, got {type(params).__name__}: "
+            "a string would bind one placeholder per character. Wrap it: params=[value]."
+        )
+    return tuple(params)
+
+
+def params_suffix(params: tuple[Any, ...] | dict[str, Any] | None) -> str:
+    """An identity suffix for bound parameters, empty when there are none.
+
+    Two reads differing only in their parameters are two relations, so they must not
+    share learned statistics or a scan-cache entry. Hashed rather than spelled, so a bound
+    value never appears in an identity string or a log line.
+    """
+    if params is None:
+        return ""
+    digest = hashlib.sha256(repr(params).encode()).hexdigest()[:16]
+    return f":params={digest}"
+
+
+def execute_bound(cursor: Any, sql: str, params: tuple[Any, ...] | dict[str, Any] | None) -> None:
+    """``cursor.execute(sql)``, with `params` bound when there are any.
+
+    The one-argument form when there are none, because some drivers treat an empty
+    parameter sequence as "parse placeholders" and choke on a literal ``%`` or ``?``.
+    """
+    if params is None:
+        cursor.execute(sql)
+    else:
+        cursor.execute(sql, params)
+
+
+def percent_escaped(query: str, render: Callable[[str], str]) -> str:
+    """`render(query)` with every ``%`` the rendering added doubled, and `query` verbatim.
+
+    Under a ``format``/``pyformat`` driver a statement executed *with* parameters treats
+    ``%`` as the start of a placeholder, so a pushed ``LIKE 'a%'`` literal must reach the
+    server as ``'a%%'`` or the driver raises (or binds a value into it). The caller's own
+    query is theirs and is already written for their driver, so only what pushdown wrapped
+    around it is escaped.
+
+    Args:
+        query: The caller's SQL, passed through untouched.
+        render: Builds the full statement around the SQL it is given.
+
+    Returns:
+        The statement to execute.
+    """
+    sentinel = "\x00batcher-query\x00"
+    return render(sentinel).replace("%", "%%").replace(sentinel, query)

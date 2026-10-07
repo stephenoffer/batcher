@@ -367,6 +367,14 @@ and nothing else would tell you.
 ds = bt.read.parquet("s3://bucket/upstream-export/", require_success=True)
 ```
 
+The `WriteManifest` a write returns also says where it landed and, for a table, which version it created. `destination` is the path or table identifier written to. `version` is the Delta log version or the Iceberg snapshot id the commit created, taken from the commit itself rather than re-read afterwards, so a concurrent writer's later commit is never reported as this one. A file write has no versions, so its `version` is `None`.
+
+```python
+manifest = bt.from_pydict({"x": [1, 2, 3]}).write.parquet(os.path.join(tempfile.mkdtemp(), "v"))
+print(manifest.total_rows, manifest.version)
+# 3 None
+```
+
 ## Compact small files
 
 Incremental or streaming writes leave many tiny part files, which slow later reads. This
@@ -471,7 +479,7 @@ print(bt.read.parquet(sorted_dir).to_pydict()["price"])
 workers to preemption re-runs only the shards that never finished, and leaves the files
 that did. Resume identifies finished work by file position, so it is exactly-once only
 for a deterministic plan. See {py:obj}`ds.write <batcher.Dataset.write>` for the
-precondition in full.
+precondition in full. It applies to the file sinks only: a Delta or Iceberg write is one atomic commit, so `resume=True` there raises `PlanError` rather than commit the rows twice.
 
 ## See also
 

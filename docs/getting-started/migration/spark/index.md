@@ -64,7 +64,7 @@ The following table lists the pages in this section with the number of names eac
 | {doc}`expressions` | 36 | 27 | 2 | 4 | 3 | 0 |
 | {doc}`functions-aggregates` | 135 | 49 | 13 | 5 | 68 | 0 |
 | {doc}`functions-collections` | 90 | 26 | 13 | 5 | 46 | 0 |
-| {doc}`functions-math-and-misc` | 133 | 75 | 14 | 8 | 28 | 8 |
+| {doc}`functions-math-and-misc` | 133 | 75 | 14 | 9 | 27 | 8 |
 | {doc}`functions-strings` | 93 | 53 | 7 | 17 | 16 | 0 |
 | {doc}`functions-temporal` | 88 | 39 | 11 | 9 | 29 | 0 |
 | {doc}`io` | 70 | 34 | 14 | 17 | 5 | 0 |

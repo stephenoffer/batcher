@@ -61,6 +61,16 @@ def hive_segment(name: str) -> tuple[str, str] | None:
     return (col, val) if col else None
 
 
+#: What to do with file *content* rather than a path. Readers are built on path splits so
+#: a read can be distributed, and a buffer exists only in this process, so the idiom is to
+#: parse it with pyarrow and hand Batcher the Arrow table.
+_BUFFER_HINT = (
+    "If this is file content rather than a path, parse it with pyarrow and wrap the table: "
+    "bt.from_arrow(pyarrow.csv.read_csv(buf)), or pyarrow.parquet.read_table(buf) / "
+    "pyarrow.json.read_json(buf)."
+)
+
+
 def normalize_path(path: Any, *, what: str = "path") -> str:
     """Coerce one path-like value to the plain `str` URI the IO layer works in.
 
@@ -98,7 +108,12 @@ def normalize_path(path: Any, *, what: str = "path") -> str:
     elif isinstance(path, bytes):
         raise _IOError(
             f"{what} must be a str or os.PathLike, not bytes. Decode it first "
-            "(path.decode()) so the URI scheme is unambiguous."
+            "(path.decode()) so the URI scheme is unambiguous. " + _BUFFER_HINT
+        )
+    elif isinstance(path, (bytearray, memoryview)) or callable(getattr(path, "read", None)):
+        raise _IOError(
+            f"{what} must be a str, pathlib.Path, or os.PathLike, got "
+            f"{type(path).__name__}, an in-memory buffer. " + _BUFFER_HINT
         )
     else:
         raise _IOError(

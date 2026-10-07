@@ -334,7 +334,7 @@ class DeltaSink:
         """
         return already_committed(path, self._app_txn, self._storage_options)
 
-    def commit(self, manifest: WriteManifest, path: str) -> None:
+    def commit(self, manifest: WriteManifest, path: str) -> int | None:
         """Register the written data files as one atomic Delta transaction.
 
         Metadata only: the files are already in place, so this writes a single commit
@@ -342,17 +342,19 @@ class DeltaSink:
         `CommitError` on a concurrent-writer conflict. When an `app_id`/`txn_version`
         pair was configured and that transaction is already in the log, the commit is
         skipped and the replayed micro-batch does not duplicate its rows.
+
+        Returns the table version the commit created, which the writer reports as
+        `WriteManifest.version`, or None when nothing was committed.
         """
         if self._merge_predicate is not None:
-            self._commit_merge(manifest, path)
-            return
+            return self._commit_merge(manifest, path)
         if already_committed(path, self._app_txn, self._storage_options):
-            return
+            return None
         mode, filters = self._overwrite_scope(path)
         replaced = None
         if mode == "replace_partitions":
             mode, filters, replaced = "overwrite", None, self._replaced_partitions
-        commit_add_actions(
+        return commit_add_actions(
             manifest,
             path,
             mode=mode,
@@ -438,7 +440,7 @@ class DeltaSink:
         self._table_parts[path] = found
         return found
 
-    def _commit_merge(self, manifest: WriteManifest, path: str) -> None:
+    def _commit_merge(self, manifest: WriteManifest, path: str) -> int | None:
         """Upsert the written files' rows into the table via `DeltaTable.merge`.
 
         Unlike an append, a merge rewrites the data files it matches, so it has to read
@@ -451,7 +453,7 @@ class DeltaSink:
         deltalake = require_deltalake()
         paths = [f.path for f in manifest.files if f.rows]
         if not paths:
-            return
+            return None
         fs = resolve_filesystem(path)
         # Each handle is closed as its file is read. `pq.read_table(fs.open(p))` inside a
         # comprehension never closes any of them: the change set is one file per shard, so
@@ -476,6 +478,7 @@ class DeltaSink:
         for p in paths:  # the merge landed the rows; these files were only the change set
             with contextlib.suppress(OSError, ValueError, NotImplementedError):
                 fs.remove(p)
+        return table.version()  # the merging handle's own state, not a racy re-read
 
 
 def _read_change_file(fs: Any, path: str) -> pa.Table:

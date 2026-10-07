@@ -25,7 +25,7 @@ answer, and picking one quietly parses the file wrong.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from batcher._internal.errors import FormatError, unknown_value
 
@@ -33,6 +33,8 @@ __all__ = [
     "BASE_SINK_OPTIONS",
     "BASE_SOURCE_ALIASES",
     "BASE_SOURCE_OPTIONS",
+    "READ_CALL_OPTIONS",
+    "BaseReadOptions",
     "OptionSpec",
     "split_base_options",
 ]
@@ -63,6 +65,34 @@ BASE_SOURCE_ALIASES: dict[str, str] = {
     "nrows": "n_rows",
     "num_rows": "n_rows",
 }
+
+
+#: Keywords the generic read call consumes before any source sees them (`api.session.read`):
+#: they belong to every file reader's vocabulary, so the static types list them too.
+READ_CALL_OPTIONS: tuple[str, ...] = ("include_path", "require_success")
+
+
+class BaseReadOptions(TypedDict, total=False):
+    """The keywords every file reader takes, typed for a static checker.
+
+    The runtime vocabulary is the `OptionSpec` each format declares, and an unknown keyword
+    already fails there with a suggestion. This is the same vocabulary for an editor and a
+    type checker, and `tests/unit/test_reader_option_types.py` holds the two equal, aliases
+    included, since a migrating script uses them.
+    """
+
+    columns: list[str]
+    files: list[str]
+    filesystem: object
+    n_rows: int
+    on_error: Literal["raise", "skip"]
+    schema_mode: Literal["strict", "union", "latest"]
+    storage_options: dict[str, str]
+    usecols: list[str]
+    nrows: int
+    num_rows: int
+    include_path: bool | str
+    require_success: bool
 
 
 class OptionSpec:

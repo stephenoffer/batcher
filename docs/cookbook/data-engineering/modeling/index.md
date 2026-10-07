@@ -7,6 +7,7 @@ These recipes cover turning what arrived into tables people can query: combining
 | {doc}`Multi-source join <multi-source-join>` | Facts in Parquet, a dimension in a CSV, and a lookup in a database |
 | {doc}`Schema evolution <schema-evolution>` | An upstream column appears, disappears, or changes type |
 | {doc}`Slowly changing dimensions <slowly-changing-dimensions>` | Keeping the old row when an attribute changes, rather than overwriting it |
+| {doc}`Debezium change data capture <debezium-cdc>` | A database's inserts, updates and deletes arriving as Debezium JSON envelopes |
 
 ## See also
 
@@ -19,4 +20,5 @@ These recipes cover turning what arrived into tables people can query: combining
 multi-source-join
 schema-evolution
 slowly-changing-dimensions
+debezium-cdc
 ```

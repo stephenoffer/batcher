@@ -268,6 +268,8 @@ replay of a feed containing deletes as a rebuild, not a resume. Delta Live Table
 type 1 has the same shape and the same caveat.
 :::
 
+A Debezium feed carries each change as a JSON envelope rather than as flat columns. {doc}`/cookbook/data-engineering/modeling/debezium-cdc` decodes one and applies it with the same call.
+
 ## Iceberg and Hudi
 
 Iceberg uses the same `read`/`write` surface, addressed by catalog identifier with
@@ -293,6 +295,21 @@ import batcher as bt
 
 events = bt.read.hudi("s3://lake/hudi/events")
 ```
+
+The three formats don't offer the same operations, and the gaps are deliberate refusals rather than silent fallbacks: each "no" below raises an error that names the reason. The following table lists what each format supports here.
+
+| Capability | Delta | Iceberg | Hudi |
+|---|---|---|---|
+| Read | Yes | Yes | Yes, snapshot reads |
+| Time travel | `version=` or `timestamp=` | `snapshot_id=` | `as_of_instant=` |
+| Append and overwrite | Yes, one commit | Yes, one snapshot | No: `write.hudi` raises |
+| `replace_where` | Retires the matching partitions in one commit | Deletes the matching rows and adds the new ones in one transaction | No |
+| MERGE | Full `merge_into`, with conditions, deletes and column subsets | Upsert only: no clause conditions, no deletes, all columns | No |
+| Change feed read | `read.read_change_feed` | No | No |
+| Streaming write | Exactly-once, through the log's `txn` action | Exactly-once, through a marker in the snapshot summary | No |
+| Distributed streaming write | Yes | No: refused, so a replayed micro-batch can't duplicate rows | No |
+| Compaction | `bt.compact`, including Z-order | No: needs Spark's `rewrite_data_files` | No |
+| Vacuum | `bt.vacuum` removes unreferenced files | `bt.vacuum` expires old snapshots | No |
 
 ## File skipping from the log
 

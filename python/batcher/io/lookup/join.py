@@ -80,6 +80,7 @@ class LookupEnricher:
         prefix: str = "",
         cache_size: int = 100_000,
         cache_ttl_seconds: float | None = None,
+        indicator: str | None = None,
     ) -> None:
         """Build the enricher and open its store.
 
@@ -96,6 +97,9 @@ class LookupEnricher:
             cache_size: Entries the per-worker cache holds; `0` disables it.
             cache_ttl_seconds: How long an entry stays usable. This is the join's freshness
                 bound.
+            indicator: Name of a boolean column marking the rows whose key the store held,
+                or None to add none. It reads the matched mask the join already builds, so
+                it costs one column, not a lookup.
 
         Raises:
             PlanError: If `how` is not ``"left"`` or ``"inner"``.
@@ -114,6 +118,7 @@ class LookupEnricher:
         self._on = on
         self._how = how
         self._prefix = prefix
+        self._indicator = indicator
         self._cache = LookupCache(cache_size, cache_ttl_seconds)
 
     def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
@@ -139,16 +144,18 @@ class LookupEnricher:
         keys = _as_strings(batch.column(batch.schema.get_field_index(self._on)))
         resolved = self._cache.resolve(_distinct_keys(keys), self._lookup.multi_get)
         schema = self._lookup.value_schema()
+        import pyarrow.compute as pc
+
         added, matched = lookup_arrays(keys, resolved, schema)
+        # A null key gathers a null from the mask; it is a miss, never "unknown".
+        found = pc.fill_null(matched, False)
         names = [self._prefix + field.name for field in schema]
+        if self._indicator is not None:
+            added, names = [*added, found], [*names, self._indicator]
         out = pa.RecordBatch.from_arrays(
             list(batch.columns) + added, names=list(batch.schema.names) + names
         )
-        if self._how == "left":
-            return out
-        import pyarrow.compute as pc
-
-        return out.filter(pc.fill_null(matched, False))
+        return out if self._how == "left" else out.filter(found)
 
     def stats(self) -> dict[str, int | float]:
         """This worker's cache effectiveness — see `LookupCache.stats`.

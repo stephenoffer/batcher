@@ -212,8 +212,11 @@ class Sink(Protocol):
         """
         ...
 
-    def commit(self, manifest: WriteManifest, path: str) -> None:
+    def commit(self, manifest: WriteManifest, path: str) -> int | None:
         """Finalize a write from the manifest every shard contributed to.
+
+        A transactional sink returns the table version its commit created, which the
+        writer reports as `WriteManifest.version`; a file sink returns None.
 
         Examples:
             .. doctest::
@@ -224,5 +227,8 @@ class Sink(Protocol):
         Args:
             manifest: Every file the write produced, merged across shards.
             path: The write's destination root.
+
+        Returns:
+            The committed table version, or None for a sink without versions.
         """
         ...

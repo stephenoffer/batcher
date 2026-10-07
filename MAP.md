@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1568 Python modules across 221 packages and 328 Rust files across 14 crates.
+Covering 1569 Python modules across 221 packages and 328 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -219,7 +219,7 @@ The `Dataset` builder package.
 | `_options.py` | 61 | Check a forwarded bag of `map_batches` options before it is forwarded. |
 | `_window.py` | 227 | Lowering of window expressions into the relational `Window` operator. |
 | `callbacks.py` | 647 | Callback adapters and the ``@udf`` decorator for the callback transforms. |
-| `frame.py` | 7139 | `Dataset` — the lazy, immutable, fluent entry point. |
+| `frame.py` | 7147 | `Dataset` — the lazy, immutable, fluent entry point. |
 | `ml.py` | 2867 | The `Dataset.ml` namespace — batch inference / embedding / model UDFs. |
 | `scd.py` | 422 | The `Dataset.scd` namespace — dimension maintenance from snapshots and change feeds. |
 
@@ -320,8 +320,8 @@ The unified read/write namespace — `bt.read` (readers) and `ds.write` (sinks).
 |---|---|---|
 | `_discovery.py` | 244 | Discoverability machinery shared by the `bt.read` and `ds.write` namespaces. |
 | `_write_opts.py` | 338 | The save-mode and keyword vocabulary `ds.write` accepts, normalized in one place. |
-| `reader.py` | 1872 | The `bt.read` namespace — typed, per-format dataset readers. |
-| `writer.py` | 2282 | The `ds.write` namespace — typed, per-format dataset sinks. |
+| `reader.py` | 1949 | The `bt.read` namespace — typed, per-format dataset readers. |
+| `writer.py` | 2477 | The `ds.write` namespace — typed, per-format dataset sinks. |
 
 ### `batcher/api/merge/` — 5 · conductor
 
@@ -383,9 +383,9 @@ Session entry points that create `Dataset`s.
 | `frameworks.py` | 492 | Framework-interop constructors: a foreign object to a lazy `Dataset`. |
 | `generate.py` | 245 | Row generators: `range` and `date_range`. |
 | `onboarding.py` | 149 | Top-level `bt.<name>` migration guidance: the traceback as the documentation. |
-| `read.py` | 133 | The generic read dispatch behind the `bt.read` namespace. |
+| `read.py` | 141 | The generic read dispatch behind the `bt.read` namespace. |
 | `sql.py` | 292 | The default session: `bt.sql`, `bt.register_function`, `bt.register_model` and its accessors. |
-| `versions.py` | 125 | Version and environment reporting (`engine_version`, `show_versions`). |
+| `versions.py` | 158 | Version and environment reporting (`engine_version`, `show_versions`). |
 
 ### `batcher/api/session/accelerators/` — 5 · conductor
 
@@ -432,14 +432,14 @@ Terminal/materialization operations for `Dataset` — package façade.
 |---|---|---|
 | `_metadata.py` | 736 | Post-execution column-statistics learning (Core measures, Kyber persists). |
 | `blob_offload.py` | 121 | Automatic blob offload placement around pipeline breakers. |
-| `core.py` | 1520 | Terminal/materialization operations for `Dataset`. |
+| `core.py` | 1523 | Terminal/materialization operations for `Dataset`. |
 | `distributed_stream.py` | 132 | Distributed streaming terminals — pull a distributed result back in bounded memory. |
 | `event_log.py` | 829 | Per-query event log — one JSON document per query (Spark's event-log analog). |
 | `lineage.py` | 505 | Emit a query's column-level lineage as an OpenLineage run event. |
 | `map_stream.py` | 190 | Windowed streaming helpers for `map_batches` (UDF) pipelines. |
 | `otel.py` | 215 | Emit a query's execution profile as OpenTelemetry spans. |
 | `preview.py` | 186 | Render a small result as a readable table for `Dataset.show`. |
-| `profile.py` | 654 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
+| `profile.py` | 683 | Profiled terminal execution — the `explain(analyze=True)` / `stats()` engine. |
 | `routing.py` | 369 | The `distributed="auto"` routing decision for terminal operations. |
 
 ### `batcher/api/terminal/gpu_backend/` — 5 · conductor
@@ -1867,12 +1867,12 @@ Credential verification: turning a presented credential into a verified `Princip
 | `_file_cache.py` | 352 | Local-SSD read-through file cache (the Disk-Cache analog) for remote reads. |
 | `catalog.py` | 131 | Unified lakehouse catalog resolver. |
 | `credentials.py` | 353 | Credential resolution for connectors, plus Databricks Unity Catalog vending. |
-| `detect.py` | 467 | Format and layout detection for the generic `read(path, format=None)` entry point. |
+| `detect.py` | 496 | Format and layout detection for the generic `read(path, format=None)` entry point. |
 | `filesystem.py` | 720 | Filesystem resolution for IO sources and sinks — one cloud-agnostic backend. |
 | `interop.py` | 710 | Framework-interop ingestion — build a `Source` from a foreign object. |
-| `manifest.py` | 148 | Write results — the manifest a sink returns and a commit consumes. |
+| `manifest.py` | 161 | Write results — the manifest a sink returns and a commit consumes. |
 | `secret_backends.py` | 317 | Key-store backends for a secret reference, resolved on the machine that needs the secret. |
-| `sink.py` | 228 | Data sinks — persisting query results. |
+| `sink.py` | 234 | Data sinks — persisting query results. |
 
 ### `batcher/io/base/` — 2 · neutral IO
 
@@ -1884,8 +1884,8 @@ Template-Method base classes for file-backed sources and sinks.
 | `_hive.py` | 149 | Hive partitioning: what a ``col=value`` path segment is, and where the runs begin. |
 | `_layout.py` | 111 | `FileLayout` — how a write divides its rows into files, resolved wherever the rows are. |
 | `_lines.py` | 198 | Line-delimited decoding, shared by the text and log sources. |
-| `_options.py` | 226 | Reader/writer keyword aliasing — one spelling table per format, one error shape. |
-| `_paths.py` | 168 | Path normalization shared by every file source and sink. |
+| `_options.py` | 256 | Reader/writer keyword aliasing — one spelling table per format, one error shape. |
+| `_paths.py` | 183 | Path normalization shared by every file source and sink. |
 | `_readahead.py` | 204 | Order-preserving, **byte-bounded** read-ahead over a sequence of files. |
 | `_tolerance.py` | 140 | The per-file error policy a `FileSource` read applies to an unreadable file. |
 | `_transient.py` | 199 | Retry for the IO failures that are worth retrying, and only those. |
@@ -1934,12 +1934,12 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 
 | module | lines | what it is |
 |---|---|---|
-| `_commit.py` | 504 | The metadata-only Delta commit: register worker-written files, move no data. |
+| `_commit.py` | 543 | The metadata-only Delta commit: register worker-written files, move no data. |
 | `_partition_replace.py` | 107 | Replacing several Delta partitions in one commit. |
 | `_predicate.py` | 175 | Rendering an expression for delta-rs: as partition filters, or as SQL. |
 | `_snapshot.py` | 542 | One cached read of a Delta table's `_delta_log`, shared by every metadata question. |
 | `maintenance.py` | 172 | Delta table maintenance: OPTIMIZE, ZORDER, VACUUM, and log checkpointing. |
-| `sink.py` | 486 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
+| `sink.py` | 489 | Writing a Delta Lake table: workers write final data files, the driver commits metadata. |
 | `source.py` | 522 | Reading a Delta Lake table: log-driven file skipping, time travel, and CDF. |
 | `stream.py` | 395 | Reading a Delta table's Change Data Feed, unbounded or over a fixed version window. |
 
@@ -1953,7 +1953,7 @@ Genomics file formats — sequences, reads, intervals, annotations, and variants
 | `_manifest.py` | 97 | Iceberg's per-file metrics, normalized into the add-action layout the engine prunes with. |
 | `maintenance.py` | 125 | Iceberg table maintenance: snapshot expiry, and an honest refusal to compact. |
 | `puffin.py` | 199 | The distinct-value counts a table's Puffin statistics publish, read for planning. |
-| `sink.py` | 288 | Writing an Iceberg table: workers stage data files, the driver commits one snapshot. |
+| `sink.py` | 295 | Writing an Iceberg table: workers stage data files, the driver commits one snapshot. |
 | `source.py` | 643 | Reading an Iceberg table: manifest-level file skipping, time travel, incremental scans. |
 
 ### `batcher/io/formats/ml/` — 2 · neutral IO
@@ -2031,9 +2031,9 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 
 | module | lines | what it is |
 |---|---|---|
-| `json.py` | 489 | JSON format — newline-delimited (line) JSON read + write. |
+| `json.py` | 502 | JSON format — newline-delimited (line) JSON read + write. |
 | `json_encoding.py` | 231 | Process-pool machinery for the JSON **write** path. |
-| `json_tolerance.py` | 146 | Dropping the unparseable line from a newline-delimited JSON buffer. |
+| `json_tolerance.py` | 187 | Dropping the unparseable line from a newline-delimited JSON buffer. |
 | `json_vector.py` | 317 | Vectorized NDJSON encoding — the JSON writer's fast path, built from Arrow kernels. |
 | `logs.py` | 222 | Log format — line-delimited text logs read as raw lines (core, no extra). |
 | `msgpack.py` | 100 | MessagePack format — row-oriented read + write via `ormsgpack`, to Arrow. |
@@ -2046,15 +2046,15 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 
 | module | lines | what it is |
 |---|---|---|
-| `_common.py` | 416 | Shared helpers for SQL/warehouse sources — query rewriting and import guards. |
+| `_common.py` | 503 | Shared helpers for SQL/warehouse sources — query rewriting and import guards. |
 | `_source_base.py` | 330 | Template-Method base for a query-backed source the server returns as one result. |
 | `bigquery.py` | 398 | BigQuery source — multi-stream Arrow reads via the Storage Read API. |
 | `clickhouse.py` | 240 | ClickHouse source and sink — Arrow reads and inserts via clickhouse-connect. |
-| `connectorx.py` | 216 | ConnectorX source — the parallel relational reader for the long tail. |
+| `connectorx.py` | 226 | ConnectorX source — the parallel relational reader for the long tail. |
 | `databricks.py` | 428 | Databricks source — direct lakehouse read, warehouse fallback. |
 | `odbc.py` | 220 | ODBC source — Arrow reads via turbodbc, for the enterprise tail. |
 | `partition.py` | 129 | Range partitioning — turning one big table read into N parallel queries. |
-| `routing.py` | 139 | Which SQL backend serves this call — the one router the read and the write share. |
+| `routing.py` | 169 | Which SQL backend serves this call — the one router the read and the write share. |
 | `snowflake.py` | 328 | Snowflake source + sink — one query submission, N shippable result chunks. |
 | `uri.py` | 708 | Connection-URI parsing — one industry-standard URI, routed to the right backend. |
 
@@ -2065,7 +2065,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | module | lines | what it is |
 |---|---|---|
 | `sink.py` | 161 | ADBC bulk-ingest sink. |
-| `source.py` | 572 | ADBC / FlightSQL source — Arrow-native database connectivity. |
+| `source.py` | 588 | ADBC / FlightSQL source — Arrow-native database connectivity. |
 
 ### `batcher/io/formats/sql/dbapi/` — 2 · neutral IO
 
@@ -2080,7 +2080,7 @@ Robotics / ADAS log formats — the containers a vehicle or robot records into.
 | `_staged.py` | 146 | Staged SQL writes: every shard into its own staging table, one transaction to publish. |
 | `_statements.py` | 483 | Dialect-aware DML for the DB-API write path — the statement each write mode runs. |
 | `sink.py` | 640 | The row-level SQL write path — ``INSERT``, ``UPSERT``, ``UPDATE``, ``DELETE``. |
-| `source.py` | 677 | DB-API 2.0 (PEP 249) source — the universal fallback for any Python driver. |
+| `source.py` | 716 | DB-API 2.0 (PEP 249) source — the universal fallback for any Python driver. |
 
 ### `batcher/io/formats/streaming/` — 2 · neutral IO
 
@@ -2106,7 +2106,7 @@ Shared base for row/message-based streaming brokers (Kafka, Kinesis, ...).
 | module | lines | what it is |
 |---|---|---|
 | `schema.py` | 292 | The fixed broker message schema, the message record, and option redaction. |
-| `source.py` | 669 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
+| `source.py` | 733 | `BrokerSource` — the abstract unbounded message source and its poll loop. |
 | `split.py` | 204 | `BrokerSplit` — one partition of a broker, read one epoch at a time on a worker. |
 
 ### `batcher/io/formats/streaming/checkpoint/` — 2 · neutral IO
@@ -2148,7 +2148,7 @@ Streaming-query checkpointing — offset log, commit log, and state store.
 | `arrow_ipc.py` | 280 | Arrow IPC / Feather format — zero-conversion read + write via `pyarrow.ipc`. |
 | `avro.py` | 417 | Avro format — row-oriented read + write via `fastavro`, assembled to Arrow. |
 | `csv.py` | 617 | CSV format — lazy read + write via pyarrow, with byte-range splits. |
-| `excel.py` | 103 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
+| `excel.py` | 139 | Excel format — read-only sheet ingestion via `python-calamine`, to Arrow. |
 | `lance.py` | 342 | Lance format — columnar, random-access read + write via `pylance` (lance). |
 | `orc.py` | 416 | ORC format — lazy, projection-pushdown read + write via `pyarrow.orc`. |
 
@@ -2161,7 +2161,7 @@ CSV keyword vocabulary — the pandas/Polars spellings, folded to pyarrow option
 | `build.py` | 443 | Resolved CSV options, and the pyarrow option objects they build. |
 | `dtypes.py` | 122 | Value coercion for the CSV options whose value is not already what pyarrow wants. |
 | `encode.py` | 122 | CSV encoding with a null token, built from Arrow string kernels. |
-| `spec.py` | 137 | The CSV keyword tables — which spellings are accepted, refused, or a no-op. |
+| `spec.py` | 194 | The CSV keyword tables — which spellings are accepted, refused, or a no-op. |
 
 ### `batcher/io/formats/structured/parquet/` — 2 · neutral IO
 
@@ -2170,8 +2170,8 @@ Parquet — lazy projection/predicate read + write, plus the dataset reader.
 | module | lines | what it is |
 |---|---|---|
 | `_native_stream.py` | 146 | Native-reader streaming for `ParquetSource._iter_file`, and the rule for when to use it. |
-| `dataset.py` | 694 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
-| `partitions.py` | 219 | What a Hive ``col=value`` directory segment means, and what it proves. |
+| `dataset.py` | 719 | `ParquetDatasetSource` — a Hive-partitioned Parquet directory tree, read at scale. |
+| `partitions.py` | 314 | What a Hive ``col=value`` directory segment means, and what it proves. |
 | `routing.py` | 160 | How a predicated Parquet read spends its work: skip row groups on the footers, decode the rest. |
 | `sink.py` | 167 | `ParquetSink` — the Parquet writer. |
 | `source.py` | 750 | `ParquetSource` — lazy projection/predicate read of one or more Parquet files. |
@@ -2198,9 +2198,9 @@ Lookup joins: enriching rows from a key-value store, one batched fetch per batch
 | `backends.py` | 278 | The point-lookup stores: Redis, RocksDB, and a plain in-memory table. |
 | `base.py` | 121 | What a lookup source is, and how a batch of keys becomes a batch of columns. |
 | `cache.py` | 167 | The lookup cache: the part of an enrichment join that makes recall cheap. |
-| `join.py` | 159 | The per-batch enrichment step: keys in, columns out, as few round trips as possible. |
+| `join.py` | 166 | The per-batch enrichment step: keys in, columns out, as few round trips as possible. |
 | `spec.py` | 112 | Building a lookup backend on the worker, from a description that can travel to it. |
-| `stage.py` | 95 | The `map_batches` stage `Dataset.lookup_join` runs on each worker. |
+| `stage.py` | 98 | The `map_batches` stage `Dataset.lookup_join` runs on each worker. |
 
 ### `batcher/io/predicate/` — 2 · neutral IO
 
@@ -2237,6 +2237,7 @@ Source connectors — the façade over the source implementation modules.
 | `inmemory_stats.py` | 513 | Lazy EXACT column statistics over an immutable in-memory Arrow relation. |
 | `iterator.py` | 213 | `IteratorSource` — a streaming relation backed by a re-iterable batch factory. |
 | `materialized.py` | 76 | `MaterializedSource` — a distributed stage's result, left partitioned on disk. |
+| `path_column.py` | 320 | `include_path=` — a file read that also says which file each row came from. |
 | `read.py` | 305 | The neutral read helpers every executor calls a `Source` through. |
 | `readahead.py` | 194 | How much of a remote Parquet read one scan keeps in flight, and how it keeps the order. |
 

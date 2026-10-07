@@ -908,7 +908,10 @@ def _commit(
     label = active_config().observability.query_label
     if label:
         manifest = dataclasses.replace(manifest, query_label=label)
-    sink.commit(manifest, path)
+    version = sink.commit(manifest, path)
+    manifest = dataclasses.replace(
+        manifest, destination=path, version=version if isinstance(version, int) else None
+    )
     _report_write(manifest, fmt)
     if auto_compact:
         # After the commit, never before: the data is already durable, so a compaction that

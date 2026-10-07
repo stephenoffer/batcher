@@ -36,8 +36,39 @@ def _rows(fh: IO[Any], sheet: str | int) -> list[list[Any]]:
     """Read a worksheet into a list of cell rows via calamine."""
     calamine = _require_calamine()
     workbook = calamine.load_workbook(fh)
-    name = workbook.sheet_names[sheet] if isinstance(sheet, int) else sheet
-    return workbook.get_sheet_by_name(name).to_python()
+    return workbook.get_sheet_by_name(_sheet_name(workbook.sheet_names, sheet)).to_python()
+
+
+def _sheet_name(names: list[str], sheet: str | int) -> str:
+    """The worksheet `sheet` names, or a `FormatError` listing the ones that exist.
+
+    The refusal is the discovery mechanism: a workbook's sheet names are otherwise only
+    visible by opening it elsewhere, and calamine's own error for a bad name or index says
+    neither which sheets there are nor which one was meant.
+
+    Args:
+        names: The workbook's sheet names, in order.
+        sheet: A sheet name, or a zero-based index.
+
+    Returns:
+        The sheet's name.
+
+    Raises:
+        FormatError: When no sheet has that name or index.
+    """
+    from batcher._internal.errors import FormatError, unknown_value
+
+    if isinstance(sheet, int):
+        if -len(names) <= sheet < len(names):
+            return names[sheet]
+        raise FormatError(
+            f"excel: sheet={sheet} is out of range; the workbook has {len(names)} sheet(s): {names}"
+        )
+    if sheet in names:
+        return sheet
+    raise unknown_value(
+        FormatError, "sheet", sheet, names, hint="pass sheet= as one of these names or an index."
+    )
 
 
 def _to_columns(rows: list[list[Any]]) -> tuple[list[str], list[list[Any]]]:
@@ -77,6 +108,11 @@ class ExcelSource(FileSource):
         # Without the `sheet`, a worker rebuilding the reader falls back to sheet 0 and silently
         # reads a different worksheet than single-node requested. Carry it to the worker.
         return {**super()._reader_kwargs(), "sheet": self._sheet}
+
+    def _schema_cache_token(self) -> object:
+        # Two sheets of one workbook are one file and two schemas. Keyed on the file alone,
+        # the second sheet read was served the first sheet's columns.
+        return (self._sheet,)
 
     def _read_schema(self, fh: IO[Any]) -> pa.Schema:
         header, columns = _to_columns(_rows(fh, self._sheet))

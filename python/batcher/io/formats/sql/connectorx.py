@@ -206,6 +206,16 @@ class ConnectorXSource(SingleResultQuerySource):
         """
         return _ConnectorXSplit(self.conn_uri, sql, None, 1)
 
+    def explain_label(self) -> str:
+        """The backend this read was routed to, for the scan line `explain()` prints.
+
+        Routing picks the backend from the URI and what is installed, so which one serves a
+        read is otherwise invisible: an ``sqlite://`` read takes the slow DB-API path when
+        ``adbc_driver_sqlite`` is missing, and the plan looked the same either way.
+        """
+        # A secret reference (`env:MYSQL_URL`) has no scheme to show, and must not be shown.
+        return f"connectorx({self.sql_dialect if '://' in self.conn_uri else 'uri'})"
+
     def identity(self) -> str:
         """The learned-statistics key: the connection *and* the query, never the query alone.
 
