@@ -278,7 +278,18 @@ def probe_options() -> dict:
     degrades to shipping nothing, which is exactly the behaviour before it existed. Without
     the guard, a caller that substitutes `sys.modules["ray"]` (which the device-health tests
     do) got the exception instead of the probe and the fleet came back with no records.
+
+    The one thing allowed to stop it is the compatibility preflight: these probes' bodies
+    live in Batcher, so running one makes the worker import the engine, and a planning-time
+    probe can reach a worker before `_ensure_ray` has. A node that cannot load the shipped
+    build raises `BackendError` here, which every caller's best-effort guard turns into "no
+    profile" — the query is then refused by `_ensure_ray` with the full report.
     """
+    import ray
+
+    from .preflight import ensure_workers_compatible
+
+    ensure_workers_compatible(ray)
     try:
         env = worker_runtime_env() or None
     except Exception as exc:  # a shipping failure must not stop the probe

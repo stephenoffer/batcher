@@ -79,7 +79,7 @@ class _Actor:
         self.wid = wid
 
 
-def _run(monkeypatch, *, n_buckets, workers, reduce_fn, republish_fn, dead=None):
+def _run(monkeypatch, *, n_buckets, workers, reduce_fn, republish_fn, dead=None, placement=None):
     from batcher.dist.executors.ray_runtime import run_bucket_reduce
 
     return run_bucket_reduce(
@@ -90,6 +90,7 @@ def _run(monkeypatch, *, n_buckets, workers, reduce_fn, republish_fn, dead=None)
         remote_reduce=reduce_fn,
         republish=republish_fn,
         dead=dead,
+        placement=placement,
     )
 
 
@@ -281,3 +282,50 @@ def test_the_host_that_died_is_recomputed_not_the_source_id(monkeypatch):
         f"expected source 1 to be recomputed after its host died, got {republished}. "
         "A host id was almost certainly used as a source id."
     )
+
+
+def test_a_dead_reducer_host_holding_no_sources_is_relaunched_not_dropped(monkeypatch):
+    """BT-007: success requires one accepted result per bucket.
+
+    A host that holds no map output (more workers than map partitions) can still host a
+    reducer. When it died, the failure translated to *no* sources to recompute, so the round
+    reported no failures and the shuffle returned without that bucket -- a short result
+    reported as success. The bucket must relaunch on a survivor instead.
+    """
+    from batcher.carbonite.resilience import SourcePlacement
+
+    exc = _install_fake_ray(monkeypatch)
+    launches: collections.Counter = collections.Counter()
+
+    def reduce_fn(host, bucket):
+        launches[bucket] += 1
+        if bucket == 2 and launches[2] == 1:
+
+            def _die():
+                raise exc.RayActorError("worker preempted")
+
+            return _die
+        return lambda b=bucket: ("ok", [f"rows-{b}"])
+
+    republished: list[tuple[int, int]] = []
+    out = _run(
+        monkeypatch,
+        n_buckets=3,
+        workers=3,
+        reduce_fn=reduce_fn,
+        republish_fn=lambda t, s: republished.append((t, s)),
+        # Two map partitions, both on worker 0: workers 1 and 2 hold no shuffle output.
+        placement=SourcePlacement(3, hosts=[0, 0]),
+    )
+    assert out == {b: [f"rows-{b}"] for b in range(3)}, "a bucket went missing"
+    assert launches[2] == 2
+    assert republished == [], "no source was lost, so none should be recomputed"
+
+
+def test_a_short_result_is_refused_at_the_end(monkeypatch):
+    """The terminal coverage check: a result missing a bucket can never be returned."""
+    from batcher.dist.executors.ray_runtime.reduce import check_complete
+
+    check_complete("sort", 2, {0: [], 1: []})
+    with pytest.raises(ResourceError, match="missing"):
+        check_complete("sort", 3, {0: [], 1: []})

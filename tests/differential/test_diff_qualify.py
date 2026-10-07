@@ -96,8 +96,21 @@ def test_qualify_with_where(duck, t):
     assert_same(bt.sql(query, t=t).collect(), duck.sql(query))
 
 
-def test_qualify_with_group_by_rejects(t):
-    """QUALIFY over an aggregate is not supported and must say so rather than mislead."""
+def test_qualify_with_group_by(t, duck):
+    """A grouped QUALIFY filters the grouped rows on a window computed over them."""
+    query = (
+        "SELECT k, sum(v) AS s FROM t GROUP BY k "
+        "QUALIFY row_number() OVER (ORDER BY sum(v) DESC) = 1"
+    )
+    assert_same(bt.sql(query, t=t).collect(), duck.sql(query))
+
+
+def test_qualify_without_a_window_beside_group_by_acts_as_having(t, duck):
+    """A deliberate divergence: DuckDB refuses a QUALIFY with no window function.
+
+    Batcher evaluates it after the grouping, exactly as the same predicate in HAVING, which
+    is what the clause means once windows are absent. Pinned so the choice stays visible.
+    """
     query = "SELECT k, sum(v) AS s FROM t GROUP BY k QUALIFY sum(v) > 3"
-    with pytest.raises(NotImplementedError, match="QUALIFY"):
-        bt.sql(query, t=t).collect()
+    having = "SELECT k, sum(v) AS s FROM t GROUP BY k HAVING sum(v) > 3"
+    assert_same(bt.sql(query, t=t).collect(), duck.sql(having))

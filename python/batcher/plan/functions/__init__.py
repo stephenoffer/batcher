@@ -26,6 +26,7 @@ from batcher.plan.functions.aggregate import (
 )
 from batcher.plan.functions.collection import (
     element,
+    element_index,
     map_from_arrays,
     named_struct,
     sequence,
@@ -116,6 +117,7 @@ from batcher.plan.functions.string import (
     strip_reasoning,
 )
 from batcher.plan.functions.temporal import (
+    business_day_count,
     current_date,
     current_timestamp,
     date_add,
@@ -135,6 +137,7 @@ __all__ = [
     "any_horizontal",
     "arctan2",
     "bit_get",
+    "business_day_count",
     "chatml_prompt",
     "concat",
     "concat_ws",
@@ -152,6 +155,7 @@ __all__ = [
     "date_sub",
     "e",
     "element",
+    "element_index",
     "elt",
     "ends_with_role",
     "extract_after",

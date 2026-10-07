@@ -75,6 +75,8 @@ NOT_LOCALLY_WRITABLE: dict[str, str] = {
     "elasticsearch": "needs an Elasticsearch cluster; covered by tests/io/test_nosql_sinks.py",
     "hbase": "needs an HBase Thrift server; covered by tests/io/test_nosql_sinks.py",
     "snowflake": "needs Snowflake credentials",
+    "bigquery": "needs a BigQuery project and credentials",
+    "databricks": "needs a Databricks SQL warehouse and a Unity Catalog volume",
     "adbc": "needs a live ADBC driver/database",
     # The DB-API sink writes rows into a *table*, so it has no path to round-trip through
     # and no extension to name. It is exercised against a real database all the same —

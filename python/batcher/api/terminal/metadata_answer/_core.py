@@ -247,10 +247,13 @@ def metadata_empty_table(
     empty`) skips the full metadata re-optimization for the overwhelmingly common
     non-empty plan — the execution path folds any residual emptiness itself.
     """
-    inferred = plan.available_schema()
-    if inferred is None or not _has_structural_empty(plan):
+    if plan.available_schema() is None or not _has_structural_empty(plan):
         return None
-    return inferred.arrow.empty_table() if metadata_is_empty(plan, sources, source_stats) else None
+    if not metadata_is_empty(plan, sources, source_stats):
+        return None
+    from batcher.api.orchestration.sizing import empty_result_table
+
+    return empty_result_table(plan)
 
 
 def _scalar_answer(kyber_fn, column: str, plan: LogicalPlan, sources, source_stats):

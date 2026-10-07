@@ -1,5 +1,6 @@
-//! Date/time evaluation for `Expr::Date`/`DateTrunc`, dtype parsing, and the
-//! month-shift used by `BinaryOp::AddMonths` (split out of `lib.rs`).
+//! Date/time evaluation for `Expr::Date`/`DateTrunc`/`DateOffset`, the event-time window
+//! keys, and dtype parsing (split out of `lib.rs`). The per-row month and day shifts live in
+//! `shift`.
 
 use std::sync::Arc;
 
@@ -43,6 +44,25 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
     if matches!(arr.data_type(), DataType::Null) {
         let nulls = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
         return eval_date(func, &nulls);
+    }
+
+    // A duration is not an instant: its fields are components, read by their own rule.
+    if let DataType::Duration(unit) = arr.data_type() {
+        return super::fields::eval_duration_part(func, arr, unit);
+    }
+
+    // The instant-valued functions read the stored count at its own resolution, before any
+    // zone or microsecond cast can touch it.
+    if matches!(func, DateFunc::EpochNs | DateFunc::Nanosecond) {
+        return super::fields::eval_precise(func, arr);
+    }
+
+    // Every calendar field of a zoned instant is read on its zone's wall clock. `epoch` is
+    // the one exception: it counts the instant, which the zone does not change.
+    if !matches!(func, DateFunc::Epoch) {
+        if let Some(local) = super::timezone::as_wall_clock(arr)? {
+            return eval_date(func, &local);
+        }
     }
 
     // `epoch` isn't a date-part: whole seconds since the Unix epoch, as Int64.
@@ -281,6 +301,7 @@ pub(crate) fn eval_date(func: DateFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         DateFunc::IsLeapYear | DateFunc::DaysInMonth | DateFunc::IsoYear => {
             unreachable!("handled above")
         }
+        DateFunc::EpochNs | DateFunc::Nanosecond => unreachable!("handled above"),
     };
     // `date_part` yields Int32; widen to Int64 for a uniform numeric type.
     let i32s = arrow::compute::kernels::temporal::date_part(arr, part)?;
@@ -306,6 +327,13 @@ pub(crate) fn eval_date_trunc(
     preserve_type: bool,
     keep_time: bool,
 ) -> Result<ArrayRef, ExprError> {
+    // A zoned instant truncates on its own zone's calendar and stays in that zone (DuckDB
+    // `date_trunc` on a TIMESTAMPTZ, Polars `dt.truncate`).
+    if let Some(out) =
+        super::timezone::on_wall_clock(arr, |local| truncate_to_timestamp(local, unit, keep_time))?
+    {
+        return Ok(out);
+    }
     let out = truncate_to_timestamp(arr, unit, keep_time)?;
     if preserve_type && matches!(arr.data_type(), DataType::Date32) {
         // A Date32 has no time of day, so the truncated instant is always a midnight and
@@ -480,6 +508,18 @@ pub(crate) fn eval_date_offset(
         return eval_date_offset(&parsed, months, days, micros);
     }
 
+    // On a zoned instant, months and days are *local* calendar units — a day after 12:00 EST
+    // on the eve of a DST change is 12:00 EDT, 23 elapsed hours — while the sub-day part is
+    // elapsed time. So the calendar part runs on the wall clock and the fixed part on the
+    // instant, in that order (Polars `offset_by`).
+    if months != 0 || days != 0 {
+        if let Some(local) =
+            super::timezone::on_wall_clock(arr, |wall| eval_date_offset(wall, months, days, 0))?
+        {
+            return eval_date_offset(&local, 0, 0, micros);
+        }
+    }
+
     match arr.data_type() {
         DataType::Date32 => {
             if micros != 0 {
@@ -513,7 +553,8 @@ pub(crate) fn eval_date_offset(
                     offset.shift_scalar(&ty, a.value(i), 1)
                 })
                 .collect();
-            Ok(Arc::new(out))
+            // The zone label survives: the declared type of a shift is its input's type.
+            Ok(Arc::new(out.with_timezone_opt(timestamp_zone(arr))))
         }
         other => Err(ExprError::UnknownType(format!("offset_by on {other}"))),
     }
@@ -526,59 +567,6 @@ pub(crate) fn eval_date_offset(
 /// `bc-expr` error on an unknown name.
 pub(crate) fn parse_dtype(name: &str) -> Result<DataType, ExprError> {
     bc_arrow::dtype_from_name(name).ok_or_else(|| ExprError::UnknownType(name.to_string()))
-}
-
-/// Add `months[i]` calendar months to each Date32/Timestamp `dates[i]` (negative
-/// to subtract), preserving the input type. Null on either side → null. Month
-/// overflow clamps to the last valid day (chrono `checked_add_months` semantics).
-pub(crate) fn add_months(dates: &ArrayRef, months: &ArrayRef) -> Result<ArrayRef, ExprError> {
-    use arrow::array::{Array, AsArray};
-    use arrow::datatypes::{Date32Type, Int64Type, TimeUnit};
-    use chrono::{DateTime, Months, NaiveDate};
-
-    let m = cast(months, &DataType::Int64)?;
-    let m = m.as_primitive::<Int64Type>();
-    let shift = |d: NaiveDate, n: i64| -> Option<NaiveDate> {
-        if n >= 0 {
-            d.checked_add_months(Months::new(n as u32))
-        } else {
-            d.checked_sub_months(Months::new((-n) as u32))
-        }
-    };
-    match dates.data_type() {
-        DataType::Date32 => {
-            let a = dates.as_primitive::<Date32Type>();
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let out: Date32Array = (0..a.len())
-                .map(|i| {
-                    if a.is_null(i) || m.is_null(i) {
-                        return None;
-                    }
-                    // Checked: a far-out Date32 must not panic `NaiveDate + Duration`.
-                    let d = epoch
-                        .checked_add_signed(chrono::Duration::try_days(i64::from(a.value(i)))?)?;
-                    shift(d, m.value(i)).map(|nd| (nd - epoch).num_days() as i32)
-                })
-                .collect();
-            Ok(Arc::new(out))
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let micros = cast(dates, &DataType::Int64)?;
-            let a = micros.as_primitive::<Int64Type>();
-            let out: TimestampMicrosecondArray = (0..a.len())
-                .map(|i| {
-                    if a.is_null(i) || m.is_null(i) {
-                        return None;
-                    }
-                    let dt = DateTime::from_timestamp_micros(a.value(i))?.naive_utc();
-                    shift(dt.date(), m.value(i))
-                        .map(|nd| nd.and_time(dt.time()).and_utc().timestamp_micros())
-                })
-                .collect();
-            Ok(Arc::new(out))
-        }
-        other => Err(ExprError::UnknownType(format!("add_months on {other}"))),
-    }
 }
 
 /// Floor-divide `a` by positive `b` (rounds toward −∞, unlike Rust's `/`).
@@ -763,7 +751,7 @@ mod tests {
         use arrow::array::Int64Array as I64;
         let far: ArrayRef = Arc::new(Date32Array::from(vec![i32::MAX]));
         let months: ArrayRef = Arc::new(I64::from(vec![1i64]));
-        let out = add_months(&far, &months).unwrap();
+        let out = crate::eval::temporal::shift::add_months(&far, &months).unwrap();
         assert!(out.as_primitive::<Date32Type>().is_null(0));
     }
 

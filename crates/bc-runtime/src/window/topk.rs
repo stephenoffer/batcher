@@ -213,6 +213,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         };
         // `rank_limit: None` forces the ordering path even for a shape the bounded one covers.
         let cols =
@@ -246,6 +247,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         };
         let cols = super::super::window_with(
             part,

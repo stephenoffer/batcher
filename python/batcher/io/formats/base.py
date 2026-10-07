@@ -95,7 +95,7 @@ class SinkFormat(Protocol):
 # The file formats a pipeline reaches for by default — Parquet, CSV, JSON, text, binary,
 # the multimodal blob readers, the robotics logs — stay eager in `formats/__init__`: they
 # are cheap, they are re-exported by name, and deferring them would only move the cost.
-_DEFERRED_FAMILIES = ("lakehouse", "ml", "nosql", "sql", "streaming")
+_DEFERRED_FAMILIES = ("http", "lakehouse", "ml", "nosql", "saas", "sql", "streaming", "vector")
 
 
 def _load_deferred_families() -> None:

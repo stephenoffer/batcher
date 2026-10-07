@@ -30,6 +30,10 @@ class WrittenFile:
     the log alone (`io.stats.file_skipping`). Empty when the sink does not collect
     them; the names are format-neutral and each sink maps them to its own log format.
 
+    `job` carries the remote system's identity for the write, for a sink whose destination
+    runs its own job: a BigQuery load job's ``job_id`` and ``location``, a Databricks
+    ``query_id``, a Snowflake ``COPY INTO`` result. Empty for a sink with no remote job.
+
     Examples:
         .. doctest::
 
@@ -43,6 +47,7 @@ class WrittenFile:
     bytes: int
     partition_values: dict[str, Any] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
+    job: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +60,13 @@ class WriteManifest:
     partition columns in the *path*, not the file, so a footer alone cannot reconstruct
     the table's type. `None` for sinks that need no schema at commit time.
 
+    `destination` is the normalized path or table identifier the write targeted, set by
+    the writer at commit, so a manifest says where it landed without the caller keeping
+    the argument around. `version` is the table version a transactional commit created:
+    the Delta log version, or the Iceberg snapshot id. It comes from the commit itself
+    rather than a re-read, so a concurrent writer's later commit is never reported as this
+    one. `None` for a file sink, which has no versions.
+
     Examples:
         .. doctest::
 
@@ -66,6 +78,11 @@ class WriteManifest:
 
     files: tuple[WrittenFile, ...] = ()
     schema: Any | None = None
+    #: The `observability.query_label` the write ran under, stamped by the driver at commit
+    #: so the manifest a job keeps says which job produced it. Empty when none was set.
+    query_label: str = ""
+    destination: str | None = None
+    version: int | None = None
 
     @property
     def total_rows(self) -> int:
@@ -121,7 +138,9 @@ class WriteManifest:
         """Combine two manifests (used to roll up distributed writer results).
 
         The merge is a concatenation, so it is associative and commutative: each
-        worker returns its own manifest and the driver folds them in any order.
+        worker returns its own manifest and the driver folds them in any order. The
+        scalar fields keep the first value that is set; the workers' manifests carry
+        none of them, since the driver sets them once at commit.
 
         Examples:
             .. doctest::
@@ -138,4 +157,10 @@ class WriteManifest:
         Returns:
             A new manifest holding both manifests' files.
         """
-        return WriteManifest(files=self.files + other.files, schema=self.schema or other.schema)
+        return WriteManifest(
+            files=self.files + other.files,
+            schema=self.schema or other.schema,
+            query_label=self.query_label or other.query_label,
+            destination=self.destination if self.destination is not None else other.destination,
+            version=self.version if self.version is not None else other.version,
+        )

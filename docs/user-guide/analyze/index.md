@@ -84,6 +84,12 @@ Geometry, robot coordinate frames and graph algorithms, built on the same operat
 SQL that builds the same plan as the DataFrame API, with sessions and Python functions.
 :::
 
+:::{grid-item-card} {octicon}`shield-check;1.1em` SQL parameters, scripts, and errors
+:link: /user-guide/analyze/sql-parameters
+:link-type: doc
+Bind values with `params=`, check a query before it runs, and read SQL errors.
+:::
+
 :::{grid-item-card} {octicon}`beaker;1.1em` Model and AI functions in SQL
 :link: /user-guide/analyze/sql-model-functions
 :link-type: doc
@@ -116,6 +122,7 @@ time-series
 window-functions
 pivoting
 sql
+sql-parameters
 sql-model-functions
 metadata-shortcuts
 domains/index

@@ -51,6 +51,11 @@ class OneHotEncoder(Preprocessor):
             column per category, so this is the guard against an unbounded output schema.
     """
 
+    _irreversible = (
+        "unseen categories and nulls all become the all-zero row, and drop_first folds the "
+        "dropped category into it too"
+    )
+
     __slots__ = ("categories_", "columns", "drop_first", "max_categories")
 
     def __init__(
@@ -69,6 +74,9 @@ class OneHotEncoder(Preprocessor):
 
     def fit(self, ds: Dataset) -> OneHotEncoder:
         """Learn each column's sorted distinct categories (one indicator per category).
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::
@@ -173,6 +181,9 @@ class MultiHotEncoder(Preprocessor):
 
     def fit(self, ds: Dataset) -> MultiHotEncoder:
         """Learn the distinct elements across all the column's lists into `categories_`.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         A no-op when an explicit `categories` vocabulary was given to the constructor.
 

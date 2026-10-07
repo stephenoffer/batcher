@@ -3282,6 +3282,9 @@ def _distributed_range_join(
         sources,
         workers,
         hub=hub,
+        # An empty right side is broadcast, not refused: inner/semi owe nothing and
+        # left/anti owe every left row, and the probe tasks compute both exactly.
+        empty_build=True,
     )
     if result is not None:
         return result
@@ -3290,7 +3293,7 @@ def _distributed_range_join(
 
     raise PlanError(
         "distributed range (inequality) join requires one side small enough to broadcast, "
-        "and this query's right side is empty or over the broadcast budget. An inequality "
+        "and this query's right side is over the broadcast budget. An inequality "
         "has no join key to co-partition on, so there is no shuffle fallback. Filter or "
         "pre-aggregate the right side, raise `OptimizerConfig.broadcast_max_bytes`, or run "
         "it single-node (`distributed=False`)."

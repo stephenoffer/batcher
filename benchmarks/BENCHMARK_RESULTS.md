@@ -1,5 +1,95 @@
 # Batcher CPU benchmark results
 
+## The public-API review: a recorded cluster run, and no regression on TPC-H or the operator mix (2026-10-06)
+
+The public-API review (`feat/public-api-review`, against the base `4686ea63`) changed `dist/`
+(the `_MapActor` release on shutdown, a cluster-wide `ProviderLimit` actor) and added many
+operators and keywords that can run distributed. `CLAUDE.md` asks for a recorded cluster run
+for either, and for a benchmark against DuckDB and Polars for anything on a hot path. This is
+both.
+
+### Single-node against distributed, on four worker nodes
+
+**Conditions.** The shared Anyscale cluster (eight `16cpu-64gb` workers, a head that schedules
+none), the engine built in release from the branch tip, the driver on the head with
+`PYTHONPATH` pointing at the branch so the package Ray ships to workers is the branch's. The
+corpus is eight Parquet files, 120,000 rows, on `/mnt/cluster_storage`, so every worker reads
+it. Each check runs one query with `collect(distributed=False)` and with
+`collect(distributed=True, num_workers=4)` and compares schemas exactly and rows as multisets
+(floats to nine significant digits; the elements of `array_agg(distinct=True)` sorted, since
+an unordered list leaves element order open).
+
+**The lever is live.** A `map_batches` that records `socket.gethostname()` ran on four
+distinct worker hosts, none of them the driver. The usual control, `LIMIT 3` over an
+unordered `group_by`, returned the same three groups on both paths in this run, which the
+rules allow but cannot be leaned on; the host count is the evidence that the work fanned out.
+
+| Shape | Result |
+|---|---|
+| `join(nulls_equal=True, indicator=...)`, full | MATCH |
+| `join(coalesce=False)`, `join(validate="m:1")`, expression key | MATCH |
+| SQL `JOIN ... ON a IS NOT DISTINCT FROM b` | MATCH |
+| SQL `SUM(DISTINCT a), AVG(DISTINCT b), COUNT(*), COUNT(DISTINCT (a, k))` | MATCH |
+| SQL grouped `QUALIFY`, SQL `params=` | MATCH |
+| `AggExpr.filter`, list `quantile`, `array_agg(distinct=True)`, `count().over` | MATCH |
+| `with_random(key=)`, `sample(fraction, key=)`, `sample(n, weights=)` | MATCH |
+| `rollup(grouping_id=)`, `pivot` with two values and aggregates plus `fill_value` | MATCH |
+| `qcut(...).over`, EWM `adjust`/`ignore_nulls`, `interpolate(max_gap=)` | MATCH |
+| decimal `round`, `convert_timezone` on a tz-aware column, `add_business_days` | MATCH |
+| `str.normalize`/`casefold`/`extract_groups`, `json.decode`/`merge_patch`, `list.zip` | MATCH |
+| `map_batches(output_columns=pa.schema, error_column=)`, `upsample(by=)`, `include_path` | MATCH |
+
+28 of 28 match. The script is not committed; it lives with the session's notes.
+
+**Distributed suites.** Run per file against the same cluster:
+
+| File | Result |
+|---|---|
+| `test_shared_provider_limit` (AP-392) | 1 passed |
+| `test_actor_pool_reuse_distributed`, `test_distributed_map_aggregate_actors` (AP-365) | 6 + 4 passed |
+| `test_distributed` | 109 passed |
+| `test_distributed_function_vocabulary` | 130 passed, 69 skipped |
+| `test_distributed_sample_and_range_join`, `test_features_distributed_equivalence` | 23 + 5 passed |
+| `test_dq_distributed`, `test_distributed_unordered_limit`, `test_distributed_merge`, `test_distributed_write`, `test_flight_shuffle` | all passed |
+| `test_sql_catalog_distributed` | 6 failed, 8 passed |
+| `test_ml_preprocessors_distributed` | 4 failed |
+| `test_udf_edges_distributed` | 4 failed, 6 passed |
+| `test_distributed_lakehouse_write` | 1 failed, 2 passed |
+
+Every failure is reproduced, count for count, by the base `4686ea63` built and run the same way
+on the same cluster. Two causes are visible in the errors: the worker image has no
+`deltalake` or `pyiceberg` (`ModuleNotFoundError` inside the Ray task), and
+`test_udf_edges_distributed::test_the_control_diverges` asserts a divergence this cluster did
+not produce. `test_ml_preprocessors_distributed` dies on a `FileNotFoundError` reading a split
+on a worker, a fixture-path defect that predates this work. None is caused by the branch, and
+none is fixed by it.
+
+### TPC-H and the operator mix, base against branch
+
+**Conditions.** `benchmarks/run.py --engines batcher,duckdb,polars --repeat 3
+--allow-busy-box` on the 8-core head, the base and the branch run back to back for each
+benchmark. The box was shared (load 0.4-1.0 per core), so the comparison is the ratio to
+DuckDB and Polars taken inside each process, not absolute times. Every result was checked
+against DuckDB before it was timed.
+
+| Benchmark | Geomean Batcher/DuckDB, base | Branch | Geomean Batcher/Polars, base | Branch |
+|---|---|---|---|---|
+| TPC-H sf1, 22 queries | 0.597, 0.624, 0.626 | 0.638, 0.614, 0.600 | 0.502, 0.521, 0.521 | 0.523, 0.512, 0.517 |
+| Operator mix, 61 cases | 0.351, 0.363, 0.370 | 0.358, 0.360, 0.389 | 0.206, 0.202, 0.203 | 0.187, 0.187, 0.202 |
+
+The means differ by less than the spread between repeats. Six operator cases came out more
+than 15% worse in the median of the first run (`op-intersect`, `op-sort-float`, `op-explode`,
+`op-filter-in-list`, `op-filter-project`, `op-expr-date-arith`), so they were re-timed alone,
+base then branch. The branch matched or beat the base on five of them and read 0.35 against
+0.31 on `op-filter-in-list`, inside the repeat-to-repeat spread. No regression is claimed
+away; none was measured.
+
+### What still needs a live system
+
+The integrations that need an external service, library or GPU are implemented and tested
+against fakes only. `tests/PENDING_VERIFICATION.md` lists each, with the command that verifies
+it once the system exists.
+
 ## Reshaping verbs raced against DuckDB and Polars, a late filter and a spilling join that stopped stalling, and GPU inference on four A10Gs (2026-10-02, later)
 
 **Conditions.** The operator figures are `benchmarks/run.py --benchmark operators --scale 1

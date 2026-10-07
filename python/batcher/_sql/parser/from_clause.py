@@ -172,7 +172,7 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
     an outer join must null-extend, and preserving them needs a real nested-loop join
     operator in the engine (tracked in `docs/architecture/internals/parity/databricks_parity.md`).
     """
-    eq_pairs, extra = _split_join_on(on, set(ds.columns), set(right.columns))
+    eq_pairs, extra, null_safe = _split_join_on(on, set(ds.columns), set(right.columns))
     if not eq_pairs:
         _reject_ambiguous_residual(on, ds, right, set())
         if how == "inner":
@@ -193,6 +193,7 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
         if marker is not None:
             left_keys = [*left_keys, marker]
             right_keys = [*right_keys, marker]
+            null_safe = [*null_safe, False]
     if extra is not None:
         _reject_ambiguous_residual(extra, ds, right, set(left_keys) | set(right_keys))
     if left_keys == right_keys:
@@ -200,12 +201,12 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
         # answer available. `_disambiguate_columns` renames an `ON`-form same-name key pair
         # apart before we get here, so this is the residue it could not reach (a subquery
         # or CTE side whose columns it cannot enumerate).
-        ds = ds.join(right, on=left_keys, how=how)
+        ds = ds.join(right, on=left_keys, how=how, nulls_equal=null_safe)
     elif how in {"semi", "anti"}:
         # A semi/anti join emits the left side's columns only — nothing is coalesced away.
-        ds = ds.join(right, left_on=left_keys, right_on=right_keys, how=how)
+        ds = ds.join(right, left_on=left_keys, right_on=right_keys, how=how, nulls_equal=null_safe)
     else:
-        ds = _join_keeping_both_keys(ds, right, left_keys, right_keys, how)
+        ds = _join_keeping_both_keys(ds, right, left_keys, right_keys, how, null_safe)
     if extra is not None:
         ds = ds.filter(tr._scalar(extra))
     if marker is not None:
@@ -214,7 +215,12 @@ def _join_on(tr, ds: Dataset, right: Dataset, on, how: str) -> Dataset:
 
 
 def _join_keeping_both_keys(
-    left: Dataset, right: Dataset, left_keys: list[str], right_keys: list[str], how: str
+    left: Dataset,
+    right: Dataset,
+    left_keys: list[str],
+    right_keys: list[str],
+    how: str,
+    null_safe: list[bool],
 ) -> Dataset:
     """Join on an ``ON`` equality without merging the two sides' key columns.
 
@@ -238,6 +244,7 @@ def _join_keeping_both_keys(
         left_keys: The left side's equi-join key columns.
         right_keys: The right side's equi-join key columns, positionally paired.
         how: The join type — inner/left/right/full (semi/anti never reach here).
+        null_safe: Per key pair, whether it was written ``IS NOT DISTINCT FROM``.
 
     Returns:
         The joined dataset, carrying both sides' key columns under their own names.
@@ -249,6 +256,7 @@ def _join_keeping_both_keys(
         left_on=left_keys,
         right_on=right_keys,
         how=how,
+        nulls_equal=null_safe,
     )
     # Left keys first, so a right key that happens to share a left key's name still wins
     # its own column — the reference that named it came from the right side.
@@ -368,7 +376,11 @@ def _orient_key_pair(a: str, b: str, left_cols, right_cols) -> tuple[str, str]:
 
 
 def _split_join_on(on, left_cols=None, right_cols=None):
-    """Split an ``ON`` predicate into ``(equi key pairs, residual predicate)``.
+    """Split an ``ON`` predicate into ``(equi key pairs, residual predicate, null-safe flags)``.
+
+    ``l.k IS NOT DISTINCT FROM r.k`` is an equi key too, flagged null-safe, so it plans as
+    a hash join with ``nulls_equal`` rather than as a cross join filtered on the null-safe
+    comparison, which is quadratic. ``l.k = r.k`` is flagged not null-safe.
 
     Each equality is oriented by which relation actually owns each column, not by the side
     of the ``=`` it was typed on. Reading position alone made ``ON b.k = a.k`` — the same
@@ -378,22 +390,24 @@ def _split_join_on(on, left_cols=None, right_cols=None):
     all of which write the right-hand table first.
     """
     eq_pairs: list[tuple[str, str]] = []
+    null_safe: list[bool] = []
     residual: list = []
     for conj in _and_conjuncts(on):
         if (
-            isinstance(conj, exp.EQ)
+            isinstance(conj, (exp.EQ, exp.NullSafeEQ))
             and isinstance(conj.this, exp.Column)
             and isinstance(conj.expression, exp.Column)
         ):
             eq_pairs.append(
                 _orient_key_pair(conj.this.name, conj.expression.name, left_cols, right_cols)
             )
+            null_safe.append(isinstance(conj, exp.NullSafeEQ))
         else:
             residual.append(conj)
     extra = None
     for term in residual:
         extra = term if extra is None else exp.And(this=extra, expression=term)
-    return eq_pairs, extra
+    return eq_pairs, extra, null_safe
 
 
 def _table(tr, node) -> Dataset:
@@ -511,8 +525,14 @@ def _apply_pivots(ds: Dataset, pivots) -> Dataset:
             raise NotImplementedError("UNPIVOT supports a single value column")
         on = [c.name for c in field.expressions]
         index = [c for c in ds.columns if c not in set(on)]
+        # sqlglot sets `include_nulls` True for `INCLUDE NULLS` and leaves it unset for a
+        # bare UNPIVOT, whose standard default (and DuckDB's) is EXCLUDE NULLS.
         return ds.unpivot(
-            index=index, on=on, variable_name=field.this.name, value_name=exprs[0].name
+            index=index,
+            on=on,
+            variable_name=field.this.name,
+            value_name=exprs[0].name,
+            include_nulls=bool(piv.args.get("include_nulls")),
         )
 
     if len(exprs) != 1 or not isinstance(exprs[0], exp.AggFunc):
@@ -523,7 +543,10 @@ def _apply_pivots(ds: Dataset, pivots) -> Dataset:
     values = agg.this.name
     on = field.this.name
     # Every listed value becomes an output column; the rest of the relation is the index.
-    columns = [str(v.this) if hasattr(v, "this") else str(v) for v in field.expressions]
+    # The values stay typed literals: stringifying them compared an integer `k` against
+    # '1', which the engine refuses ("Int64 == Utf8"). The output column is still named
+    # by the value's text, as DuckDB names it.
+    columns = [_values_literal(v) for v in field.expressions]
     index = [c for c in ds.columns if c not in {on, values}]
     return ds.pivot(
         index=index,

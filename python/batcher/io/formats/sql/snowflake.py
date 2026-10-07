@@ -113,6 +113,10 @@ class _SnowflakeBatchSplit:
 class SnowflakeSource:
     """A relation read from Snowflake as Arrow result chunks.
 
+    ``bt.read.snowflake`` builds `connection_kwargs` from one declared strategy
+    (``auth="password" | "key_pair" | "oauth" | "externalbrowser"`` plus role, warehouse,
+    database and schema); see `vendors.snowflake_auth`.
+
     Args:
         query: The single SQL query to execute.
         connection_kwargs: ``snowflake.connector.connect`` kwargs (account,
@@ -268,11 +272,16 @@ class SnowflakeSink:
     mode: str = "append"
 
     def write(self, table: pa.Table, path: str) -> WrittenFile:
-        """Ingest `table` into the Snowflake table named by `path`."""
+        """Ingest `table` into the Snowflake table named by `path`, staged through ``write_pandas``.
+
+        ``write_pandas`` uploads the frame as Parquet to a temporary stage and loads it with
+        ``COPY INTO``; its load results come back under the returned file's `job`: the chunk
+        count, the rows loaded, and the ``COPY INTO`` result rows.
+        """
         write_pandas = require_module("snowflake.connector.pandas_tools", extra=_EXTRA).write_pandas
         conn = _connect(self.connection_kwargs)
         try:
-            success, _chunks, nrows, _ = write_pandas(
+            success, nchunks, nrows, output = write_pandas(
                 conn,
                 table.to_pandas(),
                 table_name=path,
@@ -285,7 +294,17 @@ class SnowflakeSink:
                 raise BackendError(f"Snowflake write_pandas failed for table {path!r}")
         finally:
             conn.close()
-        return WrittenFile(path=path, rows=nrows, bytes=0)
+        return WrittenFile(
+            path=path,
+            rows=nrows,
+            bytes=0,
+            job={
+                "system": "snowflake",
+                "chunks": nchunks,
+                "rows_loaded": nrows,
+                "copy_into": [list(row) for row in output or ()],
+            },
+        )
 
     def write_partitioned(
         self,
@@ -315,6 +334,14 @@ class SnowflakeSink:
         Raises:
             BackendError: If ``mode="overwrite"`` meets a multi-shard write.
         """
+        from batcher.io.formats.sql.vendors.snowflake_auth import is_browser_auth
+
+        if file_index > 0 and is_browser_auth(self.connection_kwargs):
+            raise BackendError(
+                f"auth='externalbrowser' cannot be used for a distributed write to {path!r}: "
+                "every shard connects from its own worker, and a worker has no browser to "
+                "sign in with. Use auth='key_pair' or auth='oauth', or write single-node."
+            )
         if file_index > 0 and self.mode == "overwrite":
             raise BackendError(
                 f"mode='overwrite' cannot be used for a distributed write to table "

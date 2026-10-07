@@ -72,10 +72,39 @@ def test_the_gather_and_store_settings_come_from_the_shipped_config(construct) -
     assert cfg.flow_control.gather_streams != active_config().flow_control.gather_streams
     _worker, nat = construct(cfg, adaptive=False)
     assert nat.transport is not None
-    *_, store_cap, streams, inflight = nat.transport
+    *_, store_cap, streams, inflight, _spill_root = nat.transport
     assert streams == cfg.flow_control.gather_streams
     assert inflight == cfg.flow_control.gather_inflight_bytes
     assert store_cap == shuffle_store_cap(cfg)
+
+
+def test_the_shuffle_store_spills_under_the_shipped_spill_dir(construct, tmp_path) -> None:
+    """The store's spill root is the configured `memory.spill_dir`, not the OS tempdir.
+
+    It used to receive no root at all and spilled under `temp_dir()` whatever the operator
+    configured — on a container whose `/tmp` is a small tmpfs, into the RAM it was meant to
+    free (BT-030).
+    """
+    base = _driver_config()
+    cfg = dataclasses.replace(
+        base, memory=dataclasses.replace(base.memory, spill_dir=str(tmp_path))
+    )
+    _worker, nat = construct(cfg, adaptive=False)
+    assert nat.transport is not None
+    assert nat.transport[-1] == str(tmp_path)
+
+
+def test_with_no_spill_dir_the_store_uses_the_measured_local_scratch(
+    construct, monkeypatch
+) -> None:
+    import batcher._internal.site as site
+
+    base = _driver_config()
+    cfg = dataclasses.replace(base, memory=dataclasses.replace(base.memory, spill_dir=None))
+    monkeypatch.setattr(site, "local_scratch_root", lambda: "/mnt/nvme0")
+    _worker, nat = construct(cfg, adaptive=False)
+    assert nat.transport is not None
+    assert nat.transport[-1] == "/mnt/nvme0"
 
 
 def test_the_aimd_controller_uses_the_shipped_gains(construct) -> None:

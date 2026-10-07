@@ -122,24 +122,19 @@ def test_composite_distinct_declines_by_name(t, fn):
     assert "subquery" in message
 
 
-def test_two_different_distinct_expressions_still_decline(t):
-    """One dedup pass cannot serve two different DISTINCT expressions."""
-    with pytest.raises(NotImplementedError, match="two different DISTINCT"):
-        bt.sql(
-            "SELECT k, product(DISTINCT v) AS a, sum(DISTINCT w) AS b FROM t GROUP BY k",
-            t=bt.from_arrow(t),
-        ).collect()
+def test_two_different_distinct_expressions(t, duck):
+    """Two different DISTINCT expressions each get their own deduplicated copy (Expand)."""
+    q = "SELECT k, product(DISTINCT v) AS a, sum(DISTINCT w) AS b FROM t GROUP BY k"
+    assert_same(bt.sql(q, t=bt.from_arrow(t)).collect(), duck.sql(q))
 
 
-def test_composite_plain_aggregate_beside_a_distinct_one_declines_cleanly(t):
-    """A composite *plain* aggregate has no mergeable partial to pre-aggregate.
+def test_composite_plain_aggregate_beside_a_distinct_one(t, duck):
+    """A composite *plain* aggregate has no mergeable partial, so it takes the Expand rewrite.
 
     It used to raise a bare ``AttributeError: Expr has no attribute 'func'`` out of
     `Session.sql()` — the guard asked every plain aggregate for its function tag, and a
-    composite is an `Expr` with no tag at all.
+    composite is an `Expr` with no tag at all. It was then declined by name; now every
+    aggregate of the query is computed over the plain copy of the input.
     """
-    with pytest.raises(NotImplementedError, match="mixing a DISTINCT aggregate"):
-        bt.sql(
-            "SELECT k, regr_slope(v, w) AS a, sum(DISTINCT v) AS b FROM t GROUP BY k",
-            t=bt.from_arrow(t),
-        ).collect()
+    q = "SELECT k, regr_slope(v, w) AS a, sum(DISTINCT v) AS b FROM t GROUP BY k"
+    assert_same(bt.sql(q, t=bt.from_arrow(t)).collect(), duck.sql(q))

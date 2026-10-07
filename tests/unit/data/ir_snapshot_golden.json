@@ -1,4 +1,16 @@
 {
+  "add_days": {
+    "e": "binary",
+    "left": {
+      "e": "col",
+      "name": "d"
+    },
+    "op": "add_days",
+    "right": {
+      "e": "col",
+      "name": "n"
+    }
+  },
   "agg_binary": {
     "alias": "r",
     "func": "corr",
@@ -141,6 +153,39 @@
       }
     }
   },
+  "business_day_add": {
+    "e": "business_day",
+    "fn": "add",
+    "holidays": [
+      19723
+    ],
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "other": {
+      "e": "col",
+      "name": "n"
+    },
+    "roll": "forward",
+    "weekmask": [
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "business_day_is": {
+    "e": "business_day",
+    "fn": "is",
+    "input": {
+      "e": "col",
+      "name": "d"
+    }
+  },
   "case": {
     "branches": [
       {
@@ -219,6 +264,25 @@
       "name": "d"
     },
     "to_tz": "America/New_York"
+  },
+  "convert_timezone_policies": {
+    "ambiguous": "earliest",
+    "e": "convert_timezone",
+    "from_tz": "America/New_York",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "nonexistent": "shift_forward",
+    "to_tz": "UTC"
+  },
+  "date_epoch_ns": {
+    "e": "date",
+    "fn": "epoch_ns",
+    "input": {
+      "e": "col",
+      "name": "d"
+    }
   },
   "date_func": {
     "e": "date",
@@ -477,6 +541,48 @@
       "name": "x"
     }
   },
+  "json_doc_decode": {
+    "dtype": [
+      "struct",
+      [
+        [
+          "a",
+          [
+            "list",
+            "int64"
+          ]
+        ]
+      ]
+    ],
+    "e": "json_doc",
+    "fn": "decode",
+    "input": {
+      "e": "col",
+      "name": "j"
+    }
+  },
+  "json_doc_encode": {
+    "e": "json_doc",
+    "fn": "encode",
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
+  "json_doc_merge_patch": {
+    "e": "json_doc",
+    "fn": "merge_patch",
+    "input": {
+      "e": "col",
+      "name": "j"
+    },
+    "other": {
+      "e": "lit",
+      "value": {
+        "str": "{}"
+      }
+    }
+  },
   "least": {
     "e": "least",
     "inputs": [
@@ -545,6 +651,36 @@
       }
     }
   },
+  "list_filter_captures": {
+    "capture_names": [
+      "th"
+    ],
+    "captures": [
+      {
+        "e": "col",
+        "name": "th"
+      }
+    ],
+    "e": "list_filter",
+    "input": {
+      "e": "col",
+      "name": "a"
+    },
+    "pred": {
+      "e": "binary",
+      "left": {
+        "e": "col",
+        "name": "x"
+      },
+      "op": "gt",
+      "right": {
+        "e": "lit",
+        "value": {
+          "int": 0
+        }
+      }
+    }
+  },
   "list_func": {
     "e": "list",
     "fn": "sum",
@@ -556,6 +692,14 @@
   "list_func_nulls_first": {
     "e": "list",
     "fn": "sort_desc_nulls_first",
+    "input": {
+      "e": "col",
+      "name": "a"
+    }
+  },
+  "list_func_var_pop": {
+    "e": "list",
+    "fn": "var_pop",
     "input": {
       "e": "col",
       "name": "a"
@@ -680,6 +824,29 @@
       "e": "col",
       "name": "a"
     },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
+  "list_zip_struct": {
+    "e": "list_zip_struct",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "right": {
+      "e": "col",
+      "name": "b"
+    }
+  },
+  "list_zip_struct_pad": {
+    "e": "list_zip_struct",
+    "left": {
+      "e": "col",
+      "name": "a"
+    },
+    "pad": true,
     "right": {
       "e": "col",
       "name": "b"
@@ -846,6 +1013,22 @@
       "value": {
         "int": 0
       }
+    }
+  },
+  "replace_timezone": {
+    "ambiguous": "raise",
+    "e": "replace_timezone",
+    "input": {
+      "e": "col",
+      "name": "d"
+    },
+    "tz": "Europe/Paris"
+  },
+  "replace_timezone_strip": {
+    "e": "replace_timezone",
+    "input": {
+      "e": "col",
+      "name": "d"
     }
   },
   "seq_bare": {
@@ -1108,6 +1291,17 @@
       "name": "s"
     }
   },
+  "strptime_formats": {
+    "e": "strptime",
+    "format": [
+      "%Y-%m-%d",
+      "%d/%m/%Y"
+    ],
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
   "strptime_strict": {
     "e": "strptime",
     "format": "%Y-%m-%d",
@@ -1120,6 +1314,43 @@
   "struct_field": {
     "e": "struct_field",
     "field": "field",
+    "input": {
+      "e": "col",
+      "name": "s"
+    }
+  },
+  "struct_update_full": {
+    "drop": [
+      "a"
+    ],
+    "e": "struct_update",
+    "input": {
+      "e": "col",
+      "name": "s"
+    },
+    "names": [
+      "x"
+    ],
+    "rename": [
+      [
+        "b",
+        "c"
+      ]
+    ],
+    "values": [
+      {
+        "e": "lit",
+        "value": {
+          "int": 1
+        }
+      }
+    ]
+  },
+  "struct_update_min": {
+    "drop": [
+      "a"
+    ],
+    "e": "struct_update",
     "input": {
       "e": "col",
       "name": "s"

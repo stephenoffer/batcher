@@ -22,6 +22,7 @@ import pyarrow as pa
 
 from batcher.io.formats.streaming.checkpoint.identity import CheckpointOwner
 from batcher.io.formats.streaming.checkpoint.location import is_local_location
+from batcher.io.formats.streaming.checkpoint.recovery import FINALIZE_SOURCE_ID
 from batcher.io.formats.streaming.checkpoint.state_store import StateStore
 
 __all__ = ["CheckpointStore"]
@@ -87,12 +88,25 @@ class CheckpointStore:
             raise
         self._owner = owner
 
-    def record_offsets(self, batch_id: int, positions: dict[int, dict]) -> None:
-        """Write-ahead: record each source's position for `batch_id`."""
+    def record_offsets(
+        self, batch_id: int, positions: dict[int, dict], *, finalize: bool = False
+    ) -> None:
+        """Write-ahead: record each source's position for `batch_id`.
+
+        Args:
+            batch_id: The micro-batch about to publish.
+            positions: ``{source_id: position}`` the batch consumed through.
+            finalize: Mark the batch as the end-of-stream flush, so recovery re-runs the
+                flush rather than giving its id to new data (see `recovery.ResumePlan`).
+        """
         if self._owner is not None:
             self._owner.verify()
         for source_id, position in positions.items():
             self.offsets.record(batch_id, source_id, position)
+        if finalize:
+            # Recorded last: the marker is what makes recovery treat the id as a flush, so
+            # it must never be durable while the positions beside it are not.
+            self.offsets.record(batch_id, FINALIZE_SOURCE_ID, {"finalize": True})
 
     def snapshot_state(self, batch_id: int, state: pa.RecordBatch | None) -> None:
         """Snapshot the running aggregation state for `batch_id` (if any)."""

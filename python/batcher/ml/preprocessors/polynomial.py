@@ -223,6 +223,9 @@ class SplineTransformer(Preprocessor):
     def fit(self, ds: Dataset) -> SplineTransformer:
         """Learn each column's knot positions with one aggregate.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 

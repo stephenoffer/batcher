@@ -119,6 +119,7 @@ These methods append window-function columns, change the shape of the table betw
    Dataset.pivot
    Dataset.unpivot
    Dataset.transpose
+   Dataset.upsample
    Dataset.explode
    Dataset.get_dummies
    Dataset.partition_by

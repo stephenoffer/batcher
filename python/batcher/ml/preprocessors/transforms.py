@@ -111,6 +111,9 @@ class QuantileTransformer(Preprocessor):
     def fit(self, ds: Dataset) -> QuantileTransformer:
         """Learn each column's `n_quantiles` cut points in one aggregate.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 
@@ -310,6 +313,9 @@ class Clipper(Preprocessor):
 
     def fit(self, ds: Dataset) -> Clipper:
         """Learn each column's clamp bounds from the requested quantiles.
+
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
 
         Examples:
             .. doctest::

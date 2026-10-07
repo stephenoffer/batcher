@@ -283,12 +283,16 @@ _CONNECTORS: dict[str, dict] = {
     "files_incremental": {"path": "/data/tbl", "format": "parquet"},
     "hbase": {"host": "h", "table": "t"},
     "hdf5": {"path": "/data/tbl", "dataset": "ds"},
+    "milvus": {"collection": "c", "uri": "./m.db"},
     "mongo": {"uri": "mongodb://h", "database": "d", "collection": "c"},
     "neo4j": {"uri": "bolt://h", "username": "u", "password": "p", "cypher": "MATCH (n) RETURN n"},
+    "pinecone": {"index": "i", "namespace": "ns"},
     "protobuf": {"path": "/data/tbl", "message_cls": object},
+    "qdrant": {"collection": "c", "location": ":memory:"},
     "redis": {"host": "h"},
     "scylla": {"contact_points": ["h"], "keyspace": "ks", "table": "t", "partition_key": "k"},
     "snowflake": {"query": "select 1", "connection_kwargs": {"account": "a"}},
+    "turbopuffer": {"namespace": "n", "region": "r"},
 }
 
 #: What each of those must be governed as. A fingerprint in any of these is the defect:
@@ -308,12 +312,16 @@ _EXPECTED = {
     "files_incremental": "/data/tbl",
     "hbase": "h:9090/t",
     "hdf5": "/data/tbl",
+    "milvus": "c",
     "mongo": "d.c",
     "neo4j": "bolt://h/default",
+    "pinecone": "i/ns",
     "protobuf": "/data/tbl",
+    "qdrant": "c",
     "redis": "h:6379/0",
     "scylla": "ks.t",
     "snowflake": "",
+    "turbopuffer": "n",
 }
 
 

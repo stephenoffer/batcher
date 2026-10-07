@@ -51,6 +51,9 @@ Read `.claude/rules/python-control-plane.md` (the IR wire contract),
 
 - Parameterless transform/field/reduction → add **one row** to the family dispatch
   table (`_STR_TRANSFORMS`, `_DT_FIELDS`, `_LIST_FUNCS`); the accessor is generated.
+  Then run `just gen-decls`: a type checker cannot see a `setattr`-bound method, so
+  `plan/expr_ir/declared/bound.py` declares it, and `tests/unit/test_bound_decls.py` fails
+  until it is regenerated.
 - Parameterized → a thin method on the namespace class that builds the node
   (`return StrFunc("slug", self._e, replacement=sep)`).
 - Add the engine `fn` name to the matching family vocabulary in `fn_names.py`.

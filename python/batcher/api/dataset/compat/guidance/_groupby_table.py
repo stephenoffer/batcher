@@ -47,7 +47,7 @@ GROUPBY_UNSUPPORTED: dict[str, str] = {
     # --- per-group ordered / positional operations ------------------------------------
     "cumcount": (
         "A within-group running index is a window's row_number: "
-        "ds.window(partition_by=['k'], order_by=['t'], functions={'i': ('row_number',)})."
+        "ds.window(partition_by=['k'], order_by=['t'], functions={'i': 'row_number'})."
     ),
     "ngroup": (
         "A dense group id is bt.col('k').label_encode() in ds.with_columns(...); "
@@ -55,7 +55,7 @@ GROUPBY_UNSUPPORTED: dict[str, str] = {
     ),
     "rank": (
         "Per-group rank is a window: ds.window(partition_by=['k'], order_by=['x'], "
-        "functions={'r': ('rank',)})."
+        "functions={'r': 'rank'})."
     ),
     "shift": (
         "Per-group shift is a window's lag: ds.window(partition_by=['k'], order_by=['t'], "
@@ -107,7 +107,7 @@ GROUPBY_UNSUPPORTED: dict[str, str] = {
     "ngroups": "For the number of groups use ds.select('k').distinct().count().",
     "nth": (
         "The nth row per group is a window: ds.window(partition_by=['k'], order_by=['t'], "
-        "functions={'i': ('row_number',)}).filter(bt.col('i') == n)."
+        "functions={'i': 'row_number'}).filter(bt.col('i') == n)."
     ),
     "describe": (
         "Aggregate the stats you need explicitly: .agg(mean=bt.col('x').mean(), "

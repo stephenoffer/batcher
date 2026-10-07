@@ -35,6 +35,8 @@ A SQLAlchemy `+driver` suffix is accepted and ignored, so `postgresql+psycopg2:/
 
 `sqlite` and `duckdb` address a local file, so their path is a locator and not a database name. Write them with three slashes, `sqlite:///local.db`.
 
+A route reaching a database is not a statement about which of its types and write modes work. {doc}`vendor-matrix` states that for PostgreSQL, MySQL and MariaDB, SQL Server, Oracle, Trino and Redshift: the package each route needs, the write modes it carries, and how values such as a MySQL `BIGINT UNSIGNED` above 2^63 or a zero date convert or are refused. With no ConnectorX installed, a `mssql://`, `trino://` or `redshift://` URI reads through `pymssql`, `trino` or `redshift_connector` instead, and a `trino://user@host:443/catalog/schema` URI sets the session's catalog and schema.
+
 ```python
 # docs: skip
 import batcher as bt
@@ -64,6 +66,8 @@ adbc adbc_driver_postgresql app
 connectorx
 36
 ```
+
+The table names the backend a scheme prefers. When that backend's driver isn't installed, the read falls back to the scheme's PEP 249 driver if one is, so a `sqlite://` read without `adbc_driver_sqlite` still works through the standard library's `sqlite3`, several times slower. The fallback logs one INFO line on the `batcher.io.sql` logger naming the package that would avoid it, and {py:meth}`explain() <batcher.Dataset.explain>` names the backend on the scan line, such as `scan [source 0 · dbapi(sqlite3)]` or `adbc(adbc_driver_postgresql)`.
 
 ### Wire-compatible databases
 
@@ -182,6 +186,34 @@ So `LIMIT` pushes to PostgreSQL, SQLite, DuckDB, MySQL and the rest of the allow
 
 If a driver types an empty result set from row data rather than query metadata, the probe comes back with null-typed columns. Batcher checks for that and falls back to the full read, which is slower rather than wrong.
 
+### Bind parameters instead of formatting them in
+
+`params=` binds values to the query's placeholders through `cursor.execute(sql, params)`, so a value never has to be spliced into the SQL text. Pass a sequence for positional placeholders or a mapping for named ones. The placeholder style is the driver's own: `?` for `sqlite3`, `duckdb` and ADBC, `%s` for `psycopg` and `pymysql`. The parameters are bound on every statement the read runs, the schema probe and each partition's query included, and they are part of the read's identity, so two reads differing only in their parameters never share learned statistics.
+
+```python
+import sqlite3
+import tempfile
+from pathlib import Path
+
+import batcher as bt
+
+params_db = str(Path(tempfile.mkdtemp()) / "params.db")
+con = sqlite3.connect(params_db)
+con.execute("CREATE TABLE orders (id INTEGER, country TEXT)")
+con.executemany("INSERT INTO orders VALUES (?, ?)", [(1, "US"), (2, "DE"), (3, "US")])
+con.commit()
+us = bt.read.sql(
+    "SELECT id FROM orders WHERE country = ?", uri=f"sqlite:///{params_db}", params=["US"]
+)
+print(sorted(us.to_pydict()["id"]))
+```
+
+```text
+[1, 3]
+```
+
+Under a `%s`-style driver a pushed filter's own `%`, such as the one in a `LIKE 'a%'`, is doubled so the driver doesn't read it as a placeholder. Your query reaches the driver exactly as you wrote it. ConnectorX has no parameter binding, so a ConnectorX scheme with `params=` raises and names the DB-API route instead.
+
 ## How the read parallelizes
 
 Each backend parallelizes differently.
@@ -277,6 +309,8 @@ Each partition is a separate query on a separate connection, so `num_partitions=
 Skew is the cost of wrong bounds. Bounds much narrower than the data leave the edge partitions carrying most of the rows, and the extract runs at the speed of its slowest query. Bounds much wider leave the interior partitions empty. Neither loses a row. A cheap `SELECT min(id), max(id)` before the extract is usually all the accuracy needed.
 
 The splits are what the distributed executor schedules across workers, so the fan-out is realized on a {py:meth}`collect(distributed=...) <batcher.Dataset.collect>` run. On a single node the partitioned queries still run, and ConnectorX is the backend that parallelizes within one process regardless.
+
+The partitions don't share a snapshot. Each is its own query in its own transaction, so a write that lands during the extract can be seen by some partitions and not others, and a row whose partition key changes mid-read can appear in two partitions or in none. For a consistent extract, read a table nothing is writing to, such as a snapshot copy or a replica paused for the job, or don't partition.
 
 ADBC prefers server-side partitioning when the driver has it. With `partition=True` Batcher tries `adbc_execute_partitions` first, which splits one already-executed result set and is strictly better than N independent queries. Range partitioning is the fallback, reached only once the driver has declined.
 
@@ -389,6 +423,12 @@ A borrowed connection reads through the DB-API path, so its costs and its type h
 
 One more property is worth knowing before you rely on learned statistics. A borrowed connection is a live object with no stable identity across runs, so its split identity falls back to the driver name and cannot tell two databases reached through the same driver apart. Pass `bt.read.table("dbapi", module=..., connect_kwargs=...)` when you want a precise, reusable key for the optimizer.
 
+### Embedded databases
+
+An in-memory DuckDB or SQLite database exists only inside the connection that created it, so `uri="duckdb:///:memory:"` or `uri="sqlite:///:memory:"` opens a new, empty database rather than the one your notebook has been filling. To read a notebook's in-memory tables, pass its connection as `connection=`.
+
+A DuckDB file is locked by the process that has it open for writing. Another process, including a Ray worker on the same machine, then can't open it at all, even read-only, and the read fails with DuckDB's `Could not set lock on file` error. A `uri=` read in the process that holds the connection works, because DuckDB shares the open database within a process. To fan a DuckDB file out across workers, close the writing connection first.
+
 ### Coming from pandas
 
 The `connection=` support is there so a `pandas.read_sql` line ports almost verbatim. pandas takes the query first and the connection second; Batcher takes the query first and the connection as a keyword.
@@ -419,7 +459,7 @@ ConnectorX is a reader, so a ConnectorX scheme has no Arrow-native write path. T
 
 Every split opens its own connection. A partitioned FlightSQL read with a hundred descriptors means a hundred connections, so check the server's concurrency limits before fanning out.
 
-Credentials live on the split. They are never logged, but they are serialized to every worker, which is worth knowing on a shared cluster before reaching for a personal token instead of a service account.
+Credentials live on the split and are never logged. What the split carries depends on how you pass them. A literal password or token is serialized to every worker, which is worth knowing on a shared cluster before reaching for a personal token instead of a service account. A reference such as `env:PGPASSWORD`, `file:/run/secrets/pg` or `cmd:pg-prod` is different: only the reference travels, and each worker resolves it from its own environment, mounted file or secret helper when it opens the connection, so the secret itself never enters the pickled split.
 
 A scheme Batcher cannot route raises a `BackendError` listing the ones it can. For a driver with no URI scheme at all, construct the source directly, such as `bt.read.table("odbc", connection_string=...)`.
 

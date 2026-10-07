@@ -18,9 +18,15 @@ the other would answer a different question with a plausible-looking string.
 
 from __future__ import annotations
 
+import json
+
+import pyarrow as pa
 from sqlglot import expressions as exp
 
+from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir import Expr, coalesce, lit, nullif, when
+from batcher.plan.expr_ir.namespaces._json_path import check_json_path, split_wildcard_tail
+from batcher.plan.types.registry import canonical_dtype_name, resolve_dtype
 
 
 def json_path(node) -> str:
@@ -28,7 +34,11 @@ def json_path(node) -> str:
 
     The path arrives either as a ``JSONPath`` node (a list of root/key/subscript parts,
     from ``json_extract(j, '$.a')`` or ``j -> '$.a'``) or as a plain string literal; both
-    normalize to the ``$``-rooted dotted form the engine's ``.json`` accessor consumes.
+    normalize to the ``$``-rooted form the engine's ``.json`` accessor consumes. A key
+    holding a character the dotted form cannot carry (``x.y``) is re-quoted, so
+    ``'$."x.y"'`` keeps meaning the key ``x.y``. A trailing ``[*]`` is kept for
+    `json_extract` to peel off; every other multi-value selector is refused with the
+    same reasons the accessor gives.
     """
     if isinstance(node, exp.Literal):
         return node.this if node.this.startswith("$") else f"$.{node.this}"
@@ -36,15 +46,39 @@ def json_path(node) -> str:
         raise NotImplementedError("JSON path must be a constant path expression")
     out = "$"
     for part in node.expressions:
-        if isinstance(part, exp.JSONPathRoot):
-            continue
-        if isinstance(part, exp.JSONPathKey):
-            out += f".{part.this}"
-        elif isinstance(part, exp.JSONPathSubscript):
-            out += f"[{part.this}]"
-        else:
-            raise NotImplementedError(f"unsupported JSON path element: {type(part).__name__}")
+        out += _path_step(part)
     return out
+
+
+def _path_step(part) -> str:
+    """One sqlglot JSON path part as path text, refusing the selectors the engine lacks."""
+    if isinstance(part, exp.JSONPathRoot):
+        return ""
+    if isinstance(part, exp.JSONPathKey):
+        if isinstance(part.this, exp.JSONPathWildcard):
+            return ".*"
+        return f".{_quote_key(str(part.this))}"
+    if isinstance(part, exp.JSONPathSubscript):
+        if isinstance(part.this, exp.JSONPathWildcard):
+            return "[*]"
+        if isinstance(part.this, exp.JSONPathSlice):
+            return "[:]"
+        return f"[{part.this}]"
+    if isinstance(part, exp.JSONPathRecursive):
+        return f"..{part.this or ''}"
+    if isinstance(part, exp.JSONPathUnion):
+        return "[,]"
+    if isinstance(part, exp.JSONPathSelector):
+        return "[?]"
+    raise PlanError(f"unsupported JSON path element: {type(part).__name__}")
+
+
+def _quote_key(key: str) -> str:
+    """`key` bare when the dotted form can carry it, else double-quoted with escapes."""
+    if key and not any(c in key for c in ".[]\"'*\\ "):
+        return key
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def json_extract(tr, node) -> Expr:
@@ -72,9 +106,17 @@ def json_extract(tr, node) -> Expr:
         # bare key gets below is a plan-time rewrite of a constant.
         return StrFuncDyn(fn, doc, pattern=tr._scalar(node.expression))
     path = json_path(node.expression)
-    if isinstance(node, exp.JSONExtractScalar):
+    scalar = isinstance(node, exp.JSONExtractScalar)
+    prefix = split_wildcard_tail(path)
+    if prefix is not None:
+        # `$.a[*]` lists every element of `$.a`, which DuckDB answers as a LIST of the
+        # same renderings the scalar forms use. Answering it with the array as one string
+        # -- what dropping the `[*]` did -- was a different type and a different value.
+        fn_all = "json_extract_string_all" if scalar else "json_extract_all"
+        return StrFunc(fn_all, doc, pattern=prefix)
+    if scalar:
         return doc.json.extract_string(path)
-    return StrFunc("json_extract", doc, pattern=path)
+    return StrFunc("json_extract", doc, pattern=check_json_path(path))
 
 
 # `f(doc[, path])` → the `.json` accessor of the same shape. The path defaults to the
@@ -85,6 +127,52 @@ _JSON_PATH_FNS = {
     "json_exists": "exists",
     "json_value": "value",
 }
+
+# DuckDB's typed decode, and the accessor's own name for it. The structure argument is
+# DuckDB's: a JSON document whose leaves name a type (`{"a": "BIGINT", "b": ["VARCHAR"]}`).
+_JSON_DECODE_FNS = frozenset({"json_transform", "json_transform_strict", "json_decode"})
+
+
+def structure_type(spec: str) -> pa.DataType:
+    """The Arrow type a DuckDB `json_transform` structure names.
+
+    A string leaf is a type name (`"BIGINT"`, `"VARCHAR"`), a one-element array is a list
+    of that element, and an object is a struct of its keys in document order. A structure
+    that is not JSON at all is read as one flat type name, so ``json_decode(j, 'int64')``
+    works as well.
+
+    Args:
+        spec: The structure text.
+
+    Returns:
+        The Arrow type.
+
+    Raises:
+        PlanError: A leaf names no type the engine knows, or an array has other than one
+            element.
+    """
+    try:
+        parsed = json.loads(spec)
+    except ValueError:
+        parsed = spec
+    return _structure_node(parsed, spec)
+
+
+def _structure_node(node: object, spec: str) -> pa.DataType:
+    if isinstance(node, str):
+        resolved = resolve_dtype(canonical_dtype_name(node))
+        if resolved is None:
+            raise PlanError(f"json_transform structure {spec!r}: unknown type {node!r}")
+        return resolved
+    if isinstance(node, list) and len(node) == 1:
+        return pa.list_(_structure_node(node[0], spec))
+    if isinstance(node, dict) and node:
+        return pa.struct([(k, _structure_node(v, spec)) for k, v in node.items()])
+    raise PlanError(
+        f"json_transform structure {spec!r}: expected a type name, a one-element array or "
+        f"an object, got {json.dumps(node)}"
+    )
+
 
 # `f(doc)` → a `.json` accessor that reads the whole document.
 _JSON_WHOLE_FNS = {"json_pretty": "pretty", "json_structure": "structure"}
@@ -122,6 +210,12 @@ def json_function(tr, node) -> Expr | None:
     whole = _JSON_WHOLE_FNS.get(name)
     if whole is not None and len(args) == 1:
         return getattr(tr._scalar(args[0]).json, whole)()
+    if name in _JSON_DECODE_FNS and len(args) == 2:
+        from batcher._sql.parser.expressions.literals import _const_str_arg
+
+        spec = _const_str_arg(args[1], f"{name}()", "structure")
+        strict = name == "json_transform_strict"
+        return tr._scalar(args[0]).json.decode(structure_type(spec), strict=strict)
     if name == "json_contains" and len(args) == 2:
         from batcher._sql.parser.expressions.literals import _const_str_arg
 

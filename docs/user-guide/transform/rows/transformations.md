@@ -80,7 +80,7 @@ print(ds.select(bt.exclude("qty")).columns)
 # ['name', 'price']
 ```
 
-The dtype selectors pick columns by kind. {py:func}`bt.numeric() <batcher.numeric>` covers integer, float, and decimal, and {py:func}`bt.integer() <batcher.integer>`, {py:func}`bt.floating() <batcher.floating>`, {py:func}`bt.string() <batcher.string>`, and {py:func}`bt.boolean() <batcher.boolean>` narrow that to one kind each. {py:func}`bt.temporal() <batcher.temporal>` covers date, time, timestamp, and duration, and {py:func}`bt.by_dtype(pa.float64(), ...) <batcher.by_dtype>` matches Arrow types as the engine stores them, taking a `pyarrow` type or its name.
+The dtype selectors pick columns by kind. {py:func}`bt.numeric() <batcher.numeric>` covers integer, float, and decimal, and {py:func}`bt.integer() <batcher.integer>`, {py:func}`bt.floating() <batcher.floating>`, {py:func}`bt.string() <batcher.string>`, and {py:func}`bt.boolean() <batcher.boolean>` narrow that to one kind each. {py:func}`bt.temporal() <batcher.temporal>` covers date, time, timestamp, and duration, and {py:func}`bt.by_dtype(pa.float64(), ...) <batcher.by_dtype>` matches Arrow types as the engine stores them, taking a `pyarrow` type or any dtype name `cast` accepts, such as `"decimal(10,2)"`.
 
 The name selectors match column *names*. {py:func}`bt.matches(regex) <batcher.matches>` matches by regular expression, and {py:func}`bt.starts_with(...) <batcher.starts_with>`, {py:func}`bt.ends_with(...) <batcher.ends_with>`, and {py:func}`bt.contains(...) <batcher.contains>` match by literal prefix, suffix, and substring. Each of those three accepts several arguments. {py:func}`bt.all() <batcher.all>` matches every column.
 
@@ -169,6 +169,14 @@ print(sales.select(bt.numeric().mean()).to_pydict())
 
 `alias(...)` names one column, so an aliased aggregate over a selector that matched several columns raises a `PlanError` when the query is written, and so does a keyword such as `agg(total=bt.numeric().sum())`. A window works the same way: `bt.numeric().sum().over(partition_by=["region"]).name.suffix("_region")` adds one windowed column per numeric column.
 
+One expression may mix a selector with whole-frame aggregates over the same selector, which is how you standardize every numeric column at once. Bind the selector to a name and reuse it. Selectors match by identity, so writing `bt.numeric()` three times is three selectors and raises a `PlanError` that names this fix:
+
+```python
+n = bt.numeric()
+print(sales.with_columns((n - n.mean()) / n.std()).to_pydict())
+# {'region': ['n', 'n', 's'], 'price': [-1.0, 0.0, 1.0], 'qty': [-1.0, 0.0, 1.0]}
+```
+
 ### Dtypes are the stored types
 
 Batcher widens narrow types once, when data enters the engine: every integer width becomes `int64`, `float16` and `float32` become `float64`, and `large_string` and a dictionary-encoded string become `string`. A dtype selector matches the stored type, and {py:obj}`bt.by_dtype <batcher.by_dtype>` widens the type you ask for the same way, so {py:obj}`bt.by_dtype(pa.int32()) <batcher.by_dtype>` selects every `int64` column, including one that was `int64` in the source:
@@ -192,7 +200,7 @@ print(ds.drop(bt.temporal()).columns)  # nothing matched, nothing dropped
 # ['name', 'price', 'qty']
 ```
 
-A selector is refused with a `PlanError` in a filter predicate, as a join key, and in the other verbs that take column names. A join key is refused because the two sides would each expand it on their own. Some Polars selector constructors are not provided. There is no positional selector such as `by_index`, `first`, or `last`, and {py:obj}`bt.first <batcher.first>` and {py:obj}`bt.last <batcher.last>` are aggregates rather than selectors. There is also no finer dtype selector such as `date`, `datetime`, `duration`, `decimal`, `categorical`, `binary`, or `signed_integer`. Use {py:obj}`bt.by_dtype(...) <batcher.by_dtype>` with the Arrow type instead.
+A selector is refused with a `PlanError` in a filter predicate, as a join key, and in the other verbs that take column names. A join key is refused because the two sides would each expand it on their own. Some Polars selector constructors are not provided. There is no positional selector such as `by_index`, `first`, or `last`, and {py:obj}`bt.first <batcher.first>` and {py:obj}`bt.last <batcher.last>` are aggregates rather than selectors. There is also no finer dtype selector such as `date`, `datetime`, `duration`, `decimal`, `categorical`, `binary`, or `signed_integer`. Use {py:obj}`bt.by_dtype(...) <batcher.by_dtype>` with the Arrow type instead, or {py:meth}`ds.select_dtypes(...) <batcher.Dataset.select_dtypes>`, which also names the `decimal`, `binary`, `list`, `struct`, `map`, `nested`, and `tensor` families.
 
 ## Casting inside a projection
 
@@ -230,6 +238,8 @@ print(ds.pipe(with_total, tax=0.5).filter(bt.col("total") > 20).to_pydict()["tot
 ```
 
 Without `pipe` the same pipeline reads backwards. `with_total(ds).filter(...)` puts the first step in the middle. Reach for `pipe` whenever a chain grows a step that has no built-in method.
+
+Annotate a reusable step as taking a `bt.Dataset` first and returning one, with its options as further parameters, such as `def with_total(frame: bt.Dataset, tax: float = 0.0) -> bt.Dataset`. `pipe` is typed with a `ParamSpec`, so a type checker holds the arguments you pass after the function to that signature, and `ds.pipe(with_total, tax="high")` is flagged in the editor rather than failing when the query runs.
 
 Expressions have the same method. {py:meth}`Expr.pipe <batcher.Expr.pipe>` hands the expression to your function, so a reusable column builder chains the same way:
 

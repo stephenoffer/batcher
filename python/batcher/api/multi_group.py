@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 import pyarrow as pa
@@ -58,7 +58,7 @@ from batcher.plan.visitor import walk
 if TYPE_CHECKING:
     from batcher.api.dataset import Dataset
 
-__all__ = ["MultiLevelGroupBy", "cube_levels", "rollup_levels", "stack_levels"]
+__all__ = ["MultiLevelGroupBy", "cube_levels", "grouping_bits", "rollup_levels", "stack_levels"]
 
 # The single-input nodes a level may carry above its aggregate: each reads only the rows of
 # that level, so it is unchanged when the level's aggregate is computed from shared partials.
@@ -90,6 +90,26 @@ def cube_levels(keys: tuple[str, ...]) -> list[tuple[str, ...]]:
     return [
         tuple(c) for size in range(len(keys), -1, -1) for c in itertools.combinations(keys, size)
     ]
+
+
+def grouping_bits(rolled_up: Iterable[bool]) -> int:
+    """The ``GROUPING(k₁, …, kₙ)`` / ``GROUPING_ID`` integer of one level.
+
+    Bit `i` from the left is 1 when key `i` is rolled up (inactive) in the level, so the
+    first key is the most significant bit -- the SQL-standard, DuckDB and Spark order. Both
+    front-ends compute it here: the SQL translator for ``GROUPING(...)`` and the DataFrame
+    builder for ``rollup(..., grouping_id=...)``.
+
+    Args:
+        rolled_up: Per key, in key order, whether the level rolls it up.
+
+    Returns:
+        The level's grouping id.
+    """
+    bits = 0
+    for flag in rolled_up:
+        bits = (bits << 1) | int(flag)
+    return bits
 
 
 def stack_levels(frames: Sequence[Dataset]) -> Dataset:
@@ -149,13 +169,22 @@ class MultiLevelGroupBy:
             [1, 2, 3, 4, 4, 7]
     """
 
-    __slots__ = ("_ds", "_keys", "_levels")
+    __slots__ = ("_ds", "_grouping_id", "_keys", "_levels")
 
-    def __init__(self, ds: Dataset, keys: tuple[str, ...], levels: list[tuple[str, ...]]) -> None:
-        """Hold the source dataset, the full key list, and the levels to aggregate."""
+    def __init__(
+        self,
+        ds: Dataset,
+        keys: tuple[str, ...],
+        levels: list[tuple[str, ...]],
+        grouping_id: str | None = None,
+    ) -> None:
+        """Hold the source dataset, the full key list, the levels, and the id column name."""
+        if grouping_id is not None and not (isinstance(grouping_id, str) and grouping_id):
+            raise PlanError(f"grouping_id must be a non-empty column name, got {grouping_id!r}")
         self._ds = ds
         self._keys = keys
         self._levels = levels
+        self._grouping_id = grouping_id
 
     def __repr__(self) -> str:
         """A source-like rendering naming the keys and the level count."""
@@ -165,8 +194,9 @@ class MultiLevelGroupBy:
         """Aggregate every grouping level and stack the results.
 
         Each level's inactive keys read as NULL, which is how SQL marks a subtotal row.
-        Use ``grouping(...)`` semantics — testing a key for null — to tell a subtotal
-        apart from a genuine null in the data.
+        A genuine null in the data reads the same, so pass ``grouping_id="<name>"`` to the
+        constructor to tell them apart: that column holds each row's level as SQL
+        ``GROUPING_ID`` bits, and is appended after the aggregates.
 
         Args:
             **named: Output names bound to aggregate expressions, as for
@@ -177,7 +207,8 @@ class MultiLevelGroupBy:
             of rows per level.
 
         Raises:
-            PlanError: If no aggregates are given.
+            PlanError: If no aggregates are given, or the `grouping_id` column's name
+                collides with a key or an aggregate.
 
         Examples:
             .. doctest::
@@ -191,6 +222,11 @@ class MultiLevelGroupBy:
             raise PlanError(
                 "rollup()/cube()/grouping_sets() need at least one aggregate, "
                 "e.g. .agg(total=col('x').sum())"
+            )
+        gid = self._grouping_id
+        if gid is not None and (gid in self._keys or gid in named):
+            raise PlanError(
+                f"grouping_id={gid!r} collides with a key or aggregate name; choose another"
             )
         frames = [self._level_frame(level, named) for level in self._levels]
         assert frames  # `_levels` is never empty: the grand total is always one
@@ -218,10 +254,16 @@ class MultiLevelGroupBy:
             nulls: dict[str, AggExpr | Expr] = {
                 k: nullif(col(k).max(), col(k).max()) for k in self._keys
             }
-            return self._ds.agg(**named, **nulls).select(*self._keys, *named)
-        keyed = {k: col(k) if k in active else nullif(col(k), col(k)) for k in self._keys}
-        grouped = self._ds.group_by(**keyed).agg(**named)
-        return grouped.select(*self._keys, *named)
+            frame = self._ds.agg(**named, **nulls).select(*self._keys, *named)
+        else:
+            keyed = {k: col(k) if k in active else nullif(col(k), col(k)) for k in self._keys}
+            frame = self._ds.group_by(**keyed).agg(**named).select(*self._keys, *named)
+        if self._grouping_id is None:
+            return frame
+        # A per-level constant, so it is a projection above the level's aggregate -- one of
+        # the wrappers the shared-partial rewrite carries over unchanged (`_LEVEL_WRAPPERS`).
+        bits = grouping_bits(k not in active for k in self._keys)
+        return frame.with_columns(**{self._grouping_id: lit(bits).cast("int64")})
 
 
 #: Prefix of the shared aggregate's partial columns; also what marks a union already rewritten.

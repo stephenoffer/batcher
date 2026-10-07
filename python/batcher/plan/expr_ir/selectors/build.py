@@ -13,7 +13,8 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.selectors.core import Selector
-from batcher.plan.types.lattice import widen
+from batcher.plan.types.lattice import _is_any_list, widen
+from batcher.plan.types.registry import resolve_dtype_spec
 
 __all__ = [
     "all",
@@ -161,15 +162,19 @@ def by_dtype(*dtypes: pa.DataType | str) -> Selector:
     including those that were ``int32`` in the source. The selector cannot tell a source
     ``int32`` from a source ``int64``, because the engine cannot either.
 
+    A name is read by the same parser as ``Expr.cast``, so every spelling ``cast``
+    accepts selects here too: ``"BIGINT"``, ``"decimal(10,2)"``, ``"timestamp(us, UTC)"``.
+
     Args:
-        *dtypes: The Arrow data types to match, as ``pyarrow`` type objects or their
-            names (``"float64"``).
+        *dtypes: The Arrow data types to match, as ``pyarrow`` type objects, Python
+            builtin types, or dtype names (``"float64"``, ``"decimal(10,2)"``).
 
     Returns:
         A selector matching columns of those types after widening.
 
     Raises:
-        PlanError: If an argument is neither a ``pyarrow.DataType`` nor a type name.
+        PlanError: If an argument is not a ``pyarrow.DataType``, a Python type, or a
+            dtype name.
 
     Examples:
         .. doctest::
@@ -190,17 +195,26 @@ def by_dtype(*dtypes: pa.DataType | str) -> Selector:
 
 
 def _as_type(dtype: object) -> pa.DataType:
-    """`dtype` as a pyarrow type: a type passes through, a name is looked up."""
-    if isinstance(dtype, pa.DataType):
-        return dtype
+    """`dtype` as a pyarrow type, read by the same parser ``cast`` uses.
+
+    Sharing `resolve_dtype_spec` is what makes every cast spelling select: before, a name
+    went through ``pa.type_for_alias``, so ``by_dtype("decimal(10,2)")`` and
+    ``by_dtype("BIGINT")`` were refused although ``cast`` accepts both. pyarrow's own alias
+    spellings (``"timestamp[ms]"``, ``"halffloat"``) are still read when the cast grammar
+    has no entry, so no name that selected before stops selecting.
+    """
+    if isinstance(dtype, (pa.DataType, str, type)):
+        resolved = resolve_dtype_spec(dtype, caller="by_dtype")
+        if resolved is not None:
+            return resolved
     if isinstance(dtype, str):
         try:
             return pa.type_for_alias(dtype)
         except ValueError:
-            pass  # not a pyarrow alias; fall through to the PlanError naming both forms
+            pass  # not a pyarrow alias either; fall through to the PlanError naming both forms
     raise PlanError(
-        f"by_dtype() takes pyarrow types such as pa.int64() or their names such as 'int64', "
-        f"got {type(dtype).__name__} {dtype!r}"
+        f"by_dtype() takes pyarrow types such as pa.int64() or dtype names such as 'int64' "
+        f"or 'decimal(10,2)', got {type(dtype).__name__} {dtype!r}"
     )
 
 
@@ -314,3 +328,38 @@ def temporal() -> Selector:
             ['d']
     """
     return _dtype_selector(pa.types.is_temporal, "temporal()")
+
+
+# The nested and binary families `select_dtypes` names (the tensor one needs `io`'s
+# tensor-type tests, so the api layer builds it). Private: they are reachable through
+# ``ds.select_dtypes("list")`` and need no ``bt.*`` name of their own, and each
+# tests the *execution* type, after the engine boundary has widened it.
+def _list_family() -> Selector:
+    return _dtype_selector(_is_any_list, "list()")
+
+
+def _struct_family() -> Selector:
+    return _dtype_selector(pa.types.is_struct, "struct()")
+
+
+def _map_family() -> Selector:
+    return _dtype_selector(pa.types.is_map, "map()")
+
+
+def _binary_family() -> Selector:
+    return _dtype_selector(
+        lambda d: (
+            pa.types.is_binary(d) or pa.types.is_large_binary(d) or pa.types.is_fixed_size_binary(d)
+        ),
+        "binary()",
+    )
+
+
+def _decimal_family() -> Selector:
+    return _dtype_selector(pa.types.is_decimal, "decimal()")
+
+
+def _nested_family() -> Selector:
+    return _dtype_selector(
+        lambda d: _is_any_list(d) or pa.types.is_struct(d) or pa.types.is_map(d), "nested()"
+    )

@@ -59,11 +59,11 @@ The following table lists the pages in this section with the number of names eac
 
 | Page | Names | Canonical or alias | Param | Mismatch | Gap | Out of scope |
 |---|---|---|---|---|---|---|
-| {doc}`dataframe` | 115 | 58 | 18 | 28 | 9 | 2 |
+| {doc}`dataframe` | 115 | 58 | 18 | 30 | 7 | 2 |
 | {doc}`module` | 130 | 48 | 27 | 10 | 33 | 12 |
 | {doc}`functions-numeric` | 160 | 134 | 23 | 1 | 2 | 0 |
 | {doc}`functions-strings` | 121 | 52 | 46 | 18 | 5 | 0 |
-| {doc}`functions-temporal` | 100 | 56 | 13 | 9 | 22 | 0 |
+| {doc}`functions-temporal` | 100 | 56 | 13 | 23 | 8 | 0 |
 | {doc}`functions-nested` | 157 | 71 | 29 | 10 | 38 | 9 |
 | {doc}`udfs-ai-multimodal` | 63 | 0 | 22 | 18 | 23 | 0 |
 | {doc}`session-and-catalog` | 81 | 47 | 22 | 0 | 11 | 1 |

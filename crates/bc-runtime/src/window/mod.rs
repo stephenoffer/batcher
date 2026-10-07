@@ -30,6 +30,7 @@ mod fill;
 mod packed_order;
 mod parallel;
 mod partition_agg;
+mod qcut;
 mod running_par;
 mod series;
 mod topk;
@@ -114,6 +115,9 @@ pub enum WindowFn {
     /// 0-based index of the current run of equal values along the ordered partition,
     /// incrementing at every change. → Int64.
     RleId,
+    /// 0-based bin among the partition's own quantiles (pandas `qcut`). Whole-partition;
+    /// ignores any ORDER BY. → Int64. See [`crate::window::qcut`].
+    Qcut,
 }
 
 impl WindowFn {
@@ -152,6 +156,7 @@ impl WindowFn {
             WindowFn::EwmStd => "ewm_std",
             WindowFn::Interpolate => "interpolate",
             WindowFn::RleId => "rle_id",
+            WindowFn::Qcut => "qcut",
         }
     }
 
@@ -221,8 +226,12 @@ pub struct WindowCall {
     /// only `ewm_mean` accepts it.
     pub half_life: Option<f64>,
     /// `IGNORE NULLS` for `first_value`/`last_value`/`nth_value`: select among the non-null
-    /// values of the partition or frame. `false` is SQL's `RESPECT NULLS`.
+    /// values of the partition or frame. `false` is SQL's `RESPECT NULLS`. On the EWM
+    /// functions it is pandas' `ignore_na`: a null row does not age the decay.
     pub ignore_nulls: bool,
+    /// The series functions' remaining options (EWM `adjust`/`min_periods`, `interpolate`'s
+    /// `max_gap`/`by_value`) and `qcut`'s probabilities; ignored by every other function.
+    pub opts: bc_ir::WindowOpts,
 }
 
 /// Compute every window function over the partitioned/ordered input, returning
@@ -530,9 +539,11 @@ pub(crate) fn window_serial(
     // The order key's values are read for a value-based RANGE frame and for a time-decayed
     // EWM — two features asking one question ("what is this key worth as a number"), so one
     // read serves both and they cannot disagree about a temporal key's units.
-    let needs_range_order = funcs
-        .iter()
-        .any(|c| c.frame.is_some_and(|f| f.is_value_range()) || c.half_life.is_some());
+    let needs_range_order = funcs.iter().any(|c| {
+        c.frame.is_some_and(|f| f.is_value_range())
+            || c.half_life.is_some()
+            || (c.func == WindowFn::Interpolate && c.opts.by_value)
+    });
     let range_order = if needs_range_order {
         let [(key, opts)] = order_keys else {
             return Err(RuntimeError::RangeFrameNeedsOneOrderKey {
@@ -555,8 +566,10 @@ pub(crate) fn window_serial(
     // it no peer groups), so a window whose every framed call is a `ROWS` frame -- a moving
     // average, a `ROWS UNBOUNDED PRECEDING` running total -- does not need the encoding.
     let needs_peers = funcs.iter().any(|c| {
-        !matches!(c.func, WindowFn::RowNumber | WindowFn::Ntile)
-            && !c.func.is_series()
+        !matches!(
+            c.func,
+            WindowFn::RowNumber | WindowFn::Ntile | WindowFn::Qcut
+        ) && !c.func.is_series()
             && !(c.func.is_value() && c.frame.is_none())
             && !c
                 .frame
@@ -580,6 +593,15 @@ pub(crate) fn window_serial(
             // The whole-prefix recurrences: one sequential pass per ordered partition,
             // no frame and no peers (see `WindowFn::is_series`).
             f if f.is_series() => series_window(f, &ordered, call, range_order.as_ref(), num_rows)?,
+            // Whole-partition quantile binning: `ordered` holds each partition's rows (in
+            // order, which the function does not read).
+            WindowFn::Qcut => crate::window::qcut::qcut_window(
+                &ordered,
+                require(call.values.as_ref(), WindowFn::Qcut)?,
+                &call.opts.probs,
+                call.opts.drop_duplicates,
+                num_rows,
+            )?,
             // Value functions with no explicit frame select a row's value by
             // position within the *whole* ordered partition
             // (first_value/last_value/lag/lead/nth_value/fills).
@@ -667,7 +689,18 @@ fn series_window(
     }
     match func {
         WindowFn::Interpolate => {
-            crate::window::series::interpolate_window(ordered, values, num_rows)
+            // `by_value` reads the order key's distances, which the caller loaded because
+            // `needs_range_order` asked for them; a missing one is a malformed plan.
+            let by = if call.opts.by_value {
+                Some(range_order.ok_or(RuntimeError::RangeFrameNeedsOneOrderKey { got: 0 })?)
+            } else {
+                None
+            };
+            let gap = crate::window::series::InterpolateGap {
+                max_gap: call.opts.max_gap,
+                by,
+            };
+            crate::window::series::interpolate_window(ordered, values, &gap, num_rows)
         }
         WindowFn::RleId => crate::window::series::rle_id_window(ordered, values, num_rows),
         _ => {
@@ -678,7 +711,13 @@ fn series_window(
                     func: func.name().to_string(),
                     dtype: "a smoothing factor alpha in (0, 1]".to_string(),
                 })?;
-            crate::window::series::ewm_window(func, ordered, values, alpha, num_rows)
+            let ewm = crate::window::series::Ewm {
+                alpha,
+                adjust: call.opts.adjust,
+                ignore_nulls: call.ignore_nulls,
+                min_periods: call.opts.min_periods,
+            };
+            crate::window::series::ewm_window(func, ordered, values, &ewm, num_rows)
         }
     }
 }
@@ -1755,6 +1794,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         // Both the serial kernel (huge threshold) and the bucket-parallel path (threshold 1).
         for threshold in [1usize, 1 << 20] {
@@ -1806,6 +1846,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         for threshold in [1usize, 1 << 20] {
             let out = window_with(
@@ -1854,6 +1895,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::RowNumber,
@@ -1863,6 +1905,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Sum,
@@ -1872,6 +1915,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Lag,
@@ -1881,6 +1925,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         // Null-aware read (Lag yields nulls at each partition's first row; the raw
@@ -1923,6 +1968,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             }];
             // threshold 1 forces the parallel bucket path; usize::MAX keeps the oracle.
             let par = window_with(std::slice::from_ref(&part), &[], &funcs, n, 1, None).unwrap();
@@ -1957,6 +2003,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[], &[asc(order.clone())], &f, 4).unwrap();
         assert_eq!(opt_ints(&out[0]), vec![Some(20), Some(30), Some(40), None]);
@@ -1969,6 +2016,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[], &[asc(order)], &f, 4).unwrap();
         assert_eq!(opt_ints(&out[0]), vec![None, Some(10), Some(20), Some(30)]);
@@ -1986,6 +2034,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[], &[asc(order)], &funcs, 3).unwrap();
         // sorted order: idx1(10)=1, idx2(20)=2, idx0(30)=3
@@ -2011,6 +2060,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -2020,6 +2070,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -2048,6 +2099,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -2057,6 +2109,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::RowNumber,
@@ -2066,6 +2119,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -2100,6 +2154,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::CumeDist,
@@ -2109,6 +2164,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         let out = window(&[], &[asc(order)], &funcs, 4).unwrap();
@@ -2127,6 +2183,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[], &[asc(order)], &funcs, 1).unwrap();
         assert_eq!(floats(&out[0]), vec![0.0]);
@@ -2144,6 +2201,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[], &[asc(order)], &funcs, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![1, 1, 1, 2, 2]);
@@ -2161,6 +2219,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[], &[asc(order)], &funcs, 2).unwrap();
         assert_eq!(ints(&out[0]), vec![1, 2]);
@@ -2176,6 +2235,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         assert!(window(&[], &[], &funcs, 3).is_err());
     }
@@ -2195,6 +2255,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::DenseRank,
@@ -2204,6 +2265,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         let out = window(&[part], &[asc(order)], &funcs, 4).unwrap();
@@ -2225,6 +2287,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[part], &[], &funcs, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![9, 6, 9, 6, 9]);
@@ -2242,6 +2305,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Min,
@@ -2251,6 +2315,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2260,6 +2325,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Count,
@@ -2269,6 +2335,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Avg,
@@ -2278,6 +2345,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         let out = window(&[], &[], &funcs, 4).unwrap();
@@ -2309,6 +2377,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2318,6 +2387,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         // Whole-partition (no ORDER BY).
@@ -2353,6 +2423,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
             WindowCall {
                 func: WindowFn::Max,
@@ -2362,6 +2433,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             },
         ];
         let out = window(&[part], &[], &funcs, 3).unwrap();
@@ -2384,6 +2456,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         assert!(window(&[], &[], &funcs, 3).is_err());
     }
@@ -2400,6 +2473,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[part], &[], &funcs, 3).unwrap();
         assert_eq!(floats(&out[0]), vec![1.5, 1.5, 10.0]);
@@ -2426,6 +2500,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(part, &[asc(ord)], &funcs, n).unwrap();
         opt_ints(&out[0])
@@ -2520,6 +2595,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[], &[asc(ord)], &funcs, 3).unwrap();
         let s = out[0].as_any().downcast_ref::<StringArray>().unwrap();
@@ -2555,6 +2631,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
             }];
             let order = [asc(ord.clone())];
             let serial = window_with(
@@ -2595,6 +2672,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out = window(&[], &[asc(ord.clone())], &framed, 5).unwrap();
         assert_eq!(ints(&out[0]), vec![2, 2, 4, 4, 5]);
@@ -2608,6 +2686,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
         }];
         let out2 = window(&[], &[asc(ord)], &frameless, 5).unwrap();
         assert_eq!(ints(&out2[0]), vec![5, 5, 5, 5, 5]);

@@ -87,9 +87,14 @@ def child(*, key: str | None = None, omit_none: bool = False, default: Any = _NO
     return _make_field(_FieldSpec(_Kind.CHILD, key, omit), default)
 
 
-def children(*, key: str | None = None, default: Any = _NODEFAULT) -> Any:
-    """A list-of-sub-expressions field — serialized to ``[e.to_ir() for e in value]``."""
-    return _make_field(_FieldSpec(_Kind.CHILDREN, key), default)
+def children(*, key: str | None = None, omit_falsy: bool = False, default: Any = _NODEFAULT) -> Any:
+    """A list-of-sub-expressions field — serialized to ``[e.to_ir() for e in value]``.
+
+    ``omit_falsy`` drops an empty list (the engine's serde defaults it), so adding an
+    optional list to a node leaves every existing plan's wire form unchanged.
+    """
+    omit = _Omit.IF_FALSY if omit_falsy else _Omit.NEVER
+    return _make_field(_FieldSpec(_Kind.CHILDREN, key, omit), default)
 
 
 def scalar(
@@ -276,6 +281,11 @@ def _wire_plan(cls: type) -> tuple[tuple[str, str, Any, bool, bool, Any], ...]:
     return plan
 
 
+def _as_lists(value: Any) -> Any:
+    """`value` with every nested tuple made a list, which is what JSON reads back."""
+    return [_as_lists(v) for v in value] if isinstance(value, (tuple, list)) else value
+
+
 class IRNode(Expr):
     """Base for declarative `Expr` IR nodes — a generic, metadata-driven `to_ir`.
 
@@ -325,7 +335,8 @@ class IRNode(Expr):
                 continue
             if encode is None:
                 _check_scalar(self, key, value, types)
-                out[key] = value
+                # A tuple is how a frozen node holds a list, and the wire form is a list.
+                out[key] = _as_lists(value) if type(value) is tuple else value
             else:
                 out[key] = encode(value)
         self.__dict__["_ir_cache"] = out

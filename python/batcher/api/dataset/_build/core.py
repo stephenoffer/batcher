@@ -9,22 +9,18 @@ so they add no new IR — the sugar lowers to existing `select`/`with_columns`/`
 
 from __future__ import annotations
 
-import random
-from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from batcher._internal.errors import PlanError, require_float
+from batcher._internal.errors import PlanError
 from batcher.api._join_helpers import _as_key_expr
-from batcher.plan.expr_ir import Col, nullif, when
+from batcher.plan.expr_ir import Col
 from batcher.plan.expr_ir.selectors import Selector, expand_selectors
-from batcher.plan.ir_tags import RUNNING_AGGREGATES, WINDOW_AGGREGATES, WINDOW_FRAMEABLE
+from batcher.plan.ir_tags import WINDOW_AGGREGATES, WINDOW_FRAMEABLE
 from batcher.plan.logical import (
     Distinct,
-    Sample,
     SortKeySpec,
     Unnest,
-    Unpivot,
     Window,
     WindowFrame,
     WindowFuncSpec,
@@ -135,26 +131,38 @@ def build_window(
     return ds._derive(Window(ds._plan, part_keys, tuple(order_specs), tuple(specs)))
 
 
+#: The rows `distinct(keep=...)` can keep from a duplicate set.
+_DISTINCT_KEEPS = ("first", "last", "any")
+
 _RANDOM_MODULUS = 2147483647  # 2^31 - 1 (prime): the uniform denominator.
 
 
-def build_with_random(ds: Dataset, name: str, *, seed: int, normal: bool) -> Dataset:
-    """Add a reproducible pseudo-random column keyed by ``(seed, row index)``.
+def build_with_random(
+    ds: Dataset, name: str, *, seed: int, normal: bool, key: list[str] | None = None
+) -> Dataset:
+    """Add a reproducible pseudo-random column keyed by ``(seed, row index)`` or by `key`.
 
-    Pure desugaring: a `with_row_index` provides a stable per-row key, an xxhash of
-    ``seed:salt:index`` provides a well-distributed integer, and that maps to a
-    uniform ``[0, 1)`` (or, with `normal`, a standard normal via Box-Muller from two
-    independent hashes). Keyed on the stable index, so it is reproducible and matches
-    on the single-node and parallel paths.
+    Pure desugaring: an integer per row, well distributed, maps to a uniform ``[0, 1)`` (or,
+    with `normal`, a standard normal via Box-Muller from two independent integers). Without
+    `key` the integer is an xxhash of ``seed:salt:index`` over a `with_row_index`, so it is
+    reproducible for one input order. With `key` it is a typed `hash_rows` of the salt and the
+    key columns, seeded by `seed` -- a pure row-wise expression, so the value is a function of
+    the row's key alone and does not move when the data is reordered, re-split into files or
+    batches, or partitioned differently, and a row index (`RowId`, single-node only) is never
+    built.
     """
     from batcher.plan.expr_ir import Col, lit
+    from batcher.plan.expr_ir.constructors import hash_rows
     from batcher.plan.functions.string import concat_ws
 
     rid = f"__bc_random_idx_{name}"
 
     def uniform_int(salt: str) -> Expr:
-        keyed = concat_ws(":", lit(f"{seed}:{salt}"), Col(rid).cast("string"))
-        h = keyed.str.xxhash64()  # well-distributed Int64
+        if key is not None:
+            h = hash_rows(lit(salt), *(Col(c) for c in key), seed=seed)
+        else:
+            keyed = concat_ws(":", lit(f"{seed}:{salt}"), Col(rid).cast("string"))
+            h = keyed.str.xxhash64()  # well-distributed Int64
         return ((h % _RANDOM_MODULUS) + _RANDOM_MODULUS) % _RANDOM_MODULUS  # [0, M)
 
     if normal:
@@ -165,6 +173,8 @@ def build_with_random(ds: Dataset, name: str, *, seed: int, normal: bool) -> Dat
         expr = (-2.0 * u1.ln()).sqrt() * (2.0 * math.pi * u2).cos()  # Box-Muller
     else:
         expr = uniform_int("u").cast("float64") / float(_RANDOM_MODULUS)  # [0, 1)
+    if key is not None:
+        return ds.with_columns(**{name: expr})
     return ds.with_row_index(rid).with_columns(**{name: expr}).drop(rid)
 
 
@@ -328,7 +338,7 @@ def build_distinct(
     unknown = set(subset) - set(ds.columns)
     if unknown:
         raise PlanError(f"distinct(): unknown subset column(s) {sorted(unknown)}")
-    if keep not in ("first", "last", "any"):
+    if keep not in _DISTINCT_KEEPS:
         raise PlanError(f"distinct(): keep must be 'first'/'last'/'any', got {keep!r}")
     # Refused here, by name, rather than at execution as a generic breaker. The generic
     # message advises "restructure to ... a single top-level aggregate / distinct", which
@@ -374,120 +384,6 @@ def build_explode(
     if column not in ds.columns:
         raise PlanError(f"explode(): unknown column {column!r}")
     return ds._derive(Unnest(ds._plan, column, alias or column, outer, index))
-
-
-def build_unnest(ds: Dataset, columns: str | list[str]) -> Dataset:
-    """Expand each struct `column` into its fields as top-level columns (Polars
-    ``unnest``; Spark ``select("s.*")``). Composes ``struct.field`` extraction — no
-    new IR. See `Dataset.unnest` for the contract."""
-    import pyarrow as pa
-
-    from batcher.plan.expr_ir import col
-
-    names = [columns] if isinstance(columns, str) else list(columns)
-    schema = ds.schema
-    fields_of: dict[str, list[str]] = {}
-    for name in names:
-        if name not in ds.columns:
-            raise PlanError(f"unnest(): unknown column {name!r}")
-        ftype = schema.field(name).type
-        if not pa.types.is_struct(ftype):
-            raise PlanError(f"unnest(): column {name!r} is not a struct (got {ftype})")
-        fields_of[name] = [ftype.field(i).name for i in range(ftype.num_fields)]
-
-    # Output column order: each struct expands in place to its fields; others stay.
-    final: list[str] = []
-    for c in ds.columns:
-        final.extend(fields_of[c]) if c in fields_of else final.append(c)
-    if len(final) != len(set(final)):
-        # One counting pass rather than a `list.count()` per column: a struct-heavy
-        # relation can expand to thousands of output names, and the error message is
-        # not the place to spend quadratic time.
-        dup = sorted(n for n, k in Counter(final).items() if k > 1)
-        raise PlanError(f"unnest(): output columns collide: {dup} (rename before unnesting)")
-
-    derived = {
-        fname: col(sname).struct.field(fname)
-        for sname, fnames in fields_of.items()
-        for fname in fnames
-    }
-    return ds.with_columns(**derived).select(*final)
-
-
-def build_pivot(
-    ds: Dataset,
-    index: list[str],
-    on: str,
-    values: str,
-    aggregate: str,
-    columns: list[Any] | None,
-) -> Dataset:
-    """Reshape long → wide (SQL ``PIVOT`` / pandas ``pivot_table``).
-
-    Lowers to ``group_by(index).agg(...)`` with one conditional aggregate per pivot
-    value: ``<agg>(values) WHERE on == v``, expressed as
-    ``when(on == v).then(values).otherwise(<typed null>).<agg>()`` — so it reuses the
-    tested grouping/aggregation engine with no new operator. The else-branch uses
-    ``nullif(values, values)`` (a value-typed null) so non-matching rows are ignored
-    by the aggregate. With `columns` omitted, the distinct pivot values are discovered
-    by an eager pre-pass over `on` (like DuckDB's auto-`PIVOT`).
-    """
-    if aggregate not in RUNNING_AGGREGATES:
-        raise PlanError(
-            f"pivot(): aggregate must be one of {RUNNING_AGGREGATES}, got {aggregate!r}"
-        )
-    for c in (*index, on, values):
-        if c not in ds.columns:
-            raise PlanError(f"pivot(): unknown column {c!r}")
-    if columns is None:
-        seen = ds.select(on).distinct().to_pydict()[on]
-        cols = sorted(v for v in seen if v is not None)
-    else:
-        cols = list(columns)
-    if not cols:
-        raise PlanError("pivot(): no pivot column values to spread")
-    typed_null = nullif(Col(values), Col(values))
-    aggs: dict[str, Any] = {}
-    for v in cols:
-        masked = when(Col(on) == v).then(Col(values)).otherwise(typed_null)
-        aggs[str(v)] = getattr(masked, aggregate)()
-    return ds.group_by(*index).agg(**aggs)
-
-
-def build_sample(
-    ds: Dataset, fraction: float | None, seed: int | None, n: int | None = None
-) -> Dataset:
-    """Construct a `Sample` node — a fraction sample (`fraction`) or a fixed-count
-    sample (`n`). Exactly one of `fraction`/`n` is set. `seed=None` bakes a fresh
-    random seed at plan-build so the sample is reproducible within a run and
-    consistent across workers."""
-    if (fraction is None) == (n is None):
-        raise PlanError("sample() takes exactly one of `fraction` or `n`")
-    if seed is None:
-        seed = random.randrange(2**63)
-    # The fraction field is required by the node; for count mode it is unused (1.0).
-    rate = 1.0 if n is not None else require_float(fraction, func="sample", arg="fraction")
-    return ds._derive(Sample(ds._plan, rate, int(seed), n))
-
-
-def build_unpivot(
-    ds: Dataset,
-    index: list[str] | None,
-    on: list[str] | None,
-    variable_name: str,
-    value_name: str,
-) -> Dataset:
-    """Construct an `Unpivot` node (see `Dataset.unpivot` for the contract).
-
-    With `on` omitted, every column not in `index` is melted; with `index` omitted,
-    every column not in `on` becomes an identifier.
-    """
-    cols = ds.columns
-    if index is None and on is None:
-        raise PlanError("unpivot() requires `index` or `on`")
-    idx = list(index) if index is not None else [c for c in cols if c not in set(on or ())]
-    vals = list(on) if on is not None else [c for c in cols if c not in set(idx)]
-    return ds._derive(Unpivot(ds._plan, tuple(idx), tuple(vals), variable_name, value_name))
 
 
 def _bounded_interval_join(

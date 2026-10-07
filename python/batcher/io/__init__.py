@@ -24,6 +24,16 @@ from batcher.io.formats import (
     ParquetSink,
     ParquetSource,
 )
+from batcher.io.formats.http import (
+    BearerToken,
+    CursorPagination,
+    Incremental,
+    NextLinkPagination,
+    OAuth2ClientCredentials,
+    OffsetPagination,
+    PagePagination,
+    RetryPolicy,
+)
 from batcher.io.formats.multimodal.blob import read_blob_bytes
 from batcher.io.manifest import WriteManifest, WrittenFile
 from batcher.io.sink import Sink
@@ -33,17 +43,25 @@ from batcher.io.splits import FileSplit, RowGroupSplit, Split, WholeSourceSplit
 __all__ = [
     "SINKS",
     "SOURCES",
+    "BearerToken",
     "CSVSink",
     "CSVSource",
+    "CursorPagination",
     "FileSink",
     "FileSource",
     "FileSplit",
     "InMemorySource",
+    "Incremental",
     "IteratorSource",
     "JSONSink",
     "JSONSource",
+    "NextLinkPagination",
+    "OAuth2ClientCredentials",
+    "OffsetPagination",
+    "PagePagination",
     "ParquetSink",
     "ParquetSource",
+    "RetryPolicy",
     "RowGroupSplit",
     "Sink",
     "Source",

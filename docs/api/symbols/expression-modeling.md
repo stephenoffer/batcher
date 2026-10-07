@@ -25,6 +25,7 @@ Column-wide transforms that standardize, scale, normalize, bin, encode, or flag 
    Expr.softmax
    Expr.label_encode
    Expr.cut
+   Expr.qcut
    Expr.is_outlier
 ```
 
@@ -77,7 +78,7 @@ The properties that reach each typed namespace, documented in full on the pages 
 
 ## Expression introspection
 
-The `.meta` accessor reads an expression's tree rather than any row: the output name it would take, the columns it reads, and a drawing of the tree the engine receives.
+The `.meta` accessor reads an expression's tree rather than any row: the output name it would take, the type it would produce over a schema, the columns it reads, and a drawing of the tree the engine receives.
 
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.meta
@@ -90,6 +91,7 @@ The `.meta` accessor reads an expression's tree rather than any row: the output 
    :nosignatures:
 
    _MetaNamespace.output_name
+   _MetaNamespace.output_type
    _MetaNamespace.root_names
    _MetaNamespace.is_column
    _MetaNamespace.has_multiple_outputs

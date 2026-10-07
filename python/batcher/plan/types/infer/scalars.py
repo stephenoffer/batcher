@@ -56,6 +56,8 @@ _STR_INT = frozenset(
         # accessor rather than a string function, which is why it was missed while its
         # `json_extract_int` sibling two lines up was not.
         "json_array_length",
+        # Counts user-perceived characters rather than code points.
+        "length_grapheme",
     }
 )
 #: The similarity measures return a score in [0, 1]; `jaro_winkler_similarity` is `jaro`
@@ -70,6 +72,10 @@ _STR_STR = frozenset(
         "json_type",
         "squad_normalize",
         "strip_html",
+        # The Unicode-aware transforms: normalized, case-folded, or grapheme-sliced text.
+        "normalize",
+        "casefold",
+        "substring_grapheme",
         "upper",
         "lower",
         "trim",
@@ -167,6 +173,9 @@ _STR_STR_LIST = frozenset(
         # renders one. Both were declaring `null`.
         "json_object_keys",
         "json_array_values",
+        # SQL's `json_extract(j, '$.a[*]')` / `json_extract_string(...)`: every element.
+        "json_extract_all",
+        "json_extract_string_all",
     }
 )
 
@@ -178,8 +187,28 @@ _DATE_BOOL = frozenset({"is_leap_year"})
 _DATE_DATE = frozenset({"last_day"})
 
 
-def strfunc_type(fn: str) -> pa.DataType | None:
-    """The Arrow type a `str` accessor function produces, or ``None`` if not certain."""
+#: `chunk_offsets`: each chunk with its 0-based character offset into the source.
+_CHUNK_OFFSETS = pa.list_(pa.struct([("text", pa.string()), ("start", pa.int64())]))
+
+#: The group extracts, whose struct fields are named by the pattern's capture groups.
+_STR_GROUPS = frozenset({"regexp_extract_groups", "regexp_extract_groups_or_null"})
+
+
+def strfunc_type(fn: str, pattern: object = None) -> pa.DataType | None:
+    """The Arrow type a `str` accessor function produces, or ``None`` if not certain.
+
+    Every function but the group extracts answers from its name. Those return one Utf8
+    field per capture group, so they need the plan-time `pattern`; a per-row pattern (any
+    non-``str``) leaves the fields unknown.
+    """
+    if fn in _STR_GROUPS:
+        if not isinstance(pattern, str):
+            return None
+        from batcher.plan.expr_ir.namespaces._dialect import regex_group_names
+
+        return pa.struct([(name, pa.string()) for name in regex_group_names(pattern)])
+    if fn == "chunk_offsets":
+        return _CHUNK_OFFSETS
     # The per-document quality measures answer from the function name alone; their table
     # lives beside `media` and `sequence` rather than inline here.
     if (quality := quality_type(fn)) is not None:

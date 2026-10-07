@@ -55,9 +55,21 @@ print(out.to_pydict())
 # {'is_conf': [True, False, False], 'second': ['app', 'local', ''], 'head': ['etc/app', 'usr/local', '  a   b  '], 'tidy': ['etc/app/conf', 'usr/local/bin', 'a b']}
 ```
 
+Where the engine can read a parameter per row, the method accepts an expression as well as a constant: the delimiter of `split` and `split_part`, the search and replacement text of `replace`, the needle of `contains`, `starts_with` and `ends_with`, the pattern of `regexp_matches`, the bounds of `substr` and `slice`, and the comparison string of the similarity family. The engine groups the rows by their parameter values and runs the constant kernel once per group, so the per-row form computes exactly what the constant form does. A null parameter makes that row null, as SQL does.
+
+```python
+pairs = bt.from_pydict({"a": ["kitten", "flaw"], "b": ["sitting", "lawn"], "sep": ["t", "a"]})
+out = pairs.select(
+    dist=bt.col("a").str.levenshtein(bt.col("b")),
+    head=bt.col("a").str.split_part(bt.col("sep"), 1),
+)
+print(out.to_pydict())
+# {'dist': [3, 2], 'head': ['ki', 'fl']}
+```
+
 ## Encodings and fuzzy matching
 
-`ascii` returns the codepoint of the first character. `bit_length` and `octet_length` measure the encoded size in bits and UTF-8 bytes rather than in characters. {py:meth}`levenshtein(target) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.levenshtein>` gives the edit distance to a constant string and `soundex` its phonetic key.
+`ascii` returns the codepoint of the first character. `bit_length` and `octet_length` measure the encoded size in bits and UTF-8 bytes rather than in characters. {py:meth}`levenshtein(target) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.levenshtein>` gives the edit distance to another string, a constant or a column, and `soundex` its phonetic key.
 
 ```python
 words = bt.from_pydict({"w": ["Robert", "Rupert", "café"]})
@@ -73,9 +85,42 @@ print(out.to_pydict())
 
 {py:meth}`hamming(target) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.hamming>` counts the positions at which two equal-length strings differ, which is the right distance for fixed-width codes. `jaccard(target)` scores the overlap of two values' character sets. `hamming` raises on unequal lengths rather than comparing a prefix, because a prefix comparison answers a caller's mistake with a plausible number.
 
+## Unicode: case, normalization, and graphemes
+
+Every case and Unicode method is locale-independent: the tables are the Unicode Character Database's, never the machine's. `upper` and `lower` use full Unicode case mapping, so one character can become several. `upper("Straße")` is `"STRASSE"` and `lower` writes a word-final Greek sigma in its final form. DuckDB maps one character at a time instead and returns `"STRAẞE"`, so this is one place the two engines differ.
+
+`lower` isn't a caseless key, because it keeps `ß`. {py:meth}`casefold <batcher.plan.expr_ir.namespaces.strings._StrNamespace.casefold>` applies full case folding, the key Python's `str.casefold` computes, so `"Straße"` and `"STRASSE"` fold to the same value. Use it before a join or a `group_by` that should ignore case.
+
+Two strings that render identically can still differ in code points. An accented letter can arrive precomposed or as a base letter plus a combining accent, and the two don't compare equal. {py:meth}`normalize(form) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.normalize>` puts text into one of the four Unicode normal forms. `"NFC"`, the default, composes, which is DuckDB's `nfc_normalize`. `"NFKC"` and `"NFKD"` also fold compatibility characters, such as a ligature or a full-width letter, into their plain spelling.
+
+```python
+names = bt.from_pydict({"s": ["Straße", "STRASSE", "e\u0301", "\u00e9"]})
+out = names.select(
+    folded=bt.col("s").str.casefold(),
+    nfc_length=bt.col("s").str.normalize().str.len_chars(),
+)
+print(out.to_pydict())
+# {'folded': ['strasse', 'strasse', 'é', 'é'], 'nfc_length': [6, 7, 1, 1]}
+```
+
+A "character" in `len_chars`, `substr` and `slice` is a Unicode code point, which splits a letter written with a combining accent, or an emoji sequence joined by zero-width joiners, into parts. Pass `unit="grapheme"` to count what a reader sees as one character instead, the extended grapheme cluster that DuckDB's `length_grapheme` and `substring_grapheme` count. `len_chars(unit="byte")` counts UTF-8 bytes, the same as `octet_length`.
+
+```python
+emoji = bt.from_pydict({"s": ["\U0001f468\u200d\U0001f469\u200d\U0001f467 hi"]})
+out = emoji.select(
+    code_points=bt.col("s").str.len_chars(),
+    graphemes=bt.col("s").str.len_chars(unit="grapheme"),
+    tail=bt.col("s").str.substr(2, unit="grapheme"),
+)
+print(out.to_pydict())
+# {'code_points': [8], 'graphemes': [4], 'tail': [' hi']}
+```
+
 ## Paths and URLs
 
 Text columns often hold a file path or a URL component rather than prose. {py:meth}`parse_path <batcher.plan.expr_ir.namespaces.strings._StrNamespace.parse_path>` splits a path into its parts, and {py:meth}`parse_filename <batcher.plan.expr_ir.namespaces.strings._StrNamespace.parse_filename>`, {py:meth}`parse_dirname <batcher.plan.expr_ir.namespaces.strings._StrNamespace.parse_dirname>` and {py:meth}`parse_dirpath <batcher.plan.expr_ir.namespaces.strings._StrNamespace.parse_dirpath>` pick one out. The last two are easy to confuse and are genuinely different: `parse_dirname` is the *first* component, which is `/` for an absolute path, while `parse_dirpath` is the directory holding the file.
+
+All four accept both `/` and `\` as a separator by default, so a Windows path parses too. A POSIX filename may legally contain a backslash, and `separator="forward"` keeps it whole. `separator="backslash"` splits on `\` alone. These are DuckDB's `forward_slash` and `backslash` modes.
 
 {py:meth}`url_encode <batcher.plan.expr_ir.namespaces.strings._StrNamespace.url_encode>` percent-encodes a URL *component*, including `/` and `+`, and {py:meth}`url_decode <batcher.plan.expr_ir.namespaces.strings._StrNamespace.url_decode>` reverses it. A malformed escape decodes to itself. {py:meth}`escape_regex <batcher.plan.expr_ir.namespaces.strings._StrNamespace.escape_regex>` neutralizes a value's regex metacharacters so it matches itself.
 
@@ -142,11 +187,29 @@ print(out.to_pydict())
 
 A frame that isn't valid for the codec you named decompresses to null rather than failing the query, so one corrupt blob in a scan of a billion rows costs you that row and nothing else.
 
+A few hundred bytes of gzip can expand to gigabytes, so a payload from an untrusted source should be bounded. `decompress(codec, max_output_bytes=n)` returns null for a payload that would exceed `n` bytes, and detects that without materializing it. With no bound the payload is decompressed in full.
+
+```python
+bombs = bt.from_pydict({"body": ["x" * 100_000]}).select(z=bt.col("body").str.compress("gzip"))
+print(bombs.select(back=bt.col("z").str.decompress("gzip", max_output_bytes=4096)).to_pydict())
+# {'back': [None]}
+```
+
+Decompressed and decoded payloads are bytes. Turning bytes into text has two policies, chosen by the cast. `cast("string")` raises when a value is not valid UTF-8, and `try_cast("string")` returns null for that row. There is no replacement-character mode, because a string column can only hold valid UTF-8.
+
+```python
+raw = bt.from_pydict({"b": [b"ok", b"\xff\xfe"]})
+print(raw.select(text=bt.col("b").try_cast("string")).to_pydict())
+# {'text': ['ok', None]}
+```
+
 :::{note}
 `deflate` is the one codec that can't tell a corrupt frame from a valid one, because raw deflate carries no header and no checksum. Use `zlib` or `gzip` where detection matters. They wrap the same algorithm in a frame that can be validated.
 :::
 
 ## Regular expressions
+
+Patterns run on the Rust [`regex`](https://docs.rs/regex/latest/regex/#syntax) crate, whose syntax is RE2's. It matches in linear time, which means it has no lookahead, no lookbehind, no backreferences and no atomic groups. A pattern that uses one is refused with a `PlanError` when you build the expression, naming the construct and what to write instead, rather than failing once the scan starts. Capture the surrounding text with a group and keep the group, or combine two simpler patterns with `&` and `~`.
 
 Alongside the single-match {py:meth}`regexp_matches <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_matches>`, {py:meth}`regexp_replace <batcher.plan.expr_ir.namespaces.strings._StrNamespace.regexp_replace>`, and {py:meth}`extract <batcher.plan.expr_ir.namespaces.strings._StrNamespace.extract>`, three methods work over *every* match in a string: {py:meth}`count_matches <batcher.plan.expr_ir.namespaces.strings._StrNamespace.count_matches>` tallies the matches, {py:meth}`extract_all <batcher.plan.expr_ir.namespaces.strings._StrNamespace.extract_all>` gathers them into a list, and {py:meth}`replace_all(pattern, value) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.replace_all>` substitutes them all.
 
@@ -159,6 +222,18 @@ out = codes.select(
 )
 print(out.to_pydict())
 # {'digits': [3, 0, 2], 'found': [['1', '2', '3'], [], ['4', '5']], 'masked': ['a#b#c#', 'xyz', 'p#q#']}
+```
+
+`replace_all` reads its pattern as a regex, so `replace_all(".", "-")` replaces every character. Pass `literal=True` to replace the text as written, which is the same as `replace`.
+
+{py:meth}`extract_groups(pattern) <batcher.plan.expr_ir.namespaces.strings._StrNamespace.extract_groups>` runs the pattern once per row and returns every capture group as one struct. A named group keeps its name and an unnamed one is called by its number, so three fields cost one regex evaluation rather than three `extract` calls. A row that doesn't match gets empty strings, as DuckDB's `regexp_extract` with a list of names does, and `missing="null"` gives nulls instead, as Polars does.
+
+```python
+log = bt.from_pydict({"line": ["GET /index 200", "POST /login 401", "garbage"]})
+parts = bt.col("line").str.extract_groups(r"(?P<verb>[A-Z]+) (?P<path>\S+) (?P<status>\d+)")
+out = log.select(verb=parts.struct.field("verb"), status=parts.struct.field("status"))
+print(out.to_pydict())
+# {'verb': ['GET', 'POST', ''], 'status': ['200', '401', '']}
 ```
 
 `regexp_split(pattern)` is the regex counterpart of `split`, for a separator that varies, such as a run of whitespace or one of several punctuation marks. Empty pieces created by a leading or trailing separator are kept, so the piece count stays one more than the separator count.

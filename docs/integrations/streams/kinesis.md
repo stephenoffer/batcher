@@ -7,7 +7,7 @@ The following table summarizes the connector:
 | | |
 | --- | --- |
 | Read | `bt.read.kinesis(stream_name)` |
-| Write | No sink. Write the stream to Delta or another streaming sink. |
+| Write | `ds.write.kinesis(stream)`, one record per row. At-least-once; see {doc}`sinks`. |
 | Extra | `pip install 'batcher-engine[kinesis]'` |
 | Parallelism | One split per shard |
 | Credentials | The ambient `boto3` chain. There is no credential keyword. |
@@ -163,6 +163,21 @@ The checkpoint can be a local path or an `s3://` URI. The `query_name` is the De
 
 A shard iterator expires after five minutes. A trigger interval longer than that, or a shard that goes quiet while its siblings are polled, gets `ExpiredIteratorException`, and the reader re-obtains the iterator from the last delivered sequence number instead of failing the query.
 
+## Publish to Kinesis
+
+:::{warning}
+Not yet verified against a live Kinesis; see tests/PENDING_VERIFICATION.md.
+:::
+
+```python
+# docs: skip
+query = events.select(value=bt.col("value"), key=bt.col("account")).write.kinesis(
+    "clean-events", region="eu-west-1", checkpoint="/var/lib/batcher/ckpt/clean"
+)
+```
+
+The `key` column is the partition key. Records go out through `PutRecords`, at most 500 records or 5 MiB per call, and only the records a response reports as failed are resent, up to `max_attempts=` attempts. `PutRecords` doesn't guarantee order, so pass `ordered=True` when a partition key must keep its order: the sink then sends one `PutRecord` per record, chaining `SequenceNumberForOrdering`. Kinesis has no producer deduplication and no record metadata, so a replayed micro-batch republishes and `dedup_ids=` is refused. Put a record id in the payload.
+
 ## Requirements and limitations
 
 Empty polls are normal. `GetRecords` returns an empty record list constantly on a quiet shard, and the poll loop skips those and keeps going. An idle stream produces no batches, which isn't an end-of-stream.
@@ -176,6 +191,7 @@ The client takes `region`, and optionally `endpoint_url`, for LocalStack, a VPC 
 
 ## See also
 
+- {doc}`Broker sinks </integrations/streams/sinks>`: the column contract and the guarantees every broker sink states.
 - {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, and checkpointing.
 - {doc}`Windowed aggregation </cookbook/streaming/windowed-aggregation>`: what to do with the
   records once they land.

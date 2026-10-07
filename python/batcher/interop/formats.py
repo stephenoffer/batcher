@@ -188,6 +188,8 @@ def _to_pandas(batch: pa.RecordBatch) -> Any:
     Overwriting those columns with their real per-row arrays fixes both ends at once: the
     `fn` sees ``(3, 3)``, and returning them unchanged rebuilds the tensor column.
     """
+    import pandas as pd
+
     from batcher.interop.arrays import _column_to_numpy
     from batcher.io.formats.ml.ragged import is_ragged_tensor_column
     from batcher.io.formats.ml.tensor import is_tensor_column
@@ -198,7 +200,11 @@ def _to_pandas(batch: pa.RecordBatch) -> Any:
     for name in batch.schema.names:
         column = batch.column(name)
         if is_tensor_column(column) or is_ragged_tensor_column(column):
-            frame[name] = list(_column_to_numpy(column))
+            # `object` explicitly: an empty list assigned bare becomes a `float64` column,
+            # which returns as `double` -- a type no restore can tell from a real one -- where
+            # an empty `object` column returns as `null` and gets the declared type back.
+            arrays = list(_column_to_numpy(column))
+            frame[name] = pd.Series(arrays, index=frame.index, dtype=object)
         elif column.null_count and pa.types.is_integer(column.type):
             _warn_int_widening(column.type)
     return frame

@@ -13,6 +13,7 @@ handling, the type of the result — are theirs by construction rather than by c
 
 from __future__ import annotations
 
+from batcher.config.option_types import QuantileInterpolation
 from batcher.plan.expr_ir.core import AggExpr, Expr
 from batcher.plan.functions.aggregate import _as_column
 
@@ -28,7 +29,9 @@ __all__ = [
 ]
 
 
-def quantile(column: str | Expr, q: float, interpolation: str = "linear") -> AggExpr:
+def quantile(
+    column: str | Expr, q: float, interpolation: QuantileInterpolation = "linear"
+) -> AggExpr:
     """Exact ``q``-quantile of a column (``q`` in ``[0, 1]``; ``0.5`` is the median).
 
     Args:

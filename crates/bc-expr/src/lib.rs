@@ -22,6 +22,7 @@ use arrow::array::{
 use serde::Deserialize;
 
 mod analyze;
+mod dtype;
 mod error;
 mod select;
 mod subset;
@@ -29,6 +30,14 @@ mod supertype;
 pub use error::ExprError;
 pub use select::ConjunctOrder;
 pub use supertype::common_supertype;
+
+/// The IANA time-zone database release compiled into the engine (e.g. `"2025b"`).
+///
+/// Every zone rule `convert_timezone`/`replace_timezone` and the zone-aware calendar kernels
+/// apply comes from this one compiled-in copy, not the host's `/usr/share/zoneinfo`, so the
+/// release is a property of the engine binary — and the one fact needed to explain why two
+/// builds disagree about a future instant in a zone whose rules changed in between.
+pub const TZDB_VERSION: &str = chrono_tz::IANA_TZDB_VERSION;
 
 /// What a payload's leading bytes say it is, or `None` when nothing recognizes them.
 ///
@@ -417,18 +426,77 @@ pub enum Expr {
         right: Box<Expr>,
     },
 
-    /// `list.transform(func)` — apply the element sub-expression `func` (which reads
-    /// the reserved `element` column) to every list element, preserving lengths.
-    ListTransform { input: Box<Expr>, func: Box<Expr> },
+    /// `list.transform(func)` — apply the element sub-expression `func` to every list
+    /// element, preserving lengths. `func` reads the reserved `element` and
+    /// `element_index` columns, plus one column per capture: `captures[i]`, evaluated
+    /// over the *enclosing* row and repeated for each of its elements, under the name
+    /// `capture_names[i]`. That is how a lambda body reads an outer column.
+    ListTransform {
+        input: Box<Expr>,
+        func: Box<Expr>,
+        #[serde(default)]
+        captures: Vec<Expr>,
+        #[serde(default)]
+        capture_names: Vec<String>,
+    },
 
     /// `list.filter(pred)` — keep the elements where the boolean element predicate
-    /// `pred` (reading the reserved `element` column) is true.
-    ListFilter { input: Box<Expr>, pred: Box<Expr> },
+    /// `pred` is true. Scoped exactly as [`Expr::ListTransform`]'s body is.
+    ListFilter {
+        input: Box<Expr>,
+        pred: Box<Expr>,
+        #[serde(default)]
+        captures: Vec<Expr>,
+        #[serde(default)]
+        capture_names: Vec<String>,
+    },
 
     /// Struct construction (SQL `struct_pack` / Spark `struct`) — each row becomes a
     /// `Struct` with the named fields, each field's value being the per-row value of
     /// its sub-expression. The read-side counterpart is `StructField`.
     MakeStruct { fields: Vec<NamedExpr> },
+
+    /// Pair two lists element by element into a `List<Struct<left, right>>`
+    /// (`list.zip`; DuckDB `list_zip`). Two lists of different lengths are an error
+    /// unless `pad`, which extends the shorter with nulls. Null if either list is null.
+    ListZipStruct {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        #[serde(default)]
+        pad: bool,
+    },
+
+    /// Edit a struct's fields in place (`struct.with_fields` / `rename_fields` /
+    /// `drop_fields`; DuckDB `struct_update`/`struct_insert`). Applied in this order:
+    /// `drop` removes fields, `rename` renames survivors (`[old, new]` pairs), then each
+    /// `values[i]` replaces the field `names[i]` where it exists and is appended where it
+    /// does not. The outer null mask and every untouched child — its data, nullability and
+    /// field metadata — are kept as they were, so a null struct stays null rather than
+    /// becoming a struct of nulls.
+    StructUpdate {
+        input: Box<Expr>,
+        #[serde(default)]
+        names: Vec<String>,
+        #[serde(default)]
+        values: Vec<Expr>,
+        #[serde(default)]
+        drop: Vec<String>,
+        #[serde(default)]
+        rename: Vec<(String, String)>,
+    },
+
+    /// A whole-document JSON function: decode text into a typed value (`dtype`, in the
+    /// nested wire form of `dtype.rs`), encode a value as JSON text, or apply an RFC 7386
+    /// merge patch taken from `other`.
+    JsonDoc {
+        #[serde(rename = "fn")]
+        func: JsonDocFunc,
+        input: Box<Expr>,
+        #[serde(default)]
+        other: Option<Box<Expr>>,
+        #[serde(default)]
+        dtype: Option<serde_json::Value>,
+    },
 
     /// Map construction (SQL `map(keys, values)` / Spark `map_from_arrays`) — each row
     /// pairs a `List` of keys with a `List` of values into one Arrow `Map` entry.
@@ -542,12 +610,56 @@ pub enum Expr {
     /// `format` string (e.g. `%Y-%m-%d`). Null instants format to null. → Utf8.
     Strftime { input: Box<Expr>, format: String },
 
-    /// `convert_timezone(from_tz, to_tz, ts)` — shift each naive timestamp's
-    /// wall-clock from `from_tz` to `to_tz` (DST-aware). → Timestamp(us).
+    /// `convert_timezone(from_tz, to_tz, ts)` — the wall clock in `to_tz` of each instant.
+    /// → naive Timestamp(us).
+    ///
+    /// A naive input is a wall clock in `from_tz`, localized under the `ambiguous` /
+    /// `nonexistent` policies. A tz-aware input already names an instant, so it is read as
+    /// one: `from_tz` must then name the column's own zone, and a mismatch errors rather
+    /// than re-reading the instant as a wall clock in another zone (which silently shifted
+    /// it). Both policies default to `null`, today's DST behaviour.
     ConvertTimezone {
         input: Box<Expr>,
         from_tz: String,
         to_tz: String,
+        #[serde(default)]
+        ambiguous: Ambiguous,
+        #[serde(default)]
+        nonexistent: Nonexistent,
+    },
+
+    /// `replace_timezone(tz, ts)` — relabel each wall clock with a zone, keeping the clock
+    /// and so choosing a new instant (Polars `replace_time_zone`, pandas `tz_localize`).
+    /// → `Timestamp(us, tz)`, or a naive Timestamp(us) holding the local wall clock when `tz`
+    /// is absent. A naive input is localized in `tz`; an aware one is first read as its own
+    /// zone's wall clock. A DST gap or overlap follows `nonexistent` / `ambiguous`.
+    ReplaceTimezone {
+        input: Box<Expr>,
+        #[serde(default)]
+        tz: Option<String>,
+        #[serde(default)]
+        ambiguous: Ambiguous,
+        #[serde(default)]
+        nonexistent: Nonexistent,
+    },
+
+    /// A business-day calendar operation (`add_business_days`, `business_day_count`,
+    /// `is_business_day` with holidays). One variant, so the three share one definition of
+    /// "a business day": a weekday the `weekmask` admits (Monday first; absent = Monday to
+    /// Friday) that is not in `holidays` (days since the epoch). `other` is the per-row day
+    /// count for `add` and the end date for `count`.
+    BusinessDay {
+        #[serde(rename = "fn")]
+        func: BusinessDayFunc,
+        input: Box<Expr>,
+        #[serde(default)]
+        other: Option<Box<Expr>>,
+        #[serde(default)]
+        holidays: Vec<i32>,
+        #[serde(default)]
+        weekmask: Option<[bool; 7]>,
+        #[serde(default)]
+        roll: BusinessRoll,
     },
 
     /// `strptime(s, format)` — parse a Utf8 column into a Timestamp(microsecond)
@@ -558,9 +670,14 @@ pub enum Expr {
     /// `strptime`, Polars `to_date(strict=True)`), for a pipeline where a bad value must
     /// stop the query rather than become a null nobody looks at. `serde(default)` keeps
     /// every existing document meaning what it meant.
+    ///
+    /// `format` is one format or a list tried in order (DuckDB `strptime(s, [f1, f2])`):
+    /// each value takes the first that parses it, and `strict` raises only when every
+    /// format fails. A single format still travels as a plain string.
     Strptime {
         input: Box<Expr>,
-        format: String,
+        #[serde(deserialize_with = "one_or_many")]
+        format: Vec<String>,
         #[serde(default)]
         strict: bool,
     },
@@ -1886,6 +2003,12 @@ pub enum ListFunc {
     Std,
     /// Sample variance `Σ(x-mean)²/(n-1)` → Float64; null when n<2.
     Var,
+    /// Population standard deviation `sqrt(Σ(x-mean)²/n)` (`list.std(ddof=0)`, DuckDB
+    /// `list_stddev_pop`) → Float64; null for an empty or all-null row.
+    StdPop,
+    /// Population variance `Σ(x-mean)²/n` (`list.var(ddof=0)`, DuckDB `list_var_pop`)
+    /// → Float64; null for an empty or all-null row.
+    VarPop,
     /// Distinct elements preserving first-occurrence order → `List` (same element
     /// type); null elements are dropped.
     Unique,
@@ -2036,6 +2159,21 @@ pub enum MathFunc {
     /// and beyond that NaN. A node beside its two siblings, and more accurate near zero
     /// than `0.5 * ln((1 + x) / (1 - x))`, which loses precision to cancellation there.
     Atanh,
+}
+
+/// The whole-document JSON functions carried by [`Expr::JsonDoc`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JsonDocFunc {
+    /// JSON text → `dtype`, as DuckDB `json_transform` reads it; a value that does not
+    /// fit, and a document that does not parse, is null.
+    Decode,
+    /// [`JsonDocFunc::Decode`] raising instead of nulling (DuckDB `json_transform_strict`).
+    DecodeStrict,
+    /// Any value → compact JSON text (DuckDB `to_json`).
+    Encode,
+    /// RFC 7386 merge of the patch in `other` into the document (DuckDB `json_merge_patch`).
+    MergePatch,
 }
 
 /// String functions. `upper`/`lower` → Utf8; `len` → Int64; `contains`/
@@ -2210,6 +2348,16 @@ pub enum StrFunc {
     /// JSON array column into a list column that `explode` and `.list` can work on.
     /// → List<Utf8>.
     JsonArrayValues,
+    /// Every element of the JSON array at `pattern` path, each rendered as
+    /// [`StrFunc::JsonExtract`] renders a leaf: DuckDB `json_extract(doc, '<path>[*]')`.
+    /// `pattern` is the path *before* the trailing `[*]`. An absent path or a non-array
+    /// is the **empty** list, as in DuckDB; a null or malformed document is null.
+    /// → List<Utf8>.
+    JsonExtractAll,
+    /// [`StrFunc::JsonExtractAll`] with each element rendered as
+    /// [`StrFunc::JsonExtractString`] renders one (unquoted, a JSON null as a null
+    /// element): DuckDB `json_extract_string(doc, '<path>[*]')`. → List<Utf8>.
+    JsonExtractStringAll,
     /// The JSON type at `pattern` path: `object`, `array`, `string`, `number`,
     /// `boolean`, or `null`; null if the path is absent. → Utf8.
     JsonType,
@@ -2414,7 +2562,9 @@ pub enum StrFunc {
     /// Inverse of `Compress` under the codec named by `pattern`. Input that is not a valid
     /// frame for that codec yields **null** rather than erroring, matching `from_base64`
     /// and `unhex` — one corrupt blob in a scan is a bad row, not a bad query, which is
-    /// why there is no separate `try_decompress`. → Binary (nullable).
+    /// why there is no separate `try_decompress`. `length`, when present, caps the
+    /// decompressed size in bytes: a payload that would exceed it is null, detected without
+    /// being materialized (the decompression-bomb bound). → Binary (nullable).
     Decompress,
     /// Re-case an identifier into the style named by `pattern`: `snake`, `upper_snake`,
     /// `camel`, `pascal`, `kebab`, `upper_kebab`, `title`, `sentence`, `dot`, or `train`.
@@ -2445,7 +2595,9 @@ pub enum StrFunc {
     /// be embedded in a pattern as a literal. Null → null. → Utf8.
     RegexpEscape,
     /// The final component of a path (DuckDB `parse_filename`): everything after the
-    /// last separator. → Utf8.
+    /// last separator. For all four `Parse*` functions `pattern` names the separators —
+    /// `both` (absent; `/` or `\`), `forward` or `backslash`, DuckDB's `both_slash`,
+    /// `forward_slash` and `backslash`. → Utf8.
     ParseFilename,
     /// The directory part of a path (DuckDB `parse_dirname`) — the *first* component,
     /// which is `/` for an absolute POSIX path. Not the same as `ParseDirpath`, which is
@@ -2472,6 +2624,37 @@ pub enum StrFunc {
     /// 8 `0`/`1` characters, or does not decode as UTF-8, yields **null**, matching
     /// `unhex`. → Utf8 (nullable).
     FromBinary,
+    /// Unicode normalization into the form named by `pattern` — `NFC` (absent means
+    /// `NFC`, DuckDB `nfc_normalize`), `NFD`, `NFKC` or `NFKD`. A Utf8 value always holds
+    /// valid UTF-8, so the only non-value is a null, which stays null; an unknown form is
+    /// an error. → Utf8. See `eval::str::unicode`.
+    Normalize,
+    /// Full Unicode case folding (CaseFolding.txt, statuses C and F), the caseless key
+    /// Python's `str.casefold` computes: `"Straße"` folds to `"strasse"` where `Lower`
+    /// keeps the `ß`. Locale-independent. → Utf8.
+    Casefold,
+    /// Number of extended grapheme clusters (DuckDB `length_grapheme`): a ZWJ family emoji
+    /// or a letter with a combining accent counts once. → Int64.
+    LengthGrapheme,
+    /// `substring_grapheme(s, start, length)` (DuckDB): [`StrFunc::Substr`] counted in
+    /// extended grapheme clusters. Differs from `Substr` in one place, as DuckDB does: a
+    /// negative `start` reaching before the first grapheme clamps to the first one rather
+    /// than shortening the window. → Utf8.
+    SubstringGrapheme,
+    /// Every capture group of the first match of regex `pattern`, as a struct with one
+    /// Utf8 field per group, in group order: a named group keeps its name and an unnamed
+    /// one is called by its 1-based index (Polars `extract_groups`). One regex evaluation
+    /// per row. No match, or a group that sat out the match, gives `''` (DuckDB
+    /// `regexp_extract(s, p, [names])`); a null input is a null struct. → Struct<Utf8...>.
+    RegexpExtractGroups,
+    /// [`StrFunc::RegexpExtractGroups`] answering a **null field** where it answers `''`,
+    /// which is Polars `extract_groups`. → Struct<Utf8...>.
+    RegexpExtractGroupsOrNull,
+    /// [`StrFunc::Chunk`] keeping where each chunk starts: a `List<Struct<text: Utf8,
+    /// start: Int64>>` whose `start` is the chunk's 0-based **character** offset into the
+    /// source, so `source[start..start + len(text)]` (in characters) is the chunk. Same
+    /// `start`/`length`/`pattern` slots and the same chunks as `Chunk`.
+    ChunkOffsets,
 }
 
 /// Temporal *constructors* carried by [`Expr::MakeTemporal`] — the inverse direction of
@@ -2541,6 +2724,69 @@ pub enum DateFunc {
     /// ISO 8601 week-numbering year (DuckDB `isoyear`), which can differ from the
     /// calendar year near January 1st. → Int64.
     IsoYear,
+    /// Nanoseconds since the Unix epoch at the input's own resolution (DuckDB
+    /// `epoch_ns`): a `Timestamp(ns)` keeps every digit, a coarser unit is scaled. An
+    /// overflowing scale is null. → Int64.
+    EpochNs,
+    /// The nanosecond within the second, 0–999,999,999 (Polars `dt.nanosecond`), read at the
+    /// input's resolution, so a `Timestamp(ns)` reports its last three digits. → Int64.
+    Nanosecond,
+}
+
+/// What `convert_timezone`/`replace_timezone` do with a wall clock a DST *overlap* makes
+/// ambiguous (it happens twice). Wire tags are snake_case.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ambiguous {
+    /// Null for that row (the historical behaviour).
+    #[default]
+    Null,
+    /// Error the query, naming the value.
+    Raise,
+    /// The first occurrence (the earlier instant, still on the pre-transition offset).
+    Earliest,
+    /// The second occurrence (the later instant).
+    Latest,
+}
+
+/// What `convert_timezone`/`replace_timezone` do with a wall clock a DST *gap* skips (it
+/// never happens). Wire tags are snake_case.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Nonexistent {
+    /// Null for that row (the historical behaviour).
+    #[default]
+    Null,
+    /// Error the query, naming the value.
+    Raise,
+    /// The first instant after the gap (pandas `nonexistent="shift_forward"`).
+    ShiftForward,
+}
+
+/// The operation an [`Expr::BusinessDay`] performs. Wire tags are snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessDayFunc {
+    /// Move `other` business days from `input` (numpy `busday_offset`). Type-preserving.
+    Add,
+    /// Business days in `[input, other)`, negative when `other < input` (numpy
+    /// `busday_count`). → Int64.
+    Count,
+    /// Whether `input` is a business day (numpy `is_busday`). → Boolean.
+    Is,
+}
+
+/// How `add_business_days` treats a start date that is not itself a business day.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BusinessRoll {
+    /// Error the query (numpy's default).
+    #[default]
+    Raise,
+    /// Roll to the next business day first.
+    Forward,
+    /// Roll to the previous business day first.
+    Backward,
 }
 
 /// One `WHEN condition THEN value` branch of a `Case`.
@@ -2611,6 +2857,30 @@ pub enum BinaryOp {
     /// Add `right` calendar months to a Date32/Timestamp `left` (negative to
     /// subtract); used for `date + INTERVAL n MONTH/YEAR`.
     AddMonths,
+    /// Add `right` calendar days to a Date32/Timestamp `left` (negative to subtract), the
+    /// per-row form of `offset_by("Nd")`: a tz-aware timestamp moves by local days, so the
+    /// clock reads the same across a DST change.
+    AddDays,
+}
+
+/// Deserialize a field that is either one string or a list of them (`Strptime.format`).
+fn one_or_many<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => Ok(vec![s]),
+        OneOrMany::Many(v) if !v.is_empty() => Ok(v),
+        OneOrMany::Many(_) => Err(serde::de::Error::custom(
+            "strptime needs at least one format",
+        )),
+    }
 }
 
 /// Deserialize a float literal that may arrive as a JSON number (finite) or as a
@@ -2914,5 +3184,87 @@ mod str_date_tests {
         assert_eq!(out.value(0), 99.0); // 1 < 2 → then
         assert_eq!(out.value(1), 5.0); // 5 < 2 false → else
         assert!(out.is_null(2)); // null when → else (null), not 99
+    }
+}
+
+/// The temporal wire shapes exactly as Python's `to_ir()` emits them
+/// (`tests/unit/data/ir_snapshot_golden.json`): every optional field absent at its default,
+/// and a single parse format still a plain string.
+#[cfg(test)]
+mod temporal_wire_tests {
+    use super::*;
+
+    fn parse(json: &str) -> Expr {
+        serde_json::from_str(json).expect("the Python wire shape deserializes")
+    }
+
+    #[test]
+    fn zone_and_calendar_shapes_round_trip() {
+        let Expr::ConvertTimezone {
+            ambiguous,
+            nonexistent,
+            ..
+        } = parse(
+            r#"{"e":"convert_timezone","input":{"e":"col","name":"d"},"from_tz":"UTC",
+                "to_tz":"Asia/Tokyo"}"#,
+        )
+        else {
+            panic!("expected ConvertTimezone")
+        };
+        assert_eq!(
+            (ambiguous, nonexistent),
+            (Ambiguous::Null, Nonexistent::Null)
+        );
+        let Expr::ReplaceTimezone {
+            tz,
+            ambiguous,
+            nonexistent,
+            ..
+        } = parse(
+            r#"{"e":"replace_timezone","input":{"e":"col","name":"d"},"tz":"Europe/Paris",
+                "ambiguous":"latest","nonexistent":"shift_forward"}"#,
+        )
+        else {
+            panic!("expected ReplaceTimezone")
+        };
+        assert_eq!(tz.as_deref(), Some("Europe/Paris"));
+        assert_eq!(
+            (ambiguous, nonexistent),
+            (Ambiguous::Latest, Nonexistent::ShiftForward)
+        );
+        let Expr::BusinessDay {
+            func,
+            other,
+            holidays,
+            weekmask,
+            roll,
+            ..
+        } = parse(r#"{"e":"business_day","fn":"is","input":{"e":"col","name":"d"}}"#)
+        else {
+            panic!("expected BusinessDay")
+        };
+        assert_eq!(func, BusinessDayFunc::Is);
+        assert!(other.is_none() && holidays.is_empty() && weekmask.is_none());
+        assert_eq!(roll, BusinessRoll::Raise);
+    }
+
+    #[test]
+    fn strptime_takes_one_format_or_a_list() {
+        let formats = |json: &str| match parse(json) {
+            Expr::Strptime { format, .. } => format,
+            _ => panic!("expected Strptime"),
+        };
+        assert_eq!(
+            formats(r#"{"e":"strptime","input":{"e":"col","name":"s"},"format":"%Y"}"#),
+            vec!["%Y"]
+        );
+        assert_eq!(
+            formats(r#"{"e":"strptime","input":{"e":"col","name":"s"},"format":["%Y","%d"]}"#),
+            vec!["%Y", "%d"]
+        );
+        assert!(serde_json::from_str::<Expr>(
+            r#"{"e":"strptime","input":{"e":"col","name":"s"},"format":[]}"#
+        )
+        .is_err());
     }
 }

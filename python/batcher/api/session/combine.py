@@ -14,6 +14,7 @@ from typing import Any
 
 from batcher._internal.errors import PlanError
 from batcher.api.dataset import Dataset
+from batcher.config.option_types import ConcatHow
 
 __all__ = ["concat"]
 
@@ -24,7 +25,7 @@ _HOWS = ("vertical", "vertical_relaxed", "diagonal", "horizontal")
 _POSITION = "__bc_concat_position__"
 
 
-def concat(*items: Any, how: str = "vertical", rechunk: bool = False) -> Any:
+def concat(*items: Any, how: ConcatHow = "vertical", rechunk: bool = False) -> Any:
     """Concatenate datasets into one `Dataset`, or values into one string expression.
 
     ``bt.concat([ds1, ds2])`` stacks datasets, the way ``pd.concat`` and

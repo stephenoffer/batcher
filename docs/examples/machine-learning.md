@@ -100,6 +100,7 @@ The table below lists the ML and metric scripts in path order.
 | [`examples/ml/preprocessing_scaling.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml/preprocessing_scaling.py) | Scaling numeric features, and why the choice of scaler matters |
 | [`examples/ml/projection_and_neighbors.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml/projection_and_neighbors.py) | Project correlated features with PCA or TruncatedSVD, then predict with k nearest neighbours |
 | [`examples/ml/prompt_functions.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml/prompt_functions.py) | Building prompts and reading chat logs as column expressions - all fourteen helpers |
+| [`examples/ml/rag_local_eval.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml/rag_local_eval.py) | A whole RAG pipeline run locally, then evaluated: chunk, embed, retrieve, generate, score |
 | [`examples/ml/regression_on_real_data.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml/regression_on_real_data.py) | Fitting a regression on real TPC-H lineitems, end to end |
 | [`examples/ml/reranking.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml/reranking.py) | Reranking a candidate set: cheap retrieval, then an expensive score |
 | [`examples/ml/scaling_comparison.py`](https://github.com/stephenoffer/batcher/blob/main/examples/ml/scaling_comparison.py) | Four scalers on a skewed real column, and what each does to the outliers |

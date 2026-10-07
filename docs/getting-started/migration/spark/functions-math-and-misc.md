@@ -121,7 +121,7 @@ The following table maps the 66 names on the `pyspark.sql.functions` module, sor
 | `ifnull` | {py:obj}`Expr.fill_null <batcher.plan.expr_ir.core.Expr.fill_null>` | canonical |  |
 | `input_file_block_length` | n/a | out of scope | Declined: HDFS block metadata with no Batcher equivalent. |
 | `input_file_block_start` | n/a | out of scope | Declined: HDFS block metadata with no Batcher equivalent. |
-| `input_file_name` | n/a | gap | Not yet: input-file metadata column. Wave W8. |
+| `input_file_name` | {py:obj}`bt.read <batcher.read>` | mismatch | Differs: Spark's is a column expression; Batcher names the file at read time, so pass include\_path=True to the reader (bt.read.parquet(path, include\_path=True)) and use its path column. Wave W8. |
 | `isnan` | {py:obj}`Expr.is_nan <batcher.plan.expr_ir.core.Expr.is_nan>` | mismatch | Differs: Spark isnan(null) is false; Batcher (DuckDB) returns null. Wave W0. |
 | `isnotnull` | {py:obj}`Expr.is_not_null <batcher.plan.expr_ir.core.Expr.is_not_null>` | canonical |  |
 | `isnull` | {py:obj}`Expr.is_null <batcher.plan.expr_ir.core.Expr.is_null>` | canonical |  |

@@ -9,9 +9,11 @@ express the other, and each has its own origin problem to answer to DuckDB.
 
 from __future__ import annotations
 
+import datetime as _dt
+
 from sqlglot import expressions as exp
 
-from batcher.plan.expr_ir import Cast, Expr, lit
+from batcher.plan.expr_ir import Cast, Expr, Lit, lit
 from batcher.plan.expr_ir.func_nodes import WindowStart
 from batcher.plan.functions.temporal import make_date
 from batcher.plan.ir_tags import MICROS_PER_DAY
@@ -32,13 +34,10 @@ _BUCKET_MICROS = {
 }
 
 # DuckDB anchors `time_bucket` at 2000-01-03 00:00:00, not at the Unix epoch; that is
-# 10,959 days later. `WindowStart` is epoch-anchored, so the two agree only when the bucket
-# width divides the gap between the origins evenly — which is why the units above looked
-# correct: 1 DAY, 2 HOUR and 5 MINUTE all do. A width that does not (2 DAY, 7 DAY) puts
-# every boundary on the wrong instant, silently: `time_bucket(INTERVAL 2 DAY, DATE
-# '2021-01-01')` answered 2021-01-01 where DuckDB answers 2020-12-31, and a whole week's
-# rows land in the neighbouring bucket. Such a width is refused, the same way MONTH already
-# is, rather than answered with a shifted grid.
+# 10,959 days later. `WindowStart` carries its origin, so the bucket grid is anchored there
+# directly. It used to be epoch-anchored, which agreed with DuckDB only when the width
+# divided the gap between the two origins (1 DAY, 2 HOUR, 5 MINUTE do; 2 DAY and 7 DAY do
+# not), so those widths had to be refused rather than answered on a shifted grid.
 _BUCKET_ORIGIN_MICROS = 10_959 * MICROS_PER_DAY
 
 
@@ -63,13 +62,48 @@ def _month_bucket(value: Expr, months: int, to_date: bool) -> Expr:
     return built if to_date else Cast(built, "timestamp")
 
 
+def _interval_micros(interval: exp.Interval) -> tuple[str, int, int | None]:
+    """`(unit, count, fixed width in micros or None)` of an ``INTERVAL n unit`` literal."""
+    unit = (interval.text("unit") or "DAY").upper().removesuffix("S")
+    count = int(interval.this.name)
+    per = _BUCKET_MICROS.get(unit)
+    return unit, count, None if per is None else count * per
+
+
+def _bucket_origin(tr, third: exp.Expression | None) -> int | None:
+    """The bucket grid's origin in epoch micros from `time_bucket`'s optional third argument.
+
+    DuckDB takes either a TIMESTAMP origin the grid passes through, or an INTERVAL offset
+    that slides its default origin. The argument used to be ignored, so a query asking for
+    a custom origin got the default grid with no error. Anything else is refused (`None`).
+    """
+    if third is None:
+        return _BUCKET_ORIGIN_MICROS
+    if isinstance(third, exp.Interval):
+        _unit, _count, offset = _interval_micros(third)
+        return None if offset is None else _BUCKET_ORIGIN_MICROS + offset
+    origin = tr._scalar(third)
+    if isinstance(origin, Cast) and isinstance(origin.input, Lit):
+        origin = origin.input
+    if isinstance(origin, Lit) and isinstance(origin.value, str):
+        try:
+            value = _dt.datetime.fromisoformat(origin.value)
+        except ValueError:
+            return None
+        epoch = _dt.datetime(1970, 1, 1, tzinfo=value.tzinfo)
+        return (value - epoch) // _dt.timedelta(microseconds=1)
+    if isinstance(origin, Lit) and isinstance(origin.value, _dt.datetime):
+        return (origin.value - _dt.datetime(1970, 1, 1)) // _dt.timedelta(microseconds=1)
+    return None
+
+
 def time_bucket(tr, node) -> Expr | None:
-    """`time_bucket(INTERVAL n unit, ts)` → the start of the bucket containing each row."""
+    """`time_bucket(INTERVAL n unit, ts[, origin])` → the start of the bucket per row."""
     interval = node.this
     if not isinstance(interval, exp.Interval):
         return None
-    unit = (interval.text("unit") or "DAY").upper().removesuffix("S")
-    count = int(interval.this.name)
+    unit, count, width = _interval_micros(interval)
+    third = node.args.get("unit")
     value = tr._scalar(node.expression)
     # DuckDB gives back the type it was given: bucketing a DATE yields a DATE, not the
     # midnight timestamp `WindowStart` computes in. Reading the argument's type here is
@@ -77,35 +111,38 @@ def time_bucket(tr, node) -> Expr | None:
     # came from, instead of silently widening it.
     is_date = _is_date(tr, value)
     if unit in _BUCKET_MONTHS:
+        if third is not None:
+            raise NotImplementedError(
+                f"time_bucket(INTERVAL {count} {unit}, ts, origin) is not supported: a custom "
+                "origin is supported for fixed widths (DAY and below) only"
+            )
         if count <= 0:
             raise NotImplementedError(
                 f"time_bucket(INTERVAL {count} {unit}, ...) is not supported: a bucket "
                 "width must be positive"
             )
         return _month_bucket(value, count * _BUCKET_MONTHS[unit], is_date)
-    micros = _BUCKET_MICROS.get(unit)
-    if micros is None:
+    if width is None:
         raise NotImplementedError(
             f"time_bucket(INTERVAL {count} {unit}, ...) is not supported: {unit} is "
             "neither a fixed width nor a calendar unit the month index can express. Use "
             "DAY/HOUR/MINUTE/SECOND for fixed widths or MONTH/QUARTER/YEAR for calendar "
             "ones, or date_trunc for a single period"
         )
-    width = count * micros
     if width <= 0:
         raise NotImplementedError(
             f"time_bucket(INTERVAL {count} {unit}, ...) is not supported: a bucket width "
             "must be positive"
         )
-    if _BUCKET_ORIGIN_MICROS % width:
+    origin = _bucket_origin(tr, third)
+    if origin is None:
         raise NotImplementedError(
-            f"time_bucket(INTERVAL {interval.this.name} {unit}, ...) is not supported: "
-            "buckets here start from the Unix epoch, DuckDB starts them from 2000-01-03, "
-            "and this width does not divide the gap — every boundary would land on a "
-            "different instant. Use a width that divides a day evenly (1 DAY, 6 HOUR, "
-            "15 MINUTE), or date_trunc for calendar buckets"
+            "time_bucket(..., origin) is not supported for this third argument: pass a "
+            "TIMESTAMP literal origin or a fixed INTERVAL offset"
         )
-    bucketed = WindowStart(value, width)
+    # Any origin congruent modulo the width gives the same grid; the reduced one keeps the
+    # epoch-anchored IR byte-identical for every width that divides the DuckDB gap.
+    bucketed = WindowStart(value, width, origin % width)
     return Cast(bucketed, "date") if is_date else bucketed
 
 

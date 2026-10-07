@@ -334,6 +334,9 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
         // is invisible to `assert_same`, which is int/float tolerant by design, so no
         // differential test could have caught it. `Sign` is deliberately not JIT-compiled
         // (`analyze.rs` keeps it on the interpreter), so there is no compiled tier to match.
+        // A decimal stays a decimal: `round(DECIMAL(p,s))` is `DECIMAL(p,0)`, exact, as in
+        // DuckDB. The other functions in this family still take the promotion below.
+        (Round, DataType::Decimal128(..)) => round_decimal(arr, 0, false),
         (Sign, DataType::Int64) => {
             let a = arr.as_primitive::<Int64Type>();
             let out: Int64Array = unary(a, i64::signum);
@@ -351,11 +354,11 @@ pub(crate) fn eval_math(func: MathFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             // answer.
             //
             // The result is DOUBLE. For `sqrt`/`ln`/the trig family that is also what
-            // DuckDB returns. For `abs`/`floor`/`ceil`/`round`/`sign` DuckDB keeps
-            // DECIMAL, so those diverge in *result type* — the divergence the census
-            // already pinned for `ceil`/`floor`, now covering the family — and lose
-            // exactness above 2^53. A decimal-preserving path for that subset is the
-            // follow-on; it needs a scale-aware kernel per op rather than this promotion.
+            // DuckDB returns. For `abs`/`floor`/`ceil`/`sign` DuckDB keeps DECIMAL, so
+            // those diverge in *result type* — the divergence the census already pinned
+            // for `ceil`/`floor`, now covering the family — and lose exactness above 2^53.
+            // `round` on a `Decimal128` has its scale-aware kernel (`round_decimal`, the arm
+            // above); a `Decimal256` still takes this promotion.
             let f = cast(arr, &DataType::Float64)?;
             eval_math(func, &f)
         }
@@ -579,6 +582,113 @@ fn factorial_i64(n: i64) -> Result<i64, ExprError> {
         k += 1;
     }
     Ok(acc)
+}
+
+/// `round(x, digits)` on a `Decimal128` column when `digits` is a plan-time literal: exact,
+/// and the result stays a decimal.
+///
+/// Returns `None` when the shape is not that (another function, a non-decimal operand, or a
+/// per-row `digits` column), and the caller takes the Float64 path. The literal requirement is
+/// what makes the result type static: a decimal's scale is part of its type, so it cannot
+/// depend on a value that varies by row or is absent from an empty batch.
+pub(crate) fn round_decimal_lit(
+    func: Math2Func,
+    l: &ArrayRef,
+    right: &Expr,
+) -> Option<Result<ArrayRef, ExprError>> {
+    let even = match func {
+        Math2Func::Round => false,
+        Math2Func::RoundEven => true,
+        _ => return None,
+    };
+    let Expr::Lit {
+        value: crate::Literal::Int(digits),
+    } = right
+    else {
+        return None;
+    };
+    matches!(l.data_type(), DataType::Decimal128(..)).then(|| round_decimal(l, *digits, even))
+}
+
+/// Round a `Decimal128(p, s)` array to `digits` places on its exact i128 mantissa.
+///
+/// The result type is DuckDB's: `Decimal128(p, min(s, max(digits, 0)))`. Before this the
+/// column went through f64, which mistyped it `double` and broke ties on the binary
+/// approximation rather than the decimal value: `round_even(2.345, 2)` answered 2.35, because
+/// 2.345 is stored as 2.34500000000000019984 in a double. The exact answer is 2.34.
+///
+/// `even` selects half-to-even; otherwise ties go away from zero. A result that no longer
+/// fits the precision (`round(999::DECIMAL(3,0), -1)` = 1000) raises rather than storing a
+/// value the column's type cannot hold.
+fn round_decimal(l: &ArrayRef, digits: i64, even: bool) -> Result<ArrayRef, ExprError> {
+    let DataType::Decimal128(precision, scale) = *l.data_type() else {
+        unreachable!("round_decimal is only reached for Decimal128");
+    };
+    let scale_i = i64::from(scale);
+    if digits >= scale_i {
+        return Ok(Arc::clone(l)); // already at (or below) the requested places
+    }
+    let new_scale = digits.clamp(0, scale_i) as i8;
+    // Digits dropped below the kept place; past 38 every Decimal128 value rounds to zero.
+    let drop = scale_i - digits;
+    let a = l.as_primitive::<arrow::datatypes::Decimal128Type>();
+    let out: arrow::array::Decimal128Array = if drop > 38 {
+        unary(a, |_| 0i128)
+    } else {
+        let f = 10i128.pow(drop as u32);
+        // A negative `digits` lands on scale 0 holding a multiple of `10^-digits`.
+        let back = if digits < 0 {
+            10i128.pow((-digits).min(38) as u32)
+        } else {
+            1
+        };
+        let bound = 10i128
+            .checked_pow(u32::from(precision))
+            .unwrap_or(i128::MAX);
+        a.try_unary(|v| {
+            let q = round_div_i128(v, f, even) * back;
+            if q.unsigned_abs() >= bound.unsigned_abs() {
+                Err(ArrowError::ComputeError(format!(
+                    "round({digits}) of a DECIMAL({precision},{scale}) value overflows \
+                     DECIMAL({precision},{new_scale}); cast to a wider decimal first"
+                )))
+            } else {
+                Ok(q)
+            }
+        })?
+    };
+    Ok(Arc::new(
+        out.with_precision_and_scale(precision, new_scale)?,
+    ))
+}
+
+/// `v / f` rounded to the nearest integer, ties away from zero or (`even`) to even.
+///
+/// Floored quotient and a remainder in `[0, f)`, so the tie test is one comparison whatever
+/// the sign -- the same shape as `round_i64_even`. `f <= 10^38` and `|v| < 10^38`, so `2 * rem`
+/// cannot overflow i128.
+#[inline]
+fn round_div_i128(v: i128, f: i128, even: bool) -> i128 {
+    let q = v.div_euclid(f);
+    let twice = 2 * v.rem_euclid(f);
+    let up = match twice.cmp(&f) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // A tie: away from zero rounds a negative value toward the floor (q is already
+        // the floor) and a non-negative one up.
+        std::cmp::Ordering::Equal => {
+            if even {
+                q.rem_euclid(2) == 1
+            } else {
+                v >= 0
+            }
+        }
+    };
+    if up {
+        q + 1
+    } else {
+        q
+    }
 }
 
 /// Greatest common divisor of two integers (Euclid; non-negative result).
@@ -940,5 +1050,90 @@ mod int_math_tests {
             ),
             vec![None]
         );
+    }
+
+    fn dec(v: Vec<Option<i128>>, p: u8, s: i8) -> ArrayRef {
+        Arc::new(
+            arrow::array::Decimal128Array::from(v)
+                .with_precision_and_scale(p, s)
+                .unwrap(),
+        )
+    }
+
+    fn lit(d: i64) -> Expr {
+        Expr::Lit {
+            value: crate::Literal::Int(d),
+        }
+    }
+
+    fn rounded(func: Math2Func, arr: &ArrayRef, d: i64) -> (DataType, Vec<Option<i128>>) {
+        let out = round_decimal_lit(func, arr, &lit(d)).unwrap().unwrap();
+        let a = out.as_primitive::<arrow::datatypes::Decimal128Type>();
+        (out.data_type().clone(), a.iter().collect())
+    }
+
+    /// Regression: a decimal went through f64, typed `double`, and broke the half-even tie on
+    /// the binary approximation -- `round_even(2.345, 2)` gave 2.35 where the exact answer is
+    /// 2.34. Both tie rules now work on the mantissa and keep `DECIMAL(p, digits)`.
+    #[test]
+    fn decimal_round_is_exact_and_stays_decimal() {
+        let v = dec(
+            vec![Some(2345), Some(-2345), Some(2355), None, Some(2344)],
+            10,
+            3,
+        );
+        let (t, even) = rounded(Math2Func::RoundEven, &v, 2);
+        assert_eq!(t, DataType::Decimal128(10, 2));
+        assert_eq!(
+            even,
+            vec![Some(234), Some(-234), Some(236), None, Some(234)]
+        );
+        let (t, away) = rounded(Math2Func::Round, &v, 2);
+        assert_eq!(t, DataType::Decimal128(10, 2));
+        assert_eq!(
+            away,
+            vec![Some(235), Some(-235), Some(236), None, Some(234)]
+        );
+    }
+
+    /// `digits >= scale` is the identity with the input type; a negative `digits` lands on
+    /// scale 0 holding a multiple of the power of ten; dropping more than 38 places is zero.
+    #[test]
+    fn decimal_round_digit_edges() {
+        let v = dec(vec![Some(12345), Some(-12355)], 10, 1);
+        assert_eq!(
+            rounded(Math2Func::Round, &v, 3),
+            (DataType::Decimal128(10, 1), vec![Some(12345), Some(-12355)])
+        );
+        assert_eq!(
+            rounded(Math2Func::Round, &v, -2),
+            (DataType::Decimal128(10, 0), vec![Some(1200), Some(-1200)])
+        );
+        let ties = dec(vec![Some(25), Some(35), Some(-25)], 4, 1);
+        assert_eq!(
+            rounded(Math2Func::RoundEven, &ties, 0).1,
+            vec![Some(2), Some(4), Some(-2)]
+        );
+        assert_eq!(
+            rounded(Math2Func::Round, &ties, 0).1,
+            vec![Some(3), Some(4), Some(-3)]
+        );
+        assert_eq!(rounded(Math2Func::Round, &v, -40).1, vec![Some(0), Some(0)]);
+        // Unary `round` is `digits = 0`.
+        let u = eval_math(MathFunc::Round, &ties).unwrap();
+        assert_eq!(u.data_type(), &DataType::Decimal128(4, 0));
+    }
+
+    /// A rounded value past the precision raises instead of storing an out-of-type value; a
+    /// per-row `digits` column is not a literal and keeps the Float64 path.
+    #[test]
+    fn decimal_round_overflow_and_non_literal() {
+        let v = dec(vec![Some(999)], 3, 0);
+        assert!(round_decimal_lit(Math2Func::Round, &v, &lit(-1))
+            .unwrap()
+            .is_err());
+        let col = Expr::Col { name: "d".into() };
+        assert!(round_decimal_lit(Math2Func::Round, &v, &col).is_none());
+        assert!(round_decimal_lit(Math2Func::Pow, &v, &lit(1)).is_none());
     }
 }

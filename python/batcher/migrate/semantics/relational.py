@@ -64,13 +64,35 @@ def join_keys(_ctx: Context, on: Bound) -> Any | None:
     return on.node if isinstance(value, str) or names else None
 
 
+def _polars_coalesces(how: str, coalesce: Any) -> bool:
+    """Whether a Polars join merges its key columns: `None` means all but a full join do."""
+    return how != "full" if coalesce is None else bool(coalesce)
+
+
 @transform
 def polars_how(ctx: Context, how: Bound, coalesce: Bound) -> Any | None:
-    """A Polars full join keeps both key columns unless `coalesce=True`; Batcher coalesces."""
+    """A Polars join type; a coalescing right join declines (Polars leads with the left payload)."""
     found = join_how(ctx, how)
-    if found is not None and literal(found) == "full" and literal(coalesce.node) is not True:
+    if found is None:
+        return None
+    value = literal(coalesce.node)
+    if value is not None and not isinstance(value, bool):
+        return None
+    if literal(found) == "right" and _polars_coalesces("right", value):
         return None
     return found
+
+
+@transform
+def polars_coalesce(ctx: Context, how: Bound, coalesce: Bound) -> Any | None:
+    """Polars' `coalesce` (`None` = only a full join keeps both keys) as Batcher's explicit flag."""
+    found = join_how(ctx, how)
+    value = literal(coalesce.node)
+    if found is None or (value is not None and not isinstance(value, bool)):
+        return None
+    if literal(found) in ("semi", "anti", "cross"):
+        return cst.Name("None")
+    return cst.Name(str(_polars_coalesces(literal(found), value)))
 
 
 def spark_mode(_ctx: Context, mode: Bound) -> Any | None:

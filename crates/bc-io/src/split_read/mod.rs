@@ -27,6 +27,7 @@
 //! syscalls.
 
 pub(crate) mod block_cache;
+pub(crate) mod prefetch;
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -198,6 +199,38 @@ fn cached_read(
     }
 }
 
+/// A read-ahead span's failure, surfaced to the reader that waited on it.
+fn prefetch_error(e: Arc<str>) -> ParquetError {
+    ParquetError::General(format!("prefetched read failed: {e}"))
+}
+
+/// Fetch `range` of the object in the background and park it for the reader that will want it
+/// ([`prefetch`]): split into concurrent pieces like any remote read, on the shared runtime.
+pub(crate) fn start_prefetch(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    object: Arc<str>,
+    range: Range<u64>,
+) {
+    let store = Arc::clone(store);
+    let path = path.clone();
+    let plan = pieces_of(&range);
+    let bytes = async move {
+        fetch_pieces(&store, &path, plan)
+            .await
+            .map(join)
+            .map_err(|e| Arc::<str>::from(e.to_string()))
+    }
+    .boxed()
+    .shared();
+    if prefetch::park(object, range, bytes.clone()) {
+        // A shared future only runs when polled; drive it now so the bytes are on their way.
+        tokio::spawn(async move {
+            let _ = bytes.await;
+        });
+    }
+}
+
 /// Join `parts` into one buffer, or hand back the single part untouched.
 fn join(parts: Vec<Bytes>) -> Bytes {
     if parts.len() == 1 {
@@ -234,6 +267,8 @@ pub(crate) enum MaybeSplitReader {
         /// The object's identity and size, when the process keeps a block cache
         /// ([`block_cache`]): its reads are then served from, and fill, that cache.
         cached: Option<(Arc<str>, u64)>,
+        /// The object's identity, for the read-ahead spans [`prefetch`] may hold for it.
+        object: Arc<str>,
     },
 }
 
@@ -242,19 +277,21 @@ pub(crate) fn maybe_split(
     inner: ObjectReader,
     store: &Arc<dyn ObjectStore>,
     path: &Path,
-    remote: Option<(&str, u64)>,
+    remote: Option<(&str, u64, &str)>,
     local: Option<(&std::path::Path, u64)>,
 ) -> MaybeSplitReader {
     if let Some(file) = local.and_then(|(p, size)| crate::mapped::open(p, size)) {
         return MaybeSplitReader::Mapped { inner, file };
     }
-    if let Some((uri, size)) = remote {
-        let cached = block_cache::global().map(|_| (block_cache::object_id(uri, size), size));
+    if let Some((uri, size, version)) = remote {
+        let object = block_cache::object_id(uri, size, version);
+        let cached = block_cache::global().map(|_| (Arc::clone(&object), size));
         MaybeSplitReader::Split {
             inner,
             store: Arc::clone(store),
             path: path.clone(),
             cached,
+            object,
         }
     } else {
         MaybeSplitReader::Plain(inner)
@@ -274,7 +311,13 @@ impl AsyncFileReader for MaybeSplitReader {
                 store,
                 path,
                 cached,
+                object,
             } => {
+                if let Some(read) = prefetch::take(object, std::slice::from_ref(&range)) {
+                    return read
+                        .map(|r| r.map(|mut v| v.remove(0)).map_err(prefetch_error))
+                        .boxed();
+                }
                 if let (Some(cache), Some((id, size))) = (block_cache::global(), cached) {
                     return cached_read(cache, store, path, id, *size, vec![range])
                         .map(|r| r.map(|mut v| v.remove(0)))
@@ -308,7 +351,11 @@ impl AsyncFileReader for MaybeSplitReader {
                 store,
                 path,
                 cached,
+                object,
             } => {
+                if let Some(read) = prefetch::take(object, &ranges) {
+                    return read.map(|r| r.map_err(prefetch_error)).boxed();
+                }
                 if let (Some(cache), Some((id, size))) = (block_cache::global(), cached) {
                     return cached_read(cache, store, path, id, *size, ranges).boxed();
                 }

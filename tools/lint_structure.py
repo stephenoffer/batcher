@@ -84,8 +84,8 @@ DIR_ALLOW: dict[str, str] = {
         "ml/tabular already are — this entry is debt, not a design"
     ),
     "python/batcher/kyber": (
-        "OVER BUDGET AND TRACKED: 23 modules against a cap of 12, and GROWING (21 when this "
-        "entry was written). The learned-adaptive family "
+        "OVER BUDGET AND TRACKED: 22 modules against a cap of 12 (21 when this entry was written, "
+        "23 at its peak). The learned-adaptive family "
         "(cost/cardinality/calibration/cpu_shares/learning/signature) is the natural subpackage "
         "to lift out; this entry is debt, not a design"
     ),
@@ -213,6 +213,11 @@ STRUCTURE_ALLOW: dict[str, str] = {
     ),
     "python/batcher/api/io_namespace/writer.py": (
         "ds.write façade; per-format examples push it over"
+    ),
+    # The `bt.read` façade: one thin delegating method per connector. Splitting it means a
+    # mixin (banned) or a second namespace (`bt.read.vector.qdrant`), a second spelling.
+    "python/batcher/api/io_namespace/reader.py": (
+        "bt.read façade; one thin method per connector, the writer.py precedent"
     ),
     # The `ds.ml` accessor: one bound ML/multimodal namespace (map_batches, infer,
     # embed, the torch loaders, download/upload) whose every public method now carries

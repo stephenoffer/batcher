@@ -340,6 +340,10 @@ try:
             # largest buckets to local disk and reads them back on fetch, which is
             # result-preserving. Set before the server is created: each store captures the
             # cap at construction so its bound cannot shift mid-query.
+            # Its spills land on the same scratch every other spill path uses — the
+            # configured `spill_dir`, else the node's measured local volume — rather than a
+            # tempdir that may be a small RAM-backed tmpfs.
+            from batcher._internal.site import local_scratch_root
             from batcher.carbonite.policies import shuffle_store_cap
 
             # The gather's shape and its memory bound: how many concurrent Flight streams
@@ -354,6 +358,7 @@ try:
                 shuffle_store_cap(cfg),
                 cfg.flow_control.gather_streams,
                 cfg.flow_control.gather_inflight_bytes,
+                cfg.memory.spill_dir or local_scratch_root(),
             )
 
             # Shuffle TLS (off unless the operator mounted certs and enabled it). Read
@@ -620,6 +625,33 @@ try:
                 budget = max(1, budget // self._concurrency)
             return budget, sdir, codec
 
+        def _node_output_share(self) -> int:
+            """Half this worker's share of its node's RAM, divided by the calls it runs at once.
+
+            The floor under a broadcast probe's output bound. `_reduce_budget` is the *spill*
+            threshold, and the envelope sizes that from Carbonite's estimate of the query's
+            footprint: a threshold an estimate under-shoots costs a spill, which is cheap. The
+            output bound is not a spill threshold -- crossing it abandons the broadcast and
+            re-runs the join as a co-partition shuffle of the probe side. On TPC-H sf1000 over
+            eight 64 GB nodes it came out at a few megabytes (a 2.4 GB estimate divided by the
+            actor's concurrency), every broadcast was abandoned, and q9 shuffled all of
+            `lineitem` for 27 minutes before failing in the transport.
+
+            The worker's share is its core grant over the node's cores, so several workers on
+            one node do not each claim the node.
+            """
+            try:
+                import psutil
+
+                total = psutil.virtual_memory().total
+            except Exception as exc:  # pragma: no cover - optional host probe
+                note_suppressed("dist", "read node memory for a broadcast output floor", exc)
+                return 0
+            cores = max(1, int(available_cpu_count()))
+            grant = json.loads(self._engine_config).get("parallelism") or cores
+            share = min(1.0, float(grant) / cores)
+            return int(total * 0.5 * share / max(1, self._concurrency))
+
         def _record_bucket_bytes(self, sizes: dict[int, int]) -> None:
             """Fold one map call's per-bucket byte counts into this plan's running totals.
 
@@ -824,7 +856,12 @@ try:
             """
             _use_plan(plan_id)
             for ticket in tickets:
-                self.session.publish(ticket, self.session.fetch(primary_addr, ticket))
+                # `required`: the primary published this ticket, so an absent one is lost
+                # data, and copying it leniently would publish an *empty* replica that every
+                # later reducer would trust as the bucket.
+                self.session.publish(
+                    ticket, self.session.fetch(primary_addr, ticket, required=True)
+                )
             return self.session.addr
 
         def reduce_fetch(
@@ -1534,8 +1571,8 @@ try:
                 # it this actor measured every chunk it joined and discarded all of it.
                 on_metrics=self._metrics.append,
                 # This worker's own per-operation grant, so the bound tracks the fan-out and
-                # the actor's concurrency instead of a fixed share of the node.
-                output_budget=self._reduce_budget()[0],
+                # the actor's concurrency -- but never below its share of the node's RAM.
+                output_budget=max(self._reduce_budget()[0], self._node_output_share()),
             )
             if not publish:
                 return out

@@ -20,7 +20,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from batcher._internal.errors import BackendError
+from batcher._internal.errors import BackendError, PlanError
 from batcher._internal.optional import require
 from batcher.io.formats.base import SINKS, SOURCES
 from batcher.io.manifest import WriteManifest, WrittenFile
@@ -50,18 +50,29 @@ def lance_vector_search(
     filter: str | None = None,
     nprobes: int | None = None,
     refine_factor: int | None = None,
+    exact: bool = False,
 ) -> pa.Table:
-    """Approximate-nearest-neighbor search over a Lance vector column.
+    """Nearest-neighbor search over a Lance vector column, approximate unless `exact`.
 
     Returns the `k` rows nearest to `query` (a 1-D vector), with a ``_distance``
     column, using the column's ANN index when one exists (else a brute-force scan).
     `filter` is a SQL predicate applied alongside the search (pre/post-filtering is
-    Lance's choice); `nprobes`/`refine_factor` trade recall for latency.
+    Lance's choice); `nprobes`/`refine_factor` trade recall for latency. `exact` passes
+    ``use_index=False``, so Lance scans every vector even when an index exists, and the
+    index-only knobs are refused with it rather than ignored.
     """
     import numpy as np
 
+    if exact and (nprobes is not None or refine_factor is not None):
+        raise PlanError(
+            "vector_search(exact=True) scans every vector without the ANN index, so "
+            "nprobes= and refine_factor= (index tuning knobs) have no meaning; drop them "
+            "or search with exact=False"
+        )
     lance = _require_lance()
     nearest: dict[str, Any] = {"column": column, "q": np.asarray(query, dtype=np.float32), "k": k}
+    if exact:
+        nearest["use_index"] = False
     if nprobes is not None:
         nearest["nprobes"] = nprobes
     if refine_factor is not None:

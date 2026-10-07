@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, Union
 
 from batcher._internal.errors import PlanError, require_float, require_int
 from batcher._internal.mathx import is_nan
+from batcher.config.option_types import MappingStrategy, NanPolicy, QuantileInterpolation
 from batcher.plan.expr_ir.compat import expr_attribute_error as _expr_attribute_error
 from batcher.plan.ir_tags import MICROS_PER_DAY, ExprTag
 from batcher.plan.types import (
@@ -52,6 +53,12 @@ if TYPE_CHECKING:
     from batcher.plan.expr_ir.selectors.core import _SelectorNameNamespace
     from batcher.plan.expr_ir.video import _VideoNamespace
 
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.declared import AggExprBound as _AggExprBound
+else:
+    # `AggExpr` borrows `Expr`'s math methods with `setattr`; checkers read `declared`.
+    _AggExprBound = object
+
 # A value that can be promoted to an expression: another Expr or a Python scalar.
 IntoExpr = Union["Expr", int, float, bool, str]
 #: One ``ORDER BY`` key of an ordered aggregate: the key expression, ``descending``, and
@@ -71,7 +78,52 @@ def _wrap(value: IntoExpr) -> Expr:
     # `nodes` (which imports this module).
     if type(value).__name__ == "CaseBuilder":
         return value._finish()  # type: ignore[attr-defined]
+    # A bare ``None`` is SQL NULL. The IR has no untyped null, so where the operator gives
+    # it no type -- ``col("x") + None`` -- it is the same Int64 NULL ``bt.lit(None)`` is.
+    # The operators that *can* type it by context (the comparisons, `eq_missing`,
+    # `fill_null`, `coalesce`) intercept it before it gets here; see `_is_null_literal`.
+    # Lifting it to `Lit(None)` instead deferred a "a literal must be ... None" error to
+    # `to_ir`, which rejected the very value the message listed as allowed.
+    if value is None:
+        from batcher.plan.expr_ir.constructors import null
+
+        return null()
     return Lit(value)
+
+
+def _is_null_literal(value: object) -> bool:
+    """Whether `value` is a NULL with no type of its own: ``None`` or ``bt.lit(None)``.
+
+    ``bt.lit(None)`` is built as ``nullif(1, 1)`` over one shared `Lit` -- an Int64 NULL,
+    because the IR has no untyped one. Compared with a string or a date column that Int64
+    is a type error in the engine (``Utf8 == Int64``), although SQL's answer is simply NULL
+    whatever the other side's type. The operators whose answer does not depend on that type
+    recognise this shape and answer without it. A *typed* null (``lit(None, dtype=...)``)
+    is a `Cast` and is not matched: it already has a type, and comparing with it is exact.
+    Matched by name because `nodes` imports this module.
+    """
+    if value is None:
+        return True
+    if type(value).__name__ != "NullIf":
+        return False
+    left, right = value.left, value.right  # type: ignore[attr-defined]
+    return left is right and isinstance(left, Lit) and type(left.value) is int
+
+
+def _compare(op: str, left: Expr, other: IntoExpr | None) -> Expr:
+    """``left <op> other`` for a comparison operator, with a NULL operand typed by context.
+
+    A comparison with NULL is NULL in SQL, whatever the other operand's type, so
+    ``col("s") == None`` is a Boolean NULL on every row rather than a type error. It is
+    spelled ``is_null(left) <op> NULL::bool`` -- not a bare NULL constant -- so the result
+    still reads `left` and keeps the output name ``select(col("s") == None)`` would give.
+    Use `Expr.is_null` or `Expr.eq_missing` to *test* for null.
+    """
+    if _is_null_literal(other):
+        from batcher.plan.expr_ir.constructors import null
+
+        return Binary(op, IsNull(left), null("bool"))
+    return Binary(op, left, _wrap(other))  # type: ignore[arg-type]
 
 
 # `constructors` imports this module, so `col` is resolved on first use rather than at
@@ -229,27 +281,34 @@ class Expr:
     # --- comparison operators (yield boolean expressions) ------------------
     def __gt__(self, other: IntoExpr) -> Expr:
         """Element-wise greater-than (``a > b``), yielding a boolean expression."""
-        return Binary("gt", self, _wrap(other))
+        return _compare("gt", self, other)
 
     def __ge__(self, other: IntoExpr) -> Expr:
         """Element-wise greater-than-or-equal (``a >= b``), yielding a boolean expression."""
-        return Binary("ge", self, _wrap(other))
+        return _compare("ge", self, other)
 
     def __lt__(self, other: IntoExpr) -> Expr:
         """Element-wise less-than (``a < b``), yielding a boolean expression."""
-        return Binary("lt", self, _wrap(other))
+        return _compare("lt", self, other)
 
     def __le__(self, other: IntoExpr) -> Expr:
         """Element-wise less-than-or-equal (``a <= b``), yielding a boolean expression."""
-        return Binary("le", self, _wrap(other))
+        return _compare("le", self, other)
 
-    def __eq__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
-        """Element-wise equality (``a == b``), yielding a boolean expression (not a Python bool)."""
-        return Binary("eq", self, _wrap(other))
+    def __eq__(self, other: IntoExpr | None) -> Expr:  # type: ignore[override]
+        """Element-wise equality (``a == b``), yielding a boolean expression (not a Python bool).
 
-    def __ne__(self, other: IntoExpr) -> Expr:  # type: ignore[override]
-        """Element-wise inequality (``a != b``), yielding a boolean expression."""
-        return Binary("ne", self, _wrap(other))
+        Comparing with ``None`` follows SQL: ``col("x") == None`` is NULL on every row, of
+        any column type. Test for null with `is_null`, or use `eq_missing`.
+        """
+        return _compare("eq", self, other)
+
+    def __ne__(self, other: IntoExpr | None) -> Expr:  # type: ignore[override]
+        """Element-wise inequality (``a != b``), yielding a boolean expression.
+
+        As with ``==``, comparing with ``None`` is NULL on every row (SQL ``x <> NULL``).
+        """
+        return _compare("ne", self, other)
 
     # `Expr` stays unhashable (see `__hash__` below, which raises with the reason).
 
@@ -259,7 +318,7 @@ class Expr:
 
     # --- arithmetic operators ---------------------------------------------
     def __add__(self, other: IntoExpr) -> Expr:
-        """Element-wise addition (``a + b``); also the string-concat operator on Utf8."""
+        """Element-wise numeric addition (``a + b``); join strings with ``bt.concat`` instead."""
         return Binary("add", self, _wrap(other))
 
     def __sub__(self, other: IntoExpr) -> Expr:
@@ -955,12 +1014,24 @@ class Expr:
         upper = self <= hi if closed in ("both", "right") else self < hi
         return lower & upper
 
-    def eq_missing(self, other: IntoExpr) -> Expr:
+    def eq_missing(self, other: IntoExpr | None) -> Expr:
         """Null-safe equality (SQL ``IS NOT DISTINCT FROM``) where two nulls compare equal.
 
         A null compared with a non-null is **false** (never null). The reliable way
         to compare possibly-null keys — used for change detection
         in slowly-changing dimensions. Desugars to existing ops (no new IR).
+        ``eq_missing(None)`` is `is_null`, for a column of any type.
+
+        How it differs from ``==`` (NaN is a value, equal to itself, in both):
+
+        ==============  ==========  ==============
+        left, right     ``==``      ``eq_missing``
+        ==============  ==========  ==============
+        null, null      null        true
+        null, 1         null        false
+        NaN, NaN        true        true
+        NaN, 1.0        false       false
+        ==============  ==========  ==============
 
         Args:
             other: The expression or scalar to compare against.
@@ -975,8 +1046,14 @@ class Expr:
                 >>> ds = bt.from_pydict({"a": [1, None], "b": [1, None]})
                 >>> ds.select(r=bt.col("a").eq_missing(bt.col("b"))).to_pydict()
                 {'r': [True, True]}
+                >>> bt.from_pydict({"s": ["x", None]}).select(
+                ...     r=bt.col("s").eq_missing(None)
+                ... ).to_pydict()
+                {'r': [False, True]}
         """
-        o = _wrap(other)
+        if _is_null_literal(other):
+            return IsNull(self)
+        o = _wrap(other)  # type: ignore[arg-type]
         both_null = self.is_null() & o.is_null()
         return Coalesce([self == o, Lit(False)]) | both_null
 
@@ -2909,7 +2986,7 @@ class Expr:
 
         return hash_rows(self, seed=seed, algorithm=algorithm)
 
-    def fill_null(self, value: IntoExpr) -> Coalesce:
+    def fill_null(self, value: IntoExpr | None) -> Coalesce:
         """Replace nulls with `value`, leaving non-null values unchanged (SQL ``COALESCE``).
 
         `value` may be a scalar or another expression (e.g. a column to fall back to).
@@ -2930,6 +3007,10 @@ class Expr:
                 >>> ds.select(r=bt.col("x").fill_null(0)).to_pydict()
                 {'r': [1, 0, 3]}
         """
+        if _is_null_literal(value):
+            # ``COALESCE(x, NULL)`` is ``x``; an Int64 NULL here would only be a type error
+            # against a non-integer column.
+            return Coalesce([self])
         return Coalesce([self, _wrap(value)])
 
     # --- NaN handling / clamping -------------------------------------------
@@ -3105,7 +3186,7 @@ class Expr:
         """
         return AggExpr("min", self)
 
-    def max(self, *, nan_policy: str = "propagate") -> AggExpr | Expr:
+    def max(self, *, nan_policy: NanPolicy = "propagate") -> AggExpr | Expr:
         """Maximum non-null value per group. Use in ``group_by().agg(...)`` or ``.over(...)``.
 
         Floats follow SQL's total order, in which NaN is greater than every number, so one
@@ -3484,11 +3565,20 @@ class Expr:
         """
         return AggExpr("median", self)
 
-    def quantile(self, q: float, interpolation: str = "linear") -> AggExpr:
+    def quantile(
+        self, q: float | Sequence[float], interpolation: QuantileInterpolation = "linear"
+    ) -> AggExpr | Expr:
         """Continuous quantile at ``q`` in [0, 1] (linear interpolation).
 
         ``quantile(0.5)`` equals :meth:`median`. Raises ``PlanError`` if ``q`` is
         outside [0, 1].
+
+        A list of fractions, ``quantile([0.25, 0.5, 0.75])``, answers one ``List`` of the
+        quantiles in the order given, in the same pass, as DuckDB's
+        ``quantile_cont(x, [0.25, 0.5, 0.75])`` does. A group with no non-null value
+        answers a null list, not a list of nulls. Each fraction is still its own exact
+        quantile state, so memory grows with the number of fractions. The list form has
+        no window spelling; use it in ``agg(...)``.
 
         `interpolation` decides what happens when rank ``q·(n-1)`` falls between two
         values, with Polars' names: ``"linear"`` (DuckDB's ``quantile_cont``, the default),
@@ -3497,14 +3587,15 @@ class Expr:
         ``ceil(q·n) - 1``, which is :meth:`quantile_disc`).
 
         Args:
-            q: The quantile in ``[0, 1]``.
+            q: The quantile in ``[0, 1]``, or a list or tuple of them.
             interpolation: How to resolve a rank between two values.
 
         Returns:
-            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``.
+            An aggregate expression for use in ``group_by().agg(...)`` or ``.over(...)``;
+            for a list of fractions, a ``List`` expression for ``agg(...)``.
 
         Raises:
-            PlanError: If `q` is outside ``[0, 1]``.
+            PlanError: If a `q` is outside ``[0, 1]``, or the list of fractions is empty.
 
         Examples:
             .. doctest::
@@ -3516,10 +3607,17 @@ class Expr:
                 >>> nearest = bt.col("x").quantile(0.5, "nearest")
                 >>> ds.group_by("g").agg(r=nearest).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'r': [2.0, 10.0]}
+
+                >>> ds.agg(r=bt.col("x").quantile([0.5, 0.0])).to_pydict()
+                {'r': [[2.0, 1.0]]}
         """
         from batcher._internal.errors import PlanError
         from batcher.plan.ir_tags import QUANTILE_INTERPOLATIONS
 
+        if isinstance(q, (list, tuple)):
+            from batcher.plan.functions.aggregate_semantics import quantile_list
+
+            return quantile_list(self, list(q), interpolation)
         q = require_float(q, func="quantile", arg="q")
         if not 0.0 <= q <= 1.0:
             raise PlanError(f"quantile q must be in [0, 1], got {q}")
@@ -4178,6 +4276,7 @@ class Expr:
         descending: bool | Sequence[bool] = False,
         nulls_last: bool | Sequence[bool] = True,
         ignore_nulls: bool = False,
+        distinct: bool = False,
     ) -> AggExpr | Expr:
         """Collect each group's values (including nulls) into a ``List`` (SQL ``array_agg``).
 
@@ -4201,6 +4300,14 @@ class Expr:
         ``ignore_nulls=True`` leaves the nulls out, as Spark's ``collect_list`` and
         ``array_agg`` do, so a group of only nulls collects to ``[]``.
 
+        ``distinct=True`` keeps each value once, sorted by the value, as SQL's
+        ``array_agg(DISTINCT x ORDER BY x)`` and Spark's ``array_sort(collect_set(x))`` do.
+        One null is kept unless ``ignore_nulls=True``. ``order_by`` may then only name the
+        value itself, to choose ``descending`` or ``nulls_last``: among duplicates there is
+        no single row whose key could decide a position, so any other key is refused, as
+        in Postgres and DuckDB. The list is collected in full and deduplicated afterwards,
+        so it holds every value of the group until then.
+
         Args:
             order_by: The key or keys that order the elements; none leaves the order
                 unspecified.
@@ -4208,13 +4315,15 @@ class Expr:
             nulls_last: Place elements whose key is null after the others, for every key or
                 per key.
             ignore_nulls: Whether to leave null values out of the list.
+            distinct: Whether to keep each value once, sorted by the value.
 
         Returns:
             An aggregate expression for use in ``group_by().agg(...)``.
 
         Raises:
             PlanError: If ``descending`` or ``nulls_last`` is a sequence whose length is not
-                the number of ``order_by`` keys.
+                the number of ``order_by`` keys, or ``distinct=True`` is ordered by anything
+                but the value itself.
 
         Examples:
             .. doctest::
@@ -4231,13 +4340,19 @@ class Expr:
                 >>> nulls = bt.from_pydict({"x": [1, None]})
                 >>> nulls.agg(r=bt.col("x").array_agg(ignore_nulls=True)).to_pydict()
                 {'r': [[1]]}
+
+                >>> dup = bt.from_pydict({"x": [2, None, 1, 2]})
+                >>> dup.agg(r=bt.col("x").array_agg(distinct=True)).to_pydict()
+                {'r': [[1, 2, None]]}
         """
+        from batcher.plan.functions import aggregate_semantics as sem
+
         keys = _agg_order_keys(order_by, descending, nulls_last, func="array_agg")
+        if distinct:
+            return sem.distinct_array_agg(self, keys, drop_nulls=ignore_nulls)
         agg = AggExpr("list_agg", self, order_by=keys)
         if not ignore_nulls:
             return agg
-        from batcher.plan.functions import aggregate_semantics as sem
-
         return sem.array_agg_without_nulls(agg)
 
     # --- Cumulative / shift (Polars-style window conveniences) ------------------
@@ -4472,7 +4587,7 @@ class Expr:
         *,
         descending: bool | Iterable[bool] = False,
         nulls_last: bool = True,
-        mapping_strategy: str = "group_to_rows",
+        mapping_strategy: MappingStrategy = "group_to_rows",
     ) -> Expr:
         """Evaluate this expression per window — Polars ``over``, SQL ``… OVER (…)``.
 
@@ -4730,7 +4845,12 @@ class Expr:
 
         return WindowExpr("backward_fill", self, [], [], None)
 
-    def interpolate(self) -> WindowExpr:
+    def interpolate(
+        self,
+        *,
+        max_gap: int | float | str | None = None,
+        by: IntoExpr | None = None,
+    ) -> WindowExpr:
         """Draw a straight line across each interior gap — Polars ``interpolate``.
 
         Where :meth:`forward_fill` holds the last reading flat across a gap, this
@@ -4744,12 +4864,32 @@ class Expr:
         The result is always floating point, because the value between two integers
         generally is not one.
 
-        A window expression, so it must be bound with ``.over(...)`` and ``order_by``
-        is required — interpolation follows a defined row order, and an unordered
-        relation has none.
+        By default the line is weighted by row position, which is right only when the
+        readings are evenly spaced. Pass `by` to weight it by the distance along that
+        column instead (Polars ``interpolate_by``): a reading two minutes into a
+        ten-minute gap then sits a fifth of the way along the line, however many rows the
+        gap holds. `by` becomes the window's order, so no ``.over(order_by=...)`` is
+        needed; chain ``.over(partition_by=...)`` to restart per group.
+
+        `max_gap` refuses to invent a long stretch of data: a gap wider than it stays
+        null as a whole. Without `by` it counts the null rows in the gap. With `by` it is
+        the distance between the two readings that bracket the gap, as a number in that
+        column's units or a duration such as ``"10m"`` for a temporal column. pandas'
+        ``interpolate(limit=n)`` differs: it fills the first `n` rows of a longer gap.
+
+        Without `by` this is a window expression, so it must be bound with
+        ``.over(...)`` and ``order_by`` is required — interpolation follows a defined row
+        order, and an unordered relation has none.
+
+        Args:
+            max_gap: The widest gap to fill, or ``None`` (the default) for no limit.
+            by: The single numeric or temporal column to measure distance along.
 
         Returns:
             A window expression carrying the interpolated column.
+
+        Raises:
+            PlanError: If `max_gap` is negative, or is a duration without `by`.
 
         Examples:
             .. doctest::
@@ -4758,10 +4898,22 @@ class Expr:
                 >>> ds = bt.from_pydict({"t": [1, 2, 3, 4], "x": [10.0, None, None, 40.0]})
                 >>> ds.with_columns(i=bt.col("x").interpolate().over(order_by=["t"])).to_pydict()
                 {'t': [1, 2, 3, 4], 'x': [10.0, None, None, 40.0], 'i': [10.0, 20.0, 30.0, 40.0]}
-        """
-        from batcher.plan.expr_ir.nodes import WindowExpr
 
-        return WindowExpr("interpolate", self, [], [], None)
+                >>> x = [0.0, None, 5.0, None, None, 8.0]
+                >>> gappy = bt.from_pydict({"t": [0, 1, 5, 6, 7, 8], "x": x})
+                >>> filled = bt.col("x").interpolate(by="t", max_gap=3)
+                >>> gappy.with_columns(i=filled).to_pydict()["i"]
+                [0.0, None, 5.0, 6.0, 7.0, 8.0]
+        """
+        from batcher.plan.expr_ir.nodes import WindowExpr, WindowOptions
+
+        gap = _interpolate_gap(max_gap, by_value=by is not None)
+        if by is None:
+            series = None if gap is None else WindowOptions(max_gap=gap)
+            return WindowExpr("interpolate", self, [], [], None, opts=series)
+        series = WindowOptions(max_gap=gap, by_value=True)
+        window = WindowExpr("interpolate", self, [], [], None, opts=series)
+        return window.over(order_by=[by])
 
     def rle_id(self) -> WindowExpr:
         """Number the runs of equal consecutive values — Polars ``rle_id``.
@@ -4797,16 +4949,24 @@ class Expr:
     def _ewm(
         self,
         func: str,
-        com: float | None,
-        span: float | None,
-        half_life: float | None,
-        alpha: float | None,
+        decay: tuple[float | None, float | None, float | None, float | None],
+        adjust: bool,
+        ignore_nulls: bool,
+        min_periods: int,
     ) -> WindowExpr:
-        """Resolve one of the four decay spellings to an alpha and build the window."""
-        from batcher.plan.expr_ir.nodes import WindowExpr
+        """Resolve the decay spelling to an alpha, validate the options, build the window."""
+        from batcher.plan.expr_ir.nodes import WindowExpr, WindowOptions
 
-        resolved = _ewm_alpha(func, com, span, half_life, alpha)
-        return WindowExpr(func, self, [], [], None, alpha=resolved)
+        resolved = _ewm_alpha(func, *decay)
+        for arg, flag in (("adjust", adjust), ("ignore_nulls", ignore_nulls)):
+            if not isinstance(flag, bool):
+                raise PlanError(f"{func}(): {arg} must be a bool, got {flag!r}")
+        # pandas' `min_periods=0` means "no minimum", which is what 1 means here.
+        minp = max(1, require_int(min_periods, func=func, arg="min_periods", minimum=0))
+        series = None if adjust and minp == 1 else WindowOptions(adjust=adjust, min_periods=minp)
+        return WindowExpr(
+            func, self, [], [], None, alpha=resolved, ignore_nulls=ignore_nulls, opts=series
+        )
 
     def ewm_mean(
         self,
@@ -4815,6 +4975,9 @@ class Expr:
         span: float | None = None,
         half_life: float | None = None,
         alpha: float | None = None,
+        adjust: bool = True,
+        ignore_nulls: bool = False,
+        min_periods: int = 1,
     ) -> WindowExpr:
         """Exponentially weighted moving average — Polars/pandas ``ewm_mean``.
 
@@ -4832,7 +4995,10 @@ class Expr:
 
         A null input row yields a null output and contributes no value, but still ages
         the decay — pandas' ``adjust=True, ignore_na=False`` and Polars'
-        ``adjust=True, ignore_nulls=False``, the default in both.
+        ``adjust=True, ignore_nulls=False``, the default in both. `adjust`,
+        `ignore_nulls` and `min_periods` follow those two libraries' meanings, so a
+        smoother ported from either keeps its numbers at every non-null row. pandas
+        carries the last value across a null row where Batcher and Polars return null.
 
         A window expression, so it must be bound with ``.over(...)`` and ``order_by``
         is required.
@@ -4842,6 +5008,12 @@ class Expr:
             span: Span, ``>= 1``.
             half_life: Half-life in rows, ``> 0``.
             alpha: The smoothing factor itself, in ``(0, 1]``.
+            adjust: Divide by the decayed sum of every weight (``True``, the default), or
+                use the recursive form ``y = (1 - alpha) * y_prev + alpha * x``.
+            ignore_nulls: Let a null row leave the decay alone, so weights follow the
+                position among the non-null values rather than among all rows.
+            min_periods: Non-null observations a partition must have seen before a row
+                gets a value; earlier rows are null.
 
         Returns:
             A window expression carrying the exponentially weighted mean.
@@ -4858,8 +5030,14 @@ class Expr:
                 >>> w = bt.col("x").ewm_mean(alpha=0.5).over(order_by=["t"])
                 >>> ds.with_columns(e=w).to_pydict()["e"]
                 [1.0, 1.6666666666666665, 2.4285714285714284]
+
+                >>> w = bt.col("x").ewm_mean(alpha=0.5, adjust=False, min_periods=2)
+                >>> ds.with_columns(e=w.over(order_by=["t"])).to_pydict()["e"]
+                [None, 1.5, 2.25]
         """
-        return self._ewm("ewm_mean", com, span, half_life, alpha)
+        return self._ewm(
+            "ewm_mean", (com, span, half_life, alpha), adjust, ignore_nulls, min_periods
+        )
 
     def ewm_mean_by(
         self,
@@ -4934,6 +5112,9 @@ class Expr:
         span: float | None = None,
         half_life: float | None = None,
         alpha: float | None = None,
+        adjust: bool = True,
+        ignore_nulls: bool = False,
+        min_periods: int = 1,
     ) -> WindowExpr:
         """Exponentially weighted moving standard deviation — Polars ``ewm_std``.
 
@@ -4951,6 +5132,12 @@ class Expr:
             span: Span, ``>= 1``.
             half_life: Half-life in rows, ``> 0``.
             alpha: The smoothing factor itself, in ``(0, 1]``.
+            adjust: Divide by the decayed sum of every weight (``True``, the default), or
+                use the recursive form ``y = (1 - alpha) * y_prev + alpha * x``.
+            ignore_nulls: Let a null row leave the decay alone, so weights follow the
+                position among the non-null values rather than among all rows.
+            min_periods: Non-null observations a partition must have seen before a row
+                gets a value; earlier rows are null.
 
         Returns:
             A window expression carrying the exponentially weighted standard deviation.
@@ -4968,7 +5155,9 @@ class Expr:
                 >>> ds.with_columns(e=w).to_pydict()["e"]
                 [None, 0.7071067811865477, 0.9636241116594317]
         """
-        return self._ewm("ewm_std", com, span, half_life, alpha)
+        return self._ewm(
+            "ewm_std", (com, span, half_life, alpha), adjust, ignore_nulls, min_periods
+        )
 
     def ewm_var(
         self,
@@ -4977,6 +5166,9 @@ class Expr:
         span: float | None = None,
         half_life: float | None = None,
         alpha: float | None = None,
+        adjust: bool = True,
+        ignore_nulls: bool = False,
+        min_periods: int = 1,
     ) -> WindowExpr:
         """Exponentially weighted moving variance — Polars ``ewm_var``.
 
@@ -4989,6 +5181,12 @@ class Expr:
             span: Span, ``>= 1``.
             half_life: Half-life in rows, ``> 0``.
             alpha: The smoothing factor itself, in ``(0, 1]``.
+            adjust: Divide by the decayed sum of every weight (``True``, the default), or
+                use the recursive form ``y = (1 - alpha) * y_prev + alpha * x``.
+            ignore_nulls: Let a null row leave the decay alone, so weights follow the
+                position among the non-null values rather than among all rows.
+            min_periods: Non-null observations a partition must have seen before a row
+                gets a value; earlier rows are null.
 
         Returns:
             A window expression carrying the exponentially weighted variance.
@@ -5006,7 +5204,9 @@ class Expr:
                 >>> ds.with_columns(e=w).to_pydict()["e"]
                 [None, 0.5000000000000002, 0.928571428571429]
         """
-        return self._ewm("ewm_var", com, span, half_life, alpha)
+        return self._ewm(
+            "ewm_var", (com, span, half_life, alpha), adjust, ignore_nulls, min_periods
+        )
 
     # --- rolling (fixed-size trailing window) aggregates --------------------
     def _rolling(
@@ -5685,6 +5885,88 @@ class Expr:
             builder = builder.when(below).then(lit(name))
         return builder.otherwise(lit(names[-1]))
 
+    def qcut(
+        self,
+        q: int | Iterable[float],
+        labels: Iterable[str] | None = None,
+        *,
+        duplicates: str = "raise",
+    ) -> Expr:
+        """Bin a numeric column by its own quantiles — pandas ``qcut``, Polars ``qcut``.
+
+        Where :meth:`cut` takes fixed breaks, this derives them from the data: ``q=4``
+        puts each row in the quartile it falls in, so every bin holds about the same
+        number of rows whatever the distribution. Pass a list of probabilities instead of
+        a count for uneven bins, such as ``[0, 0.9, 0.99, 1]`` for the bulk, the tail and
+        the extreme tail.
+
+        The edges are the column's quantiles under numpy's ``linear`` rule, which is what
+        pandas uses, and the bins are right-closed with the minimum in the first one. So a
+        value that sits exactly on an edge joins the lower bin, as in pandas. A null or NaN
+        input stays null. A value outside the outer probabilities, possible only when
+        they do not span 0 to 1, is null too.
+
+        Without `labels` the result is the 0-based bin number (pandas ``labels=False``),
+        an integer column. With `labels` it is that bin's label.
+
+        Tied input can make two edges equal: a column that is three quarters zeros has no
+        second quartile of its own. ``duplicates="raise"`` (the default) fails the query
+        with an error naming the edges. ``duplicates="drop"`` merges the equal edges, so
+        such a column gets fewer bins numbered consecutively, and a constant column gets
+        none, which leaves every row null.
+
+        The quantiles are computed over the whole column. Chain
+        ``.over(partition_by=...)`` to bin within each group by that group's quantiles.
+
+        Args:
+            q: The number of equal-probability bins, or the bin edges as probabilities in
+                ``[0, 1]``, strictly increasing.
+            labels: One name per bin. Defaults to the bin number.
+            duplicates: ``"raise"`` or ``"drop"`` when tied input makes two edges equal.
+
+        Returns:
+            An Int64 bin-number expression, or a Utf8 one when `labels` is given.
+
+        Raises:
+            PlanError: If `q` is not a count of at least 1 or an increasing list of at
+                least two probabilities, if `duplicates` is unknown, if `labels` has the
+                wrong length, or if `labels` is combined with ``duplicates="drop"``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [5, 1, 8, 2, 7, 3, 6, 4]})
+                >>> ds.select(b=bt.col("x").qcut(4)).to_pydict()
+                {'b': [2, 0, 3, 0, 3, 1, 2, 1]}
+
+                >>> halves = bt.col("x").qcut([0, 0.5, 1], ["low", "high"])
+                >>> ds.select(h=halves).to_pydict()["h"][:3]
+                ['high', 'low', 'high']
+        """
+        from batcher.plan.expr_ir.constructors import array, lit
+        from batcher.plan.expr_ir.func_nodes import ListGetDyn
+        from batcher.plan.expr_ir.nodes import WindowExpr, WindowOptions
+
+        probs = _qcut_probs(q)
+        if duplicates not in ("raise", "drop"):
+            raise PlanError(f"qcut(): duplicates must be 'raise' or 'drop', got {duplicates!r}")
+        opts = WindowOptions(probs=probs, drop_duplicates=duplicates == "drop")
+        codes = WindowExpr("qcut", self, [], [], None, opts=opts)
+        if labels is None:
+            return codes
+        names = [str(name) for name in labels]
+        if duplicates == "drop":
+            raise PlanError(
+                "qcut(): labels cannot be combined with duplicates='drop', because merged "
+                "edges leave fewer bins than labels; omit labels to get bin numbers"
+            )
+        if len(names) != len(probs) - 1:
+            raise PlanError(
+                f"qcut(): {len(probs) - 1} bins need {len(probs) - 1} labels, got {len(names)}"
+            )
+        return ListGetDyn(array(*(lit(name) for name in names)), codes)
+
     def rank(
         self,
         method: str = "min",
@@ -5816,6 +6098,57 @@ from batcher.plan.expr_ir.node_base import (  # noqa: E402
     expr_node,
     scalar,
 )
+
+
+def _qcut_probs(q: int | Iterable[float]) -> tuple[float, ...]:
+    """`qcut`'s bin edges as probabilities, computed the way pandas computes them.
+
+    An integer count becomes numpy's ``linspace(0, 1, q + 1)``; then, like pandas, each
+    probability goes through ``p * 100 / 100``, because pandas reaches the quantiles through
+    ``numpy.percentile``. Reproducing that arithmetic keeps every edge the same double
+    pandas uses, which is what decides a value lying exactly on an edge.
+    """
+    if isinstance(q, bool):
+        raise PlanError(f"qcut(): q must be a bin count or a list of probabilities, got {q!r}")
+    if hasattr(q, "__index__"):
+        count = require_int(q, func="qcut", arg="q", minimum=1)
+        step = 1.0 / count
+        raw = [float(i) * step + 0.0 for i in range(count)] + [1.0]
+    else:
+        raw = [require_float(p, func="qcut", arg="q") for p in q]  # type: ignore[union-attr]
+        if len(raw) < 2:
+            raise PlanError(f"qcut(): q needs at least two probabilities, got {raw}")
+        if any(not 0.0 <= p <= 1.0 for p in raw):
+            raise PlanError(f"qcut(): every probability in q must be in [0, 1], got {raw}")
+        if any(lo >= hi for lo, hi in itertools.pairwise(raw)):
+            raise PlanError(f"qcut(): the probabilities in q must strictly increase, got {raw}")
+    return tuple(p * 100.0 / 100.0 for p in raw)
+
+
+def _interpolate_gap(max_gap: int | float | str | None, *, by_value: bool) -> float | None:
+    """`interpolate`'s `max_gap` as the engine's number: null rows, or key distance under `by`.
+
+    A duration only means something against a temporal `by` column, where the engine
+    measures distance in microseconds, so it is resolved here; without `by` the gap is a
+    count of rows and must be an integer.
+    """
+    if max_gap is None:
+        return None
+    if not by_value:
+        if isinstance(max_gap, str):
+            raise PlanError(
+                f"interpolate(): max_gap={max_gap!r} is a duration, which needs by= a temporal "
+                "column; without by, max_gap counts null rows"
+            )
+        return float(require_int(max_gap, func="interpolate", arg="max_gap", minimum=0))
+    if isinstance(max_gap, str):
+        from batcher.plan.functions.temporal import _duration_micros
+
+        return float(_duration_micros(max_gap, arg="interpolate max_gap"))
+    gap = require_float(max_gap, func="interpolate", arg="max_gap")
+    if not gap >= 0:
+        raise PlanError(f"interpolate(): max_gap must be >= 0, got {max_gap!r}")
+    return gap
 
 
 def _ewm_alpha(
@@ -6041,9 +6374,9 @@ class Lit(Expr):
             # the reader to work out both which argument and what to do instead.
             raise PlanError(
                 f"cannot use {type(v).__name__} {v!r} as a literal value: a literal must "
-                "be a string, number, boolean, None, or a date/time/datetime/Decimal. "
-                "To reference a column use col('name'); to pass a Python object to your "
-                "own code use map_batches()."
+                "be a string, number, boolean, or a date/time/datetime/Decimal; a NULL is "
+                "bt.lit(None, dtype=...). To reference a column use col('name'); to pass a "
+                "Python object to your own code use map_batches()."
             )
         out = {"e": ExprTag.LIT, "value": tagged}
         self._ir_cache = out
@@ -6334,7 +6667,7 @@ def normalize_key_list(keys: IntoExpr | Iterable[IntoExpr] | None) -> list[IntoE
     return list(keys)
 
 
-class AggExpr:
+class AggExpr(_AggExprBound):
     """An aggregate over an optional input expression.
 
     Built via `col(...).sum()` etc. or the top-level `count()`; bound to an output
@@ -6535,6 +6868,46 @@ class AggExpr:
             order_by=self.order_by,
         )
 
+    def filter(self, predicate: IntoExpr) -> AggExpr | Expr:
+        """Aggregate only the rows where `predicate` is true (SQL ``agg FILTER (WHERE p)``).
+
+        Rows where `predicate` is false or null are left out of this aggregate alone; the
+        group keys, and every other aggregate in the same `agg(...)`, still see every row.
+        That is how one pass computes a total beside a subset total, where filtering the
+        `Dataset` first would need two passes and a join.
+
+        The aggregate's own empty rule is untouched by the filter: a group with no matching
+        row counts ``0`` and sums to null, exactly as a group with no rows at all does, and
+        ``array_agg`` keeps the null values of the rows that match. For a different empty
+        answer, coalesce the result: ``bt.coalesce(col("x").sum().filter(p), 0)``. SQL's
+        ``FILTER (WHERE ...)`` lowers through the same code, so the two spellings agree.
+
+        Args:
+            predicate: A boolean expression over the input rows.
+
+        Returns:
+            The restricted aggregate, for ``group_by().agg(...)`` or ``Dataset.agg(...)``.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "x": [1, 5, 2]})
+                >>> big = bt.col("x") > 1
+                >>> ds.group_by("g").agg(
+                ...     n=bt.count(),
+                ...     n_big=bt.count().filter(big),
+                ...     s_big=bt.col("x").sum().filter(big),
+                ... ).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'n': [2, 1], 'n_big': [1, 1], 's_big': [5, 2]}
+
+                >>> ds.agg(none=bt.col("x").sum().filter(bt.col("x") > 9)).to_pydict()
+                {'none': [None]}
+        """
+        from batcher.plan.functions.aggregate_semantics import filter_aggregate
+
+        return filter_aggregate(self, _wrap(predicate))
+
     def to_ir(self, alias: str | None = None) -> dict[str, Any]:
         """Lower this aggregate to its JSON ``AggregateItem`` dict, bound to `alias`.
 
@@ -6583,7 +6956,7 @@ class AggExpr:
         *,
         descending: bool | Iterable[bool] = False,
         nulls_last: bool = True,
-        mapping_strategy: str = "group_to_rows",
+        mapping_strategy: MappingStrategy = "group_to_rows",
     ) -> WindowExpr:
         """Turn this aggregate into a window expression — SQL ``<agg> OVER (…)``.
 

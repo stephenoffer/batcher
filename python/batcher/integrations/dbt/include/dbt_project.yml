@@ -1,0 +1,5 @@
+# The macros the Batcher dbt adapter ships; dbt loads this as the adapter's own project.
+name: dbt_batcher
+version: "1.0"
+config-version: 2
+macro-paths: ["macros"]

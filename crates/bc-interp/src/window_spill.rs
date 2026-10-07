@@ -265,6 +265,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
                 alias: "rn".into(),
             },
             WindowFunc {
@@ -275,6 +276,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
                 alias: "s".into(),
             },
         ];
@@ -322,6 +324,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
                 alias: "rn".into(),
             },
             WindowFunc {
@@ -332,6 +335,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
                 alias: "s".into(),
             },
         ];

@@ -6,12 +6,19 @@ This page maps the readers, writers, constructors, and exporters you already use
 
 {py:obj}`bt.read(path) <batcher.read>` infers the format, and typed methods such as {py:meth}`bt.read.parquet <batcher.api.io_namespace.reader.Reader.parquet>` name it. {py:obj}`ds.write <batcher.Dataset.write>` mirrors it.
 
+A file write replaces existing output by default, where PySpark raises, so these examples pass `mode` explicitly and write under a fresh temporary directory. `mode="error"` raises if the path already exists.
+
 ```python
+import os
+import tempfile
+
 import batcher as bt
 
+root = tempfile.mkdtemp()
 ds = bt.from_pydict({"city": ["NYC", "LA", "NYC"], "amount": [10, 20, 30]})
-ds.write.parquet("/tmp/sales")  # ds.write("/tmp/sales") also infers parquet
-back = bt.read.parquet("/tmp/sales")
+sales = os.path.join(root, "sales")
+ds.write.parquet(sales, mode="error")  # ds.write(sales, mode="error") also infers parquet
+back = bt.read.parquet(sales)
 print(sorted(back.to_pydict()["amount"]))
 # [10, 20, 30]
 ```
@@ -19,9 +26,11 @@ print(sorted(back.to_pydict()["amount"]))
 CSV and JSON work the same way:
 
 ```python
-ds.write.csv("/tmp/sales_csv")
-ds.write.json("/tmp/sales_json")
-print(bt.read.csv("/tmp/sales_csv").count(), bt.read.json("/tmp/sales_json").count())
+sales_csv = os.path.join(root, "sales_csv")
+sales_json = os.path.join(root, "sales_json")
+ds.write.csv(sales_csv, mode="error")
+ds.write.json(sales_json, mode="error")
+print(bt.read.csv(sales_csv).count(), bt.read.json(sales_json).count())
 # 3 3
 ```
 

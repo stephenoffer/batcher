@@ -13,11 +13,14 @@ the 429s a hosted API returns.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from batcher.ml.llm.channels import finish_reason_sink, usage_sink
-from batcher.ml.llm.engines.base import Engine, EngineFactory, unpack_request
-from batcher.ml.llm.engines.limits import _estimated_tokens, build_limiter
+from batcher.ml.llm.engines.base import Engine, EngineFactory, batched_engine, unpack_request
+from batcher.ml.llm.engines.limits import _estimated_tokens, admitted, build_limiter
+
+if TYPE_CHECKING:
+    from batcher.ml.llm.engines.limits import ProviderLimit
+    from batcher.ml.llm.tokens import TokenBudget
 
 __all__ = ["anthropic_engine"]
 
@@ -46,6 +49,8 @@ def anthropic_engine(
     concurrency: int = 8,
     requests_per_minute: float | None = None,
     tokens_per_minute: float | None = None,
+    shared_limit: ProviderLimit | None = None,
+    token_budget: TokenBudget | None = None,
 ) -> EngineFactory:
     """An `EngineFactory` calling the Anthropic Messages API — a hosted Claude model.
 
@@ -90,6 +95,10 @@ def anthropic_engine(
             retrying a 429 only re-sends the burst that caused it.
         tokens_per_minute: client-side cap on tokens per minute, per worker, counting the
             prompt plus the reply the request reserved. Unset means unlimited.
+        shared_limit: a `ProviderLimit` every worker obeys together, composing with the
+            per-worker caps above.
+        token_budget: a `TokenBudget` grouping each batch so the prompt tokens in flight
+            together stay under a budget.
 
     Returns:
         A zero-arg factory building the Anthropic-backed `Engine` once per worker.
@@ -116,7 +125,7 @@ def anthropic_engine(
         if key:
             headers["x-api-key"] = key
 
-        def call_one(request: Any) -> tuple[str, tuple[int | None, int | None], str | None]:
+        def call_one(request: Any) -> _Reply:
             prompt, image, overrides = unpack_request(request, ("max_tokens", "temperature"))
             body = _messages_body(
                 model,
@@ -129,32 +138,28 @@ def anthropic_engine(
                 image,
                 extra_body,
             )
-            if limiter is not None:
-                # Charged before the call: waiting for capacity holds the send rate at the
-                # quota, where retrying a 429 only re-sends the burst that caused it.
-                limiter.acquire(_estimated_tokens(prompt, body))
-            try:
-                resp = post_json(
-                    url, body, headers=headers, timeout=timeout, retries=retries, backoff=backoff
-                )
-            except Exception:
-                if on_error == "raise":
-                    raise
-                return "", (None, None), None
-            return _message_text(resp), _message_usage(resp), _message_finish_reason(resp)
+            # Charged before the call: waiting for capacity holds the send rate at the quota,
+            # where retrying a 429 only re-sends the burst that caused it.
+            with admitted(limiter, shared_limit, lambda: _estimated_tokens(prompt, body)):
+                try:
+                    resp = post_json(
+                        url,
+                        body,
+                        headers=headers,
+                        timeout=timeout,
+                        retries=retries,
+                        backoff=backoff,
+                    )
+                except Exception:
+                    if on_error == "raise":
+                        raise
+                    return _Reply("", (None, None), None)
+            return _Reply(_message_text(resp), _message_usage(resp), _message_finish_reason(resp))
 
         pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
-
-        def engine(prompts: list) -> list[str]:
-            if concurrency <= 1 or len(prompts) <= 1:
-                results = [call_one(p) for p in prompts]
-            else:
-                results = list(pool.map(call_one, prompts))
-            usage = [u for _t, u, _r in results]
-            usage_sink().report(usage)
-            finish_reason_sink().report([r for _t, _u, r in results])
-            engine.last_usage = usage  # the documented legacy channel
-            return [text for text, _u, _r in results]
+        # The batch loop is `base.batched_engine`, shared with every served-endpoint engine,
+        # so ordering, reporting and the token budget behave the same here as there.
+        engine = batched_engine(call_one, pool, concurrency, token_budget=token_budget)
 
         # The pool lives as long as the worker, which is the point — but nothing was ever
         # shutting it down, so `concurrency` threads outlived every engine that was built.
@@ -164,6 +169,19 @@ def anthropic_engine(
         return engine
 
     return factory
+
+
+class _Reply:
+    """One request's outcome: the text plus its usage and finish reason."""
+
+    __slots__ = ("finish_reason", "text", "usage")
+
+    def __init__(
+        self, text: str, usage: tuple[int | None, int | None], finish_reason: str | None
+    ) -> None:
+        self.text = text
+        self.usage = usage
+        self.finish_reason = finish_reason
 
 
 def _messages_body(

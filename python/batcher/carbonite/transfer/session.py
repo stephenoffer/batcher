@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 
 import pyarrow as pa
 
+from batcher._internal.errors import RetryableShuffleError
 from batcher.carbonite.policies.congestion import (
     ChannelCongestion,
     StarvationMeter,
@@ -236,13 +237,20 @@ class ShuffleSession:
         # Pure read — `_observe_backpressure` is this session's sampler.
         return self._pressure.classify() < PressureLevel.SPILL
 
-    def fetch(self, addr: str, ticket: ShuffleTicket) -> list[pa.RecordBatch]:
+    def fetch(
+        self, addr: str, ticket: ShuffleTicket, *, required: bool = False
+    ) -> list[pa.RecordBatch]:
         """Fetch one partition from `addr`, choosing the cheapest transfer mode.
 
         Same address ⇒ `DIRECT_MEMORY` (local store, no socket). Same node, different
         process (shared memory on) ⇒ `SHARED_MEMORY` (mmap'd Arrow IPC, no gRPC), with a
         Flight fallback when the peer didn't shm the bucket. Otherwise credit-bounded
         Flight (`NETWORK`). The chosen mode is recorded for `locality_ratio`.
+
+        `required=True` is for a ticket the caller knows was published, such as a mapper's
+        bucket being copied to a replica or a stage output read through its handle. Absence
+        then raises `RetryableShuffleError` on every transfer mode instead of reading as an
+        empty partition, which would copy or return nothing in place of lost rows.
         """
         # Pass node identity (the address host) only when shm is on, so the default
         # path's mode selection — and behavior — is exactly as before.
@@ -260,7 +268,11 @@ class ShuffleSession:
         self._count_fetch(1, off_network=mode is not TransferMode.NETWORK)
         if mode is TransferMode.DIRECT_MEMORY:
             local = self._server.local_fetch(ticket)
-            return local if local is not None else []
+            if local is not None:
+                return local
+            if required:
+                raise RetryableShuffleError(f"shuffle bucket {ticket} is not published here")
+            return []
         if mode is TransferMode.SHARED_MEMORY:
             shared = self._server.shm_fetch(addr, ticket)
             if shared is not None:  # a miss (empty/un-shm'd bucket) falls back to Flight
@@ -271,7 +283,9 @@ class ShuffleSession:
         # NETWORK (or a shared-memory miss): stream over credit-bounded Flight. The
         # process-wide pooled client reuses one channel per peer across every session's
         # fetches. The window is adaptive when a flow controller is set.
-        out = process_client().fetch(addr, ticket, credits=self._window(), token=self._token)
+        out = process_client().fetch(
+            addr, ticket, credits=self._window(), token=self._token, required=required
+        )
         with self._stats_lock:
             self._observe_backpressure()
         return out

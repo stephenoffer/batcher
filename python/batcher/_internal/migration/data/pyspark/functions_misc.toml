@@ -39,7 +39,7 @@ expr = { status = "canonical", batcher = "bt.sql_expr", template = 'expr(str) ->
 ifnull = { status = "canonical", batcher = "Expr.fill_null" }
 input_file_block_length = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }
 input_file_block_start = { status = "out_of_scope", reason = "HDFS block metadata with no Batcher equivalent" }
-input_file_name = { status = "gap", need = "input-file metadata column", wave = "W8" }
+input_file_name = { status = "mismatch", batcher = "bt.read", note = "Spark's is a column expression; Batcher names the file at read time, so pass include_path=True to the reader (bt.read.parquet(path, include_path=True)) and use its path column", wave = "W8" }
 isnan = { status = "mismatch", batcher = "Expr.is_nan", template = 'isnan(col) -> sem.column(col).is_nan().fill_null(False)', note = "Spark isnan(null) is false; Batcher (DuckDB) returns null", wave = "W0" }
 isnotnull = { status = "canonical", batcher = "Expr.is_not_null" }
 isnull = { status = "canonical", batcher = "Expr.is_null" }

@@ -21,13 +21,14 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import pyarrow as pa
 
 from batcher._internal.errors import BackendError
+from batcher._internal.logging import get_logger, note_suppressed
 from batcher.io.credentials import UnityLease, resolve_secret, unity_lease
 from batcher.io.formats.base import SOURCES
 from batcher.io.formats.lakehouse.delta import DeltaSource
@@ -47,6 +48,7 @@ __all__ = ["DatabricksSource"]
 
 _EXTRA = "databricks"
 _SQL_MODULE = "databricks.sql"
+_LOGGER = get_logger("io.sql")
 
 
 #: Rows per ``fetchmany_arrow`` call on the warehouse streaming path. Chosen as a multiple of
@@ -63,14 +65,40 @@ def _fetch_chunks(fetch: Any) -> Iterator[Any]:
         yield chunk
 
 
+def _warehouse_identity(host: Any, http_path: Any, options: dict[str, Any]) -> dict[str, Any]:
+    """What names a warehouse relation: the warehouse, plus a default catalog/schema if set.
+
+    An unqualified table name resolves against the session's catalog and schema, so the
+    same query under two of them is two relations. Added only when set, so a read that
+    names neither keeps the key it always had.
+    """
+    material: dict[str, Any] = {"server_hostname": host, "http_path": http_path}
+    material.update({k: options[k] for k in ("catalog", "schema") if k in options})
+    return material
+
+
+def _cancel(cur: Any) -> None:
+    """Cancel the cursor's running statement on the warehouse; best-effort, never masking."""
+    try:
+        cur.cancel()
+    except Exception as exc:
+        note_suppressed("io", "cancel Databricks statement", exc)
+
+
 @dataclass(frozen=True, slots=True)
 class _DatabricksWarehouseSplit:
-    """A picklable warehouse read: connection params + SQL (no live conn)."""
+    """A picklable warehouse read: connection params + SQL (no live conn).
+
+    `connect_options` carries the session's ``catalog``, ``schema`` and
+    ``session_configuration`` — plain values, so they travel with the split and a worker's
+    session matches the driver's.
+    """
 
     server_hostname: str
     http_path: str
     access_token: str = field(repr=False)
     query: str
+    connect_options: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def _connect(self) -> Any:
         sql = require_module(_SQL_MODULE, extra=_EXTRA)
@@ -79,19 +107,43 @@ class _DatabricksWarehouseSplit:
             http_path=self.http_path,
             # Resolved on the worker: the split carries the reference, not the token.
             access_token=resolve_secret(self.access_token, what="Databricks access_token"),
+            **self.connect_options,
         )
 
-    def _table(self) -> pa.Table:
+    @contextmanager
+    def _statement(self) -> Iterator[Any]:
+        """A cursor that has run the query, cancelled remotely if the read is abandoned.
+
+        A warehouse keeps executing a statement whose client went away, and keeps billing
+        for it. So when the caller stops early — an exception, an interrupt, or a consumer
+        that closes the stream after the rows it needed — the statement is cancelled on the
+        warehouse before the connection closes. A failure names the warehouse's query id,
+        which is what the query history and a support ticket are keyed on.
+        """
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(self.query)
+            try:
+                cur.execute(self.query)
+            except Exception as exc:
+                raise BackendError(
+                    f"Databricks query failed (query id {getattr(cur, 'query_id', None)}): {exc}"
+                ) from exc
+            _LOGGER.info("Databricks query id %s", getattr(cur, "query_id", None))
+            try:
+                yield cur
+            except BaseException:
+                _cancel(cur)
+                raise
+        finally:
+            conn.close()
+
+    def _table(self) -> pa.Table:
+        with self._statement() as cur:
             result = cur.fetchall_arrow()
             if isinstance(result, pa.RecordBatch):
                 result = pa.Table.from_batches([result])
             return result
-        finally:
-            conn.close()
 
     def schema(self) -> pa.Schema:
         """The result's column types, from its first chunk rather than the whole result.
@@ -127,10 +179,7 @@ class _DatabricksWarehouseSplit:
         A connector build without `fetchmany_arrow` falls back to the materializing fetch
         rather than failing, so this is never worse than the behavior it replaces.
         """
-        conn = self._connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(self.query)
+        with self._statement() as cur:
             fetch = getattr(cur, "fetchmany_arrow", None)
             if fetch is None:
                 result = cur.fetchall_arrow()
@@ -143,15 +192,13 @@ class _DatabricksWarehouseSplit:
                 table = chunk if isinstance(chunk, pa.Table) else pa.Table.from_batches([chunk])
                 for batch in table.to_batches():
                     yield batch.select(projection) if projection is not None else batch
-        finally:
-            conn.close()
 
     def row_count(self) -> int | None:
         return None
 
     def identity(self) -> str:
         fingerprint = connection_fingerprint(
-            {"server_hostname": self.server_hostname, "http_path": self.http_path}
+            _warehouse_identity(self.server_hostname, self.http_path, self.connect_options)
         )
         return f"databricks-wh:{fingerprint}:{self.query}"
 
@@ -179,6 +226,13 @@ class DatabricksSource:
         http_path: SQL warehouse HTTP path (warehouse fallback).
         access_token: SQL warehouse access token (warehouse fallback). Never
             logged.
+        catalog: The warehouse session's default catalog (warehouse fallback).
+        db_schema: The warehouse session's default schema (warehouse fallback);
+            ``bt.read.databricks(schema=...)`` sets it.
+        session_configuration: Spark/SQL configuration for the warehouse session, passed
+            to ``databricks.sql.connect(session_configuration=...)``.
+        statement_timeout_s: Cancel the warehouse statement after this many seconds, via
+            the session's ``STATEMENT_TIMEOUT`` configuration.
 
     Raises:
         BackendError: If neither a valid lakehouse nor warehouse configuration is
@@ -199,6 +253,24 @@ class DatabricksSource:
     server_hostname: str | None = None
     http_path: str | None = None
     access_token: str | None = field(default=None, repr=False)
+    catalog: str | None = None
+    db_schema: str | None = None
+    session_configuration: dict[str, Any] | None = field(default=None, repr=False)
+    statement_timeout_s: int | None = None
+
+    def _connect_options(self) -> dict[str, Any]:
+        """The warehouse session options, as ``databricks.sql.connect`` spells them."""
+        options: dict[str, Any] = {}
+        if self.catalog:
+            options["catalog"] = self.catalog
+        if self.db_schema:
+            options["schema"] = self.db_schema
+        config = dict(self.session_configuration or {})
+        if self.statement_timeout_s is not None:
+            config["STATEMENT_TIMEOUT"] = str(int(self.statement_timeout_s))
+        if config:
+            options["session_configuration"] = config
+        return options
 
     def __post_init__(self) -> None:
         if not self._is_lakehouse() and not self._is_warehouse():
@@ -240,14 +312,16 @@ class DatabricksSource:
         """The warehouse split, with the pushdown already folded into its SQL (see `push_down`)."""
         host, http_path, token, query = self._warehouse()
         return _DatabricksWarehouseSplit(
-            host, http_path, token, push_down(query, predicate, projection)
+            host, http_path, token, push_down(query, predicate, projection), self._connect_options()
         )
 
     def schema(self) -> pa.Schema:
         if self._is_lakehouse():
             return self._delta_source().schema()
         host, http_path, token, query = self._warehouse()
-        probed = _DatabricksWarehouseSplit(host, http_path, token, schema_probe(query)).schema()
+        probed = _DatabricksWarehouseSplit(
+            host, http_path, token, schema_probe(query), self._connect_options()
+        ).schema()
         return probed if probe_is_typed(probed) else self._warehouse_split().schema()
 
     def read(
@@ -283,7 +357,7 @@ class DatabricksSource:
             workspace = connection_fingerprint({"workspace": self.workspace})
             return f"databricks:{workspace}:{self.table}"
         fingerprint = connection_fingerprint(
-            {"server_hostname": self.server_hostname, "http_path": self.http_path}
+            _warehouse_identity(self.server_hostname, self.http_path, self._connect_options())
         )
         return f"databricks-wh:{fingerprint}:{self.query}"
 

@@ -346,6 +346,7 @@ def test_extract_threads_an_image_into_the_request():
     import numpy as np
 
     from batcher.io.formats.ml.tensor import to_tensor_column
+    from batcher.ml.llm.extract_schema import resolve_schema
     from batcher.ml.llm.structured import _extract_batch
 
     seen = []
@@ -362,7 +363,7 @@ def test_extract_threads_an_image_into_the_request():
     _extract_batch(
         factory(),
         batch,
-        fields={"n": pa.int64()},
+        fields=resolve_schema({"n": "int64"}),
         prompt_column="q",
         template=None,
         instruct=False,

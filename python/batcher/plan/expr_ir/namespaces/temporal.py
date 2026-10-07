@@ -8,23 +8,37 @@ from `_DT_FIELDS` (data, not code).
 from __future__ import annotations
 
 import re
-from typing import Any
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError
 from batcher.plan.expr_ir.compat.guidance import DT_UNSUPPORTED, accessor_attribute_error
 from batcher.plan.expr_ir.constructors import col, lit, when
-from batcher.plan.expr_ir.core import Expr
+from batcher.plan.expr_ir.core import Binary, Expr, IntoExpr, _wrap
 from batcher.plan.expr_ir.func_nodes import (
+    BusinessDay,
     ConvertTimezone,
     DateFunc,
     DateOffset,
     DateTrunc,
     MakeTemporal,
+    ReplaceTimezone,
     Strftime,
 )
 from batcher.plan.expr_ir.namespaces._bind import _bind_accessors
-from batcher.plan.expr_ir.namespaces._temporal_units import trunc_unit
+from batcher.plan.expr_ir.namespaces._calendar import (
+    business_day,
+    duration_total,
+    trunc_unit,
+    tz_policies,
+)
 from batcher.plan.ir_tags import MICROS_PER_DAY
+
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.declared import DtBound as _Bound
+else:
+    # The runtime class binds these methods with `setattr`; checkers read `declared`.
+    _Bound = object
 
 # Offset-string units → (months, days, micros) contribution per unit count. `mo`
 # must precede `m` in the regex so "mo" parses as months, not minutes.
@@ -152,7 +166,7 @@ def _wrap_temporal(other: Any) -> Expr:
     )
 
 
-class _DtNamespace:
+class _DtNamespace(_Bound):
     """Date/time field extractions on a temporal column: ``col("d").dt.year()``, ``.dt.hour()``.
 
     The available extractors are **data, not code**: each is one row in
@@ -384,8 +398,10 @@ class _DtNamespace:
     def epoch_ns(self) -> Expr:
         """Nanoseconds since the Unix epoch as an integer (DuckDB ``epoch_ns``, → Int64).
 
-        The nanosecond-resolution epoch; the stored microseconds scaled by 1000 (the
-        sub-microsecond digits are always zero at microsecond storage resolution).
+        Read at the column's own resolution: a ``timestamp[ns]`` column keeps every digit,
+        and a coarser one (microseconds, the engine's usual resolution, or a ``Date``) is
+        scaled up exactly. A value too large to count in nanoseconds (past the year 2262)
+        is null rather than a wrapped number.
 
         Returns:
             A new Int64 expression of nanoseconds since 1970-01-01 UTC.
@@ -398,8 +414,14 @@ class _DtNamespace:
                 >>> ds = bt.from_pydict({"d": [dt.datetime(2021, 1, 1)]})
                 >>> ds.select(r=bt.col("d").dt.epoch_ns()).to_pydict()
                 {'r': [1609459200000000000]}
+
+                >>> import pyarrow as pa
+                >>> t = pa.array([1_000_000_001], pa.timestamp("ns"))
+                >>> ns = bt.from_arrow(pa.table({"t": t}))
+                >>> ns.select(r=bt.col("t").dt.epoch_ns()).to_pydict()
+                {'r': [1000000001]}
         """
-        return self._micros() * 1000
+        return DateFunc("epoch_ns", self._e)
 
     def _subsecond_micros(self) -> Expr:
         """Microseconds past the whole second, always in ``[0, 999999]``.
@@ -454,9 +476,11 @@ class _DtNamespace:
         return (self._subsecond_micros() // 1000).cast("int64")
 
     def nanosecond(self) -> Expr:
-        """The nanosecond-of-second component, 0-999999000 (Polars ``dt.nanosecond``, → Int64).
+        """The nanosecond-of-second component, 0-999999999 (Polars ``dt.nanosecond``, → Int64).
 
-        Microsecond-resolution storage means the last three digits are always zero.
+        Read at the column's own resolution, so a ``timestamp[ns]`` column reports its last
+        three digits. On a microsecond column (the engine's usual resolution) they are zero,
+        because there is nothing finer to report.
 
         Returns:
             A new Int64 expression of the nanosecond component.
@@ -469,8 +493,14 @@ class _DtNamespace:
                 >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 1, 0, 0, 0, 123456)]})
                 >>> ds.select(r=bt.col("d").dt.nanosecond()).to_pydict()
                 {'r': [123456000]}
+
+                >>> import pyarrow as pa
+                >>> t = pa.array([1_000_000_001], pa.timestamp("ns"))
+                >>> ns = bt.from_arrow(pa.table({"t": t}))
+                >>> ns.select(r=bt.col("t").dt.nanosecond()).to_pydict()
+                {'r': [1]}
         """
-        return self._subsecond_micros() * 1000
+        return DateFunc("nanosecond", self._e)
 
     # --- Polars-compatible spellings (delegate to the SQL-named accessors) ----------
 
@@ -936,9 +966,9 @@ class _DtNamespace:
     def ceil(self, unit: str) -> Expr:
         """Round **up** to the start of the next `unit` — pandas ``dt.ceil``.
 
-        The mirror of :meth:`floor`: an instant already on a boundary stays put, and any
+        The mirror of :meth:`truncate`: an instant already on a boundary stays put, and any
         other advances to the next one. Use it to close a half-open bucket — the end of the
-        hour a reading belongs to — where `floor` gives its start.
+        hour a reading belongs to — where `truncate` gives its start.
 
         Composed from `truncate` and `offset_by`, so it adds no engine surface and inherits
         their calendar correctness: rounding February 15th up to a month gives March 1st,
@@ -984,10 +1014,10 @@ class _DtNamespace:
 
         An instant exactly half way rounds **up**, the everyday reading of "round to the
         nearest hour". (pandas breaks that tie to the even boundary instead; the difference
-        shows only for an instant landing precisely on a half-boundary.) Where :meth:`floor`
-        and :meth:`ceil` bias every value one way, this is the one to bucket by when the bias
-        would accumulate — plotting a downsampled series, or aligning two feeds sampled off
-        each other's grid.
+        shows only for an instant landing precisely on a half-boundary.) Where
+        :meth:`truncate` and :meth:`ceil` bias every value one way, this is the one to
+        bucket by when the bias would accumulate — plotting a downsampled series, or
+        aligning two feeds sampled off each other's grid.
 
         Composed from `truncate` and `offset_by` over the microsecond epoch, so a calendar
         unit rounds by real elapsed time: a date in mid-February is nearer to March 1st than
@@ -1354,19 +1384,42 @@ class _DtNamespace:
         months, days, micros = parse_offset(by)
         return DateOffset(self._e, months, days, micros)
 
-    def convert_timezone(self, from_tz: str, to_tz: str) -> ConvertTimezone:
-        """Re-interpret each naive timestamp's wall-clock from one zone to another, DST-aware.
+    def convert_timezone(
+        self,
+        from_tz: str,
+        to_tz: str,
+        *,
+        ambiguous: str = "null",
+        nonexistent: str = "null",
+    ) -> ConvertTimezone:
+        """The wall clock in ``to_tz`` of each instant, DST-aware (DuckDB ``convert_timezone``).
 
-        DuckDB ``convert_timezone``. The instant is shifted so the wall-clock reads
-        correctly in ``to_tz``. A local time that does not exist or is ambiguous under
-        DST yields null. Type-preserving (Timestamp).
+        This *converts*: the instant is kept and the result is what a clock in ``to_tz``
+        reads at it, as a naive timestamp. A naive input is read as a wall clock in
+        ``from_tz``. A tz-aware input already names an instant, so ``from_tz`` must name its
+        own zone (an equivalent spelling such as ``"UTC"`` for ``"+00:00"`` is accepted), and
+        any other zone raises rather than re-reading the instant as another zone's clock. To
+        keep the clock and change the zone instead, use :meth:`replace_timezone`.
+
+        A naive wall clock that a DST change makes ambiguous (it happens twice) or
+        nonexistent (it never happens) in ``from_tz`` is null by default; the two policies
+        choose another answer.
 
         Args:
-            from_tz: IANA zone the naive timestamp is currently expressed in, e.g. ``"UTC"``.
-            to_tz: IANA zone to convert the wall-clock to, e.g. ``"America/New_York"``.
+            from_tz: IANA zone a naive input is expressed in, e.g. ``"UTC"``; for a tz-aware
+                input, the column's own zone.
+            to_tz: IANA zone whose wall clock to return, e.g. ``"America/New_York"``.
+            ambiguous: For a naive input, a wall clock that happens twice: ``"null"`` (the
+                default), ``"earliest"``, ``"latest"`` or ``"raise"``.
+            nonexistent: For a naive input, a wall clock a DST gap skips: ``"null"`` (the
+                default), ``"shift_forward"`` (the first instant after the gap) or
+                ``"raise"``.
 
         Returns:
-            A new Timestamp expression, or null for invalid local times.
+            A new naive Timestamp expression holding the ``to_tz`` wall clock.
+
+        Raises:
+            PlanError: If a policy is not one of its choices.
 
         Examples:
             .. doctest::
@@ -1377,14 +1430,199 @@ class _DtNamespace:
                 >>> r = bt.col("d").dt.convert_timezone("UTC", "America/New_York")
                 >>> ds.select(r.alias("r")).to_pydict()
                 {'r': [datetime.datetime(2024, 2, 15, 8, 45, 30)]}
-        """
-        return ConvertTimezone(self._e, from_tz, to_tz)
 
-    def is_business_day(self) -> Expr:
-        """True Monday through Friday — the complement of :meth:`is_weekend`.
+                >>> gap = bt.from_pydict({"d": [dt.datetime(2024, 3, 10, 2, 30)]})
+                >>> r = bt.col("d").dt.convert_timezone(
+                ...     "America/New_York", "UTC", nonexistent="shift_forward"
+                ... )
+                >>> gap.select(r=r).to_pydict()
+                {'r': [datetime.datetime(2024, 3, 10, 7, 0)]}
+        """
+        amb, gap = tz_policies("dt.convert_timezone", ambiguous, nonexistent)
+        return ConvertTimezone(self._e, from_tz, to_tz, ambiguous=amb, nonexistent=gap)
+
+    def replace_timezone(
+        self,
+        tz: str | None,
+        *,
+        ambiguous: str = "raise",
+        nonexistent: str = "raise",
+    ) -> ReplaceTimezone:
+        """Keep each wall clock and label it with ``tz`` (Polars ``replace_time_zone``).
+
+        This *localizes*: 09:00 stays 09:00 and becomes 09:00 in ``tz``, which is a
+        different instant from 09:00 in any other zone. It is pandas' ``tz_localize`` and
+        the way to say which zone a naive column was recorded in. A tz-aware input is first
+        read as its own zone's clock, so ``replace_timezone("Asia/Tokyo")`` on a New York
+        column keeps the clock and moves the instant. ``tz=None`` strips the zone and keeps
+        the local clock. To keep the instant instead, use :meth:`convert_timezone`.
+
+        A wall clock that is ambiguous or nonexistent in ``tz`` raises by default (as
+        Polars does), because a localization that silently picks an answer is a wrong
+        timestamp nobody sees.
+
+        Args:
+            tz: The IANA zone to attach, e.g. ``"Europe/Paris"``, or ``None`` to strip it.
+            ambiguous: A wall clock a DST overlap repeats: ``"raise"`` (the default),
+                ``"earliest"``, ``"latest"`` or ``"null"``.
+            nonexistent: A wall clock a DST gap skips: ``"raise"`` (the default),
+                ``"shift_forward"`` (the first instant after the gap) or ``"null"``.
 
         Returns:
-            A Boolean expression, true on weekdays.
+            A new ``timestamp[us, tz]`` expression, or a naive one when ``tz`` is ``None``.
+
+        Raises:
+            PlanError: If a policy is not one of its choices.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 1, 15, 9, 0)]})
+                >>> paris = ds.select(r=bt.col("d").dt.replace_timezone("Europe/Paris"))
+                >>> paris.schema.field("r").type
+                TimestampType(timestamp[us, tz=Europe/Paris])
+                >>> paris.select(h=bt.col("r").dt.hour()).to_pydict()
+                {'h': [9]}
+
+                >>> overlap = bt.from_pydict({"d": [dt.datetime(2024, 11, 3, 1, 30)]})
+                >>> r = bt.col("d").dt.replace_timezone("America/New_York", ambiguous="latest")
+                >>> overlap.select(r=r.dt.convert_timezone("America/New_York", "UTC")).to_pydict()
+                {'r': [datetime.datetime(2024, 11, 3, 6, 30)]}
+        """
+        if tz is not None and not isinstance(tz, str):
+            raise PlanError(f"dt.replace_timezone(): tz must be a zone name or None, got {tz!r}")
+        amb, gap = tz_policies("dt.replace_timezone", ambiguous, nonexistent)
+        return ReplaceTimezone(self._e, tz, ambiguous=amb, nonexistent=gap)
+
+    def total(self, unit: str) -> Expr:
+        """A duration as a whole count of ``unit``, truncated toward zero (Polars ``dt.total_*``).
+
+        The total, where :meth:`hour`/:meth:`minute`/:meth:`second` on a duration are its
+        components: for 2 days 01:05:00, ``total("h")`` is 49 while ``hour()`` is 1 (DuckDB's
+        reading of ``hour(interval)``). A negative duration truncates toward zero, so
+        minus 90 minutes is ``-1`` hour.
+
+        Args:
+            unit: ``"d"``, ``"h"``, ``"m"`` (minutes), ``"s"``, ``"ms"`` or ``"us"``.
+
+        Returns:
+            A new Int64 expression.
+
+        Raises:
+            PlanError: If ``unit`` is not one of those.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict(
+                ...     {"a": [dt.datetime(2024, 1, 3, 1, 5)], "b": [dt.datetime(2024, 1, 1)]}
+                ... )
+                >>> span = bt.col("a") - bt.col("b")
+                >>> ds.select(total=span.dt.total("h"), hour=span.dt.hour()).to_pydict()
+                {'total': [49], 'hour': [1]}
+        """
+        return duration_total(self._e, unit)
+
+    def add_months(self, n: IntoExpr) -> Expr:
+        """Add ``n`` calendar months, where ``n`` may be a column (Spark ``add_months``).
+
+        The per-row form of ``offset_by("Nmo")``: each row moves by its own count, so a
+        validity period stored beside its start date is applied without a callback. Month
+        ends clamp, as in :meth:`offset_by` (January 31 plus one month is the last day of
+        February). A date stays a date; a tz-aware timestamp moves by its own zone's
+        calendar and keeps its zone. A null count gives null.
+
+        Args:
+            n: Months to add (negative subtracts): an integer or an integer expression.
+
+        Returns:
+            A new expression of the input's type, shifted.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.date(2024, 1, 31)] * 2, "n": [1, 13]})
+                >>> ds.select(r=bt.col("d").dt.add_months(bt.col("n"))).to_pydict()
+                {'r': [datetime.date(2024, 2, 29), datetime.date(2025, 2, 28)]}
+        """
+        return Binary("add_months", self._e, _wrap(n))
+
+    def add_business_days(
+        self,
+        n: IntoExpr,
+        *,
+        holidays: Iterable[Any] = (),
+        weekmask: str | Sequence[bool] = "1111100",
+        roll: str = "raise",
+    ) -> BusinessDay:
+        """Move ``n`` business days, skipping weekends and ``holidays`` (numpy ``busday_offset``).
+
+        A business day is a weekday ``weekmask`` admits that is not in ``holidays``; the same
+        definition :meth:`is_business_day` and :func:`batcher.business_day_count` use. ``n``
+        may be a column, and a negative ``n`` moves backwards. A date stays a date; a
+        timestamp keeps its time of day and, if tz-aware, its zone.
+
+        A start that is not itself a business day raises by default, because "two business
+        days after a Saturday" has two defensible answers; ``roll`` picks one.
+
+        Args:
+            n: Business days to move: an integer or an integer expression.
+            holidays: Dates that are never business days (``datetime.date`` values or
+                ``"YYYY-MM-DD"`` strings). A plan-time constant; a holiday on a non-working
+                weekday changes nothing.
+            weekmask: Seven Monday-first flags: ``"1111100"`` (the default, Monday to
+                Friday), ``"1111001"`` for a Sunday-to-Thursday week, or a sequence of bools.
+            roll: For a start that is not a business day: ``"raise"`` (the default),
+                ``"forward"`` to the next business day first, or ``"backward"`` to the
+                previous one.
+
+        Returns:
+            A new expression of the input's type.
+
+        Raises:
+            PlanError: If the calendar or ``roll`` is malformed.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> import datetime as dt
+                >>> ds = bt.from_pydict({"d": [dt.date(2024, 12, 23)]})  # a Monday
+                >>> ds.select(r=bt.col("d").dt.add_business_days(3)).to_pydict()
+                {'r': [datetime.date(2024, 12, 26)]}
+                >>> xmas = [dt.date(2024, 12, 25)]
+                >>> ds.select(r=bt.col("d").dt.add_business_days(3, holidays=xmas)).to_pydict()
+                {'r': [datetime.date(2024, 12, 27)]}
+        """
+        return business_day("dt.add_business_days", "add", self._e, n, holidays, weekmask, roll)
+
+    def is_business_day(
+        self,
+        *,
+        holidays: Iterable[Any] = (),
+        weekmask: str | Sequence[bool] = "1111100",
+    ) -> Expr:
+        """True on a business day, Monday through Friday by default (numpy ``is_busday``).
+
+        With ``holidays`` or a ``weekmask``, the same calendar :meth:`add_business_days`
+        and :func:`batcher.business_day_count` use (numpy ``is_busday``).
+
+        Args:
+            holidays: Dates that are never business days (``datetime.date`` values or
+                ``"YYYY-MM-DD"`` strings).
+            weekmask: Seven Monday-first flags, e.g. ``"1111100"`` (the default).
+
+        Returns:
+            A Boolean expression, true on business days.
+
+        Raises:
+            PlanError: If the calendar is malformed.
 
         Examples:
             .. doctest::
@@ -1394,8 +1632,15 @@ class _DtNamespace:
                 >>> ds = bt.from_pydict({"d": [dt.datetime(2024, 2, 3), dt.datetime(2024, 2, 5)]})
                 >>> ds.select(r=bt.col("d").dt.is_business_day()).to_pydict()
                 {'r': [False, True]}
+                >>> ds.select(
+                ...     r=bt.col("d").dt.is_business_day(holidays=[dt.date(2024, 2, 5)])
+                ... ).to_pydict()
+                {'r': [False, False]}
         """
-        return self.weekday() <= 5
+        if not holidays and weekmask == "1111100":
+            # The default week keeps its historical composition, which every tier compiles.
+            return self.weekday() <= 5
+        return business_day("dt.is_business_day", "is", self._e, None, holidays, weekmask)
 
 
 # Python accessor name → engine `DateFunc` wire tag (serde snake_case). Each maps

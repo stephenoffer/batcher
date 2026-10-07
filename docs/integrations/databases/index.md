@@ -26,6 +26,12 @@ users.write.sql("users_clean", uri="postgresql://svc@db:5432/app", mode="upsert"
 One connection URI for PostgreSQL, MySQL, SQL Server, Oracle, SQLite, Trino and the rest, 36 schemes in all. Parallel range extraction, and any PEP 249 driver besides.
 :::
 
+:::{grid-item-card} {octicon}`checklist;1.1em` Vendor capability matrix
+:link: /integrations/databases/vendor-matrix
+:link-type: doc
+Which route serves PostgreSQL, MySQL, SQL Server, Oracle, Trino and Redshift, what each can write, and how problematic vendor types convert or refuse.
+:::
+
 :::{grid-item-card} {octicon}`pencil;1.1em` Writing to a database
 :link: /integrations/databases/writing
 :link-type: doc
@@ -50,6 +56,12 @@ Arrow built directly off the wire, `_id` range splits, and bulk upserts back.
 ES|QL results as an Arrow stream, sliced scroll for bulk pulls, and `_bulk` indexing with every item checked.
 :::
 
+:::{grid-item-card} {octicon}`telescope;1.1em` Vector stores
+:link: /integrations/databases/vector-stores
+:link-type: doc
+Qdrant, Pinecone, Milvus and Turbopuffer behind one contract, with every point checked before the first request.
+:::
+
 ::::
 
 A few more stores have readers without a page of their own. ClickHouse reads Arrow natively through {py:meth}`bt.read.clickhouse <batcher.api.io_namespace.reader.Reader.clickhouse>`. DB2, Teradata, SAP HANA, Vertica and other ODBC-reachable systems read through `bt.read.table("odbc", ...)`. Couchbase Columnar and Neo4j read through `bt.read.table("couchbase", ...)` and `bt.read.table("neo4j", ...)`. {doc}`/api/symbols/readers-and-writers` lists the reader surface they share.
@@ -58,8 +70,10 @@ A few more stores have readers without a page of their own. ClickHouse reads Arr
 :hidden:
 
 databases
+vendor-matrix
 writing
 key-value-stores
 mongodb
 elasticsearch
+vector-stores
 ```

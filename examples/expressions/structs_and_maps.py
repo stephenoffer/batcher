@@ -72,6 +72,20 @@ def main() -> None:
     assert read["theme"] == ["dark", "light"]
     assert read["has_lang"] == [True, False]
 
+    # Edit a struct in place: replace or add fields, rename them, drop them. A null struct
+    # stays null, and untouched fields keep their type and metadata.
+    people = bt.from_pydict({"p": [{"name": "ada", "age": 36}, None]})
+    p = col("p")
+    edited = people.select(
+        older=p.struct.with_fields(age=p.struct.field("age") + 1, active=True),
+        renamed=p.struct.rename_fields({"name": "who"}),
+        ageless=p.struct.drop_fields("age"),
+    ).to_pydict()
+    print(edited)
+    assert edited["older"] == [{"name": "ada", "age": 37, "active": True}, None]
+    assert edited["renamed"][0] == {"who": "ada", "age": 36}
+    assert edited["ageless"][0] == {"name": "ada"}
+
 
 if __name__ == "__main__":
     main()

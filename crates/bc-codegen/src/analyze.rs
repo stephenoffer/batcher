@@ -146,6 +146,7 @@ pub(crate) fn analyze(
                     Err(CodegenError::Unsupported("bitwise op".into()))
                 }
                 AddMonths => Err(CodegenError::Unsupported("date month arithmetic".into())),
+                AddDays => Err(CodegenError::Unsupported("date day arithmetic".into())),
                 // Floored division always falls back to the interpreter. Cranelift's
                 // `sdiv` truncates toward zero, so compiling it would need the explicit
                 // remainder-sign correction the interpreter applies — and the integer
@@ -342,6 +343,9 @@ pub(crate) fn analyze(
         Expr::ListTransform { .. } => Err(CodegenError::Unsupported("list transform".into())),
         Expr::ListFilter { .. } => Err(CodegenError::Unsupported("list filter".into())),
         Expr::MakeStruct { .. } => Err(CodegenError::Unsupported("struct construction".into())),
+        Expr::ListZipStruct { .. } => Err(CodegenError::Unsupported("list zip".into())),
+        Expr::StructUpdate { .. } => Err(CodegenError::Unsupported("struct update".into())),
+        Expr::JsonDoc { .. } => Err(CodegenError::Unsupported("json document function".into())),
         Expr::MakeMap { .. } => Err(CodegenError::Unsupported("map construction".into())),
         Expr::ListJoin { .. } => Err(CodegenError::Unsupported("list join".into())),
         Expr::Math { func, input } => {
@@ -441,6 +445,8 @@ pub(crate) fn analyze(
         Expr::MakeTemporal { .. } => Err(CodegenError::Unsupported("temporal constructor".into())),
         Expr::Strftime { .. } => Err(CodegenError::Unsupported("strftime".into())),
         Expr::ConvertTimezone { .. } => Err(CodegenError::Unsupported("convert_timezone".into())),
+        Expr::ReplaceTimezone { .. } => Err(CodegenError::Unsupported("replace_timezone".into())),
+        Expr::BusinessDay { .. } => Err(CodegenError::Unsupported("business-day calendar".into())),
         Expr::Strptime { .. } => Err(CodegenError::Unsupported("strptime".into())),
         Expr::ListBinary { .. } => Err(CodegenError::Unsupported("list binary op".into())),
         Expr::DateOffset { .. } => Err(CodegenError::Unsupported("offset_by".into())),

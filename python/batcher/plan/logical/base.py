@@ -192,7 +192,7 @@ def _undeclared_udf_hint(source: LogicalPlan | None) -> str:
     stage is found by walking the single-input chain from `source`; only the error path
     pays for the walk.
     """
-    from batcher.plan.logical.relational import MapBatches
+    from batcher.plan.logical.map_batches import MapBatches
 
     node = source
     while node is not None:
@@ -259,6 +259,18 @@ def _validate_projection_refs(expr: Expr, available: set[str], alias: str) -> No
     _validate_refs(expr, available, what=f"projection {alias!r}")
 
 
+def _with_child_keys(value: Any, keys: dict[int, str]) -> Any:
+    """`value` (a node's IR) with every embedded child IR replaced by that child's key."""
+    if isinstance(value, dict):
+        key = keys.get(id(value))
+        if key is not None:
+            return {"@child": key}
+        return {k: _with_child_keys(v, keys) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_with_child_keys(v, keys) for v in value]
+    return value
+
+
 class LogicalPlan:
     """Base class for logical plan nodes."""
 
@@ -321,13 +333,42 @@ class LogicalPlan:
         cache = self.__dict__
         val = cache.get("_c_content_key", _UNSET)
         if val is _UNSET:
-            payload = self.ir_json()
+            payload = self._content_payload()
             if payload is None:
-                payload = f"opaque:{id(self):x}"
-            payload += "|" + self._identity_suffixes()
+                payload = f"opaque:{id(self):x}|" + self._identity_suffixes()
             val = hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
             cache["_c_content_key"] = val
         return val
+
+    def _content_payload(self) -> str | None:
+        """What `content_key` hashes: this node's IR with each child's IR replaced by its key.
+
+        Composed from the children's keys rather than serializing the whole subtree here. A
+        plan is re-planned into fresh node objects on every `collect`, so a whole-subtree dump
+        per node made keying a plan quadratic in its size: TPC-DS q64 spent ~0.5 s of a
+        ~1.2 s query keying its 2,000-node plan for common-subplan analysis. The child's key
+        stands for exactly what it replaces -- its IR and its subtree's identity suffixes --
+        so two subtrees still key equal exactly when their IR and suffixes are equal.
+
+        A child is found by identity: `to_ir` is memoized, so a parent's IR embeds the very
+        dict its child returns. A node that rebuilds a child's IR instead simply has it
+        serialized in full, which is the same answer at the old cost. `None` for an opaque
+        plan, whose `to_ir` raises.
+        """
+        from batcher.plan.visitor import children
+
+        try:
+            ir = self.to_ir()
+        except NotImplementedError:
+            return None
+        keys = {}
+        for child in children(self):
+            try:
+                keys[id(child.to_ir())] = child.content_key()
+            except NotImplementedError:
+                continue  # not in this node's IR, which serialized; nothing to replace
+        own = json.dumps(_with_child_keys(ir, keys), separators=(",", ":"), default=str)
+        return own + "|" + self.identity_suffix()
 
     def ir_json(self) -> str | None:
         """`to_ir()` as compact JSON text (memoized per node), or `None` for an opaque plan.

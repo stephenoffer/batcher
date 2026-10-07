@@ -21,10 +21,11 @@ from __future__ import annotations
 import math
 
 from batcher._internal.errors import PlanError, require_float, require_int
-from batcher.plan.expr_ir.constructors import count, lit, when
+from batcher.plan.expr_ir.constructors import array, count, lit, when
 from batcher.plan.expr_ir.core import AggExpr, Coalesce, Expr, MathExpr
-from batcher.plan.expr_ir.func_nodes import ListFilter
+from batcher.plan.expr_ir.func_nodes import ListFilter, ListTransform
 from batcher.plan.expr_ir.nodes import NullIf
+from batcher.plan.functions.collection import element, struct
 
 __all__: list[str] = []
 
@@ -139,6 +140,142 @@ def array_agg_without_nulls(agg: AggExpr) -> Expr:
     Dropping them from the finished list is the same answer, including the empty list a
     group of only nulls collects to in Spark.
     """
-    from batcher.plan.functions.collection import element
-
     return ListFilter(agg, element().is_not_null())  # type: ignore[arg-type]
+
+
+def filter_aggregate(agg: AggExpr, predicate: Expr) -> AggExpr | Expr:
+    """`agg` over only the rows where `predicate` is true: SQL ``agg(...) FILTER (WHERE p)``.
+
+    The one lowering both front ends use: `AggExpr.filter` calls it, and the SQL translator
+    calls it for every ``FILTER (WHERE ...)`` clause, so the two cannot drift.
+
+    Most aggregates skip a null input, so masking every operand to null where `predicate`
+    is not true (false or null, as in a ``WHERE``) leaves exactly the matching rows. Three
+    observe a row whose input is null, and each gets the rule that keeps that row out:
+
+    * ``count(*)`` counts a constant that is null off the predicate, so a group with no
+      match counts ``0``, not null.
+    * ``array_agg`` keeps null elements. The value is packed into a one-field struct that
+      is null off the predicate, the null structs are dropped from the collected list and
+      the field is unpacked, so a genuine null value survives and a filtered row does not.
+      A group with no match is null, as DuckDB answers, rather than ``[]``.
+    * ``first``/``last`` with ``ignore_nulls=False`` skip a row only when its order key
+      is null, which masking the key as well as the value does.
+
+    Every piece is an existing mergeable aggregate plus a projection over its result, so a
+    filtered aggregate is as distributed-safe as the unfiltered one.
+
+    Args:
+        agg: The aggregate to restrict.
+        predicate: The boolean row condition.
+
+    Returns:
+        The restricted aggregate, or an expression over aggregates for ``array_agg``.
+    """
+    if agg.func == "count_star":
+        return AggExpr("count", masked(lit(1), predicate), name=agg._alias)
+    if agg.func == "list_agg" and agg.input is not None:
+        return _filtered_list(agg, agg.input, predicate)
+    return agg.map_operands(lambda operand: masked(operand, predicate))
+
+
+def filter_aggregate_leaves(expr: AggExpr | Expr, predicate: Expr) -> AggExpr | Expr:
+    """`filter_aggregate` applied to every aggregate inside `expr`, for a composite one.
+
+    ``stddev_pop``, ``sum(empty_value=0)`` and the ``regr_*`` family are expressions over
+    several aggregates. Restricting each of them to the same rows restricts the whole.
+
+    Args:
+        expr: An aggregate, or an expression over aggregates.
+        predicate: The boolean row condition.
+
+    Returns:
+        The same shape with every aggregate restricted to the matching rows.
+    """
+    if isinstance(expr, AggExpr):
+        return filter_aggregate(expr, predicate)
+    from batcher.plan.expr_rewrite.traverse import transform_expr_up
+
+    def rule(node: Expr) -> Expr:
+        if isinstance(node, AggExpr):
+            return filter_aggregate(node, predicate)  # type: ignore[return-value]
+        return node
+
+    return transform_expr_up(expr, rule)
+
+
+def masked(value: Expr, predicate: Expr) -> Expr:
+    """`value` where `predicate` is true, and a null of `value`'s own type elsewhere.
+
+    The row guard every `FILTER (WHERE ...)` lowering is built from, exported so the SQL
+    DISTINCT rewrite masks a deduplicated value exactly as `filter_aggregate` masks an
+    aggregate's input, and the two expressions compare equal.
+    """
+    return when(predicate).then(value).otherwise(None)
+
+
+def _filtered_list(agg: AggExpr, value: Expr, predicate: Expr) -> Expr:
+    """`agg`, an `array_agg` of `value`, leaving out the rows `predicate` rejects."""
+    packed = masked(struct(v=value), predicate)
+    collected = AggExpr("list_agg", packed, order_by=agg.order_by)
+    kept = ListTransform(
+        ListFilter(collected, element().is_not_null()),  # type: ignore[arg-type]
+        element().struct.field("v"),
+    )
+    matched = AggExpr("count", masked(lit(1), predicate))
+    result = when(matched > lit(0)).then(kept).otherwise(None)  # type: ignore[operator]
+    return result if agg._alias is None else result.alias(agg._alias)  # type: ignore[return-value]
+
+
+def quantile_list(column: Expr, qs: list[float], interpolation: str) -> Expr:
+    """The quantiles of `column` at each of `qs`, as one list (DuckDB ``quantile_cont(x, [...])``).
+
+    One aggregate per fraction, assembled into a list in the order given, all in the same
+    mergeable pass. A group with no non-null value answers a null list, as DuckDB does,
+    rather than a list of nulls.
+
+    Args:
+        column: The column to summarize.
+        qs: The fractions, each in ``[0, 1]``.
+        interpolation: How a rank between two values resolves, as for `Expr.quantile`.
+
+    Returns:
+        A ``List`` expression over the quantile aggregates.
+    """
+    if not qs:
+        raise PlanError("quantile() needs at least one fraction in its list of q values")
+    parts = [column.quantile(q, interpolation) for q in qs]
+    return when(column.count() > lit(0)).then(array(*parts)).otherwise(None)
+
+
+def distinct_array_agg(
+    column: Expr, keys: tuple[tuple[Expr, bool, bool], ...], *, drop_nulls: bool
+) -> Expr:
+    """`array_agg(column)` with each value kept once, sorted by the value itself.
+
+    SQL's ``array_agg(DISTINCT x ORDER BY x)``. The list is collected as usual and then
+    deduplicated and sorted, so it is the same mergeable pass as `array_agg` plus a
+    projection. The only order key accepted is the value itself, which sets the direction
+    and the null placement: among duplicates there is no one row whose key could decide a
+    position, so Postgres and DuckDB refuse any other key and so does this. One null is
+    kept unless `drop_nulls`.
+
+    Args:
+        column: The collected value.
+        keys: The normalized ``(expr, descending, nulls_first)`` order keys.
+        drop_nulls: Leave the null element out.
+
+    Returns:
+        The deduplicated, sorted list expression.
+    """
+    from batcher.plan.expr_ir.namespaces.collections import _ListNamespace
+
+    if len(keys) > 1 or (keys and repr(keys[0][0]) != repr(column)):
+        raise PlanError(
+            "array_agg(distinct=True) can only be ordered by the value itself: among "
+            "duplicate values there is no single row whose order key decides a position. "
+            "Drop order_by, or order by the aggregated column"
+        )
+    descending, nulls_first = (keys[0][1], keys[0][2]) if keys else (False, False)
+    unique = _ListNamespace(AggExpr("list_agg", column)).unique(drop_nulls=drop_nulls)  # type: ignore[arg-type]
+    return unique.list.sort(descending=descending, nulls_last=not nulls_first)

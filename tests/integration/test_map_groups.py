@@ -227,3 +227,86 @@ def test_apply_guidance_points_at_map_groups(ds: bt.Dataset) -> None:
     for name in ("apply", "applyInPandas"):
         with pytest.raises(AttributeError, match="map_groups"):
             getattr(ds.group_by("k"), name)
+
+
+_SUMMARY_SCHEMA = pa.schema([("k", pa.string()), ("n", pa.int64()), ("total", pa.int64())])
+
+
+def test_an_input_with_no_groups_keeps_the_declared_schema(ds: bt.Dataset) -> None:
+    """With `output_schema`, no groups is an empty table of it, so the union is legal.
+
+    Without it the empty result had no columns while `.columns` reported three, and the
+    union below raised "union inputs must have identical columns".
+    """
+    empty = (
+        ds.filter(bt.col("v") > 99)
+        .group_by("k")
+        .map_groups(_summary, output_schema=_SUMMARY_SCHEMA)
+    )
+    got = empty.collect()
+    assert got.schema == _SUMMARY_SCHEMA
+    assert got.num_rows == 0
+    assert empty.columns == ["k", "n", "total"]
+    full = ds.group_by("k").map_groups(_summary, output_schema=_SUMMARY_SCHEMA)
+    assert full.union(empty).sort("k").to_pydict() == {
+        "k": ["a", "b"],
+        "n": [3, 2],
+        "total": [9, 30],
+    }
+
+
+def test_results_are_cast_to_the_declared_schema(ds: bt.Dataset) -> None:
+    """A result column is cast to `output_schema` and reordered to it."""
+    schema = pa.schema([("total", pa.float64()), ("k", pa.string())])
+
+    def fn(group: pa.RecordBatch) -> dict:
+        return {"k": [group.column("k")[0].as_py()], "total": [sum(group.column("v").to_pylist())]}
+
+    out = ds.group_by("k").map_groups(fn, output_schema=schema).collect()
+    assert out.schema == schema
+    assert sorted(out.to_pydict()["total"]) == [9.0, 30.0]
+
+
+def test_a_result_missing_a_declared_column_raises(ds: bt.Dataset) -> None:
+    def fn(group: pa.RecordBatch) -> dict:
+        return {"k": [group.column("k")[0].as_py()]}
+
+    with pytest.raises(bt.ExecutionError, match="output_schema declares"):
+        ds.group_by("k").map_groups(fn, output_schema=_SUMMARY_SCHEMA).to_pydict()
+
+
+def test_output_schema_disagreeing_with_output_columns_is_refused(ds: bt.Dataset) -> None:
+    with pytest.raises(PlanError, match="disagree"):
+        ds.group_by("k").map_groups(_summary, output_schema=_SUMMARY_SCHEMA, output_columns=["k"])
+    with pytest.raises(PlanError, match=r"pyarrow\.Schema"):
+        ds.group_by("k").map_groups(_summary, output_schema=["k"])
+
+
+@pytest.mark.parametrize(
+    ("limits", "unit"),
+    [({"max_group_rows": 2}, "rows"), ({"max_group_bytes": 20}, "bytes")],
+)
+def test_an_oversized_group_is_refused_before_the_call(ds: bt.Dataset, limits, unit) -> None:
+    """Group `a` (3 rows, 24 bytes of `v` plus its key) trips the limit; `fn` never sees it."""
+    seen: list[str] = []
+
+    def fn(group: pa.RecordBatch) -> dict:
+        seen.append(group.column("k")[0].as_py())
+        return _summary(group)
+
+    with pytest.raises(bt.ExecutionError, match=rf"group \{{'k': 'a'\}} holds .* {unit}"):
+        ds.group_by("k").map_groups(fn, **limits).to_pydict()
+    assert "a" not in seen
+
+
+def test_limits_that_every_group_fits_change_nothing(ds: bt.Dataset) -> None:
+    out = ds.group_by("k").map_groups(
+        _summary, output_columns=["k", "n", "total"], max_group_rows=3, max_group_bytes=10**6
+    )
+    assert out.sort("k").to_pydict() == {"k": ["a", "b"], "n": [3, 2], "total": [9, 30]}
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True])
+def test_a_malformed_limit_is_refused(ds: bt.Dataset, bad) -> None:
+    with pytest.raises(PlanError, match="positive integer"):
+        ds.group_by("k").map_groups(_summary, max_group_rows=bad)

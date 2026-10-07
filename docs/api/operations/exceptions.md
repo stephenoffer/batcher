@@ -8,6 +8,8 @@ Batcher raises typed exceptions, so a failure names what went wrong and what to 
 .. autoexception:: BatcherError
 .. autoexception:: PlanError
 .. autoexception:: ColumnNotFoundError
+.. autoexception:: SQLSyntaxError
+.. autoexception:: SQLUnsupportedError
 .. autoexception:: ConfigError
 .. autoexception:: MissingDependencyError
 .. autoexception:: AccessDeniedError
@@ -24,7 +26,7 @@ Batcher raises typed exceptions, so a failure names what went wrong and what to 
 .. autoexception:: TransportError
 ```
 
-{py:exc}`BatcherError <batcher.BatcherError>` is the root every other Batcher error subclasses, so catching it covers them all. Several also subclass a builtin so existing handlers keep working: {py:exc}`PlanError <batcher.PlanError>`, {py:exc}`ConfigError <batcher.ConfigError>`, and {py:exc}`DataQualityError <batcher.DataQualityError>` are each a `ValueError`. {py:exc}`ColumnNotFoundError <batcher.ColumnNotFoundError>` is a `KeyError` and carries the missing `.column`. {py:exc}`MissingDependencyError <batcher.MissingDependencyError>` is an `ImportError` and carries the `.install` hint for the extra to install. {py:exc}`AccessDeniedError <batcher.AccessDeniedError>` is a `PermissionError`.
+{py:exc}`BatcherError <batcher.BatcherError>` is the root every other Batcher error subclasses, so catching it covers them all. Several also subclass a builtin so existing handlers keep working: {py:exc}`PlanError <batcher.PlanError>`, {py:exc}`ConfigError <batcher.ConfigError>`, and {py:exc}`DataQualityError <batcher.DataQualityError>` are each a `ValueError`. {py:exc}`ColumnNotFoundError <batcher.ColumnNotFoundError>` is a `KeyError` and carries the missing `.column`. {py:exc}`MissingDependencyError <batcher.MissingDependencyError>` is an `ImportError` and carries the `.install` hint for the extra to install. {py:exc}`AccessDeniedError <batcher.AccessDeniedError>` is a `PermissionError`. The two SQL errors are both a `PlanError`, and {py:exc}`SQLUnsupportedError <batcher.SQLUnsupportedError>` is also a `NotImplementedError`.
 
 In practice you handle them with `try` and `except`, usually catching the base type.
 
@@ -48,12 +50,14 @@ The table maps each type to the failure that raises it.
 | Error | Raised when |
 | --- | --- |
 | `PlanError` | The plan or schema is invalid (an unknown column, a type mismatch). Raised at build time, before execution. |
+| {py:exc}`SQLSyntaxError <batcher.SQLSyntaxError>` | A SQL string does not parse in the session's dialect. Carries `.line`, `.column`, `.start` and `.end`. |
+| {py:exc}`SQLUnsupportedError <batcher.SQLUnsupportedError>` | Valid SQL uses a construct, function or named argument Batcher does not translate. Carries the same position fields. |
 | {py:exc}`ExecutionError <batcher.ExecutionError>` | An operator fails at runtime inside the engine. |
 | {py:exc}`OptimizationError <batcher.OptimizationError>` | The optimizer cannot produce a valid physical plan. |
 | {py:exc}`CompileError <batcher.CompileError>` | JIT compilation of a pipeline fails. The interpreter remains as a fallback, so this is rare. |
 | {py:exc}`ResourceError <batcher.ResourceError>` | The resource manager cannot satisfy a memory or credit request. |
 | {py:exc}`IOError <batcher.IOError>` | A source or sink fails to read, write, list, or open a path. |
-| `DataQualityError` | A `ds.dq...fail()` expectation has violating rows. Carries the per-constraint counts. |
+| `DataQualityError` | A `ds.dq...fail()` expectation has violating rows, or a `join`/`update` `validate=` check found a repeated key. Carries the per-constraint counts. |
 | `AccessDeniedError` | A principal may select no column of a governed table. A *column* it cannot select is instead absent, surfacing as `PlanError`. |
 | {py:exc}`FormatError <batcher.FormatError>`, {py:exc}`BackendError <batcher.BackendError>`, {py:exc}`CommitError <batcher.CommitError>`, {py:exc}`TransportError <batcher.TransportError>` | Lower-level IO, backend, write-commit, and shuffle failures. |
 

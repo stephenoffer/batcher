@@ -274,6 +274,7 @@ def detect_format(path: Any, explicit: str | None = None) -> str:
 
     # A list of files is one relation; the first names the format they all share.
     root, files = normalize_source_path(path)
+    _refuse_mixed_extensions(files)
     path = files[0] if files else root
     scheme = _scheme(path)
     if scheme in _SCHEME_TO_FORMAT:
@@ -306,6 +307,34 @@ def detect_format(path: Any, explicit: str | None = None) -> str:
             "A directory of files with no recognized extension always needs format=."
         ),
     )
+
+
+def _refuse_mixed_extensions(files: list[str] | None) -> None:
+    """Refuse a path list whose extensions name two different formats.
+
+    Inference reads the format off the first entry, so ``[x.parquet, y.csv]`` used to fail
+    as a *parquet parse* of ``y.csv`` -- an error about file contents for what is a mistake
+    in the argument. Pure string work on the extensions, no I/O. An entry with no
+    recognized extension (a directory, a glob) is left to the first-entry rule.
+
+    Args:
+        files: The normalized path list, or None for a single path.
+
+    Raises:
+        FormatError: Naming one entry of each of two different formats.
+    """
+    first: dict[str, str] = {}
+    for f in files or ():
+        fmt = _EXT_TO_FORMAT.get(_ext(f))
+        if fmt is not None:
+            first.setdefault(fmt, f)
+    if len(first) > 1:
+        (fmt_a, path_a), (fmt_b, path_b) = list(first.items())[:2]
+        raise FormatError(
+            f"read(): the path list mixes formats -- {path_a!r} is {fmt_a} and {path_b!r} "
+            f"is {fmt_b}. One read is one relation in one format: pass format= if they "
+            "really are one format, or read each format separately and union the results."
+        )
 
 
 def _format_from_directory(path: str) -> str | None:

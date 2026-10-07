@@ -14,6 +14,7 @@ import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.api._varargs import flatten_varargs
+from batcher.config.option_types import NanPolicy, QuantileInterpolation
 from batcher.plan.expr_ir import AggExpr, Aliased, Col, Expr, IntoExpr
 from batcher.plan.expr_ir.selectors import Selector, expand_one, expand_selectors, has_selector
 from batcher.plan.expr_rewrite.naming import output_name
@@ -179,6 +180,12 @@ class GroupBy:
         and distributed. A predicate that is null for a group drops the group, as in SQL.
         Calling `having` again adds predicates, all of which must hold.
 
+        `having` returns one row per surviving group. To keep the *original rows* of the
+        groups that pass, filter on a window aggregate instead, which broadcasts the
+        group's value to each of its rows: ``ds.filter(bt.count().over("g") >= 2)`` keeps
+        every row whose group has at least two rows (SQL ``QUALIFY count(*) OVER
+        (PARTITION BY g) >= 2``), counting the rows of a null key as one group.
+
         Args:
             *predicates: Boolean expressions over aggregates. A list of them is accepted too.
 
@@ -195,6 +202,8 @@ class GroupBy:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "b"], "v": [1, 2, 3]})
                 >>> ds.group_by("g").having(bt.count() > 1).agg(s=bt.col("v").sum()).to_pydict()
                 {'g': ['a'], 's': [3]}
+                >>> ds.filter(bt.count().over("g") > 1).sort("v").to_pydict()
+                {'g': ['a', 'a'], 'v': [1, 2]}
         """
         from batcher.plan.expr_ir.walk import contains_aggregate
 
@@ -291,7 +300,15 @@ class GroupBy:
             raise PlanError("agg() requires at least one aggregate")
         return self._source._derive(self._lower_aggregates(resolved))
 
-    def map_groups(self, fn: Callable, **options: Any) -> Dataset:
+    def map_groups(
+        self,
+        fn: Callable,
+        *,
+        output_schema: pa.Schema | None = None,
+        max_group_rows: int | None = None,
+        max_group_bytes: int | None = None,
+        **options: Any,
+    ) -> Dataset:
         """Apply a Python function to each group as one whole batch.
 
         `fn` receives a `pyarrow.RecordBatch` holding every row of one group, in the
@@ -314,6 +331,18 @@ class GroupBy:
         relational breaker, whether `collect(distributed=True)` accepts the plan is the same
         question as for ``group_by(...).agg(...).map_batches(fn)``.
 
+        Declare `output_schema` whenever the input can have no groups. With no group there
+        is no call to `fn` and nothing to learn the result's columns from, so without it an
+        empty input yields a result with **no columns**, which then fails to union with a
+        non-empty one. With it, an empty input yields an empty table of that schema, every
+        result is cast to it (a missing or extra column raises), and it also sets
+        ``output_columns``.
+
+        `max_group_rows` and `max_group_bytes` refuse a group over either limit before `fn`
+        is called, raising `ExecutionError` naming the group's key, its size and the limit.
+        The engine has already assembled the group by then, so they protect the Python side
+        (the conversion to `batch_format` and what `fn` builds), not engine memory.
+
         Examples:
             .. doctest::
 
@@ -327,8 +356,17 @@ class GroupBy:
                 >>> out.sort("k").to_pydict()
                 {'k': ['a', 'b'], 'spread': [2, 0]}
 
+                >>> schema = pa.schema([("k", pa.string()), ("spread", pa.int64())])
+                >>> empty = ds.filter(bt.col("v") > 100)
+                >>> empty.group_by("k").map_groups(spread, output_schema=schema).collect().schema
+                k: string
+                spread: int64
+
         Args:
             fn: Called once per group with that group's rows as a `pyarrow.RecordBatch`.
+            output_schema: The result's schema, and the result of an input with no groups.
+            max_group_rows: Refuse a group with more rows than this before calling `fn`.
+            max_group_bytes: Refuse a group larger than this many bytes before calling `fn`.
             **options: `map_batches` options for the per-group stage, such as
                 ``output_columns``, ``batch_format``, ``num_gpus``, or ``concurrency``.
 
@@ -336,7 +374,10 @@ class GroupBy:
             A new lazy `Dataset` holding what `fn` returned for each group, concatenated.
 
         Raises:
-            PlanError: if every column is a group key, leaving nothing to hand `fn`.
+            PlanError: if every column is a group key, leaving nothing to hand `fn`, or
+                an option is malformed.
+            ExecutionError: If a group exceeds a size limit, or a result does not match
+                `output_schema`.
         """
         from batcher.api.group_apply import build_map_groups
 
@@ -348,7 +389,8 @@ class GroupBy:
                 f"({sorted(self._named)}). Add the derived column with with_columns first, "
                 "then group by its name."
             )
-        return build_map_groups(self._source, self._keys, fn, options)
+        limits = {"max_group_rows": max_group_rows, "max_group_bytes": max_group_bytes}
+        return build_map_groups(self._source, self._keys, fn, options, output_schema, **limits)
 
     def _spec_to_aggs(self, spec: dict[str, Any]) -> dict[str, AggExpr]:
         """Expand a pandas ``{column: "sum"}`` / ``{column: ["min", "max"]}`` agg spec.
@@ -477,14 +519,20 @@ class GroupBy:
         return self._reduce("count", columns)
 
     def quantile(
-        self, q: float, *columns: str | Selector, interpolation: str = "linear"
+        self,
+        q: float | Sequence[float],
+        *columns: str | Selector,
+        interpolation: QuantileInterpolation = "linear",
     ) -> Dataset:
         """The `q`-quantile of each column per group (every non-key numeric column by default).
 
         `interpolation` is as for :meth:`Expr.quantile`; Polars' default is ``"nearest"``.
+        A list of fractions answers one ``List`` column per column, the quantiles in the
+        order given, as :meth:`Expr.quantile` does.
 
         Args:
-            q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median).
+            q: The quantile to compute, in ``[0, 1]`` (``0.5`` is the median), or a list
+                of them.
             *columns: Columns (names or selectors) to reduce; defaults to every
                 non-key numeric column.
             interpolation: How to resolve a rank that falls between two values.
@@ -499,17 +547,10 @@ class GroupBy:
                 >>> ds = bt.from_pydict({"g": ["a", "a", "a", "b"], "x": [1.0, 2.0, 3.0, 9.0]})
                 >>> ds.group_by("g").quantile(0.5).sort("g").to_pydict()
                 {'g': ['a', 'b'], 'x': [2.0, 9.0]}
+                >>> ds.group_by("g").quantile([0.0, 1.0]).sort("g").to_pydict()
+                {'g': ['a', 'b'], 'x': [[1.0, 3.0], [9.0, 9.0]]}
         """
-        if not 0.0 <= q <= 1.0:
-            raise PlanError(f"quantile q must be in [0, 1], got {q}")
-        targets = self._resolve_columns(columns, numeric_only=True)
-        if not targets:
-            raise PlanError(
-                "group_by().quantile() has no numeric value columns to reduce — "
-                "name the columns to reduce explicitly"
-            )
-        specs = tuple(AggregateSpec(c, Col(c).quantile(q, interpolation)) for c in targets)
-        return self._finish(specs)
+        return self._reduce("quantile", columns, q=q, interpolation=interpolation)
 
     def sum(self, *columns: str | Selector, empty_value: int | float | None = None) -> Dataset:
         """Sum each value column per group (every non-key numeric column by default).
@@ -577,7 +618,7 @@ class GroupBy:
         """
         return self._reduce("min", columns)
 
-    def max(self, *columns: str | Selector, nan_policy: str = "propagate") -> Dataset:
+    def max(self, *columns: str | Selector, nan_policy: NanPolicy = "propagate") -> Dataset:
         """Maximum of each value column per group (all non-key columns by default).
 
         A NaN is the greatest float, so it is a group's maximum; ``nan_policy="ignore"``
@@ -865,6 +906,7 @@ class GroupBy:
         descending: bool | Sequence[bool] = False,
         nulls_last: bool | Sequence[bool] = True,
         ignore_nulls: bool = False,
+        distinct: bool = False,
     ) -> Dataset:
         """Collect each value column's values into a list per group (all non-key by default).
 
@@ -883,6 +925,8 @@ class GroupBy:
                 per key.
             ignore_nulls: Whether to leave nulls out of the lists, as Spark's
                 ``collect_list`` does.
+            distinct: Whether to keep each value once, sorted by the value, as for
+                :meth:`Expr.array_agg <batcher.Expr.array_agg>`.
 
         Returns:
             A new `Dataset` of the group keys followed by a `List` column per collected column.
@@ -902,6 +946,7 @@ class GroupBy:
             descending=descending,
             nulls_last=nulls_last,
             ignore_nulls=ignore_nulls,
+            distinct=distinct,
         )
 
     def mode(self, *columns: str | Selector, all_modes: bool = False) -> Dataset:
@@ -973,7 +1018,7 @@ class GroupBy:
     # mirroring pandas' `numeric_only`: averaging or summing a string column is an error,
     # so an explicit-columns call is required to attempt it.
     _NUMERIC_ONLY = frozenset(
-        {"sum", "mean", "median", "std", "var", "product", "skew", "kurtosis"}
+        {"sum", "mean", "median", "quantile", "std", "var", "product", "skew", "kurtosis"}
     )
 
     def _value_columns(self, numeric_only: bool) -> list[str]:

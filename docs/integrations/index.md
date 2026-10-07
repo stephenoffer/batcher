@@ -77,7 +77,7 @@ Each connector page opens with a capability table: what it reads and writes, the
 
 ## Libraries in your process
 
-Two more groups aren't connectors. {doc}`/integrations/dataframes/index` covers Polars, pandas, DuckDB, PyArrow, and NumPy, which share Arrow with Batcher, so a table crosses between them as a pointer rather than a copy. {doc}`/integrations/orchestration/index` covers Airflow, Dagster, and Prefect. Batcher has no daemon, so a scheduled task is a Python function that imports it.
+Two more groups aren't connectors. {doc}`/integrations/dataframes/index` covers Polars, pandas, DuckDB, PyArrow, and NumPy, which share Arrow with Batcher, so a table crosses between them as a pointer rather than a copy. {doc}`/integrations/orchestration/index` covers Airflow, Dagster, and Prefect. Batcher has no daemon, so a scheduled task is a Python function that imports it. {doc}`/integrations/sql-clients/index` covers the other direction, tools that drive Batcher: a DB-API client, SQLAlchemy, dbt, Ibis, and Flight SQL.
 
 ### Model runtimes
 
@@ -117,7 +117,13 @@ Delta Lake, Apache Iceberg, and Apache Hudi tables.
 :::{grid-item-card} {octicon}`server;1.1em` Databases
 :link: /integrations/databases/index
 :link-type: doc
-SQL databases, key-value stores, MongoDB, and Elasticsearch, with writes back into them.
+SQL databases, key-value stores, MongoDB, Elasticsearch, and vector stores, with writes back into them.
+:::
+
+:::{grid-item-card} {octicon}`globe;1.1em` HTTP APIs and SaaS
+:link: /integrations/apis/index
+:link-type: doc
+Paginated JSON APIs, GraphQL, GitHub, Salesforce, Google Sheets, SharePoint, and Airbyte connectors.
 :::
 
 :::{grid-item-card} {octicon}`cpu;1.1em` ML and compute
@@ -137,6 +143,12 @@ Prometheus and Grafana, OpenTelemetry traces, and OpenLineage.
 Polars, pandas, DuckDB, PyArrow, and NumPy, exchanged through Arrow at no copy cost.
 :::
 
+:::{grid-item-card} {octicon}`terminal;1.1em` SQL clients
+:link: /integrations/sql-clients/index
+:link-type: doc
+DB-API, SQLAlchemy, dbt, Ibis, and Flight SQL clients driving a Batcher session.
+:::
+
 :::{grid-item-card} {octicon}`workflow;1.1em` Orchestrators
 :link: /integrations/orchestration/index
 :link-type: doc
@@ -152,10 +164,12 @@ The following table maps each group to what it covers in full:
 | {doc}`/integrations/streams/index` | Kafka, Amazon Kinesis, Apache Pulsar, Google Cloud Pub/Sub, Azure Event Hubs, and the Avro, JSON, and Protobuf payloads they carry |
 | {doc}`/integrations/warehouses/index` | Snowflake, BigQuery, and Databricks |
 | {doc}`/integrations/lakehouse/index` | Delta Lake, Apache Iceberg, and Apache Hudi |
-| {doc}`/integrations/databases/index` | SQL databases over one connection URI, writing back to a database, DynamoDB, Cassandra, ScyllaDB, Redis, HBase, MongoDB, and Elasticsearch |
+| {doc}`/integrations/databases/index` | SQL databases over one connection URI, writing back to a database, DynamoDB, Cassandra, ScyllaDB, Redis, HBase, MongoDB, Elasticsearch, and the Qdrant, Pinecone, Milvus, and Turbopuffer vector stores |
+| {doc}`/integrations/apis/index` | Paginated HTTP JSON APIs, GraphQL, GitHub, Salesforce, Google Sheets, SharePoint and OneDrive, and Airbyte source connectors |
 | {doc}`/integrations/compute/index` | Ray, batch schedulers, PyTorch, Hugging Face, and MLflow |
 | {doc}`/integrations/observability/index` | Prometheus and Grafana, OpenTelemetry traces, and OpenLineage |
 | {doc}`/integrations/dataframes/index` | Polars, pandas, DuckDB, PyArrow, and NumPy, in the same process and over the same Arrow |
+| {doc}`/integrations/sql-clients/index` | The PEP 249 adapter, the SQLAlchemy dialect, and the dbt, Ibis, and Flight SQL pilots |
 | {doc}`/integrations/orchestration/index` | Airflow, Dagster, and Prefect, plus what makes a task safe to retry |
 
 Every connector is built on the same public contracts: {py:class}`Source <batcher.io.Source>`, {py:class}`Sink <batcher.io.Sink>`, {py:class}`Split <batcher.io.Split>`, and the format registry they register into. A system not listed here plugs in the same way, as {doc}`custom connectors </user-guide/moving-data/custom-connectors>` describes.
@@ -177,8 +191,10 @@ streams/index
 warehouses/index
 lakehouse/index
 databases/index
+apis/index
 compute/index
 observability/index
 dataframes/index
+sql-clients/index
 orchestration/index
 ```

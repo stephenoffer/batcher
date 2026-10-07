@@ -51,6 +51,8 @@ __all__ = [
     "build_anon_agg",
     "build_typed_agg",
     "distinct_input",
+    "distinct_list_agg",
+    "distinct_operand",
     "is_agg_node",
     "iter_agg_nodes",
 ]
@@ -213,6 +215,67 @@ def distinct_input(tr, node, args=None):
         )
     tr._agg_pending_distinct.append((exprs[0].sql(), exprs[0]))
     return exprs[0]
+
+
+def distinct_operand(tr, node) -> Expr:
+    """The value a ``COUNT(DISTINCT ...)`` counts: a row-tuple ``(a, b)`` becomes a struct.
+
+    DuckDB counts distinct *tuples*, and a tuple holding a NULL field is still a value:
+    ``(1, NULL)`` and ``(NULL, NULL)`` are each counted once. A struct has exactly that
+    identity, so the tuple form is the engine's ordinary distinct count over a struct.
+
+    Args:
+        tr: The translator instance.
+        node: The single expression inside the `DISTINCT`.
+
+    Returns:
+        The expression to count distinct values of.
+    """
+    if not isinstance(node, exp.Tuple):
+        return tr._scalar(node)
+    from batcher.plan.functions.collection import struct
+
+    return struct(**{f"f{i}": tr._scalar(e) for i, e in enumerate(node.expressions)})
+
+
+def distinct_list_agg(tr, arg) -> Expr:
+    """``array_agg(DISTINCT x [ORDER BY x])``, through `Expr.array_agg(distinct=True)`.
+
+    The SQL and DataFrame spellings share that one implementation. As in DuckDB and
+    Postgres, the ``ORDER BY`` may only order by the aggregated value: among duplicates
+    there is no single row whose key could decide a position.
+
+    Args:
+        tr: The translator instance.
+        arg: The aggregate's argument: a `Distinct`, or an `Order` wrapping one.
+
+    Returns:
+        The deduplicated, sorted list expression.
+
+    Raises:
+        NotImplementedError: For several DISTINCT arguments, or an ORDER BY over anything
+            but the aggregated value.
+    """
+    order = arg if isinstance(arg, exp.Order) else None
+    distinct = order.this if order is not None else arg
+    if len(distinct.expressions) != 1:
+        raise NotImplementedError("array_agg(DISTINCT ...) supports exactly one expression")
+    node = distinct.expressions[0]
+    keys = list(order.expressions) if order is not None else []
+    if len(keys) > 1 or (keys and keys[0].this.sql() != node.sql()):
+        raise NotImplementedError(
+            "in array_agg(DISTINCT x ORDER BY ...) / string_agg(DISTINCT ...), ORDER BY may "
+            "only order by the aggregated value x, as in DuckDB and Postgres"
+        )
+    value = tr._scalar(node)
+    if not keys:
+        return value.array_agg(distinct=True)
+    return value.array_agg(
+        order_by=value,
+        descending=bool(keys[0].args.get("desc")),
+        nulls_last=not keys[0].args.get("nulls_first"),
+        distinct=True,
+    )
 
 
 def _reject_distinct(node, args=None) -> None:

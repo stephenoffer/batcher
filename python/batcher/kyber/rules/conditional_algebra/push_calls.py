@@ -68,7 +68,13 @@ def _rebuild_unary(call: Expr, value: Expr) -> Expr:
     if isinstance(call, Strptime):
         return Strptime(value, call.format, strict=call.strict)
     if isinstance(call, ConvertTimezone):
-        return ConvertTimezone(value, call.from_tz, call.to_tz)
+        return ConvertTimezone(
+            value,
+            call.from_tz,
+            call.to_tz,
+            ambiguous=call.ambiguous,
+            nonexistent=call.nonexistent,
+        )
     if isinstance(call, DateOffset):
         return DateOffset(value, call.months, call.days, call.micros)
     if isinstance(call, ListFunc):

@@ -52,6 +52,12 @@ Pull a subscription with ack-after-publish delivery and message attributes as he
 The native AMQP reader, or the Kafka endpoint with no Azure SDK at all.
 :::
 
+:::{grid-item-card} {octicon}`upload;1.1em` Broker sinks
+:link: /integrations/streams/sinks
+:link-type: doc
+Publish a stream back to any of the five brokers, with ordering and retry guarantees stated per broker.
+:::
+
 :::{grid-item-card} {octicon}`file-code;1.1em` Payload formats
 :link: /integrations/streams/payload-formats
 :link-type: doc
@@ -70,5 +76,6 @@ kinesis
 pulsar
 pubsub
 eventhubs
+sinks
 payload-formats
 ```

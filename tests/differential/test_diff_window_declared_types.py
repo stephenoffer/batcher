@@ -98,8 +98,15 @@ def _by_expression(rows: pa.Table, func: str, name: str | None):
     return bt.from_arrow(rows).with_columns(w=series)
 
 
+def _by_bin_count(rows: pa.Table, func: str, name: str | None):
+    """The spelling for `qcut`, whose quantile probabilities neither arm above can carry."""
+    if name is None or func != "qcut":
+        raise TypeError("only qcut is spelled with a bin count")
+    return bt.from_arrow(rows).with_columns(w=bt.col(name).qcut(2))
+
+
 #: Tried in order; the first that builds and runs is the one the pair is measured through.
-_BUILDERS = (_by_window, _by_expression)
+_BUILDERS = (_by_window, _by_expression, _by_bin_count)
 
 
 @pytest.mark.parametrize("func", sorted(WINDOW_FUNCS))

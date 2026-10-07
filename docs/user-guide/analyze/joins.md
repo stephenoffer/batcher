@@ -72,6 +72,80 @@ print(a.join(b, left_on="k", right_on="kk").sort("k").to_pydict())
 
 When both inputs carry a non-key column of the same name, the right side's column gets the `suffix` (default `"_right"`).
 
+### Which key columns survive
+
+Each key pair comes out as one column named after the left key. An inner or left join reads it from the left side, a right join from the right, and a full join takes whichever side matched. Pass `coalesce=False` to keep both instead. The left key stays first under its own name, and the right key stays among the right columns under its own name, taking the `suffix` when the two names are equal. Each is null where its own side had no row.
+
+```python
+a = bt.from_pydict({"k": [1, 2], "v": [10, 20]})
+b = bt.from_pydict({"k": [2, 3], "w": [200, 300]})
+print(a.join(b, on="k", how="full").sort("v").to_pydict())
+# {'k': [1, 2, 3], 'v': [10, 20, None], 'w': [None, 200, 300]}
+print(a.join(b, on="k", how="full", coalesce=False).sort("v").to_pydict())
+# {'k': [1, 2, None], 'v': [10, 20, None], 'k_right': [None, 2, 3], 'w': [None, 200, 300]}
+```
+
+Semi and anti joins return the left columns only, so `coalesce=False` is refused for them.
+
+### Computed keys
+
+A key can be an expression, evaluated on its own side. `left_on` and `right_on` take one each, and an expression passed as `on` runs on both sides. A computed key adds no output column. The columns it reads stay as ordinary left and right columns, so here both spellings of the address survive.
+
+```python
+users = bt.from_pydict({"email": ["Ann@x.io", "bob@x.io"], "plan": ["pro", "free"]})
+logins = bt.from_pydict({"email": ["ann@x.io", "ann@x.io", "cy@x.io"], "n": [3, 4, 1]})
+key = bt.col("email").str.lower()
+print(users.join(logins, left_on=key, right_on=key).sort("n").to_pydict())
+# {'email': ['Ann@x.io', 'Ann@x.io'], 'plan': ['pro', 'pro'],
+#  'email_right': ['ann@x.io', 'ann@x.io'], 'n': [3, 4]}
+```
+
+A bare `bt.col("k")` is the column name `"k"`, and behaves exactly like the string.
+
+### Null keys
+
+A null key matches nothing, which is what SQL `=` does. Pass `nulls_equal=True` to make a null key match a null key, which is SQL `IS NOT DISTINCT FROM`. A list gives one flag per key. It runs on the same hash join, with each null-safe key replaced by a null flag and the value, so it costs an extra key column rather than a nested loop.
+
+```python
+x = bt.from_pydict({"region": ["west", None], "target": [100, 50]})
+y = bt.from_pydict({"region": ["west", None], "actual": [90, 40]})
+print(x.join(y, on="region").to_pydict())
+# {'region': ['west'], 'target': [100], 'actual': [90]}
+print(x.join(y, on="region", nulls_equal=True).sort("target").to_pydict())
+# {'region': [None, 'west'], 'target': [50, 100], 'actual': [40, 90]}
+```
+
+The SQL front end plans `ON a.k IS NOT DISTINCT FROM b.k` the same way, mixed freely with `=` conjuncts, so it is a hash join on the key rather than a cross join filtered afterwards. `nulls_equal` accepts numeric, boolean, decimal, string, binary and temporal keys, and raises for a nested one.
+
+### Check the key cardinality
+
+A key repeated on both sides multiplies rows, and an enrichment join against a dimension that turned out to have duplicate keys silently inflates every total downstream. `validate` states the cardinality you expect and raises a {py:exc}`DataQualityError <batcher.DataQualityError>` before the join is built when the data disagrees. `"1:1"` requires unique keys on both sides, `"1:m"` on the left, `"m:1"` on the right, and the default `"m:m"` checks nothing.
+
+```python
+dupes = bt.from_pydict({"category": ["a", "b", "b"], "region": ["west", "east", "north"]})
+try:
+    orders.join(dupes, on="category", how="left", validate="m:1")
+except bt.DataQualityError as e:
+    print(e)
+# join(validate='m:1'): the right side must have unique keys ['category'], but 2 of its
+# rows share a key, e.g. ['b']. Deduplicate that side (distinct(..., keep=...)) or relax validate=
+print(orders.join(dim, on="category", how="left", validate="m:1").count())
+# 5
+```
+
+A null key is not a repeat, because it matches nothing and cannot multiply a row. Under `nulls_equal=True` it can, so it counts. Unlike the rest of a plan, the check executes when `join` is called: one uniqueness pass over each checked side, so a large source is read for it.
+
+### Where each row came from
+
+`indicator` names an added column holding `"both"`, `"left_only"` or `"right_only"`. It reads markers the join adds to each side, not the payload, so a matched row whose columns are all null is still `"both"`.
+
+```python
+more = bt.from_pydict({"category": ["b", "c"], "region": ["east", "south"]})
+print(dim.join(more, on="category", how="full", indicator="source").sort("category").to_pydict())
+# {'category': ['a', 'b', 'c'], 'region': ['west', 'east', None],
+#  'region_right': [None, 'east', 'south'], 'source': ['left_only', 'both', 'right_only']}
+```
+
 ## Set operations
 
 Set operations combine two datasets with matching schemas.
@@ -154,6 +228,17 @@ print(fill.join_asof(quotes, on="t", by="sym", allow_exact_matches=False).to_pyd
 
 Both `tolerance` and `"nearest"` have to subtract two keys, so they need a numeric or temporal `on` column. A string key still orders fine for a plain backward or forward search.
 
+Two right rows with the same `by` values and the same `on` value tie. The engine breaks the tie by row order: a backward search takes the later row and a forward search the earlier one. Row order is the order rows arrived in, which partitioning and distribution do not preserve, so a tie gives no deterministic answer. When the right side can hold ties, remove them first with a column that orders them, such as a sequence number.
+
+```python
+ticks = bt.from_pydict(
+    {"sym": ["A", "A", "A"], "t": [8, 8, 38], "seq": [2, 1, 3], "price": [1.05, 1.0, 1.1]}
+)
+latest = ticks.distinct(["sym", "t"], keep="last", order_by="seq")
+print(trades.join_asof(latest, on="t", by="sym").sort("sym", "t").to_pydict()["price"])
+# [1.05, 1.1, None]
+```
+
 ## Joins on predicates
 
 An equi-join matches equal keys. {py:meth}`join_where <batcher.Dataset.join_where>` matches on any predicates over both sides instead, such as an event falling inside an interval. It keeps every pair of rows for which all the predicates are true, which is an inner join.
@@ -168,6 +253,8 @@ print(inside.select("t", "crew").sort("t").to_pydict())
 
 A predicate names right columns by name. A right column whose name the left side already has takes the `suffix`, `_right` by default, so {py:obj}`bt.col("v_right") <batcher.col>` is the right side's `v`. One or two inequalities between the sides run as a range join rather than as a filtered cartesian product, and an equality runs as a hash join.
 
+References are by name, never by dataset. `events["t"]` is `bt.col("t")` and is not tied to `events`, so with two inputs that both have a `k`, `left["k"] == right["k"]` compares the left `k` with itself. `join_where` refuses that comparison with a `PlanError` that names the column to use, `bt.col("k_right")`, rather than return the cross product it would otherwise produce.
+
 ## Update values from another dataset
 
 {py:meth}`update <batcher.Dataset.update>` overwrites values with another dataset's where the keys match. Every column the two share, other than the key, takes the other side's value on a matched row, and a null there leaves the value alone.
@@ -178,7 +265,7 @@ print(orders.update(fixes, on="id").sort("id").to_pydict())
 # {'id': [1, 2, 3, 4, 5], 'category': ['a', 'b', 'a', 'b', 'a'], 'amount': [10, 25, 30, 40, 50]}
 ```
 
-Pass `include_nulls=True` when a null is itself the new value, and `how="inner"` or `how="full"` to keep only the matched rows or to add the other side's unmatched ones.
+Pass `include_nulls=True` when a null is itself the new value, and `how="inner"` or `how="full"` to keep only the matched rows or to add the other side's unmatched ones. A key repeated in the other dataset repeats the row, as in any join. Pass `validate="m:1"` to refuse that instead, with the repeated keys named, as `join` does.
 
 ```python
 print(orders.update(fixes, on="id", include_nulls=True).sort("id").select("id", "amount").to_pydict())
@@ -217,6 +304,8 @@ enriched = orders.lookup_join(
 The cost scales with the distinct keys in your data rather than with the size of the store, which is the only reason a store far larger than memory can be joined at all. It works unchanged single-node, distributed, and over an unbounded source, because the enrichment happens per batch. `rocksdb:///path/to/db` reads an embedded database instead of a server.
 
 `how="left"`, the default, keeps every row and null-fills the misses. `how="inner"` drops them. A right or full outer join is not offered, because producing one would mean enumerating the store, which is the scan this exists to avoid.
+
+A null-filled miss looks exactly like a stored record whose fields are null. When the difference matters, such as when a missing customer should be flagged and a customer with no tier should not, pass `indicator="found"`. It appends a boolean column that is true when the store held the key, and it's never null, because a null key is a miss.
 
 ### Why it is fast, and what it costs
 

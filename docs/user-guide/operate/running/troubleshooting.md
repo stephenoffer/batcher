@@ -26,6 +26,7 @@ The six symptoms people hit most often each have a usual cause and a first move,
 | Credentials or an object-store path fail | {doc}`/user-guide/moving-data/cloud-storage` and {doc}`/user-guide/trust/secrets` |
 | A write failed, or two writers collided | {doc}`/user-guide/moving-data/writing-data` and {doc}`/user-guide/moving-data/lakehouse` |
 | A distributed run hangs, or a worker died | {doc}`/architecture/fault-tolerance` and {doc}`/integrations/compute/ray` |
+| A worker cannot import a module your UDF uses | "Check what remote workers need", below |
 | You want to know what the engine actually did | {doc}`/user-guide/operate/running/observability` |
 
 ```python
@@ -178,7 +179,7 @@ reachable as `bt.<Name>`:
 | {py:exc}`bt.FormatError <batcher.FormatError>` | an unknown format, or a file malformed for its format | |
 | {py:exc}`bt.CommitError <batcher.CommitError>` | an atomic write commit failing (a concurrent-writer conflict) | |
 | {py:exc}`bt.SchemaError <batcher.SchemaError>` | schemas that can't be reconciled across files or against an expected one | |
-| {py:exc}`bt.DataQualityError <batcher.DataQualityError>` | a `ds.dq...fail()` expectation with violating rows (carries the counts) | `ValueError` |
+| {py:exc}`bt.DataQualityError <batcher.DataQualityError>` | a `ds.dq...fail()` expectation with violating rows, or a `join`/`update` `validate=` cardinality check (carries the counts) | `ValueError` |
 | {py:exc}`bt.BackendError <batcher.BackendError>` | a specific execution backend failing | `RuntimeError` |
 | {py:exc}`bt.TransportError <batcher.TransportError>` | the distributed data plane (shared memory / Flight) failing | |
 
@@ -246,6 +247,25 @@ overhead that only pays for itself on a big job.
 # docs: skip
 out = ds.group_by("x").agg(total=bt.col("y").sum()).collect(spill=True)
 ```
+
+## Check what remote workers need
+
+A distributed UDF stage that a worker cannot rebuild fails late: after the cluster scales up and a model loads, on the first batch, with `ModuleNotFoundError`. `explain(requirements=True)` finds that on the driver first. It serializes every UDF stage exactly as a worker would receive it, then lists the installed packages it needs with versions, any local module that a worker has only if you ship it, and the serialized size. A stage that cannot be serialized at all is an `error`, and a local or missing module is a `warn`.
+
+```python
+def double(batch):
+    return batch
+
+report = ds.map_batches(double).explain(requirements=True)
+print(report.splitlines()[-2])
+# worker requirements: ok
+```
+
+A function from your own `models.py` shows up as `models [local: .../models.py; ship it]`. Ship it with `ray.init(runtime_env={"py_modules": [...]})` or a `working_dir`, or install it on the workers. `format="json"` gives the same report under a `"requirements"` key. Whether the workers' images actually carry the listed packages is still for the cluster to answer.
+
+:::{warning}
+The report is not yet verified against a failing run on a live Ray cluster; see `tests/PENDING_VERIFICATION.md`.
+:::
 
 ## See also
 

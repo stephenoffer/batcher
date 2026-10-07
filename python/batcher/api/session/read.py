@@ -15,6 +15,7 @@ from batcher.api.session._scan import _scan
 from batcher.io.detect import detect_format, partition_aware_format
 from batcher.io.filesystem import require_success_marker
 from batcher.io.formats.base import SOURCES
+from batcher.io.source.path_column import with_path_column
 
 __all__ = [
     "read",
@@ -44,11 +45,15 @@ def read(path: str, *, format: str | None = None, **opts: Any) -> Dataset:
     Off by default, because a directory Batcher did not write has no marker and is not
     thereby incomplete; turn it on for a path another job produces.
 
+    ``include_path=True`` adds a ``path`` column naming the file each row came from
+    (Spark's ``input_file_name()``, DuckDB's ``filename=true``); a string names the column
+    instead. The read then runs one file per split. It applies to every file reader.
+
     Args:
         path: A file, directory, glob, or URI to read.
         format: Force a format instead of inferring one from `path`.
         **opts: Format-specific reader options forwarded to the source, plus
-            ``require_success`` (see above), which is consumed here.
+            ``require_success`` and ``include_path`` (see above), which are consumed here.
 
     Returns:
         A lazy `Dataset` over the source.
@@ -65,8 +70,11 @@ def read(path: str, *, format: str | None = None, **opts: Any) -> Dataset:
     """
     if opts.pop("require_success", False):
         require_success_marker(path)
+    # Resolved with `include_path` still in `opts`, so it keeps the read on the flat file
+    # reader: the partition-aware one is not a file source and cannot name a row's file.
     fmt = partition_aware_format(path, detect_format(path, format), opts)
-    return _scan(SOURCES.get(fmt)(path, **opts))
+    include_path = opts.pop("include_path", False)
+    return _scan(with_path_column(SOURCES.get(fmt)(path, **opts), include_path))
 
 
 def _read_table(format: str, *args: Any, **opts: Any) -> Dataset:

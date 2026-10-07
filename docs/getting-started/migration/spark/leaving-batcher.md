@@ -14,7 +14,7 @@ Replace `<paths>` with the files or directories to rewrite. This direction is im
 
 ## Batcher to PySpark
 
-The following table maps 310 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
+The following table maps 309 Batcher spellings to the PySpark names that compute the same thing, sorted by Batcher spelling. Each PySpark name is prefixed with the class or module it lives on.
 
 | Batcher | PySpark |
 |---|---|
@@ -133,17 +133,16 @@ The following table maps 310 Batcher spellings to the PySpark names that compute
 | {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` | `DataFrame.distinct`, `DataFrame.dropDuplicates`, `DataFrame.drop_duplicates` |
 | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` | `DataFrame.dropna` |
 | {py:obj}`Dataset.drop_nulls <batcher.Dataset.drop_nulls>` + {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | `DataFrame.na` |
-| {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | `DataFrame.exceptAll`, `DataFrame.subtract` |
+| {py:obj}`Dataset.except_ <batcher.Dataset.except_>` | `DataFrame.subtract` |
 | {py:obj}`Dataset.fill_null <batcher.Dataset.fill_null>` | `DataFrame.fillna`, `DataFrameNaFunctions.fill` |
 | {py:obj}`Dataset.filter <batcher.Dataset.filter>` | `DataFrame.filter`, `DataFrame.where` |
 | {py:obj}`Dataset.group_by <batcher.Dataset.group_by>` | `DataFrame.groupby` |
 | {py:obj}`Dataset.grouping_sets <batcher.Dataset.grouping_sets>` | `DataFrame.groupingSets` |
-| {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | `DataFrame.intersectAll`, `DataFrame.intersect` |
+| {py:obj}`Dataset.intersect <batcher.Dataset.intersect>` | `DataFrame.intersect` |
 | {py:obj}`Dataset.is_empty <batcher.Dataset.is_empty>` | `DataFrame.isEmpty` |
 | {py:obj}`Dataset.is_streaming <batcher.Dataset.is_streaming>` | `DataFrame.isStreaming` |
 | {py:obj}`Dataset.limit <batcher.Dataset.limit>` | `DataFrame.limit` |
 | {py:obj}`Dataset.pipe <batcher.Dataset.pipe>` | `DataFrame.transform` |
-| {py:obj}`Dataset.repartition <batcher.Dataset.repartition>` | `DataFrame.coalesce` |
 | {py:obj}`Dataset.rollup <batcher.Dataset.rollup>` | `DataFrame.rollup` |
 | {py:obj}`Dataset.select <batcher.Dataset.select>` | `DataFrame.selectExpr`, `DataFrame.select` |
 | {py:obj}`Dataset.sort <batcher.Dataset.sort>` | `Column.asc_nulls_first`, `Column.asc_nulls_last`, `Column.desc_nulls_first`, `Column.desc_nulls_last`, `Column.desc`, `functions.asc_nulls_first`, `functions.asc_nulls_last`, `functions.desc_nulls_first`, `functions.desc_nulls_last`, `functions.desc` |

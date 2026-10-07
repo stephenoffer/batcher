@@ -34,6 +34,7 @@ class GenerateSpec:
         temperature_column: a column giving each row its own sampling temperature.
         few_shot: fixed ``(input, output)`` demonstration pairs prepended to every prompt.
         parse_json: parse each output as JSON into a struct column (null on error).
+        raw_column: with `parse_json`, also keep each output's unparsed text in this column.
         usage: append ``prompt_tokens`` / ``completion_tokens`` columns.
         finish_reason: append a ``finish_reason`` column.
         logprobs: append a ``logprob`` column.
@@ -49,6 +50,11 @@ class GenerateSpec:
             comes back with a generation nothing downstream can tell from a real answer.
             Ignored when `template` or `image_column` is set, where the row has an input
             the prompt column does not describe.
+        request_id_column: attach a stable id to every request, under ``"request_id"``. A
+            column of this name in the batch supplies the ids; otherwise they are derived
+            from the request content (and `request_id_key`) and appended under this name.
+        request_id_key: columns whose values are folded into a derived id, so two rows
+            sending identical requests still get distinct ids.
     """
 
     prompt_column: str
@@ -60,16 +66,21 @@ class GenerateSpec:
     temperature_column: str | None = None
     few_shot: tuple[tuple[str, str], ...] | None = None
     parse_json: bool = False
+    raw_column: str | None = None
     usage: bool = False
     finish_reason: bool = False
     logprobs: bool = False
     dedup: bool = False
     skip_null_prompts: bool = False
+    request_id_column: str | None = None
+    request_id_key: tuple[str, ...] | None = None
 
     @property
     def appended_columns(self) -> list[str]:
         """The columns this spec appends to a batch, in the order they are appended."""
         names = [self.output_column]
+        if self.raw_column is not None:
+            names.append(self.raw_column)
         if self.usage:
             names += ["prompt_tokens", "completion_tokens"]
         if self.finish_reason:
@@ -196,7 +207,7 @@ def _build_requests(spec: GenerateSpec | str | None, *rest: object) -> list:
         )
     prompts = _render(spec.template, spec.prompt_column, batch, spec.few_shot)
     tags = _per_row_tags(spec, batch)
-    if not tags:
+    if not tags and spec.request_id_column is None:
         return prompts
     requests: list = []
     for i, prompt in enumerate(prompts):
@@ -205,7 +216,68 @@ def _build_requests(spec: GenerateSpec | str | None, *rest: object) -> list:
             if values[i] is not None:
                 request[key] = values[i]
         requests.append(request)
+    if spec.request_id_column is not None:
+        for request, rid in zip(requests, request_ids(spec, batch, requests), strict=True):
+            if rid is not None:
+                request["request_id"] = rid
     return requests
+
+
+def request_ids(spec: GenerateSpec, batch: pa.RecordBatch, requests: list) -> list[str | None]:
+    """Each row's stable request id: the supplied column's value, or a content hash.
+
+    A derived id is a SHA-256 over what the row actually sends — the rendered prompt, its
+    per-row overrides and adapter, the bytes of its image — plus the `request_id_key`
+    values. It depends on nothing about the run (not the batch, the partition, the worker,
+    or the attempt), so a retried batch or a re-run of the job sends the same id for the
+    same row, and the id recorded in the output names the request that was sent. Two rows
+    that send identical requests share an id unless a key separates them, which is what an
+    idempotency key means.
+
+    Args:
+        spec: The generation spec; `request_id_column` must be set.
+        batch: The batch the requests were built from.
+        requests: The row requests, before any id is attached.
+
+    Returns:
+        One id per row; `None` where a supplied id column is null.
+    """
+    import hashlib
+    import json
+
+    column = spec.request_id_column
+    if column in batch.schema.names:
+        return [None if v is None else str(v) for v in batch.column(column).to_pylist()]
+    keys = [batch.column(k).to_pylist() for k in spec.request_id_key or ()]
+    images = _image_digests(batch, spec.image_column)
+    out: list[str | None] = []
+    for i, request in enumerate(requests):
+        content = {k: v for k, v in request.items() if k != "image"}
+        payload = json.dumps(
+            [[k[i] for k in keys], content, images[i] if images else None],
+            sort_keys=True,
+            default=str,
+        )
+        out.append("bt-" + hashlib.sha256(payload.encode()).hexdigest()[:32])
+    return out
+
+
+def _image_digests(batch: pa.RecordBatch, image_column: str | None) -> list[str | None] | None:
+    """A digest of each row's raw image cell, so a derived id changes when the image does."""
+    if image_column is None:
+        return None
+    import hashlib
+
+    from batcher.io.formats.ml.tensor import is_tensor_column
+
+    column = batch.column(image_column)
+    if is_tensor_column(column):
+        if hasattr(column, "combine_chunks"):
+            column = column.combine_chunks()
+        cells = [row.tobytes() for row in column.to_numpy_ndarray()]
+    else:
+        cells = column.to_pylist()
+    return [None if c is None else hashlib.sha256(bytes(c)).hexdigest() for c in cells]
 
 
 def _per_row_tags(spec: GenerateSpec, batch: pa.RecordBatch) -> dict[str, list]:

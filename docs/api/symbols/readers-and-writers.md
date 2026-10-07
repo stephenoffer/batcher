@@ -150,6 +150,7 @@ These submit a query or scan to an external system, and `table` reaches any regi
    Reader.sql
    Reader.snowflake
    Reader.bigquery
+   Reader.athena
    Reader.clickhouse
    Reader.mongo
    Reader.cassandra
@@ -157,7 +158,31 @@ These submit a query or scan to an external system, and `table` reaches any regi
    Reader.elasticsearch
    Reader.redis
    Reader.hbase
+   Reader.qdrant
+   Reader.pinecone
+   Reader.milvus
+   Reader.turbopuffer
    Reader.table
+```
+
+### HTTP APIs and SaaS
+
+These page through an HTTP API, a GraphQL endpoint, a SaaS service, or an Airbyte connector. See {doc}`/integrations/apis/index`.
+
+```{eval-rst}
+.. currentmodule:: batcher.api.io_namespace.reader
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   Reader.http_json
+   Reader.graphql
+   Reader.github
+   Reader.salesforce
+   Reader.google_sheets
+   Reader.sharepoint
+   Reader.airbyte
 ```
 
 ### Streams
@@ -256,12 +281,19 @@ These write rows into an external database, warehouse, or search index.
    Writer.sql
    Writer.clickhouse
    Writer.snowflake
+   Writer.bigquery
+   Writer.databricks
    Writer.mongo
    Writer.dynamodb
    Writer.cassandra
    Writer.redis
    Writer.elasticsearch
    Writer.hbase
+   Writer.qdrant
+   Writer.pinecone
+   Writer.milvus
+   Writer.turbopuffer
+   Writer.google_sheets
 ```
 
 ### Streaming sinks
@@ -276,6 +308,10 @@ These run each micro-batch of a streaming query into a topic, a callback, memory
    :nosignatures:
 
    Writer.kafka
+   Writer.pulsar
+   Writer.kinesis
+   Writer.pubsub
+   Writer.eventhubs
    Writer.for_each_batch
    Writer.for_each
    Writer.memory

@@ -51,7 +51,7 @@ class SourcePlacement:
     second failure of a relocated source recoverable.
     """
 
-    __slots__ = ("_hosts", "_on_host", "_workers")
+    __slots__ = ("_complete", "_hosts", "_on_host", "_workers")
 
     def __init__(self, workers: int, hosts: list[int] | None = None) -> None:
         self._workers = workers
@@ -70,6 +70,11 @@ class SourcePlacement:
         # form assumes never held. Recording every source up front keeps `host_of` and
         # `sources_on` exact without giving either one a second code path: the reverse
         # index is simply complete from the start rather than filled in by relocations.
+        #: Whether `hosts` named every source. Then the index is the whole truth, and the
+        #: identity fallback ("worker `w` holds source `w`") must not apply: with fewer
+        #: sources than workers it invents a source `w` that was never mapped, and a worker
+        #: holding nothing would have that phantom recomputed when it dies.
+        self._complete = hosts is not None
         if hosts is not None:
             for src, host in enumerate(hosts):
                 self._hosts[src] = host
@@ -92,8 +97,9 @@ class SourcePlacement:
             The source ids whose latest output is on `host`.
         """
         out = set(self._on_host.get(host, ()))
-        # `host` still holds its own source unless that one was itself relocated away.
-        if 0 <= host < self._workers and host not in self._hosts:
+        # `host` still holds its own source unless that one was itself relocated away, or
+        # the placement was given in full and so already says what `host` holds.
+        if not self._complete and 0 <= host < self._workers and host not in self._hosts:
             out.add(host)
         return out
 

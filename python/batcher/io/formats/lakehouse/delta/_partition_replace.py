@@ -25,7 +25,7 @@ from typing import Any
 
 from batcher.io.formats.lakehouse.delta._predicate import to_partition_filters
 
-__all__ = ["partition_removes", "to_partition_dnf"]
+__all__ = ["partition_removes", "partitions_outside", "to_partition_dnf"]
 
 Conjunct = list[tuple[str, str, str]]
 
@@ -98,6 +98,59 @@ def partition_removes(table: Any, dnf: list[Conjunct]) -> list[Any]:
             )
         )
     return removes
+
+
+def partitions_outside(ir: dict[str, Any], files: Any, schema: Any) -> list[dict[str, Any]]:
+    """The partition values of each written file a ``replace_where`` does not cover.
+
+    A partition-scoped overwrite retires only the partitions the predicate names, while the
+    commit adds *every* file the write produced. A file landing in some other partition is
+    therefore appended beside that partition's existing rows rather than replacing them:
+    backfilling ``region = 'us'`` with a stray ``eu`` row leaves ``eu`` holding both its old
+    row and the new one, and nothing reports it. Spark's Delta refuses such a write by
+    default, and so does this.
+
+    Decided from metadata alone: each file holds one partition, so its partition values are
+    the whole question, and they are evaluated with the predicate's own typed semantics
+    (one row per file) rather than restated as string comparisons. A NULL partition value
+    makes the predicate NULL, which is not a match, exactly as it is for a row.
+
+    Args:
+        ir: The ``replace_where`` predicate IR, already known to be partition-scoped.
+        files: The `WrittenFile`s the commit is about to add.
+        schema: The write's Arrow schema, which types the partition values.
+
+    Returns:
+        One ``{column: value}`` per out-of-scope file that holds rows; empty when all fit.
+    """
+    import pyarrow as pa
+
+    from batcher.io.predicate import to_pyarrow_expression
+
+    written = [f for f in files if f.rows]
+    if not written:
+        return []
+    columns = sorted({c for f in written for c in f.partition_values})
+    fields = [
+        schema.field(c) if schema is not None and c in schema.names else pa.field(c, pa.string())
+        for c in columns
+    ]
+    probe = pa.table(
+        {
+            **{
+                field.name: pa.array([f.partition_values.get(field.name) for f in written]).cast(
+                    field.type
+                )
+                for field in fields
+            },
+            "__file__": pa.array(range(len(written)), pa.int64()),
+        }
+    )
+    expression = to_pyarrow_expression(ir, probe.schema)
+    if expression is None:
+        raise ValueError("the replace_where predicate has no pyarrow form")
+    inside = set(probe.filter(expression).column("__file__").to_pylist())
+    return [dict(f.partition_values) for i, f in enumerate(written) if i not in inside]
 
 
 def _matches(values: dict[str, Any], conjunct: Conjunct) -> bool:

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from batcher.config.accelerator import validate_accelerator
 from batcher.config.config import VERBOSITY_LEVELS
 from batcher.config.fault_tolerance import validate_fault_tolerance
+from batcher.config.serde import check_no_redacted_secrets
 from batcher.config.validation.check import check as _check
 from batcher.config.validation.distributed import check_distributed
 
@@ -54,6 +55,7 @@ def run_checks(cfg: Config) -> None:
     _check_governance(cfg.governance)
     _check_observability(cfg.observability)
     _check_tenant(cfg.tenant)
+    check_no_redacted_secrets(cfg)
 
 
 def _check_memory(m: MemoryConfig) -> None:
@@ -137,6 +139,12 @@ def _check_execution(e: ExecutionConfig) -> None:
     _check(
         e.skew_bucket_factor >= 1,
         f"execution.skew_bucket_factor must be >= 1, got {e.skew_bucket_factor}",
+    )
+    _check(
+        e.query_timeout_s is None
+        or (not isinstance(e.query_timeout_s, bool) and e.query_timeout_s > 0),
+        "execution.query_timeout_s must be None (no limit) or a positive number of seconds, "
+        f"got {e.query_timeout_s!r}",
     )
     _check(
         e.skew_min_bucket_rows >= 0 and e.skew_min_bucket_bytes >= 0,
@@ -349,6 +357,10 @@ def _check_observability(ob: ObservabilityConfig) -> None:
     _check(
         ob.log_format in {"human", "json"},
         f"observability.log_format must be 'human' or 'json', got {ob.log_format!r}",
+    )
+    _check(
+        isinstance(ob.query_label, str),
+        f"observability.query_label must be a string, got {type(ob.query_label).__name__}",
     )
     _check(
         ob.log_file_max_bytes > 0 and ob.log_file_backups >= 0,

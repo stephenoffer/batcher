@@ -57,6 +57,8 @@ __all__ = [
     "QueryCancelledError",
     "ResourceError",
     "RetryableShuffleError",
+    "SQLSyntaxError",
+    "SQLUnsupportedError",
     "SchemaError",
     "SecurityWarning",
     "TransportError",
@@ -258,6 +260,78 @@ class ColumnNotFoundError(PlanError, KeyError):
             available_label="Available columns",
             hint=hint,
         )
+
+
+class _SQLError(PlanError):
+    """A SQL plan-time failure that knows where in the query text it applies."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        line: int | None = None,
+        column: int | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        **kwargs: object,
+    ) -> None:
+        """Build a SQL error carrying where in the query it applies.
+
+        Args:
+            message: What failed.
+            line: The 1-based line of the offending text, or None when unknown.
+            column: The 1-based column of the offending text, or None when unknown.
+            start: The 0-based offset of the first offending character, or None.
+            end: The 0-based offset of the last offending character, or None.
+            **kwargs: The `BatcherError` fields (`suggestion`, `available`, `hint`, ...).
+        """
+        super().__init__(message, **kwargs)  # type: ignore[arg-type]
+        self.line = line
+        self.column = column
+        self.start = start
+        self.end = end
+
+
+class SQLSyntaxError(_SQLError):
+    """A SQL string that does not parse in the session's dialect.
+
+    Raised by `bt.sql`, `Session.sql` and `ds.sql` in place of the SQL parser's own
+    exception, so a typo is caught as a `PlanError` like every other plan-time failure.
+    `line` and `column` are 1-based and `start`/`end` are 0-based character offsets into
+    the query, each None when the parser could not say where it stopped.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> try:
+            ...     bt.sql("SELECT a FROM t WHERE")
+            ... except bt.SQLSyntaxError as err:
+            ...     print(err.line, isinstance(err, bt.PlanError))
+            1 True
+    """
+
+
+class SQLUnsupportedError(_SQLError, NotImplementedError):
+    """Valid SQL that uses a construct, function or argument Batcher does not translate.
+
+    The message names the construct and, where one exists, the rewrite that works. It is a
+    `PlanError` and also a `NotImplementedError`, the type these refusals had before it
+    existed, so ``except NotImplementedError`` keeps working. It carries the same
+    `line`/`column`/`start`/`end` fields as `SQLSyntaxError`, filled from the expression
+    that was being translated when Batcher refused it, and None when no position is known.
+
+    Examples:
+        .. doctest::
+
+            >>> import batcher as bt
+            >>> t = bt.from_pydict({"x": [1]})
+            >>> try:
+            ...     bt.sql("SELECT no_such_fn(x) FROM t", t=t)
+            ... except bt.SQLUnsupportedError as err:
+            ...     print(err.line, err.column, isinstance(err, NotImplementedError))
+            1 8 True
+    """
 
 
 class ConfigError(BatcherError, ValueError):
@@ -495,8 +569,9 @@ class SchemaError(IOError):
 class DataQualityError(BatcherError, ValueError):
     """A data-quality expectation failed.
 
-    Raised by ``ds.dq...fail()`` when one or more constraints have violating rows.
-    Carries the per-constraint violation counts.
+    Raised by ``ds.dq...fail()`` when one or more constraints have violating rows, and by
+    ``join(validate=...)`` / ``update(validate=...)`` when a side that must be unique repeats
+    a key. Carries the per-constraint violation counts.
 
     Examples:
         .. doctest::

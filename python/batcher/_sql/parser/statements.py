@@ -21,10 +21,21 @@ import pyarrow as pa
 from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
+from batcher._internal.sql_errors import parse_sql
 from batcher.api.dataset import Dataset
 from batcher.api.session import from_arrow
 
-__all__ = ["describing_statement", "information_schema_table"]
+__all__ = [
+    "SESSION_CATALOG",
+    "SESSION_SCHEMA",
+    "describing_statement",
+    "information_schema_table",
+    "information_schema_view",
+    "refuse_unserved",
+    "schemata_relation",
+    "tables_relation",
+    "views_relation",
+]
 
 
 def _as_dataset(t: pa.Table) -> Dataset:
@@ -122,15 +133,19 @@ def _describe(tr, node) -> Dataset:
 
 
 def _explain(tr, node) -> Dataset:
-    """Translate an ``EXPLAIN [ANALYZE] <query>`` command into a plan relation."""
-    import sqlglot
+    """Translate an ``EXPLAIN [ANALYZE] <query>`` command into a plan relation.
 
+    Reached only through the stateless translator: a `Session` serves ``EXPLAIN`` itself
+    (`api.sql_session.statements.explain`), in its own dialect. The translator holds no
+    dialect, so the inner text is read as DuckDB, the translator's default; a syntax error
+    in it is a `PlanError`, as it is everywhere else.
+    """
     text = node.args["expression"].this if node.args.get("expression") else ""
     analyze = False
     stripped = text.lstrip()
     if stripped[:8].upper() == "ANALYZE ":
         analyze, text = True, stripped[8:]
-    inner = sqlglot.parse_one(text, read="duckdb")
+    inner = parse_sql(text, dialect="duckdb")
     plan = tr.statement(inner).explain(analyze=analyze)
     return _as_dataset(pa.table({"explain_key": ["plan"], "explain_value": [plan]}))
 
@@ -143,9 +158,115 @@ def _explain(tr, node) -> Dataset:
 #: would be inventing a shape rather than reporting one. These are the columns a reflection
 #: actually selects -- SQLAlchemy reads `table_name`, `column_name`, `data_type`,
 #: `is_nullable`, `column_default` and `ordinal_position` -- so the subset is chosen by what
-#: reads it, and `docs/api/relational/sql.md` says which columns exist.
-_CATALOG = "batcher"
-_SCHEMA = "main"
+#: reads it, and `docs/api/relational/sql-statements.md` says which columns exist.
+#:
+#: Session tables and views are reported under this catalog and schema. They are not in any
+#: attached catalog -- a session name lives as long as the session -- so they get a
+#: namespace of their own, which `schemata` lists alongside the attached catalogs'.
+SESSION_CATALOG = "batcher"
+SESSION_SCHEMA = "main"
+
+#: The `information_schema` views served, for the refusal that names them.
+SERVED_VIEWS = ("tables", "columns", "views", "schemata")
+
+# Registry entries that are plumbing rather than names a user bound: the per-call bindings
+# `catalog_sql.bind` gives catalog tables and catalog listings.
+_INTERNAL_PREFIX = "__catalog_"
+
+
+def information_schema_view(node) -> str | None:
+    """The lower-cased view name ``information_schema.<view>`` names, or None.
+
+    Args:
+        node: A sqlglot node.
+
+    Returns:
+        The view name, or None when `node` is not an `information_schema` table reference.
+    """
+    if not isinstance(node, exp.Table):
+        return None
+    db = node.args.get("db") or node.args.get("catalog")
+    if db is None or str(getattr(db, "name", db)).lower() != "information_schema":
+        return None
+    return node.name.lower()
+
+
+def tables_relation(entries: list[tuple[str, str]]) -> Dataset:
+    """``information_schema.tables`` over ``(table_name, table_type)`` pairs.
+
+    Args:
+        entries: Each session name and its type, ``BASE TABLE`` or ``VIEW``.
+
+    Returns:
+        The relation, one row per entry.
+    """
+    n = len(entries)
+    return _as_dataset(
+        pa.table(
+            {
+                "table_catalog": pa.array([SESSION_CATALOG] * n, pa.string()),
+                "table_schema": pa.array([SESSION_SCHEMA] * n, pa.string()),
+                "table_name": pa.array([e[0] for e in entries], pa.string()),
+                "table_type": pa.array([e[1] for e in entries], pa.string()),
+            }
+        )
+    )
+
+
+def views_relation(entries: list[tuple[str, str]]) -> Dataset:
+    """``information_schema.views`` over ``(table_name, view_definition)`` pairs.
+
+    Args:
+        entries: Each session view and the SQL text it stores.
+
+    Returns:
+        The relation, one row per view.
+    """
+    n = len(entries)
+    return _as_dataset(
+        pa.table(
+            {
+                "table_catalog": pa.array([SESSION_CATALOG] * n, pa.string()),
+                "table_schema": pa.array([SESSION_SCHEMA] * n, pa.string()),
+                "table_name": pa.array([e[0] for e in entries], pa.string()),
+                "view_definition": pa.array([e[1] for e in entries], pa.string()),
+            }
+        )
+    )
+
+
+def schemata_relation(entries: list[tuple[str, str]]) -> Dataset:
+    """``information_schema.schemata`` over ``(catalog_name, schema_name)`` pairs.
+
+    Args:
+        entries: Each namespace, the session's own first.
+
+    Returns:
+        The relation, one row per namespace.
+    """
+    return _as_dataset(
+        pa.table(
+            {
+                "catalog_name": pa.array([e[0] for e in entries], pa.string()),
+                "schema_name": pa.array([e[1] for e in entries], pa.string()),
+            }
+        )
+    )
+
+
+def refuse_unserved(view: str) -> PlanError:
+    """The error for an `information_schema` view this engine does not serve.
+
+    Args:
+        view: The view name.
+
+    Returns:
+        The error to raise.
+    """
+    return PlanError(
+        f"information_schema.{view} is not served; {', '.join(SERVED_VIEWS)} are.",
+        hint="SHOW TABLES, SHOW SCHEMAS and DESCRIBE <table> answer the same questions.",
+    )
 
 
 def information_schema_table(tr, node) -> Dataset | None:
@@ -155,6 +276,12 @@ def information_schema_table(tr, node) -> Dataset | None:
     SQLAlchemy reflection and several BI tools use instead of either. It reads the same
     registry, so the three cannot disagree about what exists.
 
+    A `Session` answers ``tables``, ``views`` and ``schemata`` before the translator runs
+    (`api.sql_session.catalog_sql.bind`), because only it knows which names are views and
+    which namespaces exist. What reaches here is ``columns``, which needs every relation's
+    schema and so reads the registry the session built, and every view on the stateless
+    path, which has no views and no catalogs to report.
+
     Args:
         tr: The translator, for its table registry.
         node: The table reference to inspect.
@@ -162,30 +289,22 @@ def information_schema_table(tr, node) -> Dataset | None:
     Returns:
         The relation, or None when `node` does not name an `information_schema` view.
     """
-    if not isinstance(node, exp.Table):
+    view = information_schema_view(node)
+    if view is None:
         return None
-    db = node.args.get("db") or node.args.get("catalog")
-    if db is None or str(getattr(db, "name", db)).lower() != "information_schema":
-        return None
-    view = node.name.lower()
+    names = [n for n in tr._registry if not n.startswith(_INTERNAL_PREFIX)]
     if view == "tables":
-        names = list(tr._registry)
-        return _as_dataset(
-            pa.table(
-                {
-                    "table_catalog": pa.array([_CATALOG] * len(names), pa.string()),
-                    "table_schema": pa.array([_SCHEMA] * len(names), pa.string()),
-                    "table_name": pa.array(names, pa.string()),
-                    "table_type": pa.array(["BASE TABLE"] * len(names), pa.string()),
-                }
-            )
-        )
+        return tables_relation([(n, "BASE TABLE") for n in names])
+    if view == "views":
+        return views_relation([])
+    if view == "schemata":
+        return schemata_relation([(SESSION_CATALOG, SESSION_SCHEMA)])
     if view == "columns":
         cat, sch, tbl, col, pos, default, nullable, dtype = [], [], [], [], [], [], [], []
-        for name, ds in tr._registry.items():
-            for i, field in enumerate(ds.schema, start=1):
-                cat.append(_CATALOG)
-                sch.append(_SCHEMA)
+        for name in names:
+            for i, field in enumerate(tr._registry[name].schema, start=1):
+                cat.append(SESSION_CATALOG)
+                sch.append(SESSION_SCHEMA)
                 tbl.append(name)
                 col.append(field.name)
                 pos.append(i)
@@ -206,7 +325,4 @@ def information_schema_table(tr, node) -> Dataset | None:
                 }
             )
         )
-    raise PlanError(
-        f"information_schema.{view} is not served; `tables` and `columns` are.",
-        hint="SHOW TABLES and DESCRIBE <table> answer the same questions.",
-    )
+    raise refuse_unserved(view)

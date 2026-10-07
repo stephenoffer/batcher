@@ -96,6 +96,15 @@ print(trimmed.startswith("START"), trimmed.endswith("END"))
 # True True
 ```
 
+A row that still overflows reaches the engine, and {py:func}`vllm_engine <batcher.ml.vllm_engine>` applies its `truncation` policy with the worker's own tokenizer. `truncation="head"`, the default, keeps the first tokens and warns with the number of rows it cut. `"tail"` keeps the last tokens, for a long document followed by the question. `"error"` cuts nothing and raises `DataQualityError` naming how many prompts didn't fit, so no input is ever shortened without a visible policy. When no tokenizer is reachable the engine measures nothing, so neither the cut nor the `"error"` check happens.
+
+```python
+# docs: skip
+from batcher.ml import vllm_engine
+
+engine = vllm_engine("meta-llama/Llama-3-8B-Instruct", chat=True, truncation="error")
+```
+
 ## Rows with no prompt
 
 A null in `prompt_column` renders as empty text and is sent to the engine like any other row.

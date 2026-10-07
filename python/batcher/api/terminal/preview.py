@@ -20,41 +20,54 @@ from __future__ import annotations
 
 import pyarrow as pa
 
-__all__ = ["render"]
+__all__ = ["MAX_CELL", "MAX_WIDTH", "render"]
 
-#: Longest cell rendered in full. Past this the value is cut and marked, because one long
-#: JSON blob or base64 string otherwise sets the width of every row on screen.
-_MAX_CELL = 32
-#: Total table width to aim for. Columns past it are dropped and counted, rather than
-#: wrapping — a wrapped table is unreadable in exactly the terminal that made it wrap.
-_MAX_WIDTH = 120
+#: Longest cell rendered in full by default. Past this the value is cut and marked, because
+#: one long JSON blob or base64 string otherwise sets the width of every row on screen.
+MAX_CELL = 32
+#: Total table width to aim for by default. Columns past it are dropped and counted, rather
+#: than wrapping — a wrapped table is unreadable in exactly the terminal that made it wrap.
+MAX_WIDTH = 120
 _ELLIPSIS = "..."
 
 
-def render(table: pa.Table, *, limit: int) -> str:
+def render(
+    table: pa.Table, *, limit: int, max_width: int = MAX_WIDTH, max_cell_width: int = MAX_CELL
+) -> str:
     """The preview text for `table`, header and all.
 
     Args:
-        table: The already-limited result to show.
-        limit: The row cap `show()` was called with, so the footer can say whether the
-            preview is the whole result or the front of it.
+        table: The result, fetched with **one row more than** `limit` when there is one,
+            so the footer can tell a result of exactly `limit` rows from a longer one.
+        limit: The row cap `show()` was called with. At most this many rows are printed.
+        max_width: Total width to fit the table in; columns past it are dropped and
+            counted. At least one column is always shown.
+        max_cell_width: Longest value printed in full; a longer one is cut and marked.
 
     Returns:
         The rendered table as a single string, without a trailing newline.
     """
     if table.num_columns == 0:
-        return f"(no columns, {table.num_rows} rows)"
+        return f"(no columns, {min(table.num_rows, limit)} rows)"
+    truncated = table.num_rows > limit
+    table = table.slice(0, limit)
+    cell = max(max_cell_width, len(_ELLIPSIS) + 1)
     names = list(table.column_names)
-    types = [_type_name(table.schema.field(n).type) for n in names]
-    rows = [[_cell(v) for v in row] for row in _row_values(table)]
-    kept, dropped = _fit(names, types, rows)
+    types = [_type_name(table.schema.field(n).type, cell) for n in names]
+    rows = [[_cell(v, cell) for v in row] for row in _row_values(table)]
+    kept, dropped = _fit(names, types, rows, max_width)
     widths = _widths(kept, names, types, rows)
     lines = [_rule(widths), _row(names, kept, widths), _row(types, kept, widths), _rule(widths)]
     if rows:
         lines.extend(_row(r, kept, widths) for r in rows)
         lines.append(_rule(widths))
-    lines.append(_footer(table, limit, dropped))
+    lines.append(_footer(table, truncated, dropped))
     return "\n".join(lines)
+
+
+def _clip(text: str, width: int) -> str:
+    """`text` cut to `width` characters with a trailing ellipsis when it is longer."""
+    return text if len(text) <= width else text[: width - len(_ELLIPSIS)] + _ELLIPSIS
 
 
 def _row_values(table: pa.Table) -> list[list[object]]:
@@ -63,7 +76,7 @@ def _row_values(table: pa.Table) -> list[list[object]]:
     return [[column[i] for column in columns] for i in range(table.num_rows)]
 
 
-def _type_name(dtype: pa.DataType) -> str:
+def _type_name(dtype: pa.DataType, width: int) -> str:
     """A short name for `dtype` — the family, not the full parameterisation.
 
     A `struct<data: binary, shape: list<item: int32>, dtype: string>` is 56 characters of
@@ -74,10 +87,10 @@ def _type_name(dtype: pa.DataType) -> str:
     for prefix in ("struct", "list", "large_list", "fixed_size_list", "map", "extension"):
         if text.startswith(prefix):
             return prefix
-    return text if len(text) <= _MAX_CELL else text[: _MAX_CELL - len(_ELLIPSIS)] + _ELLIPSIS
+    return _clip(text, width)
 
 
-def _cell(value: object) -> str:
+def _cell(value: object, width: int) -> str:
     """One value as display text.
 
     `None` prints as ``null`` rather than as Python's ``None``: the column is nullable in
@@ -92,10 +105,7 @@ def _cell(value: object) -> str:
     tensor = _tensor_cell(value)
     if tensor is not None:
         return tensor
-    text = str(value)
-    if len(text) > _MAX_CELL:
-        return text[: _MAX_CELL - len(_ELLIPSIS)] + _ELLIPSIS
-    return text
+    return _clip(str(value), width)
 
 
 def _tensor_cell(value: object) -> str | None:
@@ -139,8 +149,10 @@ def _widths(kept: int, names: list[str], types: list[str], rows: list[list[str]]
     ]
 
 
-def _fit(names: list[str], types: list[str], rows: list[list[str]]) -> tuple[int, int]:
-    """How many leading columns fit in `_MAX_WIDTH`, and how many are dropped.
+def _fit(
+    names: list[str], types: list[str], rows: list[list[str]], max_width: int
+) -> tuple[int, int]:
+    """How many leading columns fit in `max_width`, and how many are dropped.
 
     At least one column is always kept, so a single very wide column still prints something
     rather than an empty frame.
@@ -149,7 +161,7 @@ def _fit(names: list[str], types: list[str], rows: list[list[str]]) -> tuple[int
     for index in range(len(names)):
         cells = [len(names[index]), len(types[index]), *(len(r[index]) for r in rows)]
         total += max(cells) + 3
-        if total > _MAX_WIDTH and index > 0:
+        if total > max_width and index > 0:
             return index, len(names) - index
     return len(names), 0
 
@@ -162,18 +174,18 @@ def _row(cells: list[str], kept: int, widths: list[int]) -> str:
     return "| " + " | ".join(cells[i].ljust(widths[i]) for i in range(kept)) + " |"
 
 
-def _footer(table: pa.Table, limit: int, dropped: int) -> str:
+def _footer(table: pa.Table, truncated: bool, dropped: int) -> str:
     """The line under the table: what was shown, and what was left out.
 
-    It says "first N rows" only when the preview actually filled its limit, because a
-    preview that did not is the whole result and saying otherwise invites a second look for
-    rows that are not there. The total row count is deliberately not printed: `show()` pushes
-    its limit into the plan precisely so a billion-row source is never counted to preview ten
-    rows of it.
+    It says "first N rows" only when the result had *more* rows than were shown, which
+    `show()` learns by fetching one row past its limit. Comparing the row count with the
+    limit instead labelled a result of exactly `limit` rows "first N rows", sending the
+    reader looking for rows that are not there. The total row count is deliberately not
+    printed: `show()` pushes its limit into the plan precisely so a billion-row source is
+    never counted to preview ten rows of it.
     """
-    rows = table.num_rows
-    shown = _count(rows, "row")
-    if rows >= limit:
+    shown = _count(table.num_rows, "row")
+    if truncated:
         shown = f"first {shown}"
     columns = _count(table.num_columns, "column")
     if dropped:

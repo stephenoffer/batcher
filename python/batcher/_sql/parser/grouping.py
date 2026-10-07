@@ -10,7 +10,7 @@ from __future__ import annotations
 from sqlglot import expressions as exp
 
 from batcher._internal.errors import PlanError
-from batcher._sql.parser.agg_rewrites import rewrite_distinct_aggs
+from batcher._sql.parser.agg_rewrites import rewrite_distinct_aggs, split_filter
 from batcher._sql.parser.core_utils import (
     _alias_of,
     _has_aggregate,
@@ -22,12 +22,15 @@ from batcher._sql.parser.expressions.aggregates import (
     build_anon_agg,
     build_typed_agg,
     distinct_input,
+    distinct_list_agg,
+    distinct_operand,
     is_agg_node,
     iter_agg_nodes,
 )
 from batcher.api.dataset import Dataset
 from batcher.plan.expr_ir import AggExpr, Expr, col
 from batcher.plan.expr_ir.selectors import expand_selectors, has_selector
+from batcher.plan.functions.aggregate_semantics import filter_aggregate_leaves
 
 
 def _expand_star(
@@ -425,6 +428,25 @@ def _register_agg(tr, node, preferred: str | None, used: set) -> None:
 
 
 def _agg(tr, node) -> AggExpr | Expr:
+    """The aggregate `node` denotes, with any carried `FILTER (WHERE ...)` applied.
+
+    The filter is lowered by `filter_aggregate`, the one implementation `AggExpr.filter`
+    shares. A DISTINCT argument recorded while building is masked by the same predicate
+    and keyed apart from the unfiltered form, so the dedup sees only the matching rows.
+    """
+    node, condition = split_filter(node)
+    if condition is None:
+        return _agg_unfiltered(tr, node)
+    before = len(tr._agg_pending_distinct)
+    built = _agg_unfiltered(tr, node)
+    predicate = tr._scalar(condition)
+    if len(tr._agg_pending_distinct) > before:
+        key, value = tr._agg_pending_distinct[-1]
+        tr._agg_pending_distinct[-1] = (f"{key} FILTER ({condition.sql()})", value, predicate)
+    return filter_aggregate_leaves(built, predicate)
+
+
+def _agg_unfiltered(tr, node) -> AggExpr | Expr:
     if isinstance(node, exp.Anonymous):
         # A DuckDB aggregate sqlglot does not model (`product`, `sem`, `count_star`, …).
         return build_anon_agg(tr, node)
@@ -442,8 +464,11 @@ def _agg(tr, node) -> AggExpr | Expr:
         if isinstance(arg, exp.Distinct):
             exprs = arg.expressions
             if len(exprs) != 1:
-                raise NotImplementedError("COUNT(DISTINCT ...) supports exactly one expression")
-            return AggExpr("count_distinct", tr._scalar(exprs[0]))
+                raise NotImplementedError(
+                    "COUNT(DISTINCT a, b) is not supported (DuckDB rejects it too); count "
+                    "distinct rows with the tuple form COUNT(DISTINCT (a, b))"
+                )
+            return AggExpr("count_distinct", distinct_operand(tr, exprs[0]))
         return AggExpr("count", tr._scalar(arg))
     # percentile_cont(x, p) / quantile_cont(x, p) → a parameterized quantile.
     if fname in ("percentilecont", "quantilecont"):
@@ -458,14 +483,11 @@ def _agg(tr, node) -> AggExpr | Expr:
     # array_agg(x) and string_agg(x, sep) both collect into a list; the separator
     # join for string_agg happens in the projection (see scalar._scalar).
     if fname in ("arrayagg", "groupconcat"):
-        if isinstance(node.this, exp.Distinct):
-            # The engine's list aggregate has no per-group dedup flag; reject cleanly
-            # rather than letting the bare `Distinct` node crash the scalar translator.
-            raise NotImplementedError(
-                "array_agg(DISTINCT x) / string_agg(DISTINCT x) is not supported; "
-                "pre-aggregate the distinct values in a subquery"
-            )
         arg = node.this
+        if isinstance(arg, exp.Distinct) or (
+            isinstance(arg, exp.Order) and isinstance(arg.this, exp.Distinct)
+        ):
+            return distinct_list_agg(tr, arg)
         if isinstance(arg, exp.Order):
             # `array_agg(x ORDER BY y)` / `string_agg(x, sep ORDER BY y)`: the order rides the
             # aggregate itself, so each ordered aggregate keeps its own keys and the order

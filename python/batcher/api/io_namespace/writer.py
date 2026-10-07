@@ -9,7 +9,7 @@ merge helpers; sink implementations live in `io/formats/` and register into the
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 from batcher.api.io_namespace._discovery import (
     PathLike,
@@ -34,6 +34,7 @@ from batcher.api.io_namespace._write_opts import (
 )
 from batcher.api.security._write import authorize_write, required_privileges
 from batcher.api.session import read as _read
+from batcher.config.option_types import OutputModeName, TableWriteMode
 from batcher.io.formats.sql.routing import write_backend
 from batcher.io.sink import check_write_options
 
@@ -157,6 +158,34 @@ def _check_overwrite_partitions(fmt: str, partition_by: list[str] | None) -> Non
             "write(mode='overwrite_partitions') replaces only the partitions the "
             "incoming data covers, so it needs partition_by=[...] to know what a "
             "partition is. Without partitioning, that is a plain mode='overwrite'."
+        )
+
+
+#: Sinks that take `resume` for the shared `FileSink.write` signature but cannot honor
+#: it. Each is one atomic commit, so a crash before the commit leaves nothing to resume
+#: and a re-run is a second commit: `resume=True` used to be accepted and ignored here, and
+#: re-running an append wrote every row twice.
+_UNRESUMABLE_SINKS = frozenset({"delta", "iceberg", "hudi"})
+
+
+def _reject_unresumable(fmt: str, resume: bool) -> None:
+    """Refuse `resume=True` on a sink with no resume contract, before anything is written.
+
+    Args:
+        fmt: The sink format this write resolved to.
+        resume: Whether the caller asked for a resumable write.
+
+    Raises:
+        PlanError: When `resume` is set on a transactional table sink.
+    """
+    if resume and fmt in _UNRESUMABLE_SINKS:
+        from batcher._internal.errors import PlanError
+
+        raise PlanError(
+            f"write(resume=True) is not supported for {fmt!r}: the write is a single atomic "
+            "commit, so a crash before it commits leaves nothing to resume, and re-running "
+            "an append with resume would commit every row a second time. Drop resume=True; "
+            "re-run the whole write after a failure (an uncommitted write left no rows)."
         )
 
 
@@ -330,6 +359,52 @@ class Writer:
         """
         raise unknown_attribute(self, "ds.write", name)
 
+    @overload
+    def __call__(
+        self,
+        path: PathLike,
+        format: str | None = None,
+        *,
+        mode: str = "overwrite",
+        partition_by: list[str | Any] | None = None,
+        single_file: bool = False,
+        distributed: bool | str = "auto",
+        num_workers: int | None = None,
+        resume: bool = False,
+        max_rows_per_file: int | None = None,
+        sort_by: str | list[str] | None = None,
+        replace_where: Any = None,
+        trigger: Trigger,
+        output_mode: OutputModeName = "append",
+        checkpoint: str | None = None,
+        query_name: str | None = None,
+        auto_compact: bool = False,
+        **opts: Any,
+    ) -> StreamingQuery: ...
+
+    @overload
+    def __call__(
+        self,
+        path: PathLike,
+        format: str | None = None,
+        *,
+        mode: str = "overwrite",
+        partition_by: list[str | Any] | None = None,
+        single_file: bool = False,
+        distributed: bool | str = "auto",
+        num_workers: int | None = None,
+        resume: bool = False,
+        max_rows_per_file: int | None = None,
+        sort_by: str | list[str] | None = None,
+        replace_where: Any = None,
+        trigger: None = None,
+        output_mode: OutputModeName = "append",
+        checkpoint: str | None = None,
+        query_name: str | None = None,
+        auto_compact: bool = False,
+        **opts: Any,
+    ) -> WriteManifest: ...
+
     def __call__(
         self,
         path: PathLike,
@@ -345,7 +420,7 @@ class Writer:
         sort_by: str | list[str] | None = None,
         replace_where: Any = None,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         checkpoint: str | None = None,
         query_name: str | None = None,
         auto_compact: bool = False,
@@ -370,7 +445,7 @@ class Writer:
         * ``"error"`` — raise `PlanError` if `path` already exists.
         * ``"ignore"`` — skip the write (return an empty manifest) if `path` exists.
         * ``"append"`` — add to an existing table; only the sinks that can add to one
-          (`delta`/`iceberg`/`hudi`/`snowflake`) support it. A file sink raises, because
+          (`delta`/`iceberg`/`snowflake`) support it. A file sink raises, because
           it has nothing to append to.
 
         Spark's own ``"errorIfExists"`` and Python's file modes (``"w"``, ``"a"``,
@@ -408,7 +483,9 @@ class Writer:
         ``resume=True`` makes the write idempotent: output files already present
         (necessarily fully committed, since writes are atomic) are skipped, so a job
         re-run after a crash or spot preemption finishes only the unwritten shards —
-        the resumability Ray Data lacks without external bookkeeping.
+        the resumability Ray Data lacks without external bookkeeping. It applies to the
+        file sinks only: a `delta`/`iceberg` write is one atomic commit with nothing to
+        resume, so ``resume=True`` there raises `PlanError` rather than commit twice.
 
         **Correctness precondition (important):** resume identifies done work by file
         *position* (``part-NNNNN``), so it is exactly-once **only when the plan is
@@ -481,6 +558,7 @@ class Writer:
         # cannot take is a typo, and saying so here costs nothing where letting it reach a
         # Ray worker's constructor costs a provisioned cluster to say the same thing worse.
         check_write_options(fmt, opts)
+        _reject_unresumable(fmt, resume)
         if single_file:
             self._check_single_file(partition_by, max_rows_per_file, path, fmt)
             distributed = False
@@ -617,7 +695,11 @@ class Writer:
                 opts["replace_where"] = replace_where.to_ir()
                 mode = "overwrite"
             elif resolve_filesystem(path).exists(path):
-                kept = _read(path, format=fmt).filter(~replace_where)
+                # Keep every row the predicate does not make TRUE, which is not the same as
+                # `~replace_where`: on a row where the predicate is NULL (a NULL partition
+                # value under `col("r") == "us"`) the negation is NULL too, the filter drops
+                # it, and the backfill deletes a row it never claimed to replace.
+                kept = _read(path, format=fmt).filter(~replace_where.fill_null(False))
                 # `union` is positional, and a partitioned read hands its partition columns
                 # back *last* (they come from the directory names, not the files), so the
                 # kept rows and the incoming ones agree on names and disagree on order.
@@ -801,7 +883,7 @@ class Writer:
         self,
         sink: Any,
         trigger: Trigger | None,
-        output_mode: str,
+        output_mode: OutputModeName,
         query_name: str | None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -827,7 +909,7 @@ class Writer:
         checkpoint: str | None,
         num_workers: int | None,
         query_name: str | None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
     ) -> StreamingQuery | None:
         """Run a `distributed=True` streaming write across the cluster, if eligible.
 
@@ -961,7 +1043,7 @@ class Writer:
         self,
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         num_rows: int = 20,
         truncate: bool | int = True,
         query_name: str | None = None,
@@ -1007,7 +1089,7 @@ class Writer:
         name: str,
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -1065,7 +1147,7 @@ class Writer:
         fn: Callable[[pa.Table, int], Any],
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -1104,7 +1186,7 @@ class Writer:
         self,
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -1149,7 +1231,7 @@ class Writer:
         *,
         bootstrap_servers: str = "localhost:9092",
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
         **options: Any,
@@ -1200,12 +1282,217 @@ class Writer:
             checkpoint,
         )
 
+    def pulsar(
+        self,
+        topic: str | None = None,
+        *,
+        service_url: str = "pulsar://localhost:6650",
+        producer_name: str | None = None,
+        trigger: Trigger | None = None,
+        output_mode: OutputModeName = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to an Apache Pulsar topic.
+
+        The write side of `bt.read.pulsar`, on the column contract `write.kafka` uses: a
+        ``value`` column is required, and ``key`` (the partition key), ``topic`` and
+        ``headers`` (message properties) are optional. Each micro-batch is flushed and every
+        send acknowledged before it is reported written, so delivery is at-least-once. With
+        `producer_name` set, sequence ids are derived from the micro-batch, so a namespace
+        with Pulsar's broker-side deduplication enabled drops a replayed epoch's records.
+        Not yet verified against a live Pulsar; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            topic: Destination topic for rows with no ``topic`` column.
+            service_url: The Pulsar service URL.
+            producer_name: A stable producer name, enabling broker-side deduplication.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: ``auth_token=`` (a token or secret reference), ``flush_timeout=``,
+                ``dedup_ids=`` (a writer name stamped as a ``batcher-dedup-id`` property),
+                the ``value_format=`` codec family, and further ``create_producer``
+                arguments.
+
+        Returns:
+            A `StreamingQuery` handle for the running Pulsar write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.pulsar("raw", stream=True)  # doctest: +SKIP
+                >>> query = events.select(  # doctest: +SKIP
+                ...     value=bt.col("value"), key=bt.col("key")
+                ... ).write.pulsar("clean", service_url="pulsar://broker:6650")
+        """
+        from batcher.io.formats.streaming.broker_sinks import PulsarStreamSink
+
+        sink = PulsarStreamSink(
+            topic=topic, service_url=service_url, producer_name=producer_name, **options
+        )
+        return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
+    def kinesis(
+        self,
+        topic: str | None = None,
+        *,
+        region: str = "us-east-1",
+        ordered: bool = False,
+        trigger: Trigger | None = None,
+        output_mode: OutputModeName = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to an Amazon Kinesis data stream.
+
+        The write side of `bt.read.kinesis`: ``value`` is the record data, ``key`` the
+        partition key, and ``topic`` an optional per-row stream name. Records go out through
+        ``PutRecords`` (500 records or 5 MiB per call), resending only the records a response
+        reports as failed. ``PutRecords`` does not guarantee order, so pass
+        ``ordered=True`` for per-partition-key order through ``PutRecord`` and
+        ``SequenceNumberForOrdering``, at one request per record. Kinesis has no producer
+        deduplication, so a replayed epoch republishes.
+        Not yet verified against a live Kinesis; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            topic: The stream name for rows with no ``topic`` column.
+            region: The AWS region.
+            ordered: Keep per-partition-key order, one ``PutRecord`` per record.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: ``max_attempts=``, ``flush_timeout=``, the ``value_format=`` codec
+                family, ``endpoint_url=`` and AWS credentials (secret references accepted).
+
+        Returns:
+            A `StreamingQuery` handle for the running Kinesis write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.kinesis("raw", stream=True)  # doctest: +SKIP
+                >>> query = events.select(  # doctest: +SKIP
+                ...     value=bt.col("value"), key=bt.col("key")
+                ... ).write.kinesis("clean", region="eu-west-1")
+        """
+        from batcher.io.formats.streaming.broker_sinks import KinesisStreamSink
+
+        sink = KinesisStreamSink(topic=topic, region=region, ordered=ordered, **options)
+        return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
+    def pubsub(
+        self,
+        topic: str | None = None,
+        *,
+        ordered: bool = False,
+        trigger: Trigger | None = None,
+        output_mode: OutputModeName = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to a Google Cloud Pub/Sub topic.
+
+        The write side of `bt.read.pubsub`: ``value`` is the message data, ``headers``
+        become attributes, and ``topic`` is an optional per-row topic path. Every publish
+        future is awaited before the micro-batch is reported written. Pub/Sub has no message
+        key: with ``ordered=True`` the ``key`` column is the ordering key, and without it a
+        ``key`` column is refused. A replayed epoch republishes; ``dedup_ids=`` stamps a
+        ``batcher-dedup-id`` attribute to deduplicate on downstream.
+        Not yet verified against a live Pub/Sub; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            topic: The full topic path, ``projects/<project>/topics/<topic>``.
+            ordered: Publish the ``key`` column as each message's ordering key.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: ``flush_timeout=``, ``dedup_ids=``, and the ``value_format=`` codec
+                family.
+
+        Returns:
+            A `StreamingQuery` handle for the running Pub/Sub write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.pubsub(  # doctest: +SKIP
+                ...     "projects/p/subscriptions/raw", stream=True
+                ... )
+                >>> query = events.select(value=bt.col("value")).write.pubsub(  # doctest: +SKIP
+                ...     "projects/p/topics/clean"
+                ... )
+        """
+        from batcher.io.formats.streaming.broker_sinks import PubSubStreamSink
+
+        sink = PubSubStreamSink(topic=topic, ordered=ordered, **options)
+        return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
+    def eventhubs(
+        self,
+        topic: str | None = None,
+        *,
+        connection_str: str = "",
+        trigger: Trigger | None = None,
+        output_mode: OutputModeName = "append",
+        query_name: str | None = None,
+        checkpoint: str | None = None,
+        **options: Any,
+    ) -> StreamingQuery:
+        """Publish each row of each micro-batch to an Azure Event Hub.
+
+        The write side of `bt.read.eventhubs`: ``value`` is the event body, ``key`` the
+        partition key, ``partition`` an explicit partition id, and ``headers`` application
+        properties. Rows are packed into ``EventDataBatch`` objects per partition routing and
+        each batch is accepted by the service before the micro-batch is reported written. A
+        replayed epoch republishes; ``dedup_ids=`` stamps a ``batcher-dedup-id`` property.
+        Not yet verified against a live Event Hubs namespace; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            topic: The Event Hub name.
+            connection_str: The namespace connection string, or a secret reference.
+            trigger: Micro-batch cadence; a one-shot batch when omitted.
+            output_mode: Streaming output mode (``"append"``/``"complete"``/``"update"``).
+            query_name: Optional name for the streaming query.
+            checkpoint: Optional checkpoint location for offset tracking.
+            options: ``flush_timeout=``, ``dedup_ids=``, and the ``value_format=`` codec
+                family.
+
+        Returns:
+            A `StreamingQuery` handle for the running Event Hubs write.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> events = bt.read.eventhubs(  # doctest: +SKIP
+                ...     "raw", connection_str="env:EH_CONN", stream=True
+                ... )
+                >>> query = events.select(value=bt.col("value")).write.eventhubs(  # doctest: +SKIP
+                ...     "clean", connection_str="env:EH_CONN"
+                ... )
+        """
+        from batcher.io.formats.streaming.broker_sinks import EventHubsStreamSink
+
+        sink = EventHubsStreamSink(topic=topic, connection_str=connection_str, **options)
+        return self._start_stream(sink, trigger, output_mode, query_name, checkpoint)
+
     def for_each(
         self,
         fn: Callable[[dict[str, Any]], Any],
         *,
         trigger: Trigger | None = None,
-        output_mode: str = "append",
+        output_mode: OutputModeName = "append",
         query_name: str | None = None,
         checkpoint: str | None = None,
     ) -> StreamingQuery:
@@ -1243,16 +1530,37 @@ class Writer:
         )
 
     # --- File / object-store formats (path-addressed) ----------------------
-    def parquet(self, path: PathLike, *, compression: str = "zstd", **opts: Any) -> WriteManifest:
+    @overload
+    def parquet(
+        self, path: PathLike, *, compression: str = "zstd", trigger: Trigger, **opts: Any
+    ) -> StreamingQuery: ...
+
+    @overload
+    def parquet(
+        self, path: PathLike, *, compression: str = "zstd", trigger: None = None, **opts: Any
+    ) -> WriteManifest: ...
+
+    def parquet(
+        self,
+        path: PathLike,
+        *,
+        compression: str = "zstd",
+        trigger: Trigger | None = None,
+        **opts: Any,
+    ) -> WriteManifest | StreamingQuery:
         """Write as Parquet (see `__call__` for `partition_by`/`distributed`).
 
         Args:
             path: Output path/URI (file or directory) to write to.
             compression: Parquet compression codec (default ``"zstd"``).
+            trigger: Run the write as a streaming query on this cadence and return its
+                `StreamingQuery` handle instead of a manifest.
             opts: Additional write options forwarded to the sink.
 
         Returns:
-            A `WriteManifest` describing the files written.
+            A `WriteManifest` describing the files written. A `StreamingQuery` handle
+            instead when `trigger` is given or the dataset reads an unbounded source (a
+            stream with no trigger runs at the processing-time default).
 
         Examples:
             .. doctest::
@@ -1264,17 +1572,33 @@ class Writer:
                 >>> bt.read.parquet(out).count()
                 3
         """
-        return self(path, "parquet", compression=compression, **opts)
+        return self(path, "parquet", compression=compression, trigger=trigger, **opts)
 
-    def csv(self, path: PathLike, **opts: Any) -> WriteManifest:
+    @overload
+    def csv(self, path: PathLike, *, trigger: Trigger, **opts: Any) -> StreamingQuery: ...
+
+    @overload
+    def csv(self, path: PathLike, *, trigger: None = None, **opts: Any) -> WriteManifest: ...
+
+    def csv(
+        self, path: PathLike, *, trigger: Trigger | None = None, **opts: Any
+    ) -> WriteManifest | StreamingQuery:
         """Write as CSV.
 
         Args:
             path: Output path/URI (file or directory) to write to.
-            opts: Additional write options forwarded to the sink.
+            trigger: Run the write as a streaming query on this cadence and return its
+                `StreamingQuery` handle instead of a manifest.
+            opts: Write options, each also accepted under its pandas or Polars spelling:
+                ``delimiter`` (the field separator), ``header`` (write a header row),
+                ``null_value`` (the token a null is written as; a string equal to it is
+                quoted, so it reads back unchanged), and ``index`` (accepted and dropped:
+                there is no row index). Plus ``filesystem`` and ``storage_options``.
 
         Returns:
-            A `WriteManifest` describing the files written.
+            A `WriteManifest` describing the files written. A `StreamingQuery` handle
+            instead when `trigger` is given or the dataset reads an unbounded source (a
+            stream with no trigger runs at the processing-time default).
 
         Examples:
             .. doctest::
@@ -1286,17 +1610,29 @@ class Writer:
                 >>> bt.read.csv(out).count()
                 3
         """
-        return self(path, "csv", **opts)
+        return self(path, "csv", trigger=trigger, **opts)
 
-    def json(self, path: PathLike, **opts: Any) -> WriteManifest:
+    @overload
+    def json(self, path: PathLike, *, trigger: Trigger, **opts: Any) -> StreamingQuery: ...
+
+    @overload
+    def json(self, path: PathLike, *, trigger: None = None, **opts: Any) -> WriteManifest: ...
+
+    def json(
+        self, path: PathLike, *, trigger: Trigger | None = None, **opts: Any
+    ) -> WriteManifest | StreamingQuery:
         """Write as newline-delimited JSON.
 
         Args:
             path: Output path/URI (file or directory) to write to.
+            trigger: Run the write as a streaming query on this cadence and return its
+                `StreamingQuery` handle instead of a manifest.
             opts: Additional write options forwarded to the sink.
 
         Returns:
-            A `WriteManifest` describing the files written.
+            A `WriteManifest` describing the files written. A `StreamingQuery` handle
+            instead when `trigger` is given or the dataset reads an unbounded source (a
+            stream with no trigger runs at the processing-time default).
 
         Examples:
             .. doctest::
@@ -1308,7 +1644,7 @@ class Writer:
                 >>> bt.read.json(out).count()
                 3
         """
-        return self(path, "json", **opts)
+        return self(path, "json", trigger=trigger, **opts)
 
     def orc(self, path: PathLike, **opts: Any) -> WriteManifest:
         """Write as ORC.
@@ -1535,6 +1871,8 @@ class Writer:
     ) -> WriteManifest:
         """Write rows as XML elements under one root element, in Spark's XML layout.
 
+        Requires the ``xml`` extra: ``pip install 'batcher-engine[xml]'``.
+
         Each row is a `row_tag` element with one child per column, all inside a single
         `root_tag` element. A null field is omitted, a list repeats its element, a struct
         nests, and a field named with the ``"_"`` attribute prefix becomes an attribute.
@@ -1566,6 +1904,8 @@ class Writer:
 
     def numpy(self, path: PathLike, *, column: str | None = None, **opts: Any) -> WriteManifest:
         """Write one column as NumPy ``.npy`` arrays, the inverse of `bt.read.numpy`.
+
+        Requires the ``numpy`` extra: ``pip install 'batcher-engine[numpy]'``.
 
         A numeric, boolean or temporal column is written as a 1-D array, a fixed-size list
         of numbers as ``(rows, width)``, and a fixed-shape tensor column as
@@ -1623,6 +1963,8 @@ class Writer:
     ) -> WriteManifest:
         """Write rows as TFRecord files, one ``tf.train.Example`` per row by default.
 
+        Requires the ``tfrecord`` extra: ``pip install 'batcher-engine[tfrecord]'``.
+
         Integer and boolean columns become ``Int64List`` features, float columns
         ``FloatList`` (float32), string and binary columns ``BytesList``, and list columns
         the same kinds with one value per item. A null becomes an empty feature list.
@@ -1654,7 +1996,7 @@ class Writer:
         self,
         name: str,
         *,
-        mode: str = "error",
+        mode: TableWriteMode = "error",
         by_name: bool = True,
         partition_by: list[str] | None = None,
         properties: dict[str, str] | None = None,
@@ -1842,6 +2184,7 @@ class Writer:
         return MergeBuilder(self._ds, target, keys, prune=prune, format=format, opts=opts)
 
     # --- Lakehouse / catalog ----------------------------------------------
+    @overload
     def delta(
         self,
         uri: str,
@@ -1851,8 +2194,36 @@ class Writer:
         auto_compact: bool = False,
         merge_schema: bool = False,
         table_properties: dict[str, str] | None = None,
+        trigger: Trigger,
         **opts: Any,
-    ) -> WriteManifest:
+    ) -> StreamingQuery: ...
+
+    @overload
+    def delta(
+        self,
+        uri: str,
+        *,
+        mode: str = "append",
+        merge_on: str | list[str] | None = None,
+        auto_compact: bool = False,
+        merge_schema: bool = False,
+        table_properties: dict[str, str] | None = None,
+        trigger: None = None,
+        **opts: Any,
+    ) -> WriteManifest: ...
+
+    def delta(
+        self,
+        uri: str,
+        *,
+        mode: str = "append",
+        merge_on: str | list[str] | None = None,
+        auto_compact: bool = False,
+        merge_schema: bool = False,
+        table_properties: dict[str, str] | None = None,
+        trigger: Trigger | None = None,
+        **opts: Any,
+    ) -> WriteManifest | StreamingQuery:
         """Write to a Delta Lake table (one transactional commit).
 
         With `merge_on`, performs a ``MERGE INTO`` upsert keyed on those columns —
@@ -1881,10 +2252,14 @@ class Writer:
                 protocol features are turned on: ``delta.enableChangeDataFeed`` (required
                 before `bt.read.read_change_feed` can read the table),
                 ``delta.appendOnly``, the retention durations.
+            trigger: Run the write as a streaming query on this cadence and return its
+                `StreamingQuery` handle instead of a manifest.
             opts: Additional write options (e.g. ``merge_predicate=``) forwarded to the sink.
 
         Returns:
-            A `WriteManifest` describing the committed Delta files.
+            A `WriteManifest` describing the committed Delta files. A `StreamingQuery` handle
+            instead when `trigger` is given or the dataset reads an unbounded source (a
+            stream with no trigger runs at the processing-time default).
 
         Examples:
             .. doctest::
@@ -1904,18 +2279,34 @@ class Writer:
         opts["merge_schema"] = merge_schema
         if table_properties is not None:
             opts["table_properties"] = table_properties
-        return self(uri, "delta", mode=mode, auto_compact=auto_compact, **opts)
+        return self(uri, "delta", mode=mode, auto_compact=auto_compact, trigger=trigger, **opts)
 
-    def iceberg(self, identifier: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
+    @overload
+    def iceberg(
+        self, identifier: str, *, mode: str = "append", trigger: Trigger, **opts: Any
+    ) -> StreamingQuery: ...
+
+    @overload
+    def iceberg(
+        self, identifier: str, *, mode: str = "append", trigger: None = None, **opts: Any
+    ) -> WriteManifest: ...
+
+    def iceberg(
+        self, identifier: str, *, mode: str = "append", trigger: Trigger | None = None, **opts: Any
+    ) -> WriteManifest | StreamingQuery:
         """Write to an Iceberg table (``mode="append"|"overwrite"``).
 
         Args:
             identifier: Table identifier within the catalog (``db.table``).
             mode: ``"append"`` (default) or ``"overwrite"``.
+            trigger: Run the write as a streaming query on this cadence and return its
+                `StreamingQuery` handle instead of a manifest.
             opts: Additional write options forwarded to the sink.
 
         Returns:
-            A `WriteManifest` describing the committed Iceberg files.
+            A `WriteManifest` describing the committed Iceberg files. A `StreamingQuery` handle
+            instead when `trigger` is given or the dataset reads an unbounded source (a
+            stream with no trigger runs at the processing-time default).
 
         Examples:
             .. doctest::
@@ -1924,7 +2315,7 @@ class Writer:
                 >>> ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
                 >>> ds.write.iceberg("db.orders", mode="append")  # doctest: +SKIP
         """
-        return self(identifier, "iceberg", mode=mode, **opts)
+        return self(identifier, "iceberg", mode=mode, trigger=trigger, **opts)
 
     def hudi(self, table_uri: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
         """Raise: Batcher reads Hudi tables but does not write them.
@@ -2062,13 +2453,24 @@ class Writer:
         return writer(table, write_backend(mode, opts), mode=mode, **opts)
 
     def snowflake(self, table: str, **opts: Any) -> WriteManifest:
-        """Write to a Snowflake table.
+        """Write to a Snowflake table as a staged bulk load.
+
+        Each shard is staged and loaded with ``COPY INTO`` through the connector's
+        ``write_pandas``; the load results (chunks, rows loaded, the ``COPY INTO`` result
+        rows) come back in each `WrittenFile`'s ``job``. Authentication takes the same
+        ``auth=``/``account=``/``user=``/``role=``/``warehouse=``/``database=``/``schema=``
+        keywords as `bt.read.snowflake`, folded into the ``connection_kwargs`` every worker
+        connects with; ``auth="externalbrowser"`` is refused for a distributed write,
+        because a worker cannot open a browser. Not yet verified against a live Snowflake;
+        see tests/PENDING_VERIFICATION.md.
+
+        Requires the ``snowflake`` extra: ``pip install 'batcher-engine[snowflake]'``.
 
         Args:
             table: Destination Snowflake table name.
-            opts: ``connection_kwargs=`` — a dict passed to the Snowflake connector
-                (``account``, ``user``, ``warehouse``, ``database``, …) — plus
-                ``mode=`` (``"overwrite"``, the default, or ``"append"``).
+            opts: The auth and session keywords above, or ``connection_kwargs=`` — a dict
+                passed to the Snowflake connector — plus ``mode=`` (``"overwrite"``, the
+                default, or ``"append"``).
 
         Returns:
             A `WriteManifest` describing the written rows.
@@ -2087,7 +2489,109 @@ class Writer:
                 ...     },
                 ... )
         """
-        return self(table, "snowflake", **opts)
+        from batcher.io.formats.sql.vendors import snowflake_options
+
+        return self(table, "snowflake", **snowflake_options(opts))
+
+    def bigquery(
+        self,
+        table: str,
+        *,
+        project: str | None = None,
+        mode: str = "append",
+        location: str | None = None,
+        **opts: Any,
+    ) -> WriteManifest:
+        """Load into a BigQuery table through Parquet load jobs, keeping nested fields.
+
+        Each shard is serialized to Parquet and submitted as one ``load_table_from_file``
+        job with list inference on, so an Arrow list becomes a ``REPEATED`` field and a
+        struct a ``RECORD``. An array of arrays, or a NULL element inside an array, has no
+        BigQuery spelling and is refused before any job is submitted, naming the column.
+        Each `WrittenFile`'s ``job`` holds the load job's ``job_id``, ``location`` and
+        destination. ``mode="overwrite"`` truncates the table in its one job and is refused
+        on a distributed write. Credentials come from the ambient ``google.auth``
+        environment. Needs ``batcher-engine[bigquery]``. Not yet verified against a live
+        BigQuery; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            table: Destination table, ``dataset.table`` or ``project.dataset.table``.
+            project: The project the load jobs run and bill in.
+            mode: ``"append"`` (default) or ``"overwrite"``.
+            location: The job location, when it is not the dataset's default.
+            opts: Further write options.
+
+        Returns:
+            A `WriteManifest` whose files carry the load jobs' identities.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2], "tags": [["a"], ["b", "c"]]})
+                >>> manifest = ds.write.bigquery(  # doctest: +SKIP
+                ...     "my-project.analytics.events", project="my-project"
+                ... )
+                >>> manifest.files[0].job["job_id"]  # doctest: +SKIP
+                'job_...'
+        """
+        return self(table, "bigquery", mode=mode, project=project, location=location, **opts)
+
+    def databricks(
+        self,
+        table: str,
+        *,
+        volume_path: str,
+        server_hostname: str,
+        http_path: str,
+        access_token: str,
+        **opts: Any,
+    ) -> WriteManifest:
+        """Bulk-load into an existing Databricks table through a Unity Catalog volume.
+
+        Each shard is written to Parquet, uploaded into `volume_path` with ``PUT``, loaded
+        with ``COPY INTO``, and removed. Every staged file has a fresh name, because
+        ``COPY INTO`` skips a path it has loaded before. Only ``mode="append"`` is offered.
+        Each `WrittenFile`'s ``job`` holds the ``COPY INTO`` statement's ``query_id`` and
+        the row counts the warehouse reported. Needs ``batcher-engine[databricks]``. Not
+        yet verified against a live Databricks; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            table: Destination table, optionally ``catalog.schema.table``.
+            volume_path: A ``/Volumes/...`` directory to stage files in.
+            server_hostname: The SQL warehouse hostname.
+            http_path: The SQL warehouse HTTP path.
+            access_token: A token, or an ``env:``/``file:`` reference to one.
+            opts: ``catalog=``, ``schema=`` (session defaults) and further write options.
+
+        Returns:
+            A `WriteManifest` whose files carry the ``COPY INTO`` query ids.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1, 2], "amount": [10, 20]})
+                >>> ds.write.databricks(  # doctest: +SKIP
+                ...     "main.sales.orders",
+                ...     volume_path="/Volumes/main/staging/loads",
+                ...     server_hostname="adb-1.azuredatabricks.net",
+                ...     http_path="/sql/1.0/warehouses/abc",
+                ...     access_token="env:DATABRICKS_TOKEN",
+                ... )
+        """
+        if "schema" in opts:
+            opts["db_schema"] = opts.pop("schema")
+        opts.setdefault("mode", "append")
+        return self(
+            table,
+            "databricks",
+            volume_path=volume_path,
+            server_hostname=server_hostname,
+            http_path=http_path,
+            access_token=access_token,
+            **opts,
+        )
 
     def clickhouse(self, table: str, *, mode: str = "append", **opts: Any) -> WriteManifest:
         """Insert into an existing ClickHouse table over the Arrow insert interface.
@@ -2120,6 +2624,8 @@ class Writer:
     def mongo(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write to a MongoDB collection — upsert, append, overwrite, or delete.
 
+        Requires the ``mongo`` extra: ``pip install 'batcher-engine[mongo]'``.
+
         `mode` defaults to ``"upsert"`` rather than to `ds.write`'s usual ``"overwrite"``:
         a collection is an operational store that is maintained rather than replaced, and
         defaulting to the destructive mode would empty it on a call that did not say so.
@@ -2146,6 +2652,8 @@ class Writer:
 
     def dynamodb(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write rows into a DynamoDB table with ``BatchWriteItem``.
+
+        Requires the ``dynamodb`` extra: ``pip install 'batcher-engine[dynamodb]'``.
 
         `mode` defaults to ``"upsert"``, which is what a ``PutItem`` does: it replaces the
         item holding the same primary key. There is no ``append`` here, because DynamoDB
@@ -2176,6 +2684,8 @@ class Writer:
     def cassandra(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write rows into a Cassandra or ScyllaDB table with one prepared statement.
 
+        Requires the ``cassandra`` extra: ``pip install 'batcher-engine[cassandra]'``.
+
         `mode` defaults to ``"upsert"``, which is what a CQL ``INSERT`` does: it replaces
         the row holding the same primary key. Statements run concurrently rather than in a
         ``BATCH``, because a batch spanning partitions makes one coordinator responsible
@@ -2204,6 +2714,8 @@ class Writer:
     def redis(self, key_prefix: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write rows into a Redis keyspace, one pipeline per batch.
 
+        Requires the ``redis`` extra: ``pip install 'batcher-engine[redis]'``.
+
         A two-column ``(key, value)`` frame — the shape `bt.read.table("redis", ...)`
         returns — is written as one string per key. A wider frame is written as one hash
         per key, one field per remaining column.
@@ -2229,6 +2741,8 @@ class Writer:
 
     def elasticsearch(self, index: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Index rows into an Elasticsearch index over the ``_bulk`` API.
+
+        Requires the ``elasticsearch`` extra: ``pip install 'batcher-engine[elasticsearch]'``.
 
         Every ``_bulk`` response is inspected per item rather than by status code, because
         Elasticsearch reports per-document failures inside an HTTP 200.
@@ -2257,6 +2771,8 @@ class Writer:
     def hbase(self, table: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
         """Write rows into an HBase table, one happybase batch per Arrow batch.
 
+        Requires the ``hbase`` extra: ``pip install 'batcher-engine[hbase]'``.
+
         A column named ``family:qualifier`` keeps its family, and one without a colon is
         placed in ``column_family=`` (default ``"cf"``). That is what lets a frame read by
         {py:meth}`bt.read.hbase <batcher.api.io_namespace.reader.Reader.hbase>` round-trip
@@ -2280,3 +2796,145 @@ class Writer:
                 >>> ds.write.hbase("events", host="thrift")  # doctest: +SKIP
         """
         return self(table, "hbase", mode=mode, **opts)
+
+    def qdrant(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Upsert or delete points in an existing Qdrant collection.
+
+        Every point is validated, and the collection's vector size and distance checked,
+        before the first request; a failure names each point on `VectorWriteError`. A string
+        id that is not a UUID is sent as a stable UUID derived from it, so a retried write
+        lands on the same point. Not yet verified against a live Qdrant; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            collection: The collection to write into.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``url=``, ``location=`` or ``path=``, ``api_key=``, ``id_column=``,
+                ``vector_column=`` or ``vector_name=`` / ``vectors=`` for named vectors,
+                ``dimension=``, ``metric=``, ``batch_size=`` and ``max_retries=``.
+
+        Returns:
+            A `WriteManifest` counting the points written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "embedding": [[0.1, 0.2]]})
+                >>> ds.write.qdrant("docs", url="http://localhost:6333")  # doctest: +SKIP
+        """
+        return self(collection, "qdrant", mode=mode, **opts)
+
+    def pinecone(self, index: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Upsert or delete records in one namespace of an existing Pinecone index.
+
+        The index is described first, so a dimension or metric mismatch is refused before
+        anything is sent. Columns other than the id and the vector become metadata. Not yet
+        verified against a live Pinecone; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            index: The index to write into.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``api_key=``, ``namespace=``, ``id_column=``, ``vector_column=``,
+                ``dimension=``, ``metric=``, ``batch_size=`` and ``max_retries=``.
+
+        Returns:
+            A `WriteManifest` counting the records written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": ["a"], "embedding": [[0.1, 0.2]]})
+                >>> ds.write.pinecone(  # doctest: +SKIP
+                ...     "docs", api_key="env:PINECONE_API_KEY", namespace="prod"
+                ... )
+        """
+        return self(index, "pinecone", mode=mode, **opts)
+
+    def milvus(self, collection: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Upsert, insert or delete rows in an existing Milvus collection.
+
+        The collection's schema is read first: the id column is sent as its primary key, the
+        vector column as its float-vector field, and a column the collection has no field
+        for is refused unless the dynamic field is enabled. ``"append"`` is a Milvus
+        ``insert`` and is never retried. Not yet verified against a live Milvus; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            collection: The collection to write into.
+            mode: ``"upsert"`` (default), ``"append"`` or ``"delete"``.
+            opts: ``uri=``, ``token=``, ``db_name=``, ``partition=``, ``vector_field=``,
+                ``id_column=``, ``vector_column=``, ``dimension=``, ``metric=``,
+                ``batch_size=`` and ``max_retries=``.
+
+        Returns:
+            A `WriteManifest` counting the rows written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "embedding": [[0.1, 0.2]]})
+                >>> ds.write.milvus("docs", uri="./milvus.db")  # doctest: +SKIP
+        """
+        return self(collection, "milvus", mode=mode, **opts)
+
+    def turbopuffer(self, namespace: str, *, mode: str = "upsert", **opts: Any) -> WriteManifest:
+        """Upsert or delete documents in a Turbopuffer namespace.
+
+        The id column is sent as ``id``, the vector column as ``vector``, and every other
+        column as an attribute. ``metric=`` defaults to ``"cosine_distance"``. Not yet
+        verified against a live Turbopuffer; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            namespace: The namespace to write into; created by its first write.
+            mode: ``"upsert"`` (default) or ``"delete"``.
+            opts: ``region=`` or ``base_url=``, ``api_key=``, ``schema=``, ``id_column=``,
+                ``vector_column=``, ``dimension=``, ``metric=``, ``batch_size=`` and
+                ``max_retries=``.
+
+        Returns:
+            A `WriteManifest` counting the documents written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"id": [1], "embedding": [[0.1, 0.2]]})
+                >>> ds.write.turbopuffer(  # doctest: +SKIP
+                ...     "docs", region="gcp-us-central1", api_key="env:TURBOPUFFER_API_KEY"
+                ... )
+        """
+        return self(namespace, "turbopuffer", mode=mode, **opts)
+
+    # --- APIs and SaaS (HTTP) ---------------------------------------------
+    def google_sheets(
+        self, spreadsheet_id: str, range: str, *, mode: str = "overwrite", **opts: Any
+    ) -> WriteManifest:
+        """Write the result into a range of a Google Sheet, in bounded batches.
+
+        ``mode="overwrite"`` clears exactly `range` and writes the header and rows into it;
+        nothing outside the range is touched. ``mode="append"`` adds the rows (no header)
+        after the table the range holds. Rows go out ``batch_rows`` per request. Not yet
+        verified against a live Google Sheets API; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            spreadsheet_id: The spreadsheet's id, from its URL.
+            range: The A1 range written into, such as ``"Report!A1"``.
+            mode: ``"overwrite"`` (default) or ``"append"``.
+            opts: ``header=``, ``batch_rows=`` (default 500), ``value_input=``
+                (``"RAW"`` or ``"USER_ENTERED"``), and ``auth=`` (a ``bt.io.BearerToken``;
+                Application Default Credentials when omitted).
+
+        Returns:
+            A `WriteManifest` naming the range and the rows written.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"region": ["east"], "sales": [10]})
+                >>> ds.write.google_sheets("1AbC...", "Report!A1")  # doctest: +SKIP
+        """
+        return self(spreadsheet_id, "google_sheets", mode=mode, range=range, **opts)

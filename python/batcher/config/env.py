@@ -77,6 +77,7 @@ ENV_KNOBS: Final[dict[str, str]] = {
     "BATCHER_JSON_CHUNK_BYTES": "JSON reader chunk size",
     "BATCHER_SECRET_TIMEOUT_SECONDS": "per-request timeout for an HTTP-answered key store",
     "BATCHER_NATIVE_STREAM_MAX_DEPTH": "native Parquet stream prefetch depth",
+    "BATCHER_NATIVE_STREAM_REMOTE_MAX_DEPTH": "remote native Parquet stream depth cap (0 = none)",
     "BATCHER_NATIVE_WINDOW_BYTES": "native Parquet decode window",
     "BATCHER_FOOTER_CACHE_ROW_GROUPS": "row groups held in the split planner's footer cache",
     "BATCHER_ORC_STRIPE_BYTES": "target bytes per ORC stripe read",
@@ -88,6 +89,7 @@ ENV_KNOBS: Final[dict[str, str]] = {
     # --- distributed scan / scheduling ---------------------------------------------
     "BATCHER_SPLIT_TARGET_BYTES": "target bytes per scan split",
     "BATCHER_SCAN_PREFETCH": "concurrent reads a scan task keeps in flight",
+    "BATCHER_UNIT_PREFETCH": "remote row groups the engine's unit reader fetches ahead (0 = off)",
     "BATCHER_SCAN_CACHE_BYTES": "per-worker scan cache size",
     "BATCHER_SCAN_CACHE_FRACTION": "scan cache as a fraction of worker memory",
     "BATCHER_BATCH_READAHEAD": "batches read ahead per scan task",

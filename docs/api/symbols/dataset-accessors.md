@@ -32,6 +32,7 @@ These methods run a model over the rows: batch inference, embeddings, tabular sc
    DatasetML.embed
    DatasetML.predict
    DatasetML.generate
+   DatasetML.token_count
    DatasetML.classify
    DatasetML.extract
 ```
@@ -196,6 +197,7 @@ Each of these requires a statistic computed over the whole relation or a column 
    DatasetDQ.null_rate_below
    DatasetDQ.unique_ratio_above
    DatasetDQ.fresh_within
+   DatasetDQ.monotonic
 ```
 
 

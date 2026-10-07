@@ -51,6 +51,12 @@ _SUBPACKAGES = (
     "batcher.io",
     "batcher.config",
     "batcher.governance",
+    # The PEP 249 adapter and the two client integrations whose modules import without
+    # their tool installed. `integrations.sqlalchemy` and `integrations.dbt` subclass their
+    # framework at import, so they are not here: an absent extra would fail the gate itself.
+    "batcher.dbapi",
+    "batcher.integrations.flightsql",
+    "batcher.integrations.ibis",
 )
 
 

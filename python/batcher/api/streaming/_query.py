@@ -117,8 +117,10 @@ def _open_checkpoint(location: str, plan: LogicalPlan, *, stateful: bool) -> Che
 
     One helper for every launcher, so the single-node and distributed paths take the same
     lease and apply the same plan-compatibility check (`checkpoint.identity`). The
-    fingerprint is `LogicalPlan.content_key`, or ``None`` for a plan with an opaque node,
-    whose key is per-process and would refuse every restart.
+    fingerprint is `plan.streaming.fingerprint.restart_fingerprint`: the plan's
+    `content_key`, with each opaque node (a `transform_with_state`, a `map_batches`) keyed
+    by its stable shape rather than its per-process identity. Binding such a plan to no
+    fingerprint skipped the check for every keyed-state query.
 
     Args:
         location: The checkpoint location.
@@ -129,12 +131,12 @@ def _open_checkpoint(location: str, plan: LogicalPlan, *, stateful: bool) -> Che
         A claimed `CheckpointStore`.
     """
     from batcher.io.formats.streaming.checkpoint import CheckpointStore
+    from batcher.plan.streaming.fingerprint import restart_fingerprint
 
     _warn_if_checkpoint_not_durable(location)
     store = CheckpointStore(location)
-    fingerprint = plan.content_key() if plan.ir_json() is not None else None
     try:
-        store.claim(fingerprint, stateful=stateful)
+        store.claim(restart_fingerprint(plan), stateful=stateful)
     except BaseException:
         store.close()
         raise

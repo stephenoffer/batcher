@@ -304,12 +304,13 @@ impl FlightShuffleServer {
             .map(|b| normalize_batch(&b.0))
             .collect::<PyResult<_>>()?;
         py.detach(|| {
-            shared_runtime().block_on(self.exchange.publish(&t, batches));
+            let published = shared_runtime().block_on(self.exchange.publish(&t, batches));
             // Charge the new footprint (and spill if the pool will not cover it) while the
             // GIL is still released: reconciliation can write a bucket to disk.
             self.spiller.reconcile();
-        });
-        Ok(())
+            published
+        })
+        .map_err(transport_to_pyerr)
     }
 
     /// High-water mark of in-flight batches for `ticket` (peak the producer ever
@@ -329,7 +330,9 @@ impl FlightShuffleServer {
         ticket: &str,
     ) -> PyResult<Option<Vec<PyArrowType<RecordBatch>>>> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
-        let batches = py.detach(|| shared_runtime().block_on(self.exchange.local_partition(&t)));
+        let batches = py
+            .detach(|| shared_runtime().block_on(self.exchange.local_partition(&t)))
+            .map_err(transport_to_pyerr)?;
         Ok(batches.map(|bs| bs.into_iter().map(PyArrowType).collect()))
     }
 
@@ -513,10 +516,16 @@ pub(crate) fn flight_fetch(
 /// batches return through an Arrow IPC round trip), so it trades a re-read for a memory
 /// bound. `0` (the default) is unbounded, which is the historical behaviour.
 ///
-/// Called once per worker process when its Flight server starts. The cap is captured by
-/// each store at construction, so it must be set before the server is created.
+/// `shuffle_spill_root` is the local scratch directory those spilled buckets go under --
+/// the configured `memory.spill_dir` or the node's measured local volume, as every other
+/// spill path uses. `None` (or empty) keeps the OS temp dir.
+///
+/// Called once per worker process when its Flight server starts. The cap and spill root
+/// are captured by each store at construction, so they must be set before the server is
+/// created.
 #[pyfunction]
-#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None, shuffle_store_cap_bytes=0, gather_streams=0, gather_inflight_bytes=0))]
+#[pyo3(signature = (idle_timeout_ms, keepalive_ms=0, connections_per_peer=0, compression=None, shuffle_store_cap_bytes=0, gather_streams=0, gather_inflight_bytes=0, shuffle_spill_root=None))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn set_flight_transport_config(
     idle_timeout_ms: u64,
     keepalive_ms: u64,
@@ -525,7 +534,13 @@ pub(crate) fn set_flight_transport_config(
     shuffle_store_cap_bytes: u64,
     gather_streams: u64,
     gather_inflight_bytes: u64,
+    shuffle_spill_root: Option<String>,
 ) {
+    bc_transport::set_shuffle_spill_root(
+        shuffle_spill_root
+            .filter(|root| !root.is_empty())
+            .map(std::path::PathBuf::from),
+    );
     bc_transport::set_transport_timeouts(idle_timeout_ms, keepalive_ms);
     bc_transport::set_connections_per_peer(connections_per_peer);
     if let Some(code) = compression {
@@ -676,7 +691,11 @@ impl ShuffleClient {
     }
 
     /// Fetch `ticket` from `addr` over a credit-gated stream on a pooled channel.
-    #[pyo3(signature = (addr, ticket, credits=bc_transport::DEFAULT_CREDITS, token=None))]
+    ///
+    /// `required=True` is for a ticket the caller knows was published (a replica copy, a
+    /// stage-output handle): absence raises a retryable shuffle error instead of reading as
+    /// an empty partition.
+    #[pyo3(signature = (addr, ticket, credits=bc_transport::DEFAULT_CREDITS, token=None, required=false))]
     fn fetch(
         &self,
         py: Python<'_>,
@@ -684,10 +703,19 @@ impl ShuffleClient {
         ticket: &str,
         credits: u32,
         token: Option<&str>,
+        required: bool,
     ) -> PyResult<Vec<PyArrowType<RecordBatch>>> {
         let t = bc_transport::ShuffleTicket::from_string(ticket).map_err(to_pyerr)?;
         let batches = py
-            .detach(|| shared_runtime().block_on(self.pool.fetch_secured(addr, &t, credits, token)))
+            .detach(|| {
+                shared_runtime().block_on(async {
+                    if required {
+                        self.pool.fetch_required(addr, &t, credits, token).await
+                    } else {
+                        self.pool.fetch_secured(addr, &t, credits, token).await
+                    }
+                })
+            })
             .map_err(transport_to_pyerr)?;
         Ok(batches.into_iter().map(PyArrowType).collect())
     }

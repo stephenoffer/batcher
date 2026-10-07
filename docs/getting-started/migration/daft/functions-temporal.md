@@ -18,7 +18,7 @@ The following table maps the 35 names on `Expression`, sorted alphabetically.
 
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
-| `convert_time_zone` | `Expr.dt.convert_timezone` | mismatch | Differs: Daft returns a timezone-aware timestamp in the target zone; Batcher convert\_timezone(from\_tz, to\_tz) rewrites a naive wall-clock and returns a naive timestamp. Needs tz-aware timestamps. Wave W6. |
+| `convert_time_zone` | `Expr.dt.convert_timezone` | mismatch | Differs: Daft returns a timezone-aware timestamp in the target zone; Batcher convert\_timezone(from\_tz, to\_tz) returns the target zone's naive wall clock. from\_tz must name a tz-aware column's own zone. Wave W6. |
 | `date` | `Expr.dt.date` | canonical |  |
 | `date_trunc` | `Expr.dt.truncate` | param | Missing: multi-unit intervals ('15 minutes') and relative\_to= origin. Wave W6. |
 | `day` | `Expr.dt.day` | canonical |  |
@@ -36,20 +36,20 @@ The following table maps the 35 names on `Expression`, sorted alphabetically.
 | `partition_months` | {py:obj}`bt.partition_months <batcher.partition_months>` | canonical |  |
 | `partition_years` | {py:obj}`bt.partition_years <batcher.partition_years>` | canonical |  |
 | `quarter` | `Expr.dt.quarter` | canonical |  |
-| `replace_time_zone` | n/a | gap | Not yet: replace\_time\_zone (attach a zone keeping the local time). Wave W6. |
+| `replace_time_zone` | `Expr.dt.replace_timezone` | mismatch | Differs: spelled replace\_timezone(tz, ambiguous=, nonexistent=); the non\_existent keyword is nonexistent here and also takes shift\_forward. Wave W6. |
 | `second` | `Expr.dt.second` | canonical |  |
 | `strftime` | `Expr.dt.strftime` | param | Missing: optional format (Daft defaults to ISO 8601 with fractional seconds). Wave W2. |
 | `time` | `Expr.dt.time_of_day` | mismatch | Differs: Daft time() returns a TIME value; Batcher time\_of\_day returns microseconds since midnight as Int64. Needs a TIME type. Wave W6. |
 | `to_date` | `Expr.str.to_date` | canonical |  |
 | `to_datetime` | `Expr.str.to_datetime` | param | Missing: timezone= for the parsed timestamp. Wave W6. |
 | `to_unix_epoch` | `Expr.dt.timestamp` | canonical |  |
-| `total_days` | n/a | gap | Not yet: Duration total\_days. Wave W6. |
-| `total_hours` | n/a | gap | Not yet: Duration total\_hours. Wave W6. |
-| `total_microseconds` | n/a | gap | Not yet: Duration total\_microseconds. Wave W6. |
-| `total_milliseconds` | n/a | gap | Not yet: Duration total\_milliseconds. Wave W6. |
-| `total_minutes` | n/a | gap | Not yet: Duration total\_minutes. Wave W6. |
+| `total_days` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('d'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_hours` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('h'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_microseconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('us'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_milliseconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('ms'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_minutes` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('m'); the count truncates toward zero and comes back as Int64. Wave W6. |
 | `total_nanoseconds` | n/a | gap | Not yet: Duration total\_nanoseconds. Wave W6. |
-| `total_seconds` | n/a | gap | Not yet: Duration total\_seconds. Wave W6. |
+| `total_seconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('s'); the count truncates toward zero and comes back as Int64. Wave W6. |
 | `unix_date` | {py:obj}`bt.partition_days <batcher.partition_days>` | canonical |  |
 | `week_of_year` | `Expr.dt.week` | canonical |  |
 | `year` | `Expr.dt.year` | canonical |  |
@@ -61,8 +61,8 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | Daft | Batcher | Status | Notes |
 |---|---|---|---|
 | `add_months` | `Expr.dt.offset_by` | param | Missing: column-valued argument (Batcher accepts only a literal here; Daft accepts an Expression) (months; offset\_by takes a literal '1mo' string). Wave W2. |
-| `convert_time_zone` | `Expr.dt.convert_timezone` | mismatch | Differs: Daft returns a timezone-aware timestamp in the target zone; Batcher convert\_timezone(from\_tz, to\_tz) rewrites a naive wall-clock and returns a naive timestamp. Needs tz-aware timestamps. Wave W6. |
-| `convert_timezone` | `Expr.dt.convert_timezone` | mismatch | Differs: Daft returns a timezone-aware timestamp in the target zone; Batcher convert\_timezone(from\_tz, to\_tz) rewrites a naive wall-clock and returns a naive timestamp. Needs tz-aware timestamps. Wave W6. |
+| `convert_time_zone` | `Expr.dt.convert_timezone` | mismatch | Differs: Daft returns a timezone-aware timestamp in the target zone; Batcher convert\_timezone(from\_tz, to\_tz) returns the target zone's naive wall clock. from\_tz must name a tz-aware column's own zone. Wave W6. |
+| `convert_timezone` | `Expr.dt.convert_timezone` | mismatch | Differs: Daft returns a timezone-aware timestamp in the target zone; Batcher convert\_timezone(from\_tz, to\_tz) returns the target zone's naive wall clock. from\_tz must name a tz-aware column's own zone. Wave W6. |
 | `current_date` | {py:obj}`bt.current_date <batcher.current_date>` | mismatch | Differs: Daft current\_date is the UTC date; Batcher current\_date is the local date bound at plan build, so they differ across midnight in non-UTC zones. Param: tz='UTC'. Wave W6. |
 | `current_timestamp` | {py:obj}`bt.current_timestamp <batcher.current_timestamp>` | mismatch | Differs: Daft current\_timestamp is UTC; Batcher current\_timestamp is a naive local wall clock bound at plan build (22:06 vs 15:06 on a UTC-7 host). Param: tz='UTC'. Wave W6. |
 | `current_timezone` | n/a | gap | Not yet: session timezone expression. Wave W6. |
@@ -102,7 +102,7 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | `partition_months` | {py:obj}`bt.partition_months <batcher.partition_months>` | canonical |  |
 | `partition_years` | {py:obj}`bt.partition_years <batcher.partition_years>` | canonical |  |
 | `quarter` | `Expr.dt.quarter` | canonical |  |
-| `replace_time_zone` | n/a | gap | Not yet: replace\_time\_zone (attach a zone keeping the local time). Wave W6. |
+| `replace_time_zone` | `Expr.dt.replace_timezone` | mismatch | Differs: spelled replace\_timezone(tz, ambiguous=, nonexistent=); the non\_existent keyword is nonexistent here and also takes shift\_forward. Wave W6. |
 | `second` | `Expr.dt.second` | canonical |  |
 | `strftime` | `Expr.dt.strftime` | param | Missing: optional format (Daft defaults to ISO 8601 with fractional seconds). Wave W2. |
 | `time` | `Expr.dt.time_of_day` | mismatch | Differs: Daft time() returns a TIME value; Batcher time\_of\_day returns microseconds since midnight as Int64. Needs a TIME type. Wave W6. |
@@ -113,13 +113,13 @@ The following table maps the 65 names on the `daft.functions` module, sorted alp
 | `to_datetime` | `Expr.str.to_datetime` | param | Missing: timezone= for the parsed timestamp. Wave W6. |
 | `to_unix_epoch` | `Expr.dt.timestamp` | canonical |  |
 | `to_utc_timestamp` | n/a | gap | Not yet: to\_utc\_timestamp over tz-aware timestamps. Wave W6. |
-| `total_days` | n/a | gap | Not yet: Duration total\_days. Wave W6. |
-| `total_hours` | n/a | gap | Not yet: Duration total\_hours. Wave W6. |
-| `total_microseconds` | n/a | gap | Not yet: Duration total\_microseconds. Wave W6. |
-| `total_milliseconds` | n/a | gap | Not yet: Duration total\_milliseconds. Wave W6. |
-| `total_minutes` | n/a | gap | Not yet: Duration total\_minutes. Wave W6. |
+| `total_days` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('d'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_hours` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('h'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_microseconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('us'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_milliseconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('ms'); the count truncates toward zero and comes back as Int64. Wave W6. |
+| `total_minutes` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('m'); the count truncates toward zero and comes back as Int64. Wave W6. |
 | `total_nanoseconds` | n/a | gap | Not yet: Duration total\_nanoseconds. Wave W6. |
-| `total_seconds` | n/a | gap | Not yet: Duration total\_seconds. Wave W6. |
+| `total_seconds` | `Expr.dt.total` | mismatch | Differs: spelled dt.total('s'); the count truncates toward zero and comes back as Int64. Wave W6. |
 | `trunc` | `Expr.dt.truncate` | param | Missing: multi-unit intervals ('15 minutes') and relative\_to= origin. Wave W6. |
 | `unix_date` | {py:obj}`bt.partition_days <batcher.partition_days>` | canonical |  |
 | `week_of_year` | `Expr.dt.week` | canonical |  |

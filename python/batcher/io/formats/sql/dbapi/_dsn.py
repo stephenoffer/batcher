@@ -18,7 +18,7 @@ none is present lists every alternative rather than only the first.
 
 ## What it does not do
 
-Snowflake, BigQuery, Databricks and Trino authenticate with account identifiers, tokens or
+Snowflake, BigQuery and Databricks authenticate with account identifiers, tokens or
 service-account keys that a host/port/database URI cannot express. Each already has a
 dedicated connector, and inventing a URI mapping for them here would be a worse spelling of
 a thing that already works. They raise, naming the connector that does.
@@ -60,7 +60,7 @@ DRIVER_CANDIDATES: dict[str, tuple[str, ...]] = {
     "questdb": ("psycopg", "psycopg2", "pg8000"),
     "crate": ("psycopg", "psycopg2", "pg8000"),
     "cratedb": ("psycopg", "psycopg2", "pg8000"),
-    "redshift": ("psycopg", "psycopg2", "pg8000"),
+    "redshift": ("redshift_connector", "psycopg", "psycopg2", "pg8000"),
     "mysql": ("pymysql", "MySQLdb", "mysql.connector"),
     "mariadb": ("pymysql", "MySQLdb", "mysql.connector"),
     "tidb": ("pymysql", "MySQLdb", "mysql.connector"),
@@ -73,6 +73,13 @@ DRIVER_CANDIDATES: dict[str, tuple[str, ...]] = {
     "duckdb": ("duckdb",),
     "oracle": ("oracledb", "cx_Oracle"),
     "clickhouse": ("clickhouse_driver",),
+    # pymssql's `connect()` takes host/port/user/password/database, the same keywords every
+    # other driver here does, so a `mssql://` URI needs no mapping of its own. pyodbc does
+    # not (it takes one connection string) and stays reachable through `module=`.
+    "mssql": ("pymssql",),
+    "sqlserver": ("pymssql",),
+    # Trino's catalog and schema come from the URI path; see `connect_target`.
+    "trino": ("trino.dbapi",),
 }
 
 #: Schemes whose "host" is a local file path rather than a network address.
@@ -89,9 +96,6 @@ _DEDICATED: dict[str, str] = {
     "snowflake": "ds.write.snowflake(table, connection_kwargs=...)",
     "bigquery": "bt.read.table('bigquery', ...)",
     "databricks": "bt.read.databricks(...)",
-    "trino": "ds.write(table, 'dbapi', module='trino.dbapi', connect_kwargs=...)",
-    "mssql": "ds.write(table, 'dbapi', module='pymssql', connect_kwargs=...)",
-    "sqlserver": "ds.write(table, 'dbapi', module='pymssql', connect_kwargs=...)",
 }
 
 
@@ -193,10 +197,12 @@ def driver_for(scheme: str) -> str:
     found = installed_driver(scheme)
     if found is not None:
         return found
+    from batcher.io.formats.sql.vendors import install_hint
+
+    advice = install_hint(scheme) or f"Install any one of them (pip install {candidates[0]})."
     raise MissingDependencyError(
-        f"writing to {scheme!r} over PEP 249 needs one of {', '.join(candidates)} "
-        f"installed; none of them is. Install any one of them (pip install "
-        f"{candidates[0]}), or pass module= naming a different driver."
+        f"reaching {scheme!r} over PEP 249 needs one of {', '.join(candidates)} "
+        f"installed; none of them is. {advice} Or pass module= naming a different driver."
     )
 
 
@@ -254,6 +260,16 @@ def connect_target(parsed: ParsedURI, *, module: str | None = None) -> tuple[str
         kwargs["password"] = parsed.password
     if parsed.database:
         kwargs["dbname" if driver in _DBNAME_DRIVERS else "database"] = parsed.database
+    if parsed.scheme == "trino":
+        # Trino addresses `catalog/schema`, not a database: the client takes the two as
+        # separate keywords, and a password only inside an auth object, which
+        # `vendors.connect.adapt_connect_kwargs` builds on the worker from this reference.
+        catalog, _, schema = (parsed.database or "").partition("/")
+        kwargs.pop("database", None)
+        if catalog:
+            kwargs["catalog"] = catalog
+        if schema:
+            kwargs["schema"] = schema
     if parsed.scheme == "oracle":
         # Oracle addresses a *service*, not a database: python-oracledb takes one `dsn`
         # string in the Easy Connect form rather than host/port/database kwargs.

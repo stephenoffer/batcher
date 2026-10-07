@@ -10,12 +10,20 @@ way: `nodes` → `core`).
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from batcher._internal.errors import PlanError, require_int
+from batcher.config.option_types import MappingStrategy
 from batcher.plan.expr_ir.core import Expr, FrameSpec, IntoExpr, Lit, _col_or_expr, _wrap
 from batcher.plan.expr_ir.node_base import IRNode, child, children, expr_node, scalar
 from batcher.plan.ir_tags import ExprTag
+
+if TYPE_CHECKING:
+    from batcher.plan.expr_ir.declared import CaseBuilderBound as _Bound
+else:
+    # The runtime class binds these methods with `setattr`; checkers read `declared`.
+    _Bound = object
 
 
 @expr_node
@@ -61,7 +69,7 @@ class Case(IRNode):
         }
 
 
-class CaseBuilder:
+class CaseBuilder(_Bound):
     """Fluent CASE builder: ``when(c).then(v).when(c2).then(v2).otherwise(d)``.
 
     A builder that has at least one ``then`` is already an expression, as Polars' ``Then``
@@ -242,6 +250,11 @@ class MakeStruct(IRNode):
     tag = ExprTag.MAKE_STRUCT
     fields: list[tuple[str, Expr]]
 
+    def __repr__(self) -> str:
+        """``struct(name=value, ...)``. The generic rendering skips `fields`, which is not a
+        declared child, and aggregate leaves are deduplicated by their rendering."""
+        return "struct(" + ", ".join(f"{name}={value!r}" for name, value in self.fields) + ")"
+
     def to_ir(self) -> dict[str, Any]:
         # Irregular shape (named fields), so to_ir is hand-written.
         return {
@@ -274,6 +287,48 @@ class ListJoin(IRNode):
     separator: str = scalar()
 
 
+@dataclass(frozen=True, slots=True)
+class WindowOptions:
+    """The options of the series and quantile-binning window functions.
+
+    Mirrors the Rust `bc_ir::WindowOpts`; every field defaults to the behaviour the
+    functions had before it existed, and `to_ir` sends only the fields that differ, so a
+    plan that uses none of them serializes byte-identically.
+    """
+
+    #: EWM: weighted average over every weight (``True``) or the recursive form.
+    adjust: bool = True
+    #: EWM: non-null observations needed before a row gets a value.
+    min_periods: int = 1
+    #: `interpolate`: widest gap filled -- null rows, or key distance under `by_value`.
+    max_gap: float | None = None
+    #: `interpolate`: weight by the order key's value rather than row position.
+    by_value: bool = False
+    #: `qcut`: the probabilities whose quantiles are the bin edges, strictly increasing.
+    probs: tuple[float, ...] = ()
+    #: `qcut`: merge edges that tied input made equal, instead of raising.
+    drop_duplicates: bool = False
+
+    def to_ir(self) -> dict[str, Any]:
+        """The non-default fields, as the Rust `WindowOpts` serde shape."""
+        out: dict[str, Any] = {}
+        if not self.adjust:
+            out["adjust"] = False
+        if self.min_periods != 1:
+            out["min_periods"] = self.min_periods
+        if self.max_gap is not None:
+            out["max_gap"] = float(self.max_gap)
+        if self.by_value:
+            out["by_value"] = True
+        if self.probs:
+            # As `repr` strings: the engine's JSON parser can land a long float one bit
+            # off, and that bit decides the bin of a value lying exactly on an edge.
+            out["probs"] = [repr(float(p)) for p in self.probs]
+        if self.drop_duplicates:
+            out["drop_duplicates"] = True
+        return out
+
+
 class WindowExpr(Expr):
     """A window-function column built via ``agg.over(...)`` (e.g.
     ``col("x").sum().over(partition_by=["g"])``) or a value-function constructor
@@ -302,6 +357,7 @@ class WindowExpr(Expr):
         "ignore_nulls",
         "input",
         "offset",
+        "opts",
         "order_by",
         "partition_by",
     )
@@ -317,6 +373,7 @@ class WindowExpr(Expr):
         alpha: float | None = None,
         half_life: float | None = None,
         ignore_nulls: bool = False,
+        opts: WindowOptions | None = None,
     ) -> None:
         self.func = func
         self.input = input
@@ -326,8 +383,10 @@ class WindowExpr(Expr):
         self.offset = offset
         self.alpha = alpha
         self.half_life = half_life
-        # `IGNORE NULLS`, for `first_value`/`last_value`/`nth_value` only.
+        # `IGNORE NULLS` for `first_value`/`last_value`/`nth_value`; `ignore_nulls` for EWM.
         self.ignore_nulls = ignore_nulls
+        # The series functions' and `qcut`'s options (`WindowOptions`).
+        self.opts = opts
 
     def to_ir(self) -> dict[str, Any]:
         """Always raises: a window has no scalar IR — it must be hoisted to a `Window` node."""
@@ -350,6 +409,7 @@ class WindowExpr(Expr):
             self.alpha,
             self.half_life,
             self.ignore_nulls,
+            self.opts,
         )
 
     def over(
@@ -360,7 +420,7 @@ class WindowExpr(Expr):
         *,
         descending: bool | Iterable[bool] = False,
         nulls_last: bool = True,
-        mapping_strategy: str = "group_to_rows",
+        mapping_strategy: MappingStrategy = "group_to_rows",
     ) -> WindowExpr:
         """Bind this window function to a partition/order (and optional frame).
 

@@ -585,6 +585,152 @@ pub(crate) fn apply(
     Ok(out)
 }
 
+/// A join on the probe spine, seen by [`restrict_builds`] before any build side is prepared.
+pub(crate) struct SpineJoin<'a> {
+    /// The join's probe (left) input.
+    pub(crate) probe: &'a RelOp,
+    /// The join's build (right) input.
+    pub(crate) build: &'a RelOp,
+    pub(crate) left_keys: &'a [String],
+    pub(crate) right_keys: &'a [String],
+    pub(crate) join_type: JoinType,
+}
+
+/// One build side restricted to another's key set before it is hashed (see [`restrict_builds`]).
+pub(crate) struct BuildRestriction {
+    /// The index, in the list handed to [`restrict_builds`], of the build whose keys restrict.
+    pub(crate) provider: usize,
+    /// The provider's own build-side key column.
+    pub(crate) provider_key: String,
+    /// The restricted build side's key column the provider's keys are tested against.
+    pub(crate) column: String,
+}
+
+impl BuildRestriction {
+    /// The provider's key set, digested, as a filter over the restricted build's `column`.
+    ///
+    /// `None` when the provider's key column is not a selective `Int64` set (see
+    /// [`KeyFilter::build_once`]): the build side is then prepared unrestricted, which is always
+    /// correct.
+    pub(crate) fn digest(&self, provider_side: &RecordBatch) -> Option<PendingFilter> {
+        let col = provider_side.column_by_name(&self.provider_key)?;
+        let filter = KeyFilter::build_once(col)?;
+        Some(PendingFilter {
+            column: self.column.clone(),
+            filter: Arc::new(filter),
+            gauge: Gauge::default(),
+            force: switch() == Switch::Force,
+        })
+    }
+}
+
+/// Build rows a build side must scan before it is worth delaying behind another one.
+const MIN_RESTRICTED_BUILD_ROWS: usize = 16 * bc_arrow::DEFAULT_MORSEL_ROWS;
+
+/// How many times larger than its provider a build side must scan to be restricted by it.
+const MIN_RESTRICTED_PER_PROVIDER_ROW: usize = 4;
+
+/// Which of a spine's build sides to restrict to another build side's key set before hashing.
+///
+/// Two joins on one probe spine whose probe keys trace to **the same column of the same node**
+/// (by [`sink_target`]) test one value per probe row against two key sets, and an `Inner` or
+/// `Semi` join keeps a probe row only if its value is in both. So a build row whose key is
+/// absent from the *other* join's key set can only ever match probe rows the other join drops:
+/// it is dead weight in the hash table, and removing it before the table is built changes no
+/// answer. [`sink_target`]'s own argument is what makes the trace sound — it crosses only nodes
+/// that neither recompute the column nor make one row's fate depend on another's — so it holds
+/// whichever of the two joins sits higher on the spine.
+///
+/// TPC-H q9 is the shape this exists for. `lineitem` probes the 5% of `part` named "green" on
+/// `l_partkey`, then all of `partsupp` on `(l_partkey, l_suppkey)`: 800M `partsupp` rows at
+/// sf1000 hashed into a table whose rows outside those parts can never be reached. Restricted by
+/// the `part` key set it is ~43M rows. At sf1000 the unrestricted builds were 78 GB against a
+/// 65 GB envelope; the plan was refused and run in passes, then killed.
+///
+/// The cost is ordering: a restricted build waits for its provider instead of being prepared
+/// beside it. So only a build side that scans [`MIN_RESTRICTED_PER_PROVIDER_ROW`] times its
+/// provider's rows, and at least [`MIN_RESTRICTED_BUILD_ROWS`], is delayed; scanned rows are an
+/// upper bound known before anything runs, the only size available here. A provider is never
+/// itself restricted, so the delay is one level deep. A build side may be restricted by several
+/// providers at once.
+pub(crate) fn restrict_builds(
+    joins: &[SpineJoin<'_>],
+    sources: &[Vec<RecordBatch>],
+) -> Vec<Vec<BuildRestriction>> {
+    let mut out: Vec<Vec<BuildRestriction>> = joins.iter().map(|_| Vec::new()).collect();
+    let switch = switch();
+    if switch == Switch::Off || joins.len() < 2 {
+        return out;
+    }
+    let force = switch == Switch::Force;
+    let rows = SourceRows {
+        sources,
+        driving: None,
+        meter: None,
+        force,
+    };
+    let traced: Vec<Vec<Option<(&RelOp, String)>>> = joins
+        .iter()
+        .map(|j| {
+            j.left_keys
+                .iter()
+                .map(|k| {
+                    matches!(j.join_type, JoinType::Inner | JoinType::Semi)
+                        .then(|| sink_target(j.probe, k))
+                })
+                .collect()
+        })
+        .collect();
+    let size: Vec<usize> = joins.iter().map(|j| rows.scanned(j.build)).collect();
+    let mut order: Vec<usize> = (0..joins.len()).collect();
+    order.sort_by_key(|&i| (size[i], i));
+    for (rank, &t) in order.iter().enumerate() {
+        if !force && size[t] < MIN_RESTRICTED_BUILD_ROWS {
+            continue;
+        }
+        // Only a smaller build provides, and one that is not itself restricted: ascending order
+        // means a provider's own restriction, if any, was already decided. *Every* such build
+        // provides, not the first: which key set is selective is not knowable until it is built.
+        // TPC-H q9's `partsupp` shares a probe column with both `supplier` (every key kept) and
+        // the green `part` rows (one in twenty), and the smaller of the two is `supplier`.
+        // `apply` runs the filters most selective first and copies only for one that removes
+        // enough, so a provider that removes nothing costs a mask, not a copy.
+        let restrictions: Vec<BuildRestriction> = order[..rank]
+            .iter()
+            .filter(|&&f| out[f].is_empty())
+            .filter(|&&f| {
+                force || size[f].saturating_mul(MIN_RESTRICTED_PER_PROVIDER_ROW) <= size[t]
+            })
+            .filter_map(|&f| shared_key(joins, &traced, f, t))
+            .collect();
+        out[t] = restrictions;
+    }
+    out
+}
+
+/// The first key position of join `t` traced to the same node and column as one of join `f`'s.
+fn shared_key(
+    joins: &[SpineJoin<'_>],
+    traced: &[Vec<Option<(&RelOp, String)>>],
+    f: usize,
+    t: usize,
+) -> Option<BuildRestriction> {
+    for (j, tt) in traced[t].iter().enumerate() {
+        let Some((t_node, t_col)) = tt else { continue };
+        for (i, ft) in traced[f].iter().enumerate() {
+            let Some((f_node, f_col)) = ft else { continue };
+            if std::ptr::eq(*t_node, *f_node) && t_col == f_col {
+                return Some(BuildRestriction {
+                    provider: f,
+                    provider_key: joins[f].right_keys[i].clone(),
+                    column: joins[t].right_keys[j].clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use bc_expr::Expr;
@@ -1165,5 +1311,130 @@ mod tests {
         assert_eq!(apply(&filters, empty).unwrap().num_rows(), 0);
         let none = [pending("a", vec![-5], true)];
         assert_eq!(apply(&none, batch).unwrap().num_rows(), 0);
+    }
+
+    /// `scan(0) JOIN part ON pk` then `JOIN partsupp ON (pk, sk)`: TPC-H q9's spine, as
+    /// `restrict_builds` sees it. Both joins' first probe key reaches the same scan column.
+    fn q9_spine() -> (RelOp, RelOp, RelOp, Vec<Vec<RecordBatch>>) {
+        let probe = scan(0);
+        let part = scan(1);
+        let partsupp = scan(2);
+        let sources = vec![
+            vec![i64_batch(&[("pk", vec![1]), ("sk", vec![1])])],
+            vec![i64_batch(&[("p_pk", (0..1_000).collect())])],
+            vec![i64_batch(&[
+                ("ps_pk", (0..300_000).collect()),
+                ("ps_sk", (0..300_000).collect()),
+            ])],
+        ];
+        (probe, part, partsupp, sources)
+    }
+
+    fn spine<'a>(
+        probe: &'a RelOp,
+        part: &'a RelOp,
+        partsupp: &'a RelOp,
+        keys: &'a [Vec<String>; 4],
+        second: JoinType,
+    ) -> Vec<SpineJoin<'a>> {
+        vec![
+            SpineJoin {
+                probe,
+                build: part,
+                left_keys: &keys[0],
+                right_keys: &keys[1],
+                join_type: JoinType::Inner,
+            },
+            SpineJoin {
+                probe,
+                build: partsupp,
+                left_keys: &keys[2],
+                right_keys: &keys[3],
+                join_type: second,
+            },
+        ]
+    }
+
+    fn q9_keys() -> [Vec<String>; 4] {
+        [
+            vec!["pk".into()],
+            vec!["p_pk".into()],
+            vec!["pk".into(), "sk".into()],
+            vec!["ps_pk".into(), "ps_sk".into()],
+        ]
+    }
+
+    /// The large build is restricted by the small one on the key column they share, and the
+    /// small one is not delayed.
+    #[test]
+    fn a_large_build_is_restricted_by_a_smaller_one_on_the_same_probe_column() {
+        let (probe, part, partsupp, sources) = q9_spine();
+        let keys = q9_keys();
+        let joins = spine(&probe, &part, &partsupp, &keys, JoinType::Inner);
+        let out = restrict_builds(&joins, &sources);
+        assert!(
+            out[0].is_empty(),
+            "the provider is prepared first, unrestricted"
+        );
+        let r = out[1].first().expect("partsupp must be restricted by part");
+        assert_eq!(r.provider, 0);
+        assert_eq!(r.provider_key, "p_pk");
+        assert_eq!(r.column, "ps_pk");
+        let digest = r.digest(&sources[1][0]).expect("an Int64 key set digests");
+        let kept = apply(std::slice::from_ref(&digest), sources[2][0].clone()).unwrap();
+        assert_eq!(
+            kept.num_rows(),
+            1_000,
+            "only partsupp rows whose part key exists survive"
+        );
+    }
+
+    /// A `Left` join must emit its unmatched probe rows, so its build may not be restricted —
+    /// nor may it restrict another.
+    #[test]
+    fn a_non_reducible_join_neither_is_restricted_nor_restricts() {
+        let (probe, part, partsupp, sources) = q9_spine();
+        let keys = q9_keys();
+        let joins = spine(&probe, &part, &partsupp, &keys, JoinType::Left);
+        assert!(restrict_builds(&joins, &sources).iter().all(Vec::is_empty));
+    }
+
+    /// Two builds on different probe columns share nothing to restrict by.
+    #[test]
+    fn builds_on_different_probe_columns_are_left_alone() {
+        let (probe, part, partsupp, sources) = q9_spine();
+        let mut keys = q9_keys();
+        keys[2] = vec!["sk".into()];
+        keys[3] = vec!["ps_sk".into()];
+        let joins = spine(&probe, &part, &partsupp, &keys, JoinType::Inner);
+        assert!(restrict_builds(&joins, &sources).iter().all(Vec::is_empty));
+    }
+
+    /// TPC-H q9's real spine: `partsupp` shares its probe columns with *two* smaller builds, and
+    /// the smaller of those (`supplier`, every key) restricts nothing. Both must provide, or the
+    /// selective one (`part`) is never applied.
+    #[test]
+    fn every_smaller_build_on_a_shared_column_restricts() {
+        let (probe, part, partsupp, mut sources) = q9_spine();
+        let supplier = scan(3);
+        sources.push(vec![i64_batch(&[("s_sk", (0..100).collect())])]);
+        let keys = q9_keys();
+        let s_keys = (vec!["sk".to_string()], vec!["s_sk".to_string()]);
+        let mut joins = spine(&probe, &part, &partsupp, &keys, JoinType::Inner);
+        joins.push(SpineJoin {
+            probe: &probe,
+            build: &supplier,
+            left_keys: &s_keys.0,
+            right_keys: &s_keys.1,
+            join_type: JoinType::Inner,
+        });
+        let out = restrict_builds(&joins, &sources);
+        let mut providers: Vec<(&str, &str)> = out[1]
+            .iter()
+            .map(|r| (r.provider_key.as_str(), r.column.as_str()))
+            .collect();
+        providers.sort_unstable();
+        assert_eq!(providers, [("p_pk", "ps_pk"), ("s_sk", "ps_sk")]);
+        assert!(out[0].is_empty() && out[2].is_empty());
     }
 }

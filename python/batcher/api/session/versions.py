@@ -64,6 +64,45 @@ def _engine_profile() -> str:
     return str(getattr(engine(), "__engine_profile__", "unknown"))
 
 
+# The I/O backends a remote path or a database URI routes through. Kept apart from
+# `_OPTIONAL` because a missing one fails only when a path is opened, which is too late to
+# learn the `[cloud]` or `[sql]` extra was never installed.
+_IO_OPTIONAL = ("fsspec", "s3fs", "gcsfs", "adlfs", "adbc_driver_manager", "connectorx")
+
+# pyarrow's native object-store filesystems, which exist only when pyarrow was built with
+# them. Reported per store, since a build with S3 and no Azure is common.
+_PYARROW_FILESYSTEMS = {
+    "pyarrow_s3": "S3FileSystem",
+    "pyarrow_gcs": "GcsFileSystem",
+    "pyarrow_azure": "AzureFileSystem",
+}
+
+
+def _pyarrow_filesystems() -> dict[str, str]:
+    """Whether this pyarrow build carries each native object-store filesystem."""
+    try:
+        import pyarrow.fs as pafs
+    except ImportError:
+        return dict.fromkeys(_PYARROW_FILESYSTEMS, "not installed")
+    return {
+        key: "available" if hasattr(pafs, cls) else "not built"
+        for key, cls in _PYARROW_FILESYSTEMS.items()
+    }
+
+
+def _tzdata_version() -> str:
+    """The IANA time-zone database release compiled into the engine, e.g. ``2025b``.
+
+    Every zone conversion uses the engine's own compiled-in copy of the database, not the
+    host's ``tzdata``, so this is the release that decides what a timestamp in a zone whose
+    rules changed means -- and two engines built against different releases can disagree
+    about a future instant there. ``unknown`` for an engine built before it was reported.
+    """
+    from batcher._internal.native import engine
+
+    return str(getattr(engine(), "__tzdata_version__", "unknown"))
+
+
 def versions() -> dict[str, str]:
     """Return the Batcher, engine, Python, platform, and optional-backend versions.
 
@@ -76,6 +115,16 @@ def versions() -> dict[str, str]:
     build`` installs — is unoptimized, and nothing else about a running query says so, so
     it is the first thing to check when a pipeline is unexpectedly slow.
 
+    The I/O rows answer "will this remote path open" before a transfer starts: the
+    fsspec drivers (``fsspec``, ``s3fs``, ``gcsfs``, ``adlfs``), the database routing
+    drivers (``adbc_driver_manager``, ``connectorx``), and whether pyarrow was built with
+    its native S3, GCS and Azure filesystems (``pyarrow_s3``/``pyarrow_gcs``/
+    ``pyarrow_azure``: ``"available"`` or ``"not built"``).
+
+    ``tzdata`` is the IANA time-zone database release compiled into the engine (such as
+    ``2025b``). Zone conversions use that copy, never the host's, so it is the version to
+    quote when a DST boundary or a zone's changed rules give a surprising timestamp.
+
     Returns:
         A mapping of component name to version string.
 
@@ -85,6 +134,8 @@ def versions() -> dict[str, str]:
             >>> import batcher as bt
             >>> bt.versions()["batcher"]
             '0.1.0'
+            >>> len(bt.versions()["tzdata"])  # an IANA release such as '2025b'
+            5
     """
     import batcher
 
@@ -93,14 +144,16 @@ def versions() -> dict[str, str]:
         "engine": engine_version(),
         # `debug` here is the answer to "why is this slow?" more often than any plan.
         "engine_profile": _engine_profile(),
+        "tzdata": _tzdata_version(),
         "python": sys.version.split()[0],
         "platform": platform.platform(),
     }
-    for name in _OPTIONAL:
+    for name in (*_OPTIONAL, *_IO_OPTIONAL):
         try:
             out[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             out[name] = "not installed"
+    out.update(_pyarrow_filesystems())
     return out
 
 

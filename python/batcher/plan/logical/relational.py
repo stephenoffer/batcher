@@ -1,8 +1,8 @@
 """Row-wise and set relational logical nodes.
 
-`Scan`, `Filter`, `Projection`/`Project`, `Limit`, `Distinct`, `Sample`, `Union`, and
-the opaque `MapBatches`. These are the non-grouping operators; grouping/ordering,
-windowing, and the row-reshaping nodes live in sibling modules.
+`Scan`, `Filter`, `Projection`/`Project`, `Limit`, `Distinct`, `Sample`, and `Union`. These
+are the non-grouping operators; grouping/ordering, windowing, the row-reshaping nodes, and
+the opaque Python `MapBatches` stage live in sibling modules.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ __all__ = [
     "Distinct",
     "Filter",
     "Limit",
-    "MapBatches",
     "Project",
     "Projection",
     "Sample",
@@ -456,8 +455,9 @@ class Union(LogicalPlan):
         for other in self.inputs[1:]:
             if other.available_columns() != cols:
                 raise PlanError(
-                    "union inputs must have identical columns: "
-                    f"{cols} vs {other.available_columns()}"
+                    f"union inputs must have identical columns: {cols} vs "
+                    f"{other.available_columns()}. To match columns by name in any order and "
+                    "null-fill a missing one, use bt.concat([a, b], how='diagonal')"
                 )
         validate_branch_types([i.available_schema() for i in self.inputs], cols)
 
@@ -544,123 +544,3 @@ class Sample(LogicalPlan):
 
     def available_schema(self) -> SchemaRef | None:
         return self.input.available_schema()
-
-
-@dataclass(frozen=True, slots=True)
-class MapBatches(LogicalPlan):
-    """Apply an arbitrary Python function to each Arrow record batch.
-
-    This is the opaque/black-box operator (ML inference, embeddings, custom
-    preprocessing). It is executed in Python — never lowered to the Rust IR — so
-    compiled relational operators and black-box ML compose in one pipeline. The
-    optional `output_columns` declares the result schema for downstream
-    validation; if omitted, the input columns are assumed to pass through.
-
-    `input_columns` is the other half of that contract, and it is what lets the optimizer
-    see *into* the black box far enough to be useful. Without it the plan must assume the
-    `fn` may read any column of its input, so projection pushdown gives up and the scan
-    reads the whole table: an embedding stage over one column of a 41-column Parquet file
-    read all 41. Declaring the columns the `fn` actually reads turns that into a one-column
-    scan, and lets column lineage narrow to the truth instead of "everything derives from
-    everything". It is opt-in precisely because getting it wrong is a wrong answer, not a
-    slow one — an undeclared column the `fn` secretly reads would be pruned away beneath it.
-    """
-
-    input: LogicalPlan
-    # Either a callable `RecordBatch -> RecordBatch|Table|dict` (stateless), or a
-    # zero-arg *factory*/class that builds such a callable once per worker — the
-    # "load the model once, reuse across batches" pattern for GPU inference.
-    fn: object
-    batch_size: int | None = None
-    output_columns: tuple[str, ...] | None = None
-    # The columns `fn` reads. None = unknown, so the optimizer must keep every column alive
-    # (the safe default). When declared, projection pushdown prunes the scan to these columns
-    # (plus whatever the operators *above* still need), and lineage attributes the outputs to
-    # these inputs only. Declaring a column the `fn` does not read is merely wasteful;
-    # OMITTING one it does read is a correctness bug — the column gets pruned out from under it.
-    input_columns: tuple[str, ...] | None = None
-    # The columns `fn` passes through UNCHANGED — same name, same value, in every output row.
-    # None = unknown, so the optimizer must assume `fn` may rewrite any column and no predicate
-    # can ever move below the UDF (the safe default). When a column is declared here, a `Filter`
-    # whose predicate reads only preserved columns is pushed *below* the UDF, so the model runs
-    # on the rows that survive the filter instead of every row — filtering 60% of the rows
-    # before GPU inference saves 60% of the GPU work. This is the mirror of `input_columns`:
-    # that field says only what `fn` READS, which cannot justify the pushdown (a column the fn
-    # reads it may still overwrite). Preservation is the stronger claim, and it is opt-in for
-    # the same reason `input_columns` is — declaring a column the `fn` actually rewrites is a
-    # WRONG ANSWER, not a slow one: rows the predicate would drop on the *rewritten* value are
-    # dropped on the *input* value instead, silently changing the result.
-    preserves_columns: tuple[str, ...] | None = None
-    # Concurrent workers for the per-batch call (>1 overlaps GIL-releasing model
-    # inference across cores; the GIL serializes pure-Python `fn`s).
-    num_workers: int = 1
-    # GPUs to reserve per distributed worker/actor (Ray resource). 0 = CPU only.
-    num_gpus: float = 0.0
-    # Distributed actor-pool size: when set (or when a factory `fn` needs building
-    # once per worker), the distributed path runs long-lived actors that each build
-    # the model once and stream partitions through it. An `int` fixes the pool size;
-    # a `(min, max)` tuple autoscales the pool to the workload within those bounds.
-    concurrency: int | tuple[int, int] | None = None
-    # The object `fn` receives and returns per batch: "pyarrow" (RecordBatch),
-    # "numpy" ({col: ndarray}), "pandas" (DataFrame), or "torch" ({col: tensor}).
-    # The Arrow boundary is unchanged — conversion happens around the call only.
-    batch_format: str = "pyarrow"
-    # Optional GPU model to pin GPU actors/tasks to (a `ray.util.accelerators` name
-    # like "NVIDIA_A100"); None lets Ray pick any GPU.
-    accelerator_type: str | None = None
-    # Custom Ray resources per worker, as `((name, amount), ...)`. `num_gpus` only covers
-    # what Ray calls the `GPU` resource (NVIDIA/AMD/Intel/MetaX); a TPU, Trainium
-    # (`neuron_cores`), Gaudi (`HPU`), or an operator's own on-prem resource is named
-    # instead. A tuple so the node stays hashable/frozen like every other field here.
-    resources: tuple[tuple[str, float], ...] = ()
-    # Optional estimate of the model's memory footprint in GB. Lets the resource layer
-    # budget host RAM per worker (so loading the model into many workers can't OOM the
-    # node) and VRAM-pack the GPU fraction; lets Kyber's cost model scale the
-    # inference cost by model size. 0.0 = unknown (no budgeting).
-    model_memory_gb: float = 0.0
-    # Run the per-batch calls across `num_workers` *processes* instead of threads, so a
-    # CPU-bound pure-Python `fn` (which the GIL would serialize across threads) uses
-    # multiple cores on a single node. Opt-in; the local executor falls back to threads
-    # when the `fn` is not process-safe (a factory/class, a GPU `fn`, or one that cannot be
-    # serialized to a child). Any `batch_format` is fine — the conversion runs in the child.
-    # No effect on the distributed path (Ray actors already isolate).
-    multiprocessing: bool = False
-    # Dirty-data tolerance: the maximum number of ROWS whose per-row `fn` call may raise
-    # before the query fails. 0 (the default) = strict (any error propagates). When > 0, a
-    # batch that raises is bisected to isolate the offending rows; a failing single row is
-    # dropped (up to this budget) and the rest of the batch proceeds — so a corrupt image /
-    # malformed JSON / bad record doesn't kill a long inference job (the guides' universal
-    # ``max_errored_blocks`` need). Executed in Python; no IR change.
-    max_errored_rows: int = 0
-    # Transient-failure resilience for a flaky/external `fn` (an LLM API, a vector-DB upsert, a
-    # model that intermittently OOMs) — the ML-inference workload Batcher targets. A batch whose
-    # `fn` raises a retryable error is retried up to `max_retries` times with exponential backoff
-    # (`retry_backoff_s * 2**attempt`), before the failure falls through to `max_errored_rows`.
-    # 0 (the default) = no retry, so a real bug on clean data still fails fast on the first call.
-    max_retries: int = 0
-    retry_backoff_s: float = 0.5
-    # The exception types worth retrying; empty = retry any `Exception` when `max_retries > 0`.
-    # A non-retryable bug (a `TypeError` from a schema mismatch) should not burn the retry budget,
-    # so restrict retries to the transient errors an external service actually raises.
-    retry_on: tuple[type[BaseException], ...] = ()
-    # Wall-clock ceiling (seconds) for a single per-batch `fn` call; 0 = no timeout. A call that
-    # exceeds it raises `TimeoutError` (retried like any transient error, then charged to the
-    # error budget). Guards a query against a hung external call — Python cannot preempt a
-    # running call, so the timed-out call's thread is abandoned and its result discarded, not
-    # killed. Applies to the thread/sequential paths (where a flaky I/O-bound `fn` runs), not the
-    # multiprocessing path (reserved for CPU-bound pure-Python `fn`s). On the async path
-    # (`async def fn`) the timeout instead *cancels* the pending coroutine at its next await.
-    timeout_s: float = 0.0
-    # Max in-flight batches for an async (`async def`) `fn`: an I/O-bound inference/enrichment
-    # `fn` awaits a remote service, so many batches' awaits overlap on ONE event loop bounded by
-    # this semaphore — the LLM-API concurrency pattern, without a thread per request. 0 = an
-    # adaptive default. Ignored for a synchronous `fn` (which uses the thread/process paths).
-    max_concurrency: int = 0
-
-    def to_ir(self) -> dict[str, Any]:
-        raise NotImplementedError("map_batches is executed in Python, not lowered to the engine IR")
-
-    def available_columns(self) -> list[str]:
-        if self.output_columns is not None:
-            return list(self.output_columns)
-        return self.input.available_columns()

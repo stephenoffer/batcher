@@ -50,6 +50,7 @@ from harness import (
     print_table,
     run_isolated,
     summarize,
+    write_run_record,
 )
 from registry import REGISTRY
 
@@ -198,6 +199,14 @@ def _parse_args() -> argparse.Namespace:
         "geomean quoted to three decimals from a single run claims a precision no single "
         "run supports — the operator mix measures at a 4.1%% spread across three runs on "
         "one box. Use this before quoting a figure.",
+    )
+    p.add_argument(
+        "--json-out",
+        default=None,
+        metavar="PATH",
+        help="also write the whole run to PATH as JSON: the machine fingerprint, these "
+        "arguments, and every case of every repeat with its per-sample timings, including "
+        "the FAILED/ERROR/KILLED rows a geomean leaves out, so an aggregate can be recomputed",
     )
     p.add_argument(
         "--allow-busy-box",
@@ -426,6 +435,17 @@ def main() -> int:
         all_results += run_results
         per_run_results.append(run_results)
         per_run.append(summarize(run_results, names))
+    # Not in an `--isolate` child: it inherits `--json-out` with the rest of the parent's
+    # argv, and its one-case record would be overwritten by the parent's anyway.
+    if args.json_out and args.isolate_case is None:
+        write_run_record(
+            args.json_out,
+            fingerprint=fp,
+            args=vars(args),
+            runs=per_run_results,
+            summaries=per_run,
+        )
+        print(f"wrote the run record to {args.json_out}")
     # The spread, not another decimal place. A geomean from one run carries no evidence
     # about its own stability, and quoting it to three decimals asserts some.
     if args.repeat > 1:

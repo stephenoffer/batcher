@@ -113,7 +113,13 @@ pub(crate) fn eval_strftime(arr: &ArrayRef, format: &str) -> Result<ArrayRef, Ex
 
     let format = strftime_format_for_chrono(format);
     let format = format.as_str();
-    let micros = cast(arr, &DataType::Timestamp(TimeUnit::Microsecond, None))?;
+    // A zoned instant renders as the clock its zone reads, the same reading every field
+    // extraction takes; formatting the stored UTC micros printed a different day and hour.
+    let local = super::timezone::as_wall_clock(arr)?;
+    let micros = cast(
+        local.as_ref().unwrap_or(arr),
+        &DataType::Timestamp(TimeUnit::Microsecond, None),
+    )?;
     let ts = micros.as_primitive::<TimestampMicrosecondType>();
     let mut b = StringBuilder::with_capacity(ts.len(), ts.len() * format.len().max(8));
     let mut buf = String::new();
@@ -149,16 +155,23 @@ pub(crate) fn eval_strftime(arr: &ArrayRef, format: &str) -> Result<ArrayRef, Ex
 /// With `strict`, a non-null value that does not parse is an error naming the value and
 /// the format (DuckDB `strptime`, Polars `strict=True`). A null stays null: it is a
 /// missing value, not a malformed one.
+///
+/// `formats` is tried in order and each value takes the first that parses it (DuckDB
+/// `strptime(s, [f1, f2])`), so a column mixing two vendors' layouts parses
+/// reproducibly: which format wins is decided by the list, never guessed. `strict` raises
+/// only when every format fails.
 pub(crate) fn eval_strptime(
     arr: &ArrayRef,
-    format: &str,
+    formats: &[String],
     strict: bool,
 ) -> Result<ArrayRef, ExprError> {
     use arrow::array::{Array, AsArray};
     use chrono::NaiveDateTime;
 
-    let chrono_format = strptime_format_for_chrono(format);
-    let chrono_format = chrono_format.as_str();
+    let chrono_formats: Vec<String> = formats
+        .iter()
+        .map(|f| strptime_format_for_chrono(f))
+        .collect();
     let strings = cast(arr, &DataType::Utf8)?;
     let s = strings.as_string::<i32>();
     let mut out: Vec<Option<i64>> = Vec::with_capacity(s.len());
@@ -176,16 +189,23 @@ pub(crate) fn eval_strptime(
         // date and threw the hour away, answering midnight. `parse_partial` subsumes
         // it — a date-only format defaults to midnight through the same path — and
         // keeps the hour.
-        let parsed = NaiveDateTime::parse_from_str(v, chrono_format)
-            .ok()
-            .or_else(|| parse_partial(v, chrono_format));
+        let parsed = chrono_formats.iter().find_map(|f| {
+            NaiveDateTime::parse_from_str(v, f)
+                .ok()
+                .or_else(|| parse_partial(v, f))
+        });
         match parsed {
             Some(d) => out.push(Some(d.and_utc().timestamp_micros())),
             None if strict => {
+                let wanted = if formats.len() == 1 {
+                    format!("the format {:?}", formats[0])
+                } else {
+                    format!("any of the formats {formats:?}")
+                };
                 return Err(ExprError::InvalidArgument {
                     func: "strptime".to_string(),
-                    reason: format!("{v:?} does not match the format {format:?}"),
-                })
+                    reason: format!("{v:?} does not match {wanted}"),
+                });
             }
             None => out.push(None),
         }
@@ -261,7 +281,7 @@ mod tests {
             Some("not a date"),
             None,
         ]));
-        let out = eval_strptime(&arr, "%Y-%m-%d %H:%M:%S", false).unwrap();
+        let out = eval_strptime(&arr, &["%Y-%m-%d %H:%M:%S".to_string()], false).unwrap();
         let ts = out.as_primitive::<TimestampMicrosecondType>();
         let expected = NaiveDate::from_ymd_opt(2024, 2, 15)
             .unwrap()
@@ -305,7 +325,7 @@ mod tests {
             Some("2024-02-15 13:45:30.5"),
             Some("2024-02-15 13:45:30.123"),
         ]));
-        let out = eval_strptime(&arr, "%Y-%m-%d %H:%M:%S.%f", false).unwrap();
+        let out = eval_strptime(&arr, &["%Y-%m-%d %H:%M:%S.%f".to_string()], false).unwrap();
         let ts = out.as_primitive::<TimestampMicrosecondType>();
         let frac = |i: usize| ts.value(i).rem_euclid(1_000_000);
         assert_eq!(frac(0), 123_456);
@@ -320,7 +340,7 @@ mod tests {
         use chrono::NaiveDate;
 
         let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("2024-02-15")]));
-        let out = eval_strptime(&arr, "%Y-%m-%d", false).unwrap();
+        let out = eval_strptime(&arr, &["%Y-%m-%d".to_string()], false).unwrap();
         let ts = out.as_primitive::<TimestampMicrosecondType>();
         let expected = NaiveDate::from_ymd_opt(2024, 2, 15)
             .unwrap()
@@ -359,7 +379,7 @@ mod tests {
         ];
         for (value, format, want) in cases {
             let arr: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![Some(value), None]));
-            let out = eval_strptime(&arr, format, false).unwrap();
+            let out = eval_strptime(&arr, &[format.to_string()], false).unwrap();
             let o = out
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
@@ -380,7 +400,7 @@ mod tests {
             Some("2024-13-05"), // an impossible month, not a partial format
             Some("2024-03-05 extra"),
         ]));
-        let out = eval_strptime(&arr, "%Y-%m-%d", false).unwrap();
+        let out = eval_strptime(&arr, &["%Y-%m-%d".to_string()], false).unwrap();
         let o = out
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -404,7 +424,7 @@ mod tests {
     #[test]
     fn strptime_refuses_a_format_with_no_year() {
         let arr: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![Some("12:30")]));
-        let out = eval_strptime(&arr, "%H:%M", false).unwrap();
+        let out = eval_strptime(&arr, &["%H:%M".to_string()], false).unwrap();
         assert!(out
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()

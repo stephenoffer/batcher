@@ -51,7 +51,7 @@ print(out.to_pydict())
 # {'iso': [2024, 2024], 'leap': [True, True], 'month_len': [31, 30]}
 ```
 
-{py:meth}`strftime(format) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.strftime>` renders a timestamp as text with a chrono strftime pattern. {py:meth}`offset_by(by) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.offset_by>` shifts it by a Polars-style duration string such as `"1mo"`, `"3d"`, or `"-1h"`, preserving the type. {py:meth}`convert_timezone(from_tz, to_tz) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.convert_timezone>` re-reads each naive wall-clock from one zone in another, DST-aware.
+{py:meth}`strftime(format) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.strftime>` renders a timestamp as text with a chrono strftime pattern. {py:meth}`offset_by(by) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.offset_by>` shifts it by a Polars-style duration string such as `"1mo"`, `"3d"`, or `"-1h"`, preserving the type. {py:meth}`convert_timezone(from_tz, to_tz) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.convert_timezone>` keeps each instant and returns the wall clock `to_tz` reads at it, DST-aware. A naive column is read as a wall clock in `from_tz`.
 
 ```python
 out = events.select(
@@ -67,9 +67,27 @@ print(
 # {'text': ['2024/01/15', '2024/06/01'], 'next': [2, 7], 'ny_hour': [4, 14]}
 ```
 
+Converting and attaching a zone are different operations. {py:meth}`replace_timezone(tz) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.replace_timezone>` keeps the wall clock and labels it with `tz`, which picks a new instant. It is pandas' `tz_localize`, and the way to say which zone a naive column was recorded in. A wall clock a DST change repeats or skips raises unless you pass `ambiguous=` (`"earliest"`, `"latest"`, `"null"`) or `nonexistent=` (`"shift_forward"`, `"null"`). `convert_timezone` takes the same two keywords for a naive input and defaults both to `"null"`.
+
+Every field of a tz-aware column is read on that column's own clock, so `hour()`, `dayname()`, `truncate("day")` and `strftime` all agree about which day a row fell on. To report in another zone, convert first and then extract. On a tz-aware column, `offset_by("1d")` and `truncate("day")` use local days, so a day across a DST change is 23 or 25 elapsed hours and the clock reads the same.
+
+```python
+local = events.select(
+    paris=bt.col("ts").dt.replace_timezone("Europe/Paris"),
+)
+print(local.schema.field("paris").type)
+# timestamp[us, tz=Europe/Paris]
+hours = local.select(
+    hour=bt.col("paris").dt.hour(),
+    ny=bt.col("paris").dt.convert_timezone("Europe/Paris", "America/New_York").dt.hour(),
+)
+print(hours.to_pydict())
+# {'hour': [9, 18], 'ny': [3, 12]}
+```
+
 ### Top-level date and time functions
 
-Some date arithmetic reads better as a function than as an accessor call. {py:obj}`bt.date_part(part, expr) <batcher.date_part>` extracts a named field, the SQL spelling of `.dt.<part>()`. {py:obj}`bt.date_add(expr, days) <batcher.date_add>` and {py:obj}`bt.date_sub(expr, days) <batcher.date_sub>` shift by a whole number of days.
+Some date arithmetic reads better as a function than as an accessor call. {py:obj}`bt.date_part(part, expr) <batcher.date_part>` extracts a named field, the SQL spelling of `.dt.<part>()`. {py:obj}`bt.date_add(expr, days) <batcher.date_add>` and {py:obj}`bt.date_sub(expr, days) <batcher.date_sub>` shift by a whole number of days, which may be a column so each row moves by its own count.
 
 ```python
 out = events.select(
@@ -83,6 +101,30 @@ print(
     ).to_pydict()
 )
 # {'part': [1, 6], 'later': [22, 8], 'earlier': [8, 25]}
+```
+
+Per-row calendar months are {py:meth}`.dt.add_months(n) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.add_months>`, which clamps a month end the way `offset_by` does. Business days have one calendar shared by three calls: {py:meth}`.dt.add_business_days(n) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.add_business_days>`, `.dt.is_business_day()`, and {py:obj}`bt.business_day_count(start, end) <batcher.business_day_count>`, which counts the half-open range `[start, end)`. Each takes `holidays=` and a Monday-first `weekmask=` such as `"1111001"` for a Sunday-to-Thursday week.
+
+```python
+cal = bt.from_pydict(
+    {"start": [datetime.date(2024, 12, 23), datetime.date(2024, 12, 27)], "n": [3, 2], "months": [1, 2]}
+)
+xmas = [datetime.date(2024, 12, 25), datetime.date(2025, 1, 1)]
+out = cal.select(
+    due=bt.col("start").dt.add_business_days(bt.col("n"), holidays=xmas),
+    renew=bt.col("start").dt.add_months(bt.col("months")),
+    open_days=bt.business_day_count("start", bt.date_add(bt.col("start"), 14), holidays=xmas),
+)
+print(out.to_pydict())
+# {'due': [datetime.date(2024, 12, 27), datetime.date(2024, 12, 31)], 'renew': [datetime.date(2025, 1, 23), datetime.date(2025, 2, 27)], 'open_days': [8, 9]}
+```
+
+Parsing text is `.str.to_datetime(format)`. Pass a list of formats when a column mixes layouts: each value takes the first format that parses it, so the result never depends on guessing.
+
+```python
+mixed = bt.from_pydict({"s": ["2024-01-15", "15/01/2024", "n/a"]})
+print(mixed.select(t=bt.col("s").str.to_datetime(["%Y-%m-%d", "%d/%m/%Y"])).to_pydict())
+# {'t': [datetime.datetime(2024, 1, 15, 0, 0), datetime.datetime(2024, 1, 15, 0, 0), None]}
 ```
 
 ### Building dates and timestamps

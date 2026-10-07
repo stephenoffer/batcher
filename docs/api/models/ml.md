@@ -10,6 +10,7 @@ ML work attaches to a `Dataset` through the `.ml` accessor:
 | {py:meth}`ds.ml.infer(model, ...) <batcher.api.dataset.ml.DatasetML.infer>` | Run batch inference from a model id plus `column`, or from a model callable. |
 | {py:meth}`ds.ml.embed(model, ...) <batcher.api.dataset.ml.DatasetML.embed>` | Generate embeddings from a model id plus `column`, or from a model callable. |
 | {py:meth}`ds.ml.generate(engine, ...) <batcher.api.dataset.ml.DatasetML.generate>` | Offline LLM text generation, appending the response column. |
+| {py:meth}`ds.ml.token_count(column, tokenizer=...) <batcher.api.dataset.ml.DatasetML.token_count>` | Exact per-row token counts under a real tokenizer. |
 | {py:meth}`ds.ml.download(url_col, ...) <batcher.api.dataset.ml.DatasetML.download>` | Fetch bytes at each URL/path into a column. |
 | {py:meth}`ds.ml.upload(data_col, dir, ...) <batcher.api.dataset.ml.DatasetML.upload>` | Write a bytes column out to object storage. |
 | {py:meth}`ds.ml.iter_torch_batches(...) <batcher.api.dataset.ml.DatasetML.iter_torch_batches>` | Stream the dataset to PyTorch as tensor batches. |
@@ -158,6 +159,11 @@ OpenAI-compatible endpoint, and a hosted Claude model are interchangeable: swap
 {py:obj}`bedrock_engine <batcher.ml.bedrock_engine>` or
 {py:obj}`gemini_engine <batcher.ml.gemini_engine>` and nothing else changes.
 
+Two policy objects plug into the served-endpoint engines.
+{py:class}`ProviderLimit <batcher.ml.ProviderLimit>` is one rate and concurrency quota every
+worker obeys together, and {py:class}`TokenBudget <batcher.ml.TokenBudget>` keeps the prompt
+tokens a batch sends at once under a budget, counted with a real tokenizer.
+
 ```{eval-rst}
 .. currentmodule:: batcher.ml
 
@@ -171,6 +177,8 @@ OpenAI-compatible endpoint, and a hosted Claude model are interchangeable: swap
    anthropic_engine
    bedrock_engine
    gemini_engine
+   ProviderLimit
+   TokenBudget
    llm_generate
    llm_udf
    json_schema

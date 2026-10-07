@@ -67,14 +67,24 @@ def _window_node(plan: LogicalPlan, alias: str, we: WindowExpr) -> Window:
         else:
             order_specs.append(SortKeySpec(_as_key_expr(key)))
     frame = WindowFrame(*we.frame) if we.frame is not None else None
-    probe = WindowFuncSpec(we.func, we.input, alias, we.offset, frame, we.alpha, we.half_life)
+    probe = WindowFuncSpec(
+        we.func, we.input, alias, we.offset, frame, we.alpha, we.half_life, opts=we.opts
+    )
     if not order_specs and depends_on_row_order(probe):
         # Decided before the SQL default frame is applied: that frame is a consequence of
         # having an order, not evidence that the function needs one.
         order_specs.extend(established_order(plan))
     frame = sql_default_frame(we.func, frame, bool(order_specs), we.ignore_nulls)
     spec = WindowFuncSpec(
-        we.func, we.input, alias, we.offset, frame, we.alpha, we.half_life, we.ignore_nulls
+        we.func,
+        we.input,
+        alias,
+        we.offset,
+        frame,
+        we.alpha,
+        we.half_life,
+        we.ignore_nulls,
+        we.opts,
     )
     return Window(plan, part_keys, tuple(order_specs), (spec,))
 

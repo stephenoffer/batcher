@@ -257,6 +257,14 @@ a number rather than a human reading a plan.
 print(query.stats())
 ```
 
+`stats()` discards the result rows unless you ask for them. `keep_result=True` keeps the run's table on `RunStats.result`, so one execution gives you both the data and its measurements. `stats()` takes no execution arguments, so the run routes the way `collect()` does with its defaults.
+
+```python
+run = query.stats(keep_result=True)
+print(run.rows == run.result.num_rows)
+# True
+```
+
 :::{dropdown} The per-operator table
 ```text
 OP  KIND       ROWS IN  ROWS OUT  TIME  OP SHARE       OUT  BACKEND

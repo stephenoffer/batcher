@@ -31,6 +31,7 @@ resolves the module without importing it — so choosing a backend costs no impo
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 __all__ = ["read_backend", "write_backend"]
@@ -84,17 +85,46 @@ def read_backend(uri: str | None, opts: dict[str, Any]) -> str:
 
     parsed = parse_uri(uri)
     if parsed.backend == "adbc":
-        if _installed("adbc_driver_manager") and _installed(str(parsed.driver)):
+        missing = [m for m in ("adbc_driver_manager", str(parsed.driver)) if not _installed(m)]
+        if not missing:
             return "adbc"
     elif _installed("connectorx"):
         return "connectorx"
+    else:
+        missing = ["connectorx"]
     # The Arrow-native backend for this scheme is not installed. Fall back to PEP 249 only
     # if one of *its* drivers is, so a genuinely uninstallable read still names the
     # dependency the user most likely meant rather than a second one they have never heard
     # of.
     if _dbapi_available(parsed.scheme):
+        _note_dbapi_fallback(parsed.scheme, parsed.backend, missing)
         return "dbapi"
     return parsed.backend
+
+
+def _note_dbapi_fallback(scheme: str, backend: str, missing: list[str]) -> None:
+    """Say once, at INFO, that a read took the slow PEP 249 path and what would avoid it.
+
+    The fallback is correct and silent, which is the problem: a ``sqlite://`` read without
+    ``adbc_driver_sqlite`` quietly materializes every value as a Python object, several
+    times slower than the Arrow-native path, and nothing about the result says so.
+
+    Args:
+        scheme: The URI scheme being read.
+        backend: The Arrow-native backend the scheme prefers.
+        missing: The packages whose absence caused the fallback.
+    """
+    from batcher._internal.logging import get_logger, log_kv
+
+    log_kv(
+        get_logger("io.sql"),
+        logging.INFO,
+        f"{scheme}:// read falls back to DB-API: the Arrow-native {backend} backend is not "
+        f"installed (pip install {' '.join(m.replace('_', '-') for m in missing)})",
+        scheme=scheme,
+        backend="dbapi",
+        missing=",".join(missing),
+    )
 
 
 def write_backend(mode: str, opts: dict[str, Any]) -> str:

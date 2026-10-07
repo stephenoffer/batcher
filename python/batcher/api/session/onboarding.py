@@ -123,9 +123,7 @@ TOP_LEVEL_UNSUPPORTED: dict[str, str] = {
     "arange": "An integer range is bt.range(start, end) (like builtins.range).",
     "int_range": "An integer range is bt.range(start, end).",
     "datetime_range": "A timestamp range is bt.date_range(start, end=..., interval='1d').",
-    "qcut": (
-        "Quantile-bin with breaks from bt.col('x').quantile(...), then bt.col('x').cut(breaks=...)."
-    ),
+    "qcut": "Quantile-bin with bt.col('x').qcut(4) inside ds.with_columns(...).",
     "set_option": (
         "Configure with bt.set_config(...) / bt.config_context(...) and the bt.Config dataclasses."
     ),

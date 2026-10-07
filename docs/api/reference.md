@@ -55,7 +55,7 @@ Each returns a new lazy Dataset.
 | `.filter(expr)` | keep rows where the predicate is true |
 | {py:meth}`.select(*names, **derived) <batcher.Dataset.select>` | choose or derive the full output |
 | {py:meth}`.with_columns(**named) <batcher.Dataset.with_columns>` | add or replace columns |
-| `.drop(*names)` | remove columns |
+| `.drop(*names, strict=True)` | remove columns; `strict=False` ignores a name that is not a column |
 | `.rename({old: new})` | rename columns |
 | `.sort(*by, descending=False, nulls_first=False)` | order rows |
 | `.limit(n, offset=0)` | take a prefix |
@@ -87,7 +87,7 @@ reverse:
 | --- | --- |
 | {py:meth}`.explode(column, alias=None) <batcher.Dataset.explode>` | one row per element of a list column |
 | {py:meth}`.with_row_index(name="index", offset=0) <batcher.Dataset.with_row_index>` | prepend a sequential row-index column (Polars) |
-| {py:meth}`.with_random(name="random", seed=0, normal=False) <batcher.Dataset.with_random>` | add a reproducible seeded random column (uniform or standard normal) |
+| {py:meth}`.with_random(name="random", seed=0, normal=False, key=None) <batcher.Dataset.with_random>` | add a reproducible seeded random column (uniform or standard normal), keyed on row position or on `key` columns |
 | {py:meth}`.unnest(*columns) <batcher.Dataset.unnest>` | lift struct fields into top-level columns |
 | {py:meth}`.pivot(index=[...], on=, values=, aggregate="sum") <batcher.Dataset.pivot>` | long -> wide |
 | {py:meth}`.unpivot(on=[...], index=[...], ...) <batcher.Dataset.unpivot>` | wide -> long |
@@ -99,12 +99,12 @@ Each of these executes the plan and returns a result or writes it out:
 
 | Method | Returns |
 | --- | --- |
-| {py:meth}`.collect(distributed=False, num_workers=None, spill=False, num_partitions=16, adaptive=False, transport="disk") <batcher.Dataset.collect>` | pyarrow Table |
+| {py:meth}`.collect(distributed="auto", num_workers=None, spill=False, num_partitions=None, adaptive="auto", transport="auto", backend="cpu", *, max_rows=None) <batcher.Dataset.collect>` | pyarrow Table; `max_rows` raises rather than returning a larger result |
 | {py:meth}`.to_pydict() <batcher.Dataset.to_pydict>` | `dict[str, list]` |
 | {py:meth}`.to_pylist() <batcher.Dataset.to_pylist>` | `list[dict]` |
 | `.count()` | row count (`int`) |
 | {py:meth}`.iter_batches(batch_size=None) <batcher.Dataset.iter_batches>` | iterator of RecordBatch |
-| `.explain()` | optimized plan as text |
+| `.explain(analyze=False, *, format="text", backend="cpu")` | optimized plan as text; `backend="gpu"` adds whether the plan translates to the GPU tier and what blocks it |
 | {py:meth}`.show(limit=10) <batcher.Dataset.show>` | prints a preview |
 | {py:obj}`.write(path, fmt=None, partition_by=None, distributed=False, num_workers=None, **kw) <batcher.Dataset.write>` | WriteManifest |
 | `.write.parquet(path, compression="zstd", **kw)` | writes Parquet |
@@ -118,6 +118,8 @@ Each of these executes the plan and returns a result or writes it out:
 | {py:meth}`.to_ray_dataset() <batcher.Dataset.to_ray_dataset>` | a `ray.data.Dataset`, for a Ray Train / Tune / Serve stage |
 | {py:meth}`.to_daft() <batcher.Dataset.to_daft>` | a `daft.DataFrame` |
 | {py:meth}`.to_spark(spark, max_arrow_bytes=None, staging_path=None) <batcher.Dataset.to_spark>` | a `pyspark.sql.DataFrame` in `spark`, staged as Parquet past `max_arrow_bytes` |
+| {py:meth}`.to_dask(materialize="arrow") <batcher.Dataset.to_dask>` | a lazy `dask.dataframe.DataFrame` over Arrow partitions (`"arrow"`, `"deferred"` or `"parquet"`) |
+| {py:meth}`.to_huggingface(mode="materialized") <batcher.Dataset.to_huggingface>` | a `datasets.Dataset` or `datasets.IterableDataset`, with `ClassLabel` and `Image` features |
 
 ### Introspection
 
@@ -134,7 +136,7 @@ These compute (or read) a small result and so are eager.
 | {py:meth}`.corr_matrix(columns=None) <batcher.Dataset.corr_matrix>` | pairwise Pearson correlation matrix over numeric columns (one scan) |
 | {py:meth}`.cov_matrix(columns=None) <batcher.Dataset.cov_matrix>` | pairwise sample covariance matrix over numeric columns (PCA/whitening input) |
 | `.approx_quantile(column, q)` | a sketch-based quantile estimate |
-| {py:meth}`.stats() <batcher.Dataset.stats>` | the last run's measured `RunStats` |
+| {py:meth}`.stats() <batcher.Dataset.stats>` | runs the query and returns its measured `RunStats` |
 | `__arrow_c_stream__()` | Arrow PyCapsule export, so `pl.DataFrame(ds)`, `duckdb.sql("... FROM ds")`, and `pa.table(ds)` consume a `Dataset` directly, lazily and zero-copy |
 
 ```python
@@ -208,6 +210,7 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | {py:func}`bt.struct(**fields) <batcher.struct>` / {py:func}`bt.named_struct(name, value, ...) <batcher.named_struct>` | build a struct column |
 | {py:func}`bt.sequence(start, stop, step=1) <batcher.sequence>` | per-row integer list `[start..stop]` inclusive (DuckDB `generate_series`) |
 | {py:func}`bt.element() <batcher.element>` | the current element inside `list.transform` / `list.filter` (Polars) |
+| {py:func}`bt.element_index() <batcher.element_index>` | the current element's 0-based position inside `list.transform` / `list.filter` |
 | {py:func}`bt.sum_horizontal(*exprs) <batcher.sum_horizontal>` / {py:func}`bt.mean_horizontal(*exprs) <batcher.mean_horizontal>` | row-wise sum / mean across columns, ignoring nulls (Polars) |
 | {py:func}`bt.all_horizontal(*exprs) <batcher.all_horizontal>` / {py:func}`bt.any_horizontal(*exprs) <batcher.any_horizontal>` | row-wise boolean AND / OR across columns (Polars) |
 | {py:func}`bt.hash_rows(*exprs, seed=0) <batcher.hash_rows>` | deterministic 64-bit row digest (also `expr.hash(seed=0)`) |
@@ -234,8 +237,9 @@ These are the top-level function forms. Rows marked `(aggregate)` belong inside 
 | {py:func}`bt.current_timestamp() <batcher.current_timestamp>` | current timestamp, bound at plan-build time |
 | {py:func}`bt.current_date() <batcher.current_date>` | today's date, bound at plan-build time |
 | {py:func}`bt.date_part(part, expr) <batcher.date_part>` | extract a calendar field such as `year`, `month`, or `dow` |
-| {py:func}`bt.date_add(expr, days) <batcher.date_add>` | add a whole number of `days` to a date/time column (Spark {py:func}`date_add <batcher.date_add>`) |
-| {py:func}`bt.date_sub(expr, days) <batcher.date_sub>` | subtract a whole number of `days` from a date/time column (Spark {py:func}`date_sub <batcher.date_sub>`) |
+| {py:func}`bt.date_add(expr, days) <batcher.date_add>` | add a whole number of `days`, a constant or a per-row column, to a date/time column (Spark {py:func}`date_add <batcher.date_add>`) |
+| {py:func}`bt.date_sub(expr, days) <batcher.date_sub>` | subtract a whole number of `days`, a constant or a per-row column, from a date/time column (Spark {py:func}`date_sub <batcher.date_sub>`) |
+| {py:func}`bt.business_day_count(start, end, holidays=(), weekmask="1111100") <batcher.business_day_count>` | business days in `[start, end)`, sharing one calendar with `.dt.add_business_days` and `.dt.is_business_day` (numpy `busday_count`) |
 | {py:func}`bt.make_date(year, month, day) <batcher.make_date>` | build a Date from integer components; an impossible date is null |
 | {py:func}`bt.make_timestamp(year, month, day, hour=0, minute=0, second=0) <batcher.make_timestamp>` | build a Timestamp from components |
 | {py:func}`bt.from_epoch(expr, unit="s") <batcher.from_epoch>` | read an integer epoch column as a Timestamp at a stated unit (`s`/`ms`/`us`/`ns`) |
@@ -263,6 +267,7 @@ These sit outside the `Dataset` and `Expr` surfaces:
   {py:meth}`.fill_nan(value) <batcher.plan.expr_ir.core.Expr.fill_nan>`, {py:meth}`.eq_missing(other) <batcher.plan.expr_ir.core.Expr.eq_missing>`, {py:meth}`.is_nan() <batcher.plan.expr_ir.core.Expr.is_nan>`, {py:meth}`.is_not_nan() <batcher.plan.expr_ir.core.Expr.is_not_nan>`,
   `.is_finite()`, `.is_infinite()`, `.clip(lower, upper)`, `.alias(name)`
 - Binning and gap-filling: `.cut(breaks, labels=None, left_closed=False)`,
+  {py:meth}`.qcut(q, labels=None, duplicates="raise") <batcher.plan.expr_ir.core.Expr.qcut>`,
   {py:meth}`.forward_fill() <batcher.plan.expr_ir.core.Expr.forward_fill>` and {py:meth}`.backward_fill() <batcher.plan.expr_ir.core.Expr.backward_fill>`. The two fills are window functions, so bind them with {py:meth}`.over(order_by=[...]) <batcher.AggExpr.over>`. An order is required.
 - Math: `.abs()`, `.round(digits)`, `.sqrt()`, `.floor()`, `.ceil()`,
   `.ln()`, `.log10()`, `.log2()`, `.exp()`, `.sin()`, `.cos()`, `.tan()`, `.arcsin()`,

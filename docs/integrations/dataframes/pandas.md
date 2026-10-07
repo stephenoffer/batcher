@@ -29,6 +29,23 @@ print(totals.to_pandas())
 
 The blocks on this page are shown rather than executed, because the test suite that runs the documentation installs the extras CI needs and pandas is not one of them. Everything here works the same way as the Polars and Arrow pages, which are executed on every run.
 
+## Nullable columns on the way out
+
+`to_pandas()` uses pyarrow's plain conversion by default, and pandas' NumPy-backed dtypes have no null for an integer. An `int64` column holding a null therefore arrives as `float64` with NaN, which also rounds any value above 2**53. Pass `dtype_backend`, with pandas' own values, to keep the type:
+
+```python
+# docs: skip
+ids = bt.from_pydict({"id": [2**62 + 1, None]})
+print(ids.to_pandas()["id"].dtype)
+# float64
+print(ids.to_pandas(dtype_backend="numpy_nullable")["id"].tolist())
+# [4611686018427387905, <NA>]
+print(ids.to_pandas(dtype_backend="pyarrow")["id"].dtype)
+# int64[pyarrow]
+```
+
+`"numpy_nullable"` gives integer, float, Boolean and string columns pandas' nullable extension dtypes (`Int64`, `Float64`, `boolean`, `string`), and `"pyarrow"` keeps every column Arrow-backed through `pd.ArrowDtype`. The result has a fresh `RangeIndex` either way, because a `Dataset` has no index to restore.
+
 ## Where the conversion cost goes
 
 Object-dtype columns are the expensive case. A pandas column of Python strings is an array of pointers, and Arrow needs one contiguous buffer plus offsets, so the conversion walks every value. Numeric columns are close to a memcpy, and a pandas frame already backed by Arrow (`dtype_backend="pyarrow"`) is close to free.
@@ -37,12 +54,14 @@ If a pipeline crosses this boundary in a loop, the fix is usually to move the bo
 
 ## The index does not exist here
 
-A Batcher `Dataset` has columns and nothing else. There is no index, so `from_pandas` keeps the index only if you have made it a column first:
+A Batcher `Dataset` has columns and nothing else. There is no index, so `from_pandas` drops it by default. Pass `preserve_index=True` to keep it as columns, named the way `df.reset_index()` names them: each level becomes a leading column called after the level, or `index` (`level_<n>` for an unnamed level of a `MultiIndex`) when it has no name.
 
 ```python
 # docs: skip
-ds = bt.from_pandas(frame.reset_index())
+ds = bt.from_pandas(frame, preserve_index=True)
 ```
+
+A level whose name is already a data column raises a `PlanError` instead of being renamed behind your back. Rename the index with `df.rename_axis(...)` first.
 
 This is the same decision Polars made, and for the same reason: an index is a second addressing scheme that every operator has to agree about, and joins and group-bys already say what they key on. To get row positions back, {py:obj}`ds.with_row_index() <batcher.Dataset.with_row_index>` adds an explicit column.
 

@@ -70,6 +70,24 @@ print(per_region.sort("region").to_pydict())
 
 Reach for this first when a model looks fine overall. A strong aggregate can hide one weak segment, and only the grouped form shows it.
 
+A segment can also look bad because it holds almost nothing. A slice with one negative row reports `precision=0.0` and `recall=0.0` by the `zero_division=0` convention, which reads exactly like a measured zero. Pass `support=True` to add `n`, the rows each metric was computed over, and for a binary task `n_positive`, the positive rows among them. Both come from the same aggregate pass:
+
+```python
+counted = ds.ml.evaluate("y", y_score="score", by="region", metrics=["recall"], support=True)
+print(counted.sort("region").to_pydict())
+# {'region': ['eu', 'us'], 'recall': [1.0, 0.0], 'n': [2, 2], 'n_positive': [1, 1]}
+```
+
+## Weighted metrics
+
+`weight=` names a per-row sample-weight column, with the meaning of scikit-learn's `sample_weight`. It applies to the metrics that are a weighted sum over a weighted sum: `accuracy`, `precision`, `recall`, `f1` and binary `balanced_accuracy` for classification, and `mse`, `rmse`, `mae` and `r2` for regression. Naming any other metric with `weight=` raises `PlanError` rather than quietly computing the unweighted value, and an omitted `metrics=` defaults to the weighted subset of the task's set. A row with a null weight is left out, like a row with a null label:
+
+```python
+weighted = bt.from_pydict({"y": [1.0, 2.0, 3.0], "p": [1.0, 2.0, 5.0], "w": [5.0, 3.0, 2.0]})
+print(weighted.ml.evaluate("y", y_pred="p", task="regression", metrics=["mae"], weight="w"))
+# {'mae': 0.4}
+```
+
 ## Individual metrics inside any aggregate
 
 Because the metrics are expressions, they go anywhere an aggregate goes:

@@ -13,9 +13,9 @@ groups by `(keys, x)` — deduping `x` implicitly — while pre-aggregating the 
 a mergeable partial, and level 2 combines those partials. It is deliberately not two
 aggregates joined on the group keys, because a join drops the NULL-keyed group.
 
-What still has no correct single-pass form (two different DISTINCT expressions, or a plain
-aggregate with no single-column mergeable partial such as `avg`) must reject cleanly rather
-than return a plausible wrong number.
+Two different DISTINCT expressions, or a plain aggregate with no single-column mergeable
+partial such as `avg`, take Spark's Expand rewrite (`_sql/parser/agg_rewrites.py`): one
+deduplicated copy of the input per DISTINCT expression, unioned with the raw rows.
 """
 
 from __future__ import annotations
@@ -125,15 +125,13 @@ def test_distinct_mixed_global_no_group_by(duck, t):
     assert_same(bt.sql(query, t=t).collect(), duck.sql(query))
 
 
-def test_distinct_mixed_with_a_non_decomposable_aggregate_rejects(t):
-    """`avg` has no single-column mergeable partial, so it cannot be pre-aggregated."""
+def test_distinct_mixed_with_a_non_decomposable_aggregate(t, duck):
+    """`avg` has no single-column mergeable partial, so it takes the Expand rewrite."""
     query = "SELECT k, sum(DISTINCT v) AS s, avg(w) AS a FROM t GROUP BY k"
-    with pytest.raises(NotImplementedError, match="mergeable partial"):
-        bt.sql(query, t=t).collect()
+    assert_same(bt.sql(query, t=t).collect(), duck.sql(query))
 
 
-def test_two_different_distinct_expressions_reject(t):
-    """Two DISTINCT expressions need two different dedups, so one pass cannot serve both."""
+def test_two_different_distinct_expressions(t, duck):
+    """Two DISTINCT expressions need two dedups: one tagged, deduplicated copy each."""
     query = "SELECT k, sum(DISTINCT v) AS s, sum(DISTINCT w) AS c FROM t GROUP BY k"
-    with pytest.raises(NotImplementedError, match="DISTINCT expressions"):
-        bt.sql(query, t=t).collect()
+    assert_same(bt.sql(query, t=t).collect(), duck.sql(query))

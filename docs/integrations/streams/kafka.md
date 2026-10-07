@@ -324,7 +324,7 @@ Any further option is passed to `confluent-kafka` with underscores turned into d
 
 Each micro-batch is flushed and acknowledged before the sink reports it written, so a
 broker rejection fails the query instead of silently dropping records. Delivery is at-least-once: a replayed micro-batch republishes its rows, so the consumer must be
-idempotent or dedup on the key. Kafka's transactional produce is the only way to do better, and it requires the consumer to read committed-only. Spark's Kafka sink makes the same tradeoff.
+idempotent or dedup on the key, or on the `batcher-dedup-id` header that `dedup_ids=<writer name>` stamps on every record. {doc}`sinks` compares this with the other brokers. Kafka's transactional produce is the only way to do better, and it requires the consumer to read committed-only. Spark's Kafka sink makes the same tradeoff.
 
 `value_format=`, `schema_registry=`, and the other payload options work on the write too, encoding a struct `value` column before it's produced. See {doc}`/integrations/streams/payload-formats`.
 

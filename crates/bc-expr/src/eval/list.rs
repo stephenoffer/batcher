@@ -742,20 +742,23 @@ pub(crate) fn eval_list(func: ListFunc, arr: &ArrayRef) -> Result<ArrayRef, Expr
             b.append_value(m);
             continue;
         }
-        // Sample variance / std need ≥2 values; null otherwise.
-        if matches!(func, ListFunc::Std | ListFunc::Var) {
-            if vals.len() < 2 {
+        // The divisor is `n - ddof`: 1 for the sample forms, 0 for the population forms,
+        // and a row with no more than `ddof` values has no answer (null).
+        if let Some((ddof, sqrt)) = match func {
+            ListFunc::Var => Some((1, false)),
+            ListFunc::Std => Some((1, true)),
+            ListFunc::VarPop => Some((0, false)),
+            ListFunc::StdPop => Some((0, true)),
+            _ => None,
+        } {
+            if vals.len() <= ddof {
                 b.append_null();
                 continue;
             }
             let mean = vals.iter().sum::<f64>() / vals.len() as f64;
             let ss: f64 = vals.iter().map(|&x| (x - mean) * (x - mean)).sum();
-            let variance = ss / (vals.len() as f64 - 1.0);
-            b.append_value(match func {
-                ListFunc::Var => variance,
-                ListFunc::Std => variance.sqrt(),
-                _ => unreachable!(),
-            });
+            let variance = ss / (vals.len() - ddof) as f64;
+            b.append_value(if sqrt { variance.sqrt() } else { variance });
             continue;
         }
         let r = match func {

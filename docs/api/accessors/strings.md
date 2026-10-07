@@ -2,6 +2,8 @@
 
 This page is the reference for `.str`, the accessor every string expression carries. Reach it as {py:obj}`col("x").str <batcher.plan.expr_ir.core.Expr.str>`. Every method returns a new lazy expression, a null input gives a null output, and each one has its own page.
 
+Case mapping, normalization and character classes are locale-independent: they read the Unicode Character Database, never the machine's locale. A method that takes a regex runs it on the Rust `regex` crate (RE2 syntax), and a pattern with lookaround or a backreference is refused when the expression is built. The methods that accept Binary as well as text, such as `octet_length`, `hex`, the hashes and `decompress`, work on the raw bytes.
+
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.strings
 
@@ -11,7 +13,7 @@ This page is the reference for `.str`, the accessor every string expression carr
 
 ## Case and trimming
 
-Change a string's case, trim characters from its ends, and collapse its whitespace.
+Change a string's case, fold it for caseless comparison, trim characters from its ends, and collapse its whitespace.
 
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.strings
@@ -22,6 +24,7 @@ Change a string's case, trim characters from its ends, and collapse its whitespa
 
    _StrNamespace.upper
    _StrNamespace.lower
+   _StrNamespace.casefold
    _StrNamespace.capitalize
    _StrNamespace.to_titlecase
    _StrNamespace.to_case
@@ -117,6 +120,7 @@ Match, extract, count, replace, and split with a regex pattern.
    _StrNamespace.match
    _StrNamespace.extract
    _StrNamespace.extract_all
+   _StrNamespace.extract_groups
    _StrNamespace.count_matches
    _StrNamespace.replace_all
    _StrNamespace.regexp_replace
@@ -126,7 +130,7 @@ Match, extract, count, replace, and split with a regex pattern.
 
 ## Length and character classes
 
-Measure a string in characters, bytes, bits, or words, and test which characters it holds.
+Measure a string in characters, bytes, bits, or words, and test which characters it holds. `len_chars`, `substr` and `slice` count code points by default and take `unit="grapheme"` to count what a reader sees as one character.
 
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.strings
@@ -345,7 +349,7 @@ Detect, count, extract, remove, or mask URLs, email addresses, phone numbers, ha
 
 ## Cleaning and normalization
 
-Strip markup, symbols, and boilerplate from text, and normalize it into a comparison key.
+Strip markup, symbols, and boilerplate from text, and normalize it into a comparison key. `normalize` puts text into a Unicode normal form, so that a precomposed and a decomposed accent compare equal.
 
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.strings
@@ -354,6 +358,7 @@ Strip markup, symbols, and boilerplate from text, and normalize it into a compar
    :toctree: generated
    :nosignatures:
 
+   _StrNamespace.normalize
    _StrNamespace.strip_html
    _StrNamespace.remove_html_tags
    _StrNamespace.remove_markdown_links

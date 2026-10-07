@@ -27,7 +27,11 @@ __all__ = ["_DESCRIPTIONS"]
 _DESCRIPTIONS: dict[str, str] = {
     # --- .str string→string transforms (null → null) ------------------------
     "upper": (
-        "The string with every letter uppercased.\n\n"
+        "The string with every letter uppercased, by full Unicode case mapping.\n\n"
+        "Locale-independent: the mapping is the Unicode Character Database's, never the\n"
+        'machine\'s. A character may map to several, so ``"Straße"`` becomes\n'
+        '``"STRASSE"`` and the result can be longer than the input. DuckDB maps one\n'
+        'character at a time and gives ``"STRAẞE"``.\n\n'
         "Examples:\n"
         "    .. doctest::\n\n"
         "        >>> import batcher as bt\n"
@@ -36,7 +40,11 @@ _DESCRIPTIONS: dict[str, str] = {
         "        {'r': ['HELLO']}"
     ),
     "lower": (
-        "The string with every letter lowercased.\n\n"
+        "The string with every letter lowercased, by full Unicode case mapping.\n\n"
+        "Locale-independent, and context-sensitive where Unicode is: a Greek capital\n"
+        "sigma ending a word lowercases to the final sigma (U+03C2), where DuckDB,\n"
+        "mapping one character at a time, writes the medial sigma (U+03C3).\n"
+        "For a caseless comparison key use ``str.casefold``, which also folds ``ß``.\n\n"
         "Examples:\n"
         "    .. doctest::\n\n"
         "        >>> import batcher as bt\n"
@@ -249,24 +257,6 @@ _DESCRIPTIONS: dict[str, str] = {
         '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3, 4]]})\n'
         '        >>> ds.select(r=bt.col("xs").list.product()).to_pydict()\n'
         "        {'r': [24.0]}"
-    ),
-    "std": (
-        "The sample standard deviation of the elements of each list (→ Float64).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.std()).to_pydict()\n'
-        "        {'r': [1.0]}"
-    ),
-    "var": (
-        "The sample variance of the elements of each list (→ Float64).\n\n"
-        "Examples:\n"
-        "    .. doctest::\n\n"
-        "        >>> import batcher as bt\n"
-        '        >>> ds = bt.from_pydict({"xs": [[1, 2, 3]]})\n'
-        '        >>> ds.select(r=bt.col("xs").list.var()).to_pydict()\n'
-        "        {'r': [1.0]}"
     ),
     "median": (
         "The median of the elements of each list (→ Float64).\n\n"

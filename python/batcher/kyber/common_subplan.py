@@ -175,6 +175,7 @@ def common_subplans(
     sized = None
     as_run = normalize or (lambda node: node)
     run_plan = None
+    priced: _PlanCost | None = None
     for key, node in ordered:
         if key == root_key or key in covered:
             continue
@@ -191,7 +192,9 @@ def common_subplans(
         run_node = as_run(node)
         if not _fits(run_node, sized, max_bytes, row_bytes):
             continue
-        if not _worth_materializing(run_node, run_plan, sized, appearances[key]):
+        if priced is None:
+            priced = _PlanCost(sized, run_plan)
+        if not _worth_materializing(run_node, priced, appearances[key]):
             continue
         accepted.append(node)
         covered.update(k for k in map(structural_key, walk(node)) if k is not None)
@@ -238,7 +241,29 @@ _MIN_SAVED_SHARE = 1.0 / 6.0
 _MIN_SAVED_COST = 4.0e9
 
 
-def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appearances: int) -> bool:
+class _PlanCost:
+    """One `CostModel` over the plan, and the plan's total cost, shared by every candidate.
+
+    Bar 5 judges each candidate against the same whole-plan total, and the model memoizes the
+    subtrees it has costed, so building a model and re-costing the plan per candidate repeated
+    the same work once per repeated subtree: on TPC-DS q5 the analysis was ~37 ms of ~160.
+    """
+
+    def __init__(self, estimator, plan: LogicalPlan) -> None:
+        from batcher.kyber.cost.model import CostModel
+
+        self.model = CostModel(estimator)
+        self.plan = plan
+        self._total: float | None = None
+
+    def total(self) -> float:
+        """The whole plan's cost, computed on first use."""
+        if self._total is None:
+            self._total = self.model.cost(self.plan).total()
+        return self._total
+
+
+def _worth_materializing(node: LogicalPlan, priced: _PlanCost, appearances: int) -> bool:
     """Whether materializing `node` saves enough of `plan`'s cost to pay for itself.
 
     Priced in Kyber's own currency (`CostModel`) rather than in rows, because what a subtree
@@ -250,8 +275,8 @@ def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appear
 
     Args:
         node: The candidate subtree.
-        plan: The whole plan it sits in, which is what its cost is judged against.
-        estimator: The `CardinalityEstimator` the sizes come from.
+        priced: The cost model and the whole plan's total, which the candidate is judged
+            against.
         appearances: How many times `node` occurs in `plan`. Materializing replaces all but
             one of them, so this is what turns a share of the cost into a saving.
 
@@ -259,11 +284,8 @@ def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appear
         Whether the saved share clears `_MIN_SAVED_SHARE`, or the saved cost
         `_MIN_SAVED_COST`.
     """
-    from batcher.kyber.cost.model import CostModel
-
     try:
-        model = CostModel(estimator)
-        total = model.cost(plan).total()
+        total = priced.total()
         if total <= 0 or appearances < 2:
             return False
         # `share` is every appearance's cost as a fraction of the plan, which is what the
@@ -274,7 +296,7 @@ def _worth_materializing(node: LogicalPlan, plan: LogicalPlan, estimator, appear
         # the less worth sharing it looked. Measured on a subtree that is the whole plan's
         # cost, repeated: at 2 appearances it scored 0.247 and passed, at 9 it scored
         # 0.094 and was refused -- where the true savings are half the plan and 8/9 of it.
-        one = model.cost(node).total()
+        one = priced.model.cost(node).total()
         share = one * appearances / total
         saved = share * (appearances - 1) / appearances
         return saved >= _MIN_SAVED_SHARE or one * (appearances - 1) >= _MIN_SAVED_COST

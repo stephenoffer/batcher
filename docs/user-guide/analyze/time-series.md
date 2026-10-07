@@ -52,6 +52,19 @@ print(bucketed.to_pydict())
 
 Carry the count alongside the average. It is the difference between a bucket that was quiet and a bucket where the sensor was down, and the average alone cannot tell you which.
 
+The bucket grid starts at the Unix epoch unless you move it. `origin=` names a `datetime` the grid passes through and `offset=` slides it by a fixed duration, so half-hour buckets at :15 and :45 are `offset="15m"`. `closed="right"` makes each bucket `(start, end]` instead of `[start, end)`, so a reading exactly on a boundary belongs to the bucket it ends, and `label="right"` labels each bucket by its end. These match Polars `group_by_dynamic`'s `offset`, `closed` and `label`, and apply to tumbling windows.
+
+```python
+shifted = (
+    readings.filter(bt.col("sensor") == "a")
+    .group_by(bucket=bt.window(bt.col("at"), "30m", offset="15m", label="right"))
+    .agg(n=bt.col("celsius").count())
+    .sort("bucket")
+)
+print(shifted.to_pydict())
+# {'bucket': [datetime.datetime(2024, 5, 1, 9, 15), datetime.datetime(2024, 5, 1, 9, 45)], 'n': [3, 1]}
+```
+
 For overlapping windows, pass `slide`: `bt.window(col("at"), "1h", "15m")` returns the *list* of hour-wide windows a reading belongs to, hopping every fifteen minutes. Fan it out with {py:meth}`unnest <batcher.Dataset.unnest>` before grouping.
 
 ## Fill the buckets with no rows
@@ -86,6 +99,23 @@ print(carried.to_pydict()["mean"], carried.to_pydict()["n"])
 
 A missing *count* is genuinely zero. A missing *temperature* is not, so it is carried forward instead. The count beside it is how a reader knows the value was carried rather than measured.
 
+## Upsample raw readings onto a grid
+
+The grid above is built by hand because it spans a fixed window for every sensor. When each series should run from its own first reading to its own last, {py:meth}`upsample <batcher.Dataset.upsample>` builds that grid for you. It inserts a row at every step of `every` that a series has no reading for, and `indicator=` names a boolean column marking the inserted rows.
+
+```python
+regular = readings.upsample(
+    "at", "15m", by="sensor", fill="forward", indicator="inserted"
+).sort("sensor", "at")
+print(regular.to_pydict()["celsius"], regular.to_pydict()["inserted"])
+# [20.0, 21.0, 22.0, 22.0, 22.0, 26.0, 5.0, 5.0, 5.0, 9.0]
+# [False, False, False, True, True, False, False, True, True, False]
+```
+
+Each sensor gains rows at 09:15 and 09:30, each filled from the reading before it in time. Every observed reading is kept, including those at 09:01, 09:02 and 09:32 that fall between grid points. That differs from Polars `upsample`, whose join onto the grid drops them. So `upsample` makes a series *complete* on the grid. It does not make it *regular*. Downsample with `bt.window` when you need exactly one row per step.
+
+The grid is built per series with `sequence` and `explode`, in the column's own unit, so the step must be a fixed duration and a whole number of that unit, such as whole days for a `date` column. Its size is the series' span divided by `every`, so a step much finer than the data makes a very large result.
+
 ## Fill gaps within a series
 
 {py:meth}`forward_fill <batcher.plan.expr_ir.core.Expr.forward_fill>` holds the last reading flat across a gap. {py:meth}`interpolate <batcher.plan.expr_ir.core.Expr.interpolate>` draws a straight line across it instead. Which is right depends on the quantity, not on the data: a configuration setting or a device state genuinely holds between reports, while a temperature or a meter reading was moving the whole time.
@@ -103,6 +133,22 @@ print(
 ```
 
 The trailing null shows the difference in kind. A fill has a value to carry. Interpolation has nothing on the far side to draw a line to, so the row stays null. Both take `partition_by` through `.over(...)`, which keeps one sensor's readings out of another's gaps.
+
+Interpolation by row position assumes the readings are evenly spaced. When they aren't, pass `by=` the time column and the line is weighted by elapsed time instead, which is Polars' `interpolate_by`. `max_gap=` stops it from inventing a long stretch of data: a gap wider than the bound stays null as a whole. With `by` the bound is the time between the two readings around the gap, given as a duration for a timestamp column or a number for a numeric one. Without `by` it counts null rows.
+
+```python
+uneven = bt.from_pydict({"at": [0, 1, 5, 6, 7, 8], "level": [0.0, None, 5.0, None, None, 8.0]})
+print(
+    uneven.with_columns(
+        timed=bt.col("level").interpolate(by="at"),
+        bounded=bt.col("level").interpolate(by="at", max_gap=3),
+    ).to_pydict()
+)
+# {'at': [0, 1, 5, 6, 7, 8], 'level': [0.0, None, 5.0, None, None, 8.0],
+#  'timed': [0.0, 1.0, 5.0, 6.0, 7.0, 8.0], 'bounded': [0.0, None, 5.0, 6.0, 7.0, 8.0]}
+```
+
+The first gap spans five time units, so the bounded column leaves it null. pandas' `interpolate(limit=n)` behaves differently: it fills the first `n` rows of a longer gap rather than none of them.
 
 ## Smooth over a time window
 
@@ -132,6 +178,20 @@ print(
 ```
 
 `ewm_std` and `ewm_var` give the matching spread over the same weights, which is what makes a live volatility band or control limit.
+
+All three take pandas' and Polars' tuning options. `adjust=False` switches to the recursive form `y = (1 - alpha) * y_prev + alpha * x`, `ignore_nulls=True` stops a null row from aging the weights, and `min_periods=n` leaves a row null until its series has `n` readings. Each matches those two libraries at every non-null row, so a smoother ported from either keeps its numbers.
+
+```python
+print(
+    readings.filter(bt.col("sensor") == "a")
+    .with_columns(
+        recursive=bt.col("celsius").ewm_mean(span=3, adjust=False, min_periods=2).over(order_by=["at"])
+    )
+    .sort("at")
+    .to_pydict()["recursive"]
+)
+# [None, 20.5, 21.25, 23.625]
+```
 
 `ewm_mean` decays once per *row*, which is right only when the readings are evenly spaced, and for the irregular feed above they are not: the half-hour gap costs exactly the weight one minute would. {py:meth}`ewm_mean_by <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` decays by elapsed time instead, so the smoother says the same thing whatever the sampling rate did.
 
@@ -209,6 +269,62 @@ print(runs.to_pydict())
 ```
 
 A value that comes back after an interruption opens a *new* run rather than rejoining the earlier one, which is what makes a run id a segmentation rather than a grouping.
+
+## Time zones and temporal types
+
+A timestamp column stores an instant as a count since the Unix epoch in UTC. A *tz-aware* column, such as `timestamp(us, America/New_York)`, also carries a zone, which says which wall clock to read that instant on. A naive column carries no zone.
+
+Every calendar field of a tz-aware column is read on that column's own clock. `hour()`, `day()`, `dayname()`, `strftime` and `truncate("day")` all agree about which day a row fell on, and calendar arithmetic such as `offset_by("1d")` moves by local days. To report in another zone, convert first with {py:meth}`convert_timezone <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.convert_timezone>` and then extract. {py:meth}`replace_timezone <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.replace_timezone>` attaches a zone to a naive wall clock instead, which chooses a new instant.
+
+Subtracting two temporal values gives a type that depends on the operands. The table below lists each pairing.
+
+| Expression | Result type | What it holds |
+|---|---|---|
+| timestamp - timestamp | `duration[us]` | Elapsed time. Two tz-aware columns subtract as instants, whatever their zones. |
+| date - date | `int64` | Whole days, as DuckDB returns them. |
+| timestamp + duration | `timestamp` | The instant moved by elapsed time. |
+| naive timestamp - tz-aware timestamp | `duration[us]` | The naive value is read as UTC. |
+
+A duration's `hour()`, `minute()`, `second()` and `day()` are its components, as DuckDB reads an interval, so 49 hours and 5 minutes has an `hour()` of 1. {py:meth}`total(unit) <batcher.plan.expr_ir.namespaces.temporal._DtNamespace.total>` gives the total, 49 hours. Timestamps are 64-bit counts, so a microsecond timestamp spans roughly 292,000 years either side of 1970 and a nanosecond one only the years 1677 to 2262.
+
+Comparisons coerce without raising, and the coercion is worth knowing because it can move a filter's boundary. The following table lists the mixed comparisons.
+
+| Comparison | How it is read |
+|---|---|
+| date with timestamp | The date is its midnight. |
+| naive timestamp with tz-aware timestamp | The naive value is read as a UTC instant. |
+| two tz-aware timestamps | As instants, whatever their zones. |
+
+DuckDB reads a naive timestamp in its session `TimeZone` instead, and Polars refuses the comparison. Batcher keeps the comparison and reads naive as UTC, so when a naive column holds local wall clocks, attach its zone with `replace_timezone` before comparing it with an aware one.
+
+```python
+import datetime as dt
+
+import pyarrow as pa
+
+stamps = bt.from_arrow(
+    pa.table(
+        {
+            "a": pa.array([dt.datetime(2024, 1, 3, 1, 5)], pa.timestamp("us")),
+            "b": pa.array([dt.datetime(2024, 1, 1)], pa.timestamp("us")),
+            "z": pa.array([dt.datetime(2024, 1, 3, 1, 5)], pa.timestamp("us", "UTC")),
+            "d1": pa.array([dt.date(2024, 1, 3)]),
+            "d2": pa.array([dt.date(2024, 1, 1)]),
+        }
+    )
+)
+diffs = stamps.select(
+    span=bt.col("a") - bt.col("b"),
+    days=bt.col("d1") - bt.col("d2"),
+    naive_is_utc=bt.col("a") == bt.col("z"),
+)
+print(diffs.schema)
+# span: duration[us]
+# days: int64
+# naive_is_utc: bool
+print(diffs.select(hour=bt.col("span").dt.hour(), total=bt.col("span").dt.total("h")).to_pydict())
+# {'hour': [1], 'total': [49]}
+```
 
 ## Requirements and limitations
 

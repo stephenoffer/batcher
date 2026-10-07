@@ -1,4 +1,4 @@
-"""Null handling behind `Dataset.fill_null` / `Dataset.drop_nulls` (the `api` layer).
+"""Null handling behind `Dataset.fill_null` / `drop_nulls` / `isna` (the `api` layer).
 
 Three shapes of fill live here, and they lower very differently:
 
@@ -24,7 +24,7 @@ from batcher.plan.types.domains import is_numeric_type
 if TYPE_CHECKING:
     from batcher.api.dataset.frame import Dataset
 
-__all__ = ["build_drop_nulls", "build_fill_null", "build_fill_null_strategy"]
+__all__ = ["build_drop_nulls", "build_fill_null", "build_fill_null_strategy", "build_missing_mask"]
 
 
 def _fillable_columns(ds: Dataset, value: Any, subset: list[str] | None) -> list[str]:
@@ -193,3 +193,31 @@ def build_drop_nulls(ds: Dataset, subset: list[str] | None) -> Dataset:
     for c in cols[1:]:
         predicate = predicate & Col(c).is_not_null()
     return ds.filter(predicate)
+
+
+def build_missing_mask(ds: Dataset, *, present: bool, nan: bool) -> Dataset:
+    """A same-shaped boolean dataset: true where a value is missing, or present if `present`.
+
+    Missing means null. With `nan`, a float NaN counts as missing too, as pandas counts it:
+    ``is_null() | is_nan()`` is exact under Kleene logic, because the null row's ``is_nan()``
+    is null and ``true | null`` is true. Only floating-point columns can hold a NaN, so the
+    others keep the plain null test and the schema is read only when `nan` asks for it.
+
+    Args:
+        ds: The dataset to mask.
+        present: Mark present values (`notna`) instead of missing ones (`isna`).
+        nan: Treat a floating-point NaN as missing.
+
+    Returns:
+        A new `Dataset` of booleans, one column per input column.
+    """
+    import pyarrow as pa
+
+    floats = {f.name for f in ds.schema if pa.types.is_floating(f.type)} if nan else set()
+    masks = {}
+    for name in ds.columns:
+        missing = Col(name).is_null()
+        if name in floats:
+            missing = missing | Col(name).is_nan()
+        masks[name] = ~missing if present else missing
+    return ds.select(**masks)

@@ -53,6 +53,7 @@ Sort, deduplicate, filter, map, or flatten each list, or join its elements into 
    _ListNamespace.drop_nulls
    _ListNamespace.filter
    _ListNamespace.transform
+   _ListNamespace.zip
    _ListNamespace.flatten
    _ListNamespace.concat
    _ListNamespace.append
@@ -166,7 +167,7 @@ Methods on a struct expression, reached as `col("s").struct`.
    :no-members:
 ```
 
-Read a struct's fields by name, or list the field names.
+Read a struct's fields by name, list the field names, or edit the fields in place.
 
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.collections
@@ -178,6 +179,9 @@ Read a struct's fields by name, or list the field names.
    _StructNamespace.field
    _StructNamespace.get
    _StructNamespace.keys
+   _StructNamespace.with_fields
+   _StructNamespace.rename_fields
+   _StructNamespace.drop_fields
 ```
 
 ## The `.map` namespace
@@ -219,7 +223,7 @@ Methods on a string column holding JSON documents, reached as `col("doc").json`.
    :no-members:
 ```
 
-Read typed values at a JSON path, and inspect the document's keys, types, and shape.
+Read typed values at a JSON path, inspect the document's keys, types, and shape, decode a whole document into a typed value or encode one back, and apply a merge patch.
 
 ```{eval-rst}
 .. currentmodule:: batcher.plan.expr_ir.namespaces.collections
@@ -241,6 +245,9 @@ Read typed values at a JSON path, and inspect the document's keys, types, and sh
    _JsonNamespace.type_of
    _JsonNamespace.structure
    _JsonNamespace.pretty
+   _JsonNamespace.decode
+   _JsonNamespace.encode
+   _JsonNamespace.merge_patch
 ```
 
 ## See also

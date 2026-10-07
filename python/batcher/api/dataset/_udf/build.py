@@ -10,16 +10,20 @@ binds its extra arguments the same way (`bind_fn`), and validates the rest here.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any
+
+import pyarrow as pa
 
 from batcher._internal.errors import PlanError
 from batcher.api.dataset._udf.checks import (
     normalize_resources,
     normalize_retry,
     require_number,
+    split_output_columns,
     validate_bindings,
     validate_column_list,
+    validate_error_column,
     validate_fn,
     validate_num_workers,
     validate_output_columns,
@@ -35,6 +39,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BINDING_PARAMS",
+    "FAILURE_PARAMS",
     "RAY_PARAMS",
     "ROW_OPTIONS",
     "bind_fn",
@@ -58,6 +63,19 @@ RAY_PARAMS = (
     "ray_remote_args",
     "ray_remote_args_fn",
 )
+#: The failure policy every callback verb shares, forwarded verbatim to `build_map_batches`:
+#: the dirty-row budget, its opt-in quarantine column, and the transient retry/timeout set.
+#: One tuple, so `map`, `flat_map` and `filter` cannot drift from `map_batches` again.
+FAILURE_PARAMS = (
+    "max_errored_rows",
+    "error_column",
+    "timeout",
+    "max_retries",
+    "retry_backoff",
+    "retry_on",
+)
+#: The batch formats a per-row adapter can split into rows (`map`/`flat_map`).
+_ROW_FORMATS = ("pyarrow", "numpy")
 #: The remaining options `map`/`flat_map` forward to `build_rows`.
 ROW_OPTIONS = (
     "batch_size",
@@ -67,11 +85,15 @@ ROW_OPTIONS = (
     "output_columns",
     "num_workers",
     "max_concurrency",
-    "max_errored_rows",
+    *FAILURE_PARAMS,
 )
 
 
-def refuse_callable_options(method: Callable, given: dict[str, Any]) -> None:
+def refuse_callable_options(
+    method: Callable,
+    given: dict[str, Any],
+    columns: Callable[[], Collection[str]] = tuple,
+) -> None:
     """Refuse the callable-only options of `method` when no callable was passed.
 
     `filter` takes an expression, a SQL string, or a callable, and its UDF options mean
@@ -79,20 +101,36 @@ def refuse_callable_options(method: Callable, given: dict[str, Any]) -> None:
     a scheduled predicate and run as an ordinary one, so any option that differs from its
     default is named and refused.
 
+    An option that is also a column of the dataset is almost always an equality shorthand
+    that collided with the parameter (``filter(num_workers=1)`` on a ``num_workers``
+    column), so the message then names the two spellings that cannot collide.
+
     Args:
         method: The method whose signature holds the defaults.
         given: The option values as the caller passed them.
+        columns: Returns the dataset's column names; called only when an option is refused.
 
     Raises:
         PlanError: If any option differs from its default.
     """
     defaults = _defaults(method)
     set_names = sorted(name for name, value in given.items() if value != defaults[name])
-    if set_names:
+    if not set_names:
+        return
+    names = set(columns())
+    clashes = [name for name in set_names if name in names]
+    if clashes:
+        name = clashes[0]
+        value = given[name]
         raise PlanError(
-            f"{method.__name__}() got {set_names}, which apply only to a callable predicate; "
-            "drop them, or pass the condition as a function of the batch"
+            f"{method.__name__}() got {clashes}, which name both a column and an option that "
+            f"applies only to a callable predicate; compare the column with "
+            f"filter(bt.col({name!r}) == {value!r}) or filter({{{name!r}: {value!r}}})"
         )
+    raise PlanError(
+        f"{method.__name__}() got {set_names}, which apply only to a callable predicate; "
+        "drop them, or pass the condition as a function of the batch"
+    )
 
 
 @functools.lru_cache(maxsize=32)
@@ -140,11 +178,13 @@ def build_map_batches(
     batch_format: str,
     input_columns: list[str] | None,
     preserves_columns: list[str] | None,
-    output_columns: list[str] | None,
+    output_columns: list[str] | pa.Schema | None,
     num_workers: int | str,
     model_memory_gb: float = 0.0,
     multiprocessing: bool = False,
     max_errored_rows: int = 0,
+    error_column: str | None = None,
+    per_row: bool = False,
     timeout: float = 0.0,
     max_retries: int = 0,
     retry_backoff: float = 0.5,
@@ -175,19 +215,22 @@ def build_map_batches(
     require_number(max_concurrency, param="max_concurrency", minimum=0, whole=True)
     validate_num_workers(num_workers)
     validate_fn(fn)
-    validate_output_columns(output_columns)
+    names, schema = split_output_columns(output_columns)
+    validate_output_columns(names)
     available = _all_columns(ds)
+    keeps_input = verb == "filter"
+    validate_error_column(error_column, max_errored_rows, schema, keeps_input, names or available)
     validate_column_list(input_columns, available, param="input_columns", verb=verb)
     validate_column_list(preserves_columns, available, param="preserves_columns", verb=verb)
     warn_async_combos(fn, multiprocessing, placement.num_gpus)
     warn_if_model_reloads(fn, placement.num_gpus)
-    warn_if_pushdown_is_defeated(input_columns, ds.columns, output_columns)
+    warn_if_pushdown_is_defeated(input_columns, ds.columns, names)
     return ds._derive(
         MapBatches(
             ds._plan,
             fn,
             batch_size,
-            tuple(output_columns) if output_columns is not None else None,
+            tuple(names) if names is not None else None,
             input_columns=tuple(input_columns) if input_columns is not None else None,
             preserves_columns=(tuple(preserves_columns) if preserves_columns is not None else None),
             num_workers=resolve_num_workers(num_workers, placement.num_gpus),
@@ -204,6 +247,9 @@ def build_map_batches(
             retry_on=retry_types,
             timeout_s=timeout_s,
             max_concurrency=max_concurrency,
+            output_schema=schema,
+            error_column=error_column,
+            per_row=per_row,
         )
     )
 
@@ -219,12 +265,14 @@ def build_rows(
     batch_format: str,
     zero_copy_batch: bool,
     input_columns: list[str] | None,
-    output_columns: list[str] | None,
+    output_columns: list[str] | pa.Schema | None,
     num_workers: int | str,
     max_concurrency: int,
-    max_errored_rows: int,
+    **failure: Any,
 ) -> Dataset:
     """The `map`/`flat_map` stage: a per-row `fn` wrapped in its batch adapter.
+
+    `failure` is the `FAILURE_PARAMS` set, passed through unchanged.
 
     Returns:
         A new `Dataset` with the row stage on top of `ds`.
@@ -233,9 +281,10 @@ def build_rows(
 
     verb = "flat_map" if flat else "map"
     validate_fn(fn)  # the adapter is itself callable, so check the user's fn before wrapping
-    _check_format(verb, batch_format, ("pyarrow", "numpy"))
+    _check_format(verb, batch_format, _ROW_FORMATS)
     writable = writable_format(verb, batch_format, zero_copy_batch) is not None
-    cols = tuple(output_columns) if output_columns is not None else None
+    names, _ = split_output_columns(output_columns)
+    cols = tuple(names) if names is not None else None
     adapter = row_adapter(
         bind_fn(fn, *bindings),
         cols,
@@ -255,7 +304,8 @@ def build_rows(
         preserves_columns=None,
         output_columns=output_columns,
         num_workers=num_workers,
-        max_errored_rows=max_errored_rows,
+        per_row=True,
+        **failure,
     )
 
 
@@ -271,12 +321,14 @@ def build_filter(
     input_columns: list[str] | None,
     num_workers: int | str,
     max_concurrency: int,
-    max_errored_rows: int,
+    **failure: Any,
 ) -> Dataset:
     """The callable form of `filter`: a batch predicate wrapped in its mask adapter.
 
     Every input column is declared preserved, because the adapter only ever drops rows. That
-    lets Kyber push a later expression filter below the Python one.
+    lets Kyber push a later expression filter below the Python one, and lets the stage's
+    output schema be read from its input without running the predicate. `failure` is the
+    `FAILURE_PARAMS` set, passed through unchanged.
 
     Returns:
         A new `Dataset` holding the rows the predicate kept.
@@ -300,7 +352,7 @@ def build_filter(
         output_columns=None,
         num_workers=num_workers,
         max_concurrency=max_concurrency,
-        max_errored_rows=max_errored_rows,
+        **failure,
     )
 
 

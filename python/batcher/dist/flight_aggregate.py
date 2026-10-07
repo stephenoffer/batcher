@@ -464,6 +464,7 @@ def _reduce_with_recovery(
         recovery_policy,
         speculation_policy,
     )
+    from batcher.dist.executors.ray_runtime.reduce import RELAUNCH, check_complete
 
     dead: set[int] = set(dead or ())
     # Per-source lineage: a recompute `reincarnate()`s the source to the next epoch,
@@ -566,10 +567,17 @@ def _reduce_with_recovery(
                     failed.update(placement.sources_on(payload))
             else:
                 failed.update(payload)
+        if not failed and len(done) < n_reducers:
+            # A reducer neither finished nor named a source to recompute (its host held no
+            # map output, or the failure had no host to blame). An empty `failed` is the
+            # loop's "complete" signal, so relaunch rather than return without its groups.
+            failed.add(RELAUNCH)
         return [p for p in done.values() if p is not None], failed
 
     def recompute(failed_srcs):
         for src in failed_srcs:
+            if src == RELAUNCH:
+                continue  # nothing to regenerate; the next attempt relaunches the reducer
             # The HOST holding `src` is what died — which is `src` itself only until this
             # source has been relocated once. Marking `src` unconditionally would re-mark an
             # already-dead worker and leave the real one live for `_pick_live`/`_host_for`
@@ -612,6 +620,7 @@ def _reduce_with_recovery(
             recompute({src for host in proactive for src in placement.sources_on(host)})
 
     finals = ShuffleRecovery(recovery_policy(), label="aggregate").run(attempt, recompute)
+    check_complete("aggregate", n_reducers, done)
     if materialize:
         # Handles: (addr, ticket, rows, schema); empty buckets returned None (dropped).
         return [h for h in finals if h is not None]

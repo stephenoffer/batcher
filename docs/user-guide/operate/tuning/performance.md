@@ -2,7 +2,7 @@
 
 This page covers the levers you reach for when a correct query needs to be faster or leaner: caching a reused result, cutting the fixed cost of small queries, sizing morsels, giving the engine a memory budget so it spills instead of dying, and reading back what the query did.
 
-Every knob lives on one frozen {py:class}`Config <batcher.Config>`, applied process-wide with {py:func}`set_config <batcher.set_config>` or scoped to a block with {py:func}`config_context <batcher.config_context>`. For how Batcher compares against DuckDB, Polars, and Daft, see the {doc}`benchmarks </benchmarks/index>`, which carry the methodology behind every figure.
+Every knob lives on one frozen {py:class}`Config <batcher.Config>`, applied to the current thread with {py:func}`set_config <batcher.set_config>` or scoped to a block with {py:func}`config_context <batcher.config_context>`. For how Batcher compares against DuckDB, Polars, and Daft, see the {doc}`benchmarks </benchmarks/index>`, which carry the methodology behind every figure.
 
 ## Setup
 

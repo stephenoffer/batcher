@@ -8,12 +8,14 @@ grows into the other; both expose the same `Engine` contract.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from batcher.ml.llm.channels import finish_reason_sink, logprob_sink, usage_sink
 from batcher.ml.llm.engines.base import Engine, EngineFactory
 from batcher.ml.llm.engines.footprint import declared_context
 from batcher.ml.llm.engines.parallelism import advise_tensor_parallelism
 from batcher.ml.llm.engines.templates import warn_if_chat_template_unused
-from batcher.ml.llm.sizing import fit_to_window, prompt_window, sized_window
+from batcher.ml.llm.sizing import check_truncation, fit_to_window, prompt_window, sized_window
 
 __all__ = ["vllm_engine"]
 
@@ -31,6 +33,7 @@ def vllm_engine(
     lora_path: str | None = None,
     lora_paths: dict[str, str] | None = None,
     quantization: str | None = "auto",
+    truncation: Literal["head", "tail", "error"] = "head",
     **engine_kwargs: object,
 ) -> EngineFactory:
     """An `EngineFactory` backed by vLLM (requires ``batcher-engine[vllm]`` + a GPU).
@@ -52,11 +55,14 @@ def vllm_engine(
     result it falls back to the model's own window with a warning. Because it defers the
     engine build to the first batch, it changes *when* the model loads on that path only.
 
-    Whatever the window ends up being, a prompt that would overflow it is **truncated to
-    fit** using the worker's own tokenizer (with a warning naming how many rows were cut),
-    rather than failing the whole request over one long row. Truncation is skipped entirely
-    when no tokenizer is reachable — a character heuristic would cut in the wrong place and
-    corrupt output silently.
+    Whatever the window ends up being, a prompt that would overflow it is handled by the
+    `truncation` policy, using the worker's own tokenizer. The default, ``"head"``, keeps
+    the first tokens and cuts the tail (with a warning naming how many rows were cut),
+    rather than failing the whole request over one long row. ``"tail"`` keeps the last
+    tokens instead, and ``"error"`` refuses to cut and raises. Truncation is skipped
+    entirely when no tokenizer is reachable — a character heuristic would cut in the wrong
+    place and corrupt output silently — and so is the ``"error"`` check, since without a
+    tokenizer no prompt can be measured.
 
     Examples:
         .. doctest::
@@ -101,6 +107,11 @@ def vllm_engine(
             memory at <1% quality loss, and keeps native precision (BF16/FP16) elsewhere
             — the zero-config win Ray Data users must select by hand per GPU. Pass an
             explicit string (``"fp8"``, ``"awq"``, ...) to force it, or ``None`` to disable.
+        truncation: what to do with a prompt longer than the context window. ``"head"``
+            (default) keeps its first tokens, which suits an instruction-first prompt;
+            ``"tail"`` keeps its last tokens, which suits a long document followed by the
+            question; ``"error"`` raises `DataQualityError` naming how many prompts did not
+            fit, so nothing is ever shortened silently.
         engine_kwargs: passed to ``vllm.LLM``: ``max_model_len`` (a token count, or
             ``"auto"`` to size it from the data — see above),
             ``gpu_memory_utilization``, ``tensor_parallel_size`` (for a model larger than
@@ -110,8 +121,12 @@ def vllm_engine(
 
     Returns:
         A zero-arg factory building the vLLM-backed `Engine` once per worker.
+
+    Raises:
+        PlanError: If `truncation` is not one of ``"head"``, ``"tail"``, ``"error"``.
     """
     _reject_best_of_n(sampling)
+    check_truncation(truncation)
     engine_kwargs = _vllm_batch_defaults(engine_kwargs)
 
     def factory() -> Engine:
@@ -169,7 +184,7 @@ def vllm_engine(
             llm = built["llm"]
             # Route per-row by adapter (a request may carry an "adapter" tag), co-batching
             # the adapters where vLLM supports it; usage + order are preserved.
-            prompts = fit_to_window(prompts, built["tokenizer"], built["window"])
+            prompts = fit_to_window(prompts, built["tokenizer"], built["window"], truncation)
             texts, usage, reasons, logprobs = _generate_signals(
                 llm, params, prompts, lora_table, chat=bool(chat), system=system
             )

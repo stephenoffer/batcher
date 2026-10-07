@@ -121,7 +121,8 @@ def test_a_genuinely_ambiguous_answer_is_still_null():
 def test_the_extract_instruction_reaches_a_per_row_lora_request():
     """A dict request (vision or per-row adapter) silently lost the JSON instruction, so
     the model was never told to emit JSON and every row parsed to null."""
-    from batcher.ml.llm.structured import _extract_batch, _resolve_schema
+    from batcher.ml.llm.extract_schema import resolve_schema as _resolve_schema
+    from batcher.ml.llm.structured import _extract_batch
 
     engine = _echo_engine()
     batch = pa.RecordBatch.from_pydict({"q": ["hello"], "ad": ["lora-a"]})

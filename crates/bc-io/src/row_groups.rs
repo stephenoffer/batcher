@@ -133,6 +133,61 @@ pub fn read_parquet_row_group_late(
     ))
 }
 
+/// Start fetching row group `row_group` of a remote `uri` in the background, for a read of
+/// `columns` (`None`: every column) that the caller will make soon.
+///
+/// The read-ahead of [`crate::split_read::prefetch`]: the caller reads units one at a time, and
+/// this puts the next unit's GET in flight while the current one decodes. It fetches the span
+/// from the first to the last projected column chunk, and only when the columns between them
+/// that the read does not want are at most half again what it does -- a span mostly made of
+/// skipped columns is cheaper not to read ahead. A local file, an unreadable footer, a missing
+/// row group, or a full prefetch budget make this a no-op: the read then fetches its own bytes,
+/// exactly as it would have. Never blocks the caller.
+pub fn prefetch_row_group(uri: &str, row_group: usize, columns: Option<&[String]>) {
+    let uri = uri.to_string();
+    let columns: Option<Vec<String>> = columns.map(<[String]>::to_vec);
+    crate::runtime().spawn(async move {
+        let Ok(resolved) = crate::store::resolve(&uri) else {
+            return;
+        };
+        if !resolved.remote {
+            return;
+        }
+        let Ok((size, version, amd)) = crate::load_metadata_cached(&uri, &resolved).await else {
+            return;
+        };
+        let Some(rg) = amd.metadata().row_groups().get(row_group) else {
+            return;
+        };
+        let wanted = |name: &str| {
+            columns
+                .as_ref()
+                .is_none_or(|cs| cs.iter().any(|c| c == name))
+        };
+        let (mut lo, mut hi, mut bytes) = (u64::MAX, 0u64, 0u64);
+        for chunk in rg.columns() {
+            let top = chunk
+                .column_path()
+                .parts()
+                .first()
+                .map(String::as_str)
+                .unwrap_or("");
+            if !wanted(top) {
+                continue;
+            }
+            let (start, len) = chunk.byte_range();
+            lo = lo.min(start);
+            hi = hi.max(start + len);
+            bytes += len;
+        }
+        if bytes == 0 || (hi - lo) * 2 > bytes * 3 {
+            return;
+        }
+        let object = crate::split_read::block_cache::object_id(&uri, size, &version);
+        crate::split_read::start_prefetch(&resolved.store, &resolved.path, object, lo..hi);
+    });
+}
+
 /// Each top-level column's uncompressed bytes across every row group of `uris`, by name.
 ///
 /// What a caller weighs before reading some columns ahead of the rest: the footer records
@@ -208,7 +263,7 @@ async fn read_rows_async(
         return Err(IoError::Store("row positions must ascend".into()));
     }
     let resolved = crate::store::resolve(uri)?;
-    let (size, amd) = crate::load_metadata_cached(uri, &resolved).await?;
+    let (size, _, amd) = crate::load_metadata_cached(uri, &resolved).await?;
     // Each row group holding a wanted row, with a selection of exactly those rows in it.
     let mut plans: Vec<(usize, RowSelection)> = Vec::new();
     let (mut first, mut next) = (0u64, 0usize);

@@ -137,9 +137,17 @@ def single_selector(expr: _Tree) -> Selector:
     distinct: list[Selector] = []
     _walk(expr, lambda s: None if any(s is d for d in distinct) else distinct.append(s))
     if len(distinct) != 1:
+        shown = [repr(d) for d in distinct]
+        # The same selector spelled twice, ``(bt.numeric() - bt.numeric().mean())``, is two
+        # objects; matching is by identity, so name the spelling that works.
+        hint = (
+            f"; to reuse one selector, bind it once: n = bt.{shown[0]}; (n - n.mean()) / n.std()"
+            if len(set(shown)) == 1
+            else ""
+        )
         raise PlanError(
             f"an expression may reference at most one column selector, found {len(distinct)}: "
-            f"{', '.join(repr(d) for d in distinct)}"
+            f"{', '.join(shown)}{hint}"
         )
     return distinct[0]
 

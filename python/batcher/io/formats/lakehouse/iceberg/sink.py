@@ -23,6 +23,32 @@ _APP_ID = "batcher.stream.app-id"
 _TXN_VERSION = "batcher.stream.txn-version"
 
 
+def _txn_property(app_id: str) -> str:
+    """The table property holding `app_id`'s highest committed micro-batch.
+
+    The snapshot summary alone is not durable enough to be the marker: snapshot expiry
+    removes it, and after any later commit that does not carry it (a compaction, another
+    writer) the snapshot that did becomes expirable. Table properties survive expiry.
+    """
+    return f"batcher.stream.{app_id}.txn-version"
+
+
+def _record_txn(tx: Any, app_id: str, version: int) -> None:
+    """Record a micro-batch in the table properties, inside the commit's transaction.
+
+    The same transaction as the data, so the marker and the rows land or fail together.
+    The recorded version only ever rises: a stale writer committing an older batch must
+    not make a newer one look uncommitted.
+    """
+    key = _txn_property(app_id)
+    try:
+        recorded = int(tx.table_metadata.properties.get(key, "-1"))
+    except ValueError:
+        recorded = -1
+    if version > recorded:
+        tx.set_properties({key: str(version)})
+
+
 @SINKS.register("iceberg")
 class IcebergSink:
     """Scalable append/overwrite writer for an Iceberg table (one driver-side snapshot).
@@ -189,7 +215,7 @@ class IcebergSink:
             for f in files
         ]
 
-    def commit(self, manifest: WriteManifest, path: str) -> None:  # noqa: ARG002
+    def commit(self, manifest: WriteManifest, path: str) -> int | None:  # noqa: ARG002
         """Register all staged files with the table in ONE snapshot.
 
         Two properties, both of which were missing.
@@ -208,34 +234,63 @@ class IcebergSink:
 
         `add_files` references the staged Parquet directly — the driver never re-reads or
         re-writes the data.
+
+        **An empty write still deletes.** A write whose input produced no rows used to return
+        before the transaction, so an overwrite or a `replace_where` of nothing left every
+        old row in place: the table kept contents the write said to replace. Only an append
+        of nothing is a no-op; a scoped write of nothing commits its delete. A table that
+        does not exist has nothing to delete, and with no staged file there is no schema to
+        create it from, so that case alone still commits nothing.
+
+        Returns the snapshot id the commit created, which the writer reports as
+        `WriteManifest.version`, or None when there was nothing to commit.
         """
         _require_pyiceberg()
         files = [f for f in manifest.files if f.rows]
-        if not files:
-            return
+        try:
+            scope = self._delete_scope()
+        except BackendError:
+            raise
+        except Exception as exc:
+            raise BackendError(f"Iceberg commit to {self._identifier!r} failed: {exc}") from exc
+        if not files and scope is None:
+            return None
         cat = resolve_catalog(self._catalog if self._catalog is not None else "default")
         try:
-            schema = _staged_schema(files[0].path)
-            table = cat.create_table_if_not_exists(self._identifier, schema=schema)
-            scope = self._delete_scope()
+            if files:
+                schema = _staged_schema(files[0].path)
+                table = cat.create_table_if_not_exists(self._identifier, schema=schema)
+            elif cat.table_exists(self._identifier):
+                table = cat.load_table(self._identifier)
+            else:
+                return None
             marker = {}
             if self._app_txn is not None:
                 marker = {_APP_ID: self._app_txn[0], _TXN_VERSION: str(self._app_txn[1])}
             with table.transaction() as tx:
                 if scope is not None:
                     tx.delete(scope, snapshot_properties=marker)
-                tx.add_files([f.path for f in files], snapshot_properties=marker)
+                if files:
+                    tx.add_files([f.path for f in files], snapshot_properties=marker)
+                if self._app_txn is not None:
+                    _record_txn(tx, *self._app_txn)
         except BackendError:
             raise
         except Exception as exc:
             raise BackendError(f"Iceberg commit to {self._identifier!r} failed: {exc}") from exc
+        # The committing handle's metadata, refreshed by its own transaction -- not a
+        # catalog re-read, which could return a concurrent writer's later snapshot.
+        snapshot = table.current_snapshot()
+        return None if snapshot is None else snapshot.snapshot_id
 
     def is_committed(self, path: str) -> bool:  # noqa: ARG002 - the identifier is the path
         """Whether this write's ``(app_id, batch_id)`` is already recorded in the table.
 
-        A streaming micro-batch is committed when any snapshot of the table carries this
-        app id with a transaction version at or past this batch's, the rule Delta's `txn`
-        uses. With no transaction configured there is nothing to find, so the write
+        A streaming micro-batch is committed when the table records this app id with a
+        transaction version at or past this batch's, the rule Delta's `txn` uses. The table
+        property is consulted first, because it survives snapshot expiry; the snapshot
+        summaries are still read so a table committed before the property existed keeps its
+        markers. With no transaction configured there is nothing to find, so the write
         proceeds. A table that does not exist yet has committed nothing.
 
         Args:
@@ -252,6 +307,11 @@ class IcebergSink:
             table = cat.load_table(self._identifier)
         except Exception:
             return False
+        try:
+            if int(table.properties.get(_txn_property(app_id), "-1")) >= version:
+                return True
+        except ValueError:
+            pass  # an unreadable property proves nothing; fall through to the summaries
         for snapshot in table.snapshots():
             props = snapshot.summary.additional_properties if snapshot.summary else {}
             if props.get(_APP_ID) != app_id:

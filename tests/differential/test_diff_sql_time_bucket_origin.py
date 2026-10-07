@@ -8,9 +8,9 @@ do. A width that does not put every boundary on a different instant, silently:
     time_bucket(INTERVAL 2 DAY, DATE '2021-01-01')   -- DuckDB 2020-12-31, Batcher 2021-01-01
     time_bucket(INTERVAL 7 DAY, DATE '2021-01-04')   -- DuckDB 2021-01-04, Batcher 2020-12-31
 
-A whole week of rows lands in the neighbouring bucket, so a time-series aggregate reports
-the wrong totals against the wrong periods and nothing raises. Rather than answer on a
-shifted grid, a misaligned width is refused.
+A whole week of rows landed in the neighbouring bucket, so a time-series aggregate reported
+the wrong totals against the wrong periods and nothing raised. Such widths were refused
+until `WindowStart` carried DuckDB's origin; they are now answered on DuckDB's grid.
 
 A *calendar* width is a different problem and no longer shares that answer. A month is not
 a number of microseconds at all, so it never had a `WindowStart` width to misalign; it is
@@ -62,16 +62,17 @@ def test_aligned_widths_match_duckdb(duck, width):
 @pytest.mark.parametrize(
     "width", ["2 DAY", "4 DAY", "7 DAY", "9 DAY", "5 HOUR", "7 HOUR", "7 MINUTE"]
 )
-def test_misaligned_widths_are_refused_rather_than_shifted(width):
-    with pytest.raises(NotImplementedError, match="2000-01-03"):
-        bt.sql(f"SELECT time_bucket(INTERVAL {width}, {_TS}) AS r").collect()
+@pytest.mark.parametrize("value", [_TS, "DATE '2021-01-01'", "DATE '2021-01-04'"])
+def test_misaligned_widths_now_land_on_duckdbs_grid(duck, width, value):
+    """These widths used to be refused; the bucket now carries DuckDB's 2000-01-03 origin.
 
-
-def test_the_refusal_names_a_width_that_works():
-    """The error has to be actionable, and the width it suggests has to be accepted."""
-    with pytest.raises(NotImplementedError, match="6 HOUR"):
-        bt.sql(f"SELECT time_bucket(INTERVAL 7 DAY, {_TS}) AS r").collect()
-    bt.sql(f"SELECT time_bucket(INTERVAL 6 HOUR, {_TS}) AS r").collect()
+    They were refused because the grid was epoch-anchored and these widths do not divide the
+    gap between the two origins. `WindowStart` carries its origin, so the grid is anchored
+    where DuckDB anchors it and every boundary lands on the same instant. The two cases the
+    refusal was written for are among the values.
+    """
+    query = f"SELECT time_bucket(INTERVAL {width}, {value}) AS r"
+    assert_same(bt.sql(query).collect(), duck.sql(query))
 
 
 @pytest.mark.parametrize(

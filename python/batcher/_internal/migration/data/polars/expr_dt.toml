@@ -3,12 +3,12 @@
 
 
 ["Expr.dt"]
-add_business_days = { status = "gap", need = "Expr.dt.add_business_days", wave = "W6" }
+add_business_days = { status = "mismatch", batcher = "Expr.dt.add_business_days", note = "week_mask= is spelled weekmask= (a 7-flag sequence or a 1111100 string); holidays= and roll=raise/forward/backward match", wave = "W6" }
 base_utc_offset = { status = "gap", need = "Expr.dt.base_utc_offset (a time-zone-aware Datetime type)", wave = "W6" }
 cast_time_unit = { status = "gap", need = "Expr.dt.cast_time_unit (ms/us/ns)", wave = "W6" }
 century = { status = "canonical", batcher = "Expr.dt.century" }
 combine = { status = "gap", need = "Expr.dt.combine (date + TIME)", wave = "W6" }
-convert_time_zone = { status = "mismatch", batcher = "Expr.dt.convert_timezone", note = "Polars converts a tz-aware column to one target zone; Batcher's convert_timezone takes (from, to) over naive timestamps", wave = "W6" }
+convert_time_zone = { status = "mismatch", batcher = "Expr.dt.convert_timezone", note = "Polars returns the same instant labelled with the target zone; Batcher convert_timezone(from_tz, to_tz) returns the target zone's naive wall clock (DuckDB AT TIME ZONE). from_tz must name a tz-aware column's own zone", wave = "W6" }
 date = { status = "canonical", batcher = "Expr.dt.date" }
 datetime = { status = "gap", need = "Expr.dt.datetime (naive local datetime of a time-zone-aware Datetime type)", wave = "W6" }
 day = { status = "canonical", batcher = "Expr.dt.day" }
@@ -16,7 +16,7 @@ days_in_month = { status = "canonical", batcher = "Expr.dt.days_in_month" }
 dst_offset = { status = "gap", need = "Expr.dt.dst_offset (a time-zone-aware Datetime type)", wave = "W6" }
 epoch = { status = "mismatch", batcher = "Expr.dt.timestamp", note = "Polars epoch() defaults to microseconds. Port epoch(time_unit=U) as dt.timestamp(U) for s, ms, us and ns; time_unit=d is bt.partition_days(x), Int64 where Polars returns Int32. For an instant before 1970 with a sub-millisecond part, dt.timestamp(ms) truncates toward zero where Polars floors", wave = "W0" }
 hour = { status = "canonical", batcher = "Expr.dt.hour" }
-is_business_day = { status = "param", batcher = "Expr.dt.is_business_day", need = "week_mask=, holidays=", wave = "W2" }
+is_business_day = { status = "mismatch", batcher = "Expr.dt.is_business_day", note = "week_mask= is spelled weekmask=; holidays= matches", wave = "W2" }
 is_leap_year = { status = "canonical", batcher = "Expr.dt.is_leap_year" }
 iso_year = { status = "canonical", batcher = "Expr.dt.iso_year" }
 microsecond = { status = "canonical", batcher = "Expr.dt.microsecond" }
@@ -31,20 +31,20 @@ offset_by = { status = "canonical", batcher = "Expr.dt.offset_by" }
 ordinal_day = { status = "canonical", batcher = "Expr.dt.dayofyear" }
 quarter = { status = "canonical", batcher = "Expr.dt.quarter" }
 replace = { status = "gap", need = "Expr.dt.replace (set year/month/.../microsecond fields)", wave = "W6" }
-replace_time_zone = { status = "gap", need = "Expr.dt.replace_time_zone (a time-zone-aware Datetime type)", wave = "W6" }
+replace_time_zone = { status = "mismatch", batcher = "Expr.dt.replace_timezone", note = "spelled replace_timezone(tz, ambiguous=, nonexistent=); the non_existent keyword is nonexistent here and also takes shift_forward", wave = "W6" }
 round = { status = "param", batcher = "Expr.dt.round", need = "multiples such as '15m' and offset=", wave = "W2" }
 second = { status = "param", batcher = "Expr.dt.second", need = "fractional=", wave = "W2" }
 strftime = { status = "canonical", batcher = "Expr.dt.strftime" }
 time = { status = "gap", need = "Expr.dt.time (needs a TIME type; time_of_day returns an integer)", wave = "W6" }
 timestamp = { status = "canonical", batcher = "Expr.dt.timestamp" }
 to_string = { status = "mismatch", batcher = "Expr.dt.strftime", note = "with no format Polars renders by column type: a Datetime[us] is strftime(%Y-%m-%d %H:%M:%S%.6f) and a Date is strftime(%Y-%m-%d). Batcher needs the format stated, so a port of an unknown column type needs review", wave = "W0" }
-total_days = { status = "gap", need = "Duration total_days", wave = "W6" }
-total_hours = { status = "gap", need = "Duration total_hours", wave = "W6" }
-total_microseconds = { status = "gap", need = "Duration total_microseconds", wave = "W6" }
-total_milliseconds = { status = "gap", need = "Duration total_milliseconds", wave = "W6" }
-total_minutes = { status = "gap", need = "Duration total_minutes", wave = "W6" }
+total_days = { status = "mismatch", batcher = "Expr.dt.total", note = "spelled dt.total('d'); the count truncates toward zero and comes back as Int64", wave = "W6" }
+total_hours = { status = "mismatch", batcher = "Expr.dt.total", note = "spelled dt.total('h'); the count truncates toward zero and comes back as Int64", wave = "W6" }
+total_microseconds = { status = "mismatch", batcher = "Expr.dt.total", note = "spelled dt.total('us'); the count truncates toward zero and comes back as Int64", wave = "W6" }
+total_milliseconds = { status = "mismatch", batcher = "Expr.dt.total", note = "spelled dt.total('ms'); the count truncates toward zero and comes back as Int64", wave = "W6" }
+total_minutes = { status = "mismatch", batcher = "Expr.dt.total", note = "spelled dt.total('m'); the count truncates toward zero and comes back as Int64", wave = "W6" }
 total_nanoseconds = { status = "gap", need = "Duration total_nanoseconds", wave = "W6" }
-total_seconds = { status = "gap", need = "Duration total_seconds", wave = "W6" }
+total_seconds = { status = "mismatch", batcher = "Expr.dt.total", note = "spelled dt.total('s'); the count truncates toward zero and comes back as Int64", wave = "W6" }
 truncate = { status = "param", batcher = "Expr.dt.truncate", need = "Polars duration strings (1mo, 15m) and offset=. For a single calendar unit port as truncate(unit, preserve_type=True), which keeps a Date a Date", wave = "W2" }
 week = { status = "canonical", batcher = "Expr.dt.week" }
 weekday = { status = "canonical", batcher = "Expr.dt.weekday" }

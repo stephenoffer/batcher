@@ -96,14 +96,19 @@ def with_auto_config(fn: Callable[..., _R]) -> Callable[..., _R]:
     boundary (collect / write / stats and what delegates to them) — not per stage,
     where adaptive re-planning and the growing working set would drift it. A no-op
     when the user pinned the memory config or sensing is unavailable.
+
+    Also where `execution.query_timeout_s` starts counting: `timed_terminal` opens the
+    query's cancellable scope here, around the whole operation, when a limit is set.
     """
+    from batcher.core.runtime import timed_terminal
 
     @functools.wraps(fn)
     def wrapper(*args: object, **kwargs: object) -> _R:
         resolved = resolve_auto_config()
         if resolved is active_config():
-            return fn(*args, **kwargs)
-        with config_context(resolved):
+            with timed_terminal():
+                return fn(*args, **kwargs)
+        with config_context(resolved), timed_terminal():
             return fn(*args, **kwargs)
 
     return wrapper

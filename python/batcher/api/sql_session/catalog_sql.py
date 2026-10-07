@@ -5,11 +5,14 @@ Two entry points, both called by `Session` before the SELECT translator sees a s
 `catalog_statement`
     Serves the statements that are about the catalog itself — ``USE``, ``SHOW TABLES``,
     ``SHOW DATABASES``, ``SHOW SCHEMAS``, ``CREATE``/``DROP SCHEMA``, and ``CREATE TABLE
-    AS`` / ``INSERT INTO`` a *catalog* table — and returns None for everything else, so the
-    existing session-view statements keep their exact behaviour.
+    AS`` / ``INSERT INTO`` a *catalog* table — plus ``EXPLAIN``, which must read the
+    session's dialect and catalog, and returns None for everything else, so the existing
+    session-view statements keep their exact behaviour.
 `bind`
     Rewrites a query's table references that name catalog tables into per-call bindings,
-    and inlines ``current_catalog()``, ``current_schema()``, ``current_database()`` and
+    answers ``information_schema.tables``/``views``/``schemata`` from the session (which
+    alone knows which names are views and which namespaces exist), and inlines
+    ``current_catalog()``, ``current_schema()``, ``current_database()`` and
     ``current_user`` as literals. The translator then sees an ordinary query over bound
     names and needs no knowledge of catalogs.
 
@@ -75,6 +78,11 @@ def catalog_statement(session: Session, ast: Any, tables: dict[str, Any]) -> Dat
     Returns:
         The statement's result relation, or None.
     """
+    from batcher.api.sql_session import statements
+
+    explained = statements.explain(session, ast, tables)
+    if explained is not None:
+        return explained
     if isinstance(ast, exp.Use):
         session.catalog.use(qualified_name(ast.this))
         return _position(session)
@@ -103,13 +111,45 @@ def catalog_statement(session: Session, ast: Any, tables: dict[str, Any]) -> Dat
 def _creates_catalog_table(session: Session, ast: Any) -> bool:
     """Whether ``CREATE TABLE name AS …`` writes a catalog table rather than a session one.
 
-    A qualified name always does. An unqualified one does once ``USE`` has moved the session
-    off its starting ``memory.main``: after ``USE wh.raw`` the user means ``wh.raw.name``,
-    exactly as DuckDB resolves it, and quietly binding a session-only name instead made the
-    table vanish with the process. Without a ``USE``, an unqualified ``CREATE TABLE AS``
-    keeps its long-standing meaning, a lazy session table.
+    ``CREATE TEMP TABLE`` never does: a temporary table lives as long as the session, which
+    is what a session table is, and writing it to a catalog after a ``USE`` made it outlive
+    the process it was declared temporary in. A qualified ``TEMP`` name is refused, since
+    it asks for both.
+
+    Otherwise a qualified name always does. An unqualified one does once ``USE`` has moved
+    the session off its starting ``memory.main``: after ``USE wh.raw`` the user means
+    ``wh.raw.name``, exactly as DuckDB resolves it, and quietly binding a session-only name
+    instead made the table vanish with the process. Without a ``USE``, an unqualified
+    ``CREATE TABLE AS`` keeps its long-standing meaning, a lazy session table.
+
+    Raises:
+        PlanError: A ``TEMP`` table is given a qualified name.
     """
-    return "." in qualified_name(ast.this) or session.catalog._is_repositioned()
+    qualified = "." in qualified_name(ast.this)
+    if _is_temporary(ast):
+        if qualified:
+            raise PlanError(
+                f"CREATE TEMP TABLE {qualified_name(ast.this)}: a temporary table is a "
+                "session table and takes an unqualified name",
+                hint="Drop TEMP to write the table to a catalog, or drop the qualifier.",
+            )
+        return False
+    return qualified or session.catalog._is_repositioned()
+
+
+def _is_temporary(ast: Any) -> bool:
+    """Whether a ``CREATE`` statement says ``TEMP`` or ``TEMPORARY``.
+
+    Args:
+        ast: The parsed ``CREATE`` statement.
+
+    Returns:
+        True for a temporary table or view.
+    """
+    properties = ast.args.get("properties")
+    return properties is not None and any(
+        isinstance(p, exp.TemporaryProperty) for p in properties.expressions
+    )
 
 
 def _position(session: Session) -> Dataset:
@@ -232,21 +272,82 @@ def bind(session: Session, ast: Any, tables: dict[str, Any]) -> tuple[Any, dict[
     Raises:
         PlanError: A qualified reference names no catalog table.
     """
-    if not _references(session, ast, tables) and not any(ast.find_all(*_SESSION_FUNCTIONS)):
+    if (
+        not _references(session, ast, tables)
+        and not _listings(ast)
+        and not any(ast.find_all(*_SESSION_FUNCTIONS))
+    ):
         return ast, {}, False
     ast = ast.copy()
     bindings: dict[str, Any] = {}
     for node, name in _references(session, ast, tables):
-        key = f"__catalog_{len(bindings)}"
-        bindings[key] = session.catalog.get_table(name).read()
-        alias = node.args.get("alias") or exp.TableAlias(this=exp.to_identifier(node.name))
-        node.set("this", exp.to_identifier(key))
-        node.set("db", None)
-        node.set("catalog", None)
-        node.set("alias", alias)
+        bindings[_rebind_node(node, len(bindings))] = session.catalog.get_table(name).read()
+    for node, view in _listings(ast):
+        relation = _listing(session, view, tables)
+        bindings[_rebind_node(node, len(bindings))] = relation
     for node in list(ast.find_all(*_SESSION_FUNCTIONS)):
         _inline(session, node)
     return ast, bindings, True
+
+
+def _rebind_node(node: Any, index: int) -> str:
+    """Point table reference `node` at the per-call binding ``__catalog_<index>``.
+
+    The reference keeps the name it was written with as its alias, so a qualified column
+    (``t.x``, ``tables.table_name``) still resolves.
+    """
+    key = f"__catalog_{index}"
+    alias = node.args.get("alias") or exp.TableAlias(this=exp.to_identifier(node.name))
+    node.set("this", exp.to_identifier(key))
+    node.set("db", None)
+    node.set("catalog", None)
+    node.set("alias", alias)
+    return key
+
+
+def _listings(ast: Any) -> list[tuple[Any, str]]:
+    """The ``information_schema`` references the session answers, with their view names."""
+    from batcher._sql.parser.statements import information_schema_view
+
+    found = []
+    for node in ast.find_all(exp.Table):
+        view = information_schema_view(node)
+        if view in _SESSION_LISTINGS:
+            found.append((node, view))
+    return found
+
+
+# The `information_schema` views answered here rather than by the translator: each needs
+# something only the session knows (which names are views, which namespaces exist) and none
+# needs a relation's schema. `columns` does, so it stays with the translator, which reads
+# the registry the session built with every view already expanded.
+_SESSION_LISTINGS = ("tables", "views", "schemata")
+
+
+def _listing(session: Session, view: str, tables: dict[str, Any]) -> Dataset:
+    """``information_schema.<view>`` for one of `_SESSION_LISTINGS`."""
+    from batcher._sql.parser import statements as described
+
+    shadowed = {name.casefold() for name in tables}
+    views = [key for key in session._views if key.casefold() not in shadowed]
+    if view == "tables":
+        listed = dict.fromkeys([*session._tables, *session._views, *tables])
+        names = [n for n in listed if not n.startswith("__catalog_")]
+        return described.tables_relation(
+            [(n, "VIEW" if n in views else "BASE TABLE") for n in names]
+        )
+    if view == "views":
+        return described.views_relation(
+            [(key, session._views[key].body.sql(dialect=session._dialect)) for key in views]
+        )
+    catalog = session.catalog
+    rows = [(described.SESSION_CATALOG, described.SESSION_SCHEMA)]
+    rows += [
+        (name, namespace)
+        for name in catalog.list_catalogs()
+        for namespace in catalog.get_catalog(name).list_namespaces()
+    ]
+    return described.schemata_relation(rows)
 
 
 def _references(session: Session, ast: Any, tables: dict[str, Any]) -> list[tuple[Any, str]]:

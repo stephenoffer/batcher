@@ -44,11 +44,13 @@ from batcher.plan.expr_ir.core import (
     Not,
 )
 from batcher.plan.expr_ir.func_nodes import (
+    BusinessDay,
     ConvertTimezone,
     DateFunc,
     DateOffset,
     DateTrunc,
     GeoFunc,
+    JsonDoc,
     ListBinary,
     ListContains,
     ListFilter,
@@ -61,14 +63,17 @@ from batcher.plan.expr_ir.func_nodes import (
     ListSlice,
     ListTransform,
     ListZip,
+    ListZipStruct,
     MakeTemporal,
     MapFunc,
+    ReplaceTimezone,
     SpatialFunc,
     Strftime,
     StrFunc,
     StrFuncDyn,
     Strptime,
     StructField,
+    StructUpdate,
     WindowBuckets,
     WindowStart,
 )
@@ -197,6 +202,23 @@ def _representatives() -> dict[str, Any]:
         "strftime": Strftime(Col("d"), "%Y-%m-%d"),
         "strptime": Strptime(Col("s"), "%Y-%m-%d"),
         "strptime_strict": Strptime(Col("s"), "%Y-%m-%d", strict=True),
+        "strptime_formats": Strptime(Col("s"), ["%Y-%m-%d", "%d/%m/%Y"]),
+        "convert_timezone_policies": ConvertTimezone(
+            Col("d"), "America/New_York", "UTC", ambiguous="earliest", nonexistent="shift_forward"
+        ),
+        "replace_timezone": ReplaceTimezone(Col("d"), "Europe/Paris", ambiguous="raise"),
+        "replace_timezone_strip": ReplaceTimezone(Col("d"), None),
+        "business_day_add": BusinessDay(
+            "add",
+            Col("d"),
+            Col("n"),
+            holidays=[19723],
+            weekmask=[True] * 4 + [False] * 3,
+            roll="forward",
+        ),
+        "business_day_is": BusinessDay("is", Col("d")),
+        "date_epoch_ns": DateFunc("epoch_ns", Col("d")),
+        "add_days": Binary("add_days", Col("d"), Col("n")),
         "window_start_min": WindowStart(Col("d"), 1000),
         "window_start_origin": WindowStart(Col("d"), 1000, 500),
         "window_buckets": WindowBuckets(Col("d"), 1000, 500),
@@ -210,6 +232,10 @@ def _representatives() -> dict[str, Any]:
         "list_zip": ListZip("list_add", Col("a"), Col("b")),
         "list_transform": ListTransform(Col("a"), _ELEM),
         "list_filter": ListFilter(Col("a"), _PRED),
+        "list_filter_captures": ListFilter(Col("a"), _PRED, (Col("th"),), ("th",)),
+        "list_zip_struct": ListZipStruct(Col("a"), Col("b")),
+        "list_zip_struct_pad": ListZipStruct(Col("a"), Col("b"), pad=True),
+        "list_func_var_pop": ListFunc("var_pop", Col("a")),
         "list_get": ListGet(Col("a"), -1),
         "list_get_dyn": ListGetDyn(Col("a"), Col("i")),
         "list_contains": ListContains(Col("a"), 5),
@@ -218,6 +244,15 @@ def _representatives() -> dict[str, Any]:
         "list_slice_full": ListSlice(Col("a"), 1, 2),
         # --- struct / map -------------------------------------------------------
         "struct_field": StructField(Col("s"), "field"),
+        "struct_update_min": StructUpdate(Col("s"), drop=("a",)),
+        "struct_update_full": StructUpdate(
+            Col("s"), names=("x",), values=(Lit(1),), drop=("a",), rename=(("b", "c"),)
+        ),
+        "json_doc_decode": JsonDoc(
+            "decode", Col("j"), dtype=("struct", (("a", ("list", "int64")),))
+        ),
+        "json_doc_encode": JsonDoc("encode", Col("s")),
+        "json_doc_merge_patch": JsonDoc("merge_patch", Col("j"), other=Lit("{}")),
         "map_simple": MapFunc("map_keys", Col("m")),
         "map_element_at": MapFunc("element_at", Col("m"), key="k"),
         # --- multimodal ---------------------------------------------------------

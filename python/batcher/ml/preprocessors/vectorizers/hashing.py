@@ -99,6 +99,8 @@ class HashingVectorizer(Preprocessor):
             makes every output column null for it, so missing text stays distinguishable.
     """
 
+    _irreversible = "distinct tokens collide in one hashed bucket"
+
     __slots__ = (
         "alternate_sign",
         "binary",

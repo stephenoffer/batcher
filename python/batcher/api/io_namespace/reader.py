@@ -23,10 +23,18 @@ from batcher.api.session.read import _read_table
 from batcher.io.formats.sql.routing import read_backend
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
+    from typing import Unpack
+
+    import pyarrow as pa
 
     from batcher.api.dataset import Dataset
+    from batcher.io.formats.http.options import Pagination
+    from batcher.io.formats.http.state import Incremental
+    from batcher.io.formats.semistructured.json import JSONReadOptions
+    from batcher.io.formats.structured._csv_options.spec import CsvReadOptions
+    from batcher.io.formats.structured.parquet.partitions import ParquetReadOptions
 
 __all__ = ["Reader", "read"]
 
@@ -100,10 +108,18 @@ class Reader:
         return _read(path, format=format, **opts)
 
     def table(self, format: str, *args: Any, **opts: Any) -> Dataset:
-        """Read any registered non-file source by name (escape hatch).
+        """Read from a registered source *format* named by string; this is not a catalog lookup.
 
-        ``bt.read.table("delta", "s3://bucket/table", version=3)``. The typed
-        methods below wrap this for the common backends.
+        ``bt.read.table("delta", "s3://bucket/table", version=3)`` dispatches on the
+        format name ``"delta"`` and passes the rest to that source, exactly as
+        ``bt.read.delta("s3://bucket/table", version=3)`` would. It is the escape hatch
+        for a source with no typed method below. "Table" here means the source's own
+        notion, such as a Delta path; it is not a name in a session or catalog.
+
+        To read a table *by name* from a session or catalog, use
+        ``bt.current_session().table("ns.t")`` (or `Session.table` on your own session),
+        or query it with ``bt.sql("SELECT * FROM ns.t")``. Writing by name is
+        ``ds.write.table("ns.t")``, which resolves through the catalogs the same way.
 
         Args:
             format: Registered source name to dispatch to (e.g. ``"delta"``).
@@ -122,7 +138,7 @@ class Reader:
         return _read_table(format, *args, **opts)
 
     # --- File / object-store formats (path-addressed) ----------------------
-    def parquet(self, path: PathLike, **opts: Any) -> Dataset:
+    def parquet(self, path: PathLike, **opts: Unpack[ParquetReadOptions]) -> Dataset:
         """Read a Parquet file, directory, or glob (e.g. ``d/*.parquet``).
 
         Kyber pushes column projection and row-group predicates into the read, so a
@@ -130,7 +146,12 @@ class Reader:
 
         Args:
             path: A Parquet file, directory, or glob to read.
-            opts: Format-specific reader options forwarded to the source.
+            opts: Reader options. The file-reader options every format takes:
+                ``columns`` (also ``usecols``), ``n_rows`` (also ``nrows``/``num_rows``),
+                ``files``, ``schema_mode``, ``on_error``, ``filesystem``,
+                ``storage_options``, ``include_path`` (a column naming each row's file)
+                and ``require_success``. Plus ``partitioning``: a `pyarrow.Schema` or
+                ``{column: type}`` declaring Hive partition-key types.
 
         Returns:
             A lazy `Dataset` over the Parquet source.
@@ -176,7 +197,7 @@ class Reader:
         """
         return _read(path, format="parquet_dataset", **opts)
 
-    def csv(self, path: PathLike, **opts: Any) -> Dataset:
+    def csv(self, path: PathLike, **opts: Unpack[CsvReadOptions]) -> Dataset:
         r"""Read a CSV file, directory, or glob (e.g. ``d/*.csv``).
 
         The header row and column types are auto-inferred; column projection is pushed
@@ -199,10 +220,17 @@ class Reader:
 
         Args:
             path: A CSV file, directory, or glob to read.
-            opts: Format-specific reader options forwarded to the source — notably
-                ``schema`` (a `pyarrow.Schema` declaring the column types), ``on_error``
-                (drop an unreadable *file*), and ``on_bad_lines`` (drop a malformed *row*:
-                ``"error"``, ``"warn"``, or ``"skip"``).
+            opts: Reader options, each also accepted under its pandas or Polars spelling:
+                ``delimiter`` (the field separator), ``quote_char`` (``False`` for none),
+                ``escape_char``, ``has_header`` (``False`` for no header row, or the
+                header's line number), ``column_names``, ``null_values`` (extra null
+                tokens), ``skip_rows`` and ``skip_rows_after_header``, ``encoding``,
+                ``schema`` (a `pyarrow.Schema`, or ``{column: type}`` overriding some),
+                ``true_values`` and ``false_values``, ``decimal_point``,
+                ``try_parse_dates``, and ``on_bad_lines`` (drop a malformed *row*:
+                ``"error"``, ``"warn"``, or ``"skip"``). Plus the options every file
+                reader takes, such as ``on_error`` (drop an unreadable *file*),
+                ``columns``, ``n_rows`` and ``include_path``.
 
         Returns:
             A lazy `Dataset` over the CSV source.
@@ -218,7 +246,7 @@ class Reader:
         """
         return _read(path, format="csv", **opts)
 
-    def json(self, path: PathLike, **opts: Any) -> Dataset:
+    def json(self, path: PathLike, **opts: Unpack[JSONReadOptions]) -> Dataset:
         r"""Read newline-delimited JSON: a file, directory, or glob.
 
         One JSON object per line; column types are inferred from the records.
@@ -231,9 +259,11 @@ class Reader:
 
         Args:
             path: A JSON file, directory, or glob to read.
-            opts: Format-specific reader options forwarded to the source — notably
-                ``on_error`` (drop an unreadable *file*) and ``on_bad_lines`` (drop an
-                unparseable *record*: ``"error"``, ``"warn"``, or ``"skip"``).
+            opts: Reader options: ``lines`` (``True``; ``False`` names a JSON-array file,
+                which is refused with the conversion that fixes it) and ``on_bad_lines``
+                (drop an unparseable *record*: ``"error"``, ``"warn"``, or ``"skip"``).
+                Plus the options every file reader takes, such as ``on_error`` (drop an
+                unreadable *file*), ``columns``, ``n_rows`` and ``include_path``.
 
         Returns:
             A lazy `Dataset` over the JSON source.
@@ -717,6 +747,8 @@ class Reader:
     def numpy(self, path: PathLike, **opts: Any) -> Dataset:
         """Read NumPy ``.npy``/``.npz`` file(s) — file, directory, or glob — as tensor rows.
 
+        Requires the ``numpy`` extra: ``pip install 'batcher-engine[numpy]'``.
+
         Args:
             path: A NumPy ``.npy``/``.npz`` file, directory, or glob to read.
             opts: Format-specific reader options forwarded to the source.
@@ -737,6 +769,8 @@ class Reader:
 
     def point_cloud(self, path: PathLike, **opts: Any) -> Dataset:
         """Read LiDAR / point-cloud file(s) — ``.pcd`` / ``.ply`` / raw ``.bin`` — as points.
+
+        Requires the ``numpy`` extra: ``pip install 'batcher-engine[numpy]'``.
 
         The native robotics / autonomous-driving point-cloud formats, with no third-party
         dependency. Each file is one frame; every point becomes a row with a column per
@@ -766,6 +800,8 @@ class Reader:
 
     def mcap(self, path: PathLike, **opts: Any) -> Dataset:
         """Read MCAP robot / vehicle log(s) — the ROS 2 and ADAS recording format — as messages.
+
+        Requires the ``robotics`` extra: ``pip install 'batcher-engine[robotics]'``.
 
         One log multiplexes every sensor as timestamped messages on named topics, so a row
         is a *message*: ``{topic, log_time, publish_time, sequence, schema_name,
@@ -803,6 +839,8 @@ class Reader:
 
     def mdf(self, path: PathLike, **opts: Any) -> Dataset:
         """Read ASAM MDF4 (``.mf4``) vehicle measurement(s) — CAN/LIN and sensor channels.
+
+        Requires the ``robotics`` extra: ``pip install 'batcher-engine[robotics]'``.
 
         MDF is what automotive OEMs and test fleets log to. A file holds several *channel
         groups*, each with its own sampling raster, so this reads **long format** — one row
@@ -854,6 +892,8 @@ class Reader:
 
     def tfrecord(self, path: PathLike, **opts: Any) -> Dataset:
         """Read TFRecord file(s) — the Waymo Open Dataset / TFDS / RLDS container format.
+
+        Requires the ``tfrecord`` extra: ``pip install 'batcher-engine[tfrecord]'``.
 
         Each length-prefixed, CRC-checked record becomes a row in a ``record`` binary
         column (the raw serialized payload — commonly a ``tf.train.Example`` protobuf);
@@ -1258,6 +1298,7 @@ class Reader:
         *,
         uri: str | None = None,
         connection: Any = None,
+        params: Sequence[Any] | Mapping[str, Any] | None = None,
         **opts: Any,
     ) -> Dataset:
         """Read any SQL database from a standard connection URI, in a single submission.
@@ -1294,11 +1335,19 @@ class Reader:
         DB-API path, so it stays on this process and cannot be partitioned; `uri=` is
         what scales out.
 
+        ``params=`` binds values to the query's placeholders instead of splicing them into
+        the SQL text, through ``cursor.execute(sql, params)``. The placeholder style is the
+        driver's own: ``?`` for sqlite3, duckdb and ADBC, ``%s`` for psycopg and pymysql.
+        It works on the DB-API and ADBC paths; ConnectorX has no parameter binding, so a
+        ConnectorX scheme with `params` raises and names the DB-API route instead.
+
         Args:
             query: SQL text to execute, or ``None`` when reading via ``table=``.
             uri: A connection URI, e.g. ``"postgresql://user@host:5432/mydb"``.
             connection: An already-open PEP 249 connection or SQLAlchemy handle.
                 Mutually exclusive with `uri`.
+            params: Values for the query's placeholders: a sequence for positional ones,
+                a mapping for named ones.
             opts: Further options — ``table=``, ``password=``, the partitioning
                 keywords above, ``governed_as=`` (the table a governance policy is
                 matched against for a query read), or any driver-specific keyword.
@@ -1320,9 +1369,18 @@ class Reader:
                 ...     uri="postgresql://svc@warehouse:5432/shop",
                 ...     password="env:PGPASSWORD",
                 ... )
+
+                >>> import sqlite3
+                >>> con = sqlite3.connect(":memory:")
+                >>> _ = con.execute("CREATE TABLE t (a INTEGER)")
+                >>> _ = con.executemany("INSERT INTO t VALUES (?)", [(1,), (2,), (3,)])
+                >>> bt.read.sql("SELECT a FROM t WHERE a > ?", connection=con, params=[1]).count()
+                2
         """
         # Bound by name, not positionally: `ADBCSource`'s first field is `driver`, so a
         # positional `query` silently became the driver name. Same bug as `bigquery` below.
+        if params is not None:
+            opts["params"] = params
         if connection is not None:
             if uri is not None:
                 from batcher._internal.errors import BackendError
@@ -1346,6 +1404,15 @@ class Reader:
             from batcher.io.formats.sql.uri import parse_uri
 
             if backend == "connectorx":
+                if params is not None:
+                    from batcher._internal.errors import BackendError
+
+                    raise BackendError(
+                        f"the {parse_uri(uri).scheme!r} scheme routes to ConnectorX, which "
+                        "has no parameter binding. Bind through a PEP 249 driver instead: "
+                        "pass module= (e.g. module='pymysql') to take the DB-API path, which "
+                        "accepts params=."
+                    )
                 # ConnectorX takes credentials *inside* its URI, so it gets the original
                 # string rather than the password-stripped one `parse_uri` returns. It has
                 # no separate password channel, and silently dropping one would leave the
@@ -1368,12 +1435,21 @@ class Reader:
     def snowflake(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a Snowflake SQL query, fetching result chunks in parallel as Arrow.
 
-        Connection credentials go in ``connection_kwargs``, a dict passed to
-        ``snowflake.connector.connect``.
+        Requires the ``snowflake`` extra: ``pip install 'batcher-engine[snowflake]'``.
+
+        Declare one authentication strategy with ``auth=`` — ``"password"``,
+        ``"key_pair"`` (``private_key_file=``, optionally ``private_key_file_pwd=``),
+        ``"oauth"`` (``token=``) or ``"externalbrowser"`` — beside ``account=``, ``user=``,
+        ``role=``, ``warehouse=``, ``database=`` and ``schema=``. They are validated once and
+        folded into ``connection_kwargs``, the dict every worker connects with, so a local
+        run and a distributed one authenticate the same way. Pass secrets as references
+        (``private_key_file_pwd="env:SF_KEY_PWD"``). An explicit ``connection_kwargs=`` dict
+        passed to ``snowflake.connector.connect`` still works on its own. Not yet verified
+        against a live Snowflake; see tests/PENDING_VERIFICATION.md.
 
         Args:
             query: SQL text to execute against Snowflake.
-            opts: ``connection_kwargs=`` (``account``, ``user``, ``warehouse``, ...),
+            opts: The auth and session keywords above, or ``connection_kwargs=``;
                 ``governed_as=`` (the table a governance policy is matched against, since
                 a query names none), plus any other source options.
 
@@ -1388,16 +1464,38 @@ class Reader:
                 ...     "SELECT * FROM sales.orders",
                 ...     connection_kwargs={"account": "acme", "user": "bob", "warehouse": "wh"},
                 ... )
+
+                >>> ds = bt.read.snowflake(  # doctest: +SKIP
+                ...     "SELECT * FROM sales.orders",
+                ...     account="acme",
+                ...     user="etl",
+                ...     auth="key_pair",
+                ...     private_key_file="/keys/etl.p8",
+                ...     role="ANALYST",
+                ...     warehouse="WH",
+                ... )
         """
-        return _read_table("snowflake", query, **opts)
+        from batcher.io.formats.sql.vendors import snowflake_options
 
-    def databricks(self, table: str, **opts: Any) -> Dataset:
-        """Read a Databricks/Unity Catalog table by name.
+        return _read_table("snowflake", query, **snowflake_options(opts))
 
-        Uses credential vending to read the underlying Delta files directly.
+    def databricks(self, table: str | None = None, **opts: Any) -> Dataset:
+        """Read a Databricks/Unity Catalog table by name, or a query through a SQL warehouse.
+
+        Requires the ``databricks`` extra: ``pip install 'batcher-engine[databricks]'``.
+
+        A table read uses credential vending to read the underlying Delta files directly.
+        A ``query=`` read runs on a SQL warehouse (``server_hostname=``, ``http_path=``,
+        ``access_token=``), where ``catalog=`` and ``schema=`` set the session defaults,
+        ``session_configuration=`` passes warehouse settings, and ``statement_timeout_s=``
+        bounds the statement. An abandoned or interrupted warehouse read cancels its
+        statement remotely, and a failure names the warehouse query id. The warehouse
+        options are not yet verified against a live Databricks; see
+        tests/PENDING_VERIFICATION.md.
 
         Args:
-            table: Fully qualified Unity Catalog table name (``catalog.schema.table``).
+            table: Fully qualified Unity Catalog table name (``catalog.schema.table``), or
+                None for a ``query=`` read.
             opts: Connection and credential options passed as keywords.
 
         Returns:
@@ -1408,11 +1506,24 @@ class Reader:
 
                 >>> import batcher as bt
                 >>> ds = bt.read.databricks("main.sales.orders")  # doctest: +SKIP
+
+                >>> ds = bt.read.databricks(  # doctest: +SKIP
+                ...     query="SELECT * FROM orders",
+                ...     server_hostname="adb-1.azuredatabricks.net",
+                ...     http_path="/sql/1.0/warehouses/abc",
+                ...     access_token="env:DATABRICKS_TOKEN",
+                ...     catalog="main",
+                ...     schema="sales",
+                ... )
         """
+        if "schema" in opts:
+            opts["db_schema"] = opts.pop("schema")
         return _read_table("databricks", table, **opts)
 
     def bigquery(self, query: str | None = None, **opts: Any) -> Dataset:
         """Read BigQuery via the Storage Read API as parallel Arrow streams.
+
+        Requires the ``bigquery`` extra: ``pip install 'batcher-engine[bigquery]'``.
 
         Supply a SQL ``query`` positionally, or ``table=`` to read a whole table.
 
@@ -1440,8 +1551,69 @@ class Reader:
             opts["query"] = query
         return _read_table("bigquery", **opts)
 
+    def athena(
+        self,
+        query: str,
+        *,
+        region: str,
+        workgroup: str | None = None,
+        output_location: str | None = None,
+        database: str | None = None,
+        **opts: Any,
+    ) -> Dataset:
+        """Read the result of an Amazon Athena query through PyAthena.
+
+        A thin profile over the DB-API reader: the Athena settings are translated to
+        PyAthena's ``connect()`` keywords, and the read gets the same projection and
+        predicate pushdown and zero-row schema probe as any ``bt.read.sql`` read. Athena
+        writes each result to S3, so name an ``output_location`` or a ``workgroup`` that
+        enforces one. Credentials come from the ambient AWS chain, or
+        ``profile_name=``. Needs ``batcher-engine[athena]``. Not yet verified against a
+        live Athena; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            query: SQL text to run on Athena.
+            region: The AWS region, e.g. ``"us-east-1"``.
+            workgroup: The Athena workgroup to run in.
+            output_location: The ``s3://`` prefix for query results.
+            database: The default database unqualified table names resolve in.
+            opts: ``catalog=`` and ``profile_name=``, plus any `DBAPISource` option such as
+                ``batch_size=``.
+
+        Returns:
+            A lazy `Dataset` over the query result.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.athena(  # doctest: +SKIP
+                ...     "SELECT * FROM events",
+                ...     region="us-east-1",
+                ...     workgroup="analytics",
+                ...     database="web",
+                ... )
+        """
+        from batcher.io.formats.sql._common import require_module
+        from batcher.io.formats.sql.vendors import ATHENA_DRIVER, athena_connect_kwargs
+
+        require_module(ATHENA_DRIVER, extra="athena")
+        connect_kwargs = athena_connect_kwargs(
+            region=region,
+            workgroup=workgroup,
+            output_location=output_location,
+            database=database,
+            catalog=opts.pop("catalog", None),
+            profile_name=opts.pop("profile_name", None),
+        )
+        return _read_table(
+            "dbapi", query=query, module=ATHENA_DRIVER, connect_kwargs=connect_kwargs, **opts
+        )
+
     def clickhouse(self, query: str, **opts: Any) -> Dataset:
         """Read the result of a ClickHouse SQL query over the Arrow-native interface.
+
+        Requires the ``clickhouse`` extra: ``pip install 'batcher-engine[clickhouse]'``.
 
         Connection details are passed as keyword options.
 
@@ -1466,6 +1638,8 @@ class Reader:
     def mongo(self, **opts: Any) -> Dataset:
         """Read a MongoDB collection Arrow-natively via pymongoarrow.
 
+        Requires the ``mongo`` extra: ``pip install 'batcher-engine[mongo]'``.
+
         Pass connection, database, collection, and any query/projection as keyword options.
 
         Args:
@@ -1488,6 +1662,8 @@ class Reader:
 
     def cassandra(self, **opts: Any) -> Dataset:
         """Read a Cassandra/Scylla table, fanning out across token-range splits for parallelism.
+
+        Requires the ``cassandra`` extra: ``pip install 'batcher-engine[cassandra]'``.
 
         Pass connection, keyspace, and table as keyword options.
 
@@ -1512,6 +1688,8 @@ class Reader:
     def dynamodb(self, **opts: Any) -> Dataset:
         """Read a DynamoDB table using native parallel scan segments.
 
+        Requires the ``dynamodb`` extra: ``pip install 'batcher-engine[dynamodb]'``.
+
         Pass the table name and AWS connection options as keywords.
 
         Args:
@@ -1530,6 +1708,8 @@ class Reader:
 
     def elasticsearch(self, **opts: Any) -> Dataset:
         """Read an Elasticsearch index via ES|QL Arrow output (or a sliced scroll fallback).
+
+        Requires the ``elasticsearch`` extra: ``pip install 'batcher-engine[elasticsearch]'``.
 
         Pass the hosts, index, and query as keyword options.
 
@@ -1552,6 +1732,8 @@ class Reader:
 
     def redis(self, **opts: Any) -> Dataset:
         """Read a Redis keyspace as ``(key, value)`` rows, partitioned by hash slot.
+
+        Requires the ``redis`` extra: ``pip install 'batcher-engine[redis]'``.
 
         The read walks the keyspace with ``SCAN`` over contiguous slot ranges, one split
         per range, so it parallelizes on a cluster and never blocks the server the way
@@ -1576,6 +1758,8 @@ class Reader:
     def hbase(self, **opts: Any) -> Dataset:
         """Read an HBase table, one split per region key range.
 
+        Requires the ``hbase`` extra: ``pip install 'batcher-engine[hbase]'``.
+
         Rows arrive as ``row_key`` plus one column per cell, named
         ``family:qualifier`` and decoded as UTF-8, which is the shape
         {py:meth}`ds.write.hbase <batcher.api.io_namespace.writer.Writer.hbase>` writes back.
@@ -1594,6 +1778,368 @@ class Reader:
                 >>> ds = bt.read.hbase(host="thrift", table="events")  # doctest: +SKIP
         """
         return _read_table("hbase", **opts)
+
+    # --- Vector stores -----------------------------------------------------
+    def qdrant(self, collection: str, **opts: Any) -> Dataset:
+        """Read a Qdrant collection by scrolling it, one row per point.
+
+        Rows hold the point id, one ``fixed_size_list<float32>`` column per vector (an
+        unnamed vector reads into ``embedding``), and one column per payload key. Not yet
+        verified against a live Qdrant; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            collection: The collection to read.
+            opts: ``url=``, ``location=`` (``":memory:"``) or ``path=``, ``api_key=``,
+                ``id_column=``, ``vector_column=``, ``with_vectors=`` and ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the collection.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.qdrant("docs", url="http://localhost:6333")  # doctest: +SKIP
+        """
+        return _read_table("qdrant", collection=collection, **opts)
+
+    def pinecone(self, index: str, **opts: Any) -> Dataset:
+        """Read one namespace of a serverless Pinecone index, listing its ids and fetching them.
+
+        Rows hold the record id, its vector in ``embedding`` and one column per metadata
+        field. Not yet verified against a live Pinecone; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            index: The index to read.
+            opts: ``api_key=``, ``namespace=``, ``id_column=``, ``vector_column=`` and
+                ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the namespace.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.pinecone("docs", api_key="env:PINECONE_API_KEY")  # doctest: +SKIP
+        """
+        return _read_table("pinecone", index=index, **opts)
+
+    def milvus(self, collection: str, **opts: Any) -> Dataset:
+        """Read a Milvus collection, one split per partition, with ``query_iterator``.
+
+        Columns are the collection's fields; a float-vector field reads as
+        ``fixed_size_list<float32>``. Not yet verified against a live Milvus; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            collection: The collection to read.
+            opts: ``uri=`` (a server URL or a Milvus Lite file), ``token=``, ``db_name=``,
+                ``partitions=``, ``filter=`` and ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the collection.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.milvus("docs", uri="http://localhost:19530")  # doctest: +SKIP
+        """
+        return _read_table("milvus", collection=collection, **opts)
+
+    def turbopuffer(self, namespace: str, **opts: Any) -> Dataset:
+        """Read a Turbopuffer namespace, paged in id order.
+
+        Columns come from the namespace's attribute schema; ``vector`` reads into
+        ``embedding``. Not yet verified against a live Turbopuffer; see
+        tests/PENDING_VERIFICATION.md.
+
+        Args:
+            namespace: The namespace to read.
+            opts: ``region=`` or ``base_url=``, ``api_key=``, ``id_column=``,
+                ``vector_column=`` and ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the namespace.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.turbopuffer(  # doctest: +SKIP
+                ...     "docs", region="gcp-us-central1", api_key="env:TURBOPUFFER_API_KEY"
+                ... )
+        """
+        return _read_table("turbopuffer", namespace=namespace, **opts)
+
+    # --- APIs and SaaS (HTTP) ---------------------------------------------
+    def http_json(
+        self,
+        url: str,
+        *,
+        pagination: Pagination | None = None,
+        records_path: str | tuple[str, ...] | None = None,
+        schema: pa.Schema | None = None,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        auth: Any = None,
+        incremental: Incremental | None = None,
+        **opts: Any,
+    ) -> Dataset:
+        """Read a paginated HTTP JSON API, one Arrow batch per page.
+
+        Pick the paging style with a typed option: `CursorPagination` (a cursor in the
+        body), `NextLinkPagination` (a ``Link: rel="next"`` header or a next-URL field),
+        `OffsetPagination`, or `PagePagination`. The schema is `schema` when given, else
+        inferred from the first page, and every later page is held to it: a page that
+        does not fit fails the read rather than changing or dropping a column.
+        ``bt.io.Incremental`` makes the read resumable from a durable watermark or page
+        cursor, with a lookback and dedup by key. Requests retry 429 and 5xx answers with
+        backoff, honoring ``Retry-After``.
+
+        Args:
+            url: The first page's URL.
+            pagination: The paging style, or None to read the single page at `url`.
+            records_path: Where each page holds its records (``"data.items"``); None when
+                the body is itself the list.
+            schema: The declared Arrow schema; inferred from the first page when None.
+            headers: Headers for every request. A value may be a secret reference
+                (``"env:API_KEY"``), resolved per request and never logged.
+            params: Query parameters for the first request.
+            auth: A ``bt.io.BearerToken`` or ``bt.io.OAuth2ClientCredentials``.
+            incremental: A ``bt.io.Incremental`` resume policy.
+            opts: ``retry=`` (a ``bt.io.RetryPolicy``), ``timeout=``,
+                ``max_concurrency=`` (requests in flight from this process to the host;
+                there is no cluster-wide quota), ``max_pages=``, ``method=`` and ``body=``
+                for a POST search API.
+
+        Returns:
+            A lazy `Dataset` over the API's records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.http_json(  # doctest: +SKIP
+                ...     "https://api.example.com/v1/orders",
+                ...     pagination=bt.io.CursorPagination(cursor_path="next_cursor"),
+                ...     records_path="data",
+                ...     auth=bt.io.BearerToken("env:API_TOKEN"),
+                ... )
+        """
+        return _read_table(
+            "http_json",
+            url,
+            pagination=pagination,
+            records_path=records_path,
+            schema=schema,
+            headers=headers,
+            params=params,
+            auth=auth,
+            incremental=incremental,
+            **opts,
+        )
+
+    def graphql(
+        self,
+        url: str,
+        query: str,
+        *,
+        records_path: str | tuple[str, ...],
+        variables: dict[str, Any] | None = None,
+        page_info_path: str | tuple[str, ...] | None = None,
+        **opts: Any,
+    ) -> Dataset:
+        """Read a GraphQL query's results, paging a Relay-style cursor variable.
+
+        Any entry in the response's ``errors`` fails the read, even when partial ``data``
+        came with it, so a failed field can never pass as a complete table. Not yet
+        verified against a live GraphQL service; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            url: The GraphQL endpoint.
+            query: The query document, declaring the cursor variable when it pages.
+            records_path: Where the records sit, relative to ``data``.
+            variables: Variables sent with every page.
+            page_info_path: The ``pageInfo`` object (``endCursor``/``hasNextPage``),
+                relative to ``data``; None reads one page.
+            opts: ``cursor_variable=`` (default ``"after"``), ``schema=``, ``headers=``,
+                ``auth=``, ``retry=``, ``timeout=``, ``max_pages=``, ``incremental=``.
+
+        Returns:
+            A lazy `Dataset` over the query's records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.graphql(  # doctest: +SKIP
+                ...     "https://api.github.com/graphql",
+                ...     "query($after: String) { viewer { repositories(first: 50, after: $after)"
+                ...     " { nodes { name } pageInfo { endCursor hasNextPage } } } }",
+                ...     records_path="viewer.repositories.nodes",
+                ...     page_info_path="viewer.repositories.pageInfo",
+                ...     auth=bt.io.BearerToken("env:GITHUB_TOKEN"),
+                ... )
+        """
+        return _read_table(
+            "graphql",
+            url,
+            query,
+            records_path=records_path,
+            variables=variables,
+            page_info_path=page_info_path,
+            **opts,
+        )
+
+    def github(self, repo: str, resource: str = "issues", **opts: Any) -> Dataset:
+        """Read a GitHub repository's issues, pull requests or releases through the REST API.
+
+        Pages follow the ``Link`` header, a spent rate limit waits for
+        ``x-ratelimit-reset``, and the token is a secret reference that never reaches a
+        log. ``since=`` (issues only) or ``incremental=`` makes the read incremental. Not
+        yet verified against a live GitHub API; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            repo: ``"owner/name"``.
+            resource: ``"issues"``, ``"pulls"`` or ``"releases"``.
+            opts: ``token=`` (a secret reference such as ``"env:GITHUB_TOKEN"``),
+                ``state=``, ``since=``, ``incremental=``, ``base_url=`` for GitHub
+                Enterprise, ``max_pages=``.
+
+        Returns:
+            A lazy `Dataset` with one row per issue, pull request or release.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.github(  # doctest: +SKIP
+                ...     "apache/arrow", "issues", token="env:GITHUB_TOKEN"
+                ... )
+        """
+        return _read_table("github", repo, resource, **opts)
+
+    def salesforce(
+        self, sobject: str, *, instance_url: str, schema: pa.Schema, **opts: Any
+    ) -> Dataset:
+        """Read a Salesforce object with a Bulk API 2.0 query job.
+
+        The declared `schema` is the field list and the column types, so the read never
+        guesses a type from CSV text. ``include_deleted=True`` runs ``queryAll`` and adds
+        ``IsDeleted``, and ``incremental=`` resumes by ``SystemModstamp``. Not yet
+        verified against a live Salesforce org; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            sobject: The sObject name, such as ``"Account"``.
+            instance_url: The org's instance URL (``https://<domain>.my.salesforce.com``).
+            schema: The fields to read and their Arrow types.
+            opts: ``auth=`` (a ``bt.io.BearerToken`` or
+                ``bt.io.OAuth2ClientCredentials``), ``where=``, ``include_deleted=``,
+                ``incremental=``, ``api_version=``, ``max_records=``.
+
+        Returns:
+            A lazy `Dataset` over the object's records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt, pyarrow as pa
+                >>> ds = bt.read.salesforce(  # doctest: +SKIP
+                ...     "Account",
+                ...     instance_url="https://acme.my.salesforce.com",
+                ...     schema=pa.schema([("Id", pa.string()), ("Name", pa.string())]),
+                ...     auth=bt.io.BearerToken("env:SF_TOKEN"),
+                ... )
+        """
+        return _read_table("salesforce", sobject, instance_url=instance_url, schema=schema, **opts)
+
+    def google_sheets(self, spreadsheet_id: str, range: str, **opts: Any) -> Dataset:
+        """Read a range of a Google Sheet as a table.
+
+        The first row is the header unless ``header=False`` (columns ``c0``, ``c1``, ...)
+        or ``header=[names]``. Values are read unformatted by default, so numbers arrive as
+        numbers; an empty cell is null. Not yet verified against a live Google Sheets API;
+        see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            spreadsheet_id: The spreadsheet's id, from its URL.
+            range: An A1 range such as ``"Sheet1!A1:D"``.
+            opts: ``header=``, ``value_render=`` (``"UNFORMATTED_VALUE"``,
+                ``"FORMATTED_VALUE"`` or ``"FORMULA"``), ``schema=``, and ``auth=``
+                (a ``bt.io.BearerToken``; Application Default Credentials when omitted).
+
+        Returns:
+            A lazy `Dataset` over the range.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.google_sheets("1AbC...", "Sheet1!A1:D")  # doctest: +SKIP
+        """
+        return _read_table("google_sheets", spreadsheet_id, range, **opts)
+
+    def sharepoint(self, **opts: Any) -> Dataset:
+        """List a SharePoint or OneDrive document library through Microsoft Graph delta.
+
+        One row per drive item with its metadata, a ``deleted`` flag, and the file bytes
+        with ``include_content=True``. With ``state=`` the delta link is kept, so the next
+        read returns only what was added, changed, renamed or deleted since. Not yet
+        verified against a live Microsoft Graph tenant; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            opts: ``drive_id=`` or ``site_id=``, ``auth=`` (a
+                ``bt.io.OAuth2ClientCredentials`` for the tenant), ``state=``,
+                ``folder=``, ``include_content=``.
+
+        Returns:
+            A lazy `Dataset` of drive items.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.sharepoint(  # doctest: +SKIP
+                ...     site_id="contoso.sharepoint.com,1111,2222",
+                ...     auth=bt.io.OAuth2ClientCredentials(
+                ...         token_url="https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token",
+                ...         client_id="<app-id>",
+                ...         client_secret="env:GRAPH_SECRET",
+                ...         scope="https://graph.microsoft.com/.default",
+                ...     ),
+                ...     state="s3://bucket/state/docs.json",
+                ... )
+        """
+        return _read_table("sharepoint", **opts)
+
+    def airbyte(self, stream: str, **opts: Any) -> Dataset:
+        """Read one stream of an Airbyte source connector, keeping its STATE checkpoints.
+
+        The connector runs as a Docker image (``image=``) or a local executable
+        (``command=``) speaking the Airbyte protocol. Records keep their order, and a STATE
+        message is committed to ``state=`` only once every record before it was consumed,
+        so the next read resumes exactly where Airbyte says it may. Not yet verified
+        against a live Airbyte connector; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            stream: The stream to read.
+            opts: ``image=`` or ``command=``, ``config=`` (values may be secret
+                references), ``state=``, ``sync_mode=``, ``schema=``.
+
+        Returns:
+            A lazy `Dataset` over the stream's records.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.read.airbyte(  # doctest: +SKIP
+                ...     "users", image="airbyte/source-faker:6", config={"count": 100}
+                ... )
+        """
+        return _read_table("airbyte", stream, **opts)
 
     # --- Streaming ---------------------------------------------------------
     def kafka(
@@ -1728,6 +2274,8 @@ class Reader:
         self, topic: str, *, connection_str: str = "", consumer_group: str = "$Default", **opts: Any
     ) -> Dataset:
         """Read an Azure Event Hubs stream as an unbounded source.
+
+        Requires the ``eventhubs`` extra: ``pip install 'batcher-engine[eventhubs]'``.
 
         Uses the AMQP client (the ``eventhubs`` extra); Event Hubs also exposes a
         Kafka endpoint, so `read.kafka` works against it without the extra.

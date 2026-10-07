@@ -27,7 +27,7 @@ from batcher.core.udf import strategy as strat
 from batcher.core.udf.async_udf import is_async_udf
 from batcher.core.udf.call import _coerce_udf_result, _formatted, _resilient_call
 from batcher.core.udf.lifecycle import build_udf_callable, teardown_udf
-from batcher.core.udf.resilience import wrap_resilient
+from batcher.core.udf.resilience import conform_output, wrap_resilient
 from batcher.core.udf.sizing import (
     _GPU_BATCH_NS,
     _GPU_STREAM_BATCH_ROWS,
@@ -292,10 +292,12 @@ def _apply_udf_stream(
 
     def _emit(sub: pa.RecordBatch):
         started = time.perf_counter_ns() if record is not None else 0
-        out = (
-            _resilient_call(call, sub, budget, is_gpu)
+        out = conform_output(
+            _resilient_call(call, sub, budget, is_gpu, op.error_column is not None)
             if resilient
-            else _coerce_udf_result(call(sub), sub.schema)
+            else _coerce_udf_result(call(sub), sub.schema),
+            op,
+            check_names=False,
         )
         if record is not None:
             record(time.perf_counter_ns() - started, sub, out)

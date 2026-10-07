@@ -99,9 +99,53 @@ pub(super) fn regexp_escape(s: &str) -> String {
     String::from_utf8(out).expect("escaping only inserts ASCII backslashes outside sequences")
 }
 
+/// Which characters separate path components — DuckDB's `separator` argument to the
+/// `parse_*` path functions, carried in the `pattern` slot.
+///
+/// The default accepts both, as DuckDB's `both_slash` does, so a Windows path parses too;
+/// but a POSIX filename may legally contain a backslash, and `forward` keeps it whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Separator {
+    /// `/` or `\\` (DuckDB `both_slash`, the default).
+    Both,
+    /// `/` only (DuckDB `forward_slash`).
+    Forward,
+    /// `\\` only (DuckDB `backslash`).
+    Backslash,
+}
+
+impl Separator {
+    /// The mode named by `pattern`; absent is [`Separator::Both`].
+    pub(super) fn parse(
+        pattern: Option<&str>,
+        func: crate::StrFunc,
+    ) -> Result<Self, crate::ExprError> {
+        match pattern.unwrap_or("both") {
+            "both" => Ok(Self::Both),
+            "forward" => Ok(Self::Forward),
+            "backslash" => Ok(Self::Backslash),
+            other => Err(crate::ExprError::InvalidArgument {
+                func: format!("{func:?}"),
+                reason: format!(
+                    "unknown path separator {other:?}; expected \"both\", \"forward\" or \"backslash\""
+                ),
+            }),
+        }
+    }
+
+    #[inline]
+    fn matches(self, c: char) -> bool {
+        match self {
+            Self::Both => c == '/' || c == '\\',
+            Self::Forward => c == '/',
+            Self::Backslash => c == '\\',
+        }
+    }
+}
+
 /// The final component of a path (DuckDB `parse_filename`).
-pub(super) fn parse_filename(s: &str) -> &str {
-    match s.rfind(is_separator) {
+pub(super) fn parse_filename(s: &str, sep: Separator) -> &str {
+    match s.rfind(|c| sep.matches(c)) {
         Some(i) => &s[i + 1..],
         None => s,
     }
@@ -110,8 +154,8 @@ pub(super) fn parse_filename(s: &str) -> &str {
 /// The *first* component of a path (DuckDB `parse_dirname`): `/` for an absolute POSIX
 /// path, the leading directory otherwise, and the empty string when there is no
 /// separator at all.
-pub(super) fn parse_dirname(s: &str) -> &str {
-    match s.find(is_separator) {
+pub(super) fn parse_dirname(s: &str, sep: Separator) -> &str {
+    match s.find(|c| sep.matches(c)) {
         Some(0) => &s[..1],
         Some(i) => &s[..i],
         None => "",
@@ -125,8 +169,8 @@ pub(super) fn parse_dirname(s: &str) -> &str {
 /// would give the empty string, and DuckDB returns `/` — the root is its own directory.
 /// `/single` really is `''`, and `//` really is `/`, so the carve-out is exactly the
 /// one-character path, not "a leading separator".
-pub(super) fn parse_dirpath(s: &str) -> &str {
-    match s.rfind(is_separator) {
+pub(super) fn parse_dirpath(s: &str, sep: Separator) -> &str {
+    match s.rfind(|c| sep.matches(c)) {
         Some(0) if s.len() == 1 => s,
         Some(i) => &s[..i],
         None => "",
@@ -135,10 +179,11 @@ pub(super) fn parse_dirpath(s: &str) -> &str {
 
 /// A path split into components (DuckDB `parse_path`), keeping a leading separator as
 /// its own first element so an absolute path is distinguishable from a relative one.
-pub(super) fn parse_path(s: &str) -> Vec<&str> {
+pub(super) fn parse_path(s: &str, sep: Separator) -> Vec<&str> {
     if s.is_empty() {
         return Vec::new();
     }
+    let is_separator = |c: char| sep.matches(c);
     let (lead, rest) = if s.starts_with(is_separator) {
         (Some(&s[..1]), &s[1..])
     } else {
@@ -147,12 +192,6 @@ pub(super) fn parse_path(s: &str) -> Vec<&str> {
     let mut out: Vec<&str> = lead.into_iter().collect();
     out.extend(rest.split(is_separator).filter(|p| !p.is_empty()));
     out
-}
-
-/// Both separators are accepted, as DuckDB does, so a Windows path parses too.
-#[inline]
-fn is_separator(c: char) -> bool {
-    c == '/' || c == '\\'
 }
 
 /// The UTF-8 bytes of `s` as `0`/`1` characters, 8 per byte, MSB first (DuckDB
@@ -246,28 +285,34 @@ mod tests {
 
         // `parse_dirname` is the first component, `parse_dirpath` everything before the
         // filename — they agree only on a one-level relative path.
-        assert_eq!(parse_dirname("/x/y/z.csv"), "/");
-        assert_eq!(parse_dirpath("/x/y/z.csv"), "/x/y");
-        assert_eq!(parse_filename("/x/y/z.csv"), "z.csv");
-        assert_eq!(parse_path("/x/y/z.csv"), vec!["/", "x", "y", "z.csv"]);
-        assert_eq!(parse_dirname("a/b/c.txt"), "a");
-        assert_eq!(parse_dirpath("a/b/c.txt"), "a/b");
-        assert_eq!(parse_path("a/b/c.txt"), vec!["a", "b", "c.txt"]);
+        assert_eq!(parse_dirname("/x/y/z.csv", Separator::Both), "/");
+        assert_eq!(parse_dirpath("/x/y/z.csv", Separator::Both), "/x/y");
+        assert_eq!(parse_filename("/x/y/z.csv", Separator::Both), "z.csv");
+        assert_eq!(
+            parse_path("/x/y/z.csv", Separator::Both),
+            vec!["/", "x", "y", "z.csv"]
+        );
+        assert_eq!(parse_dirname("a/b/c.txt", Separator::Both), "a");
+        assert_eq!(parse_dirpath("a/b/c.txt", Separator::Both), "a/b");
+        assert_eq!(
+            parse_path("a/b/c.txt", Separator::Both),
+            vec!["a", "b", "c.txt"]
+        );
         // No separator: the whole value is the filename and there is no directory.
-        assert_eq!(parse_filename("noslash"), "noslash");
-        assert_eq!(parse_dirname("noslash"), "");
-        assert_eq!(parse_dirpath("noslash"), "");
+        assert_eq!(parse_filename("noslash", Separator::Both), "noslash");
+        assert_eq!(parse_dirname("noslash", Separator::Both), "");
+        assert_eq!(parse_dirpath("noslash", Separator::Both), "");
         // The root is its own directory; a one-level absolute path has none. Both are
         // DuckDB's answers and the two disagree, which is why the carve-out is the
         // one-character path rather than "starts with a separator".
-        assert_eq!(parse_dirpath("/"), "/");
-        assert_eq!(parse_dirpath("/single"), "");
-        assert_eq!(parse_dirpath("//"), "/");
-        assert_eq!(parse_dirpath("//a"), "/");
-        assert_eq!(parse_dirpath("a/b/"), "a/b");
-        assert_eq!(parse_path("/"), vec!["/"]);
-        assert_eq!(parse_path("//a"), vec!["/", "a"]);
-        assert!(parse_path("").is_empty());
+        assert_eq!(parse_dirpath("/", Separator::Both), "/");
+        assert_eq!(parse_dirpath("/single", Separator::Both), "");
+        assert_eq!(parse_dirpath("//", Separator::Both), "/");
+        assert_eq!(parse_dirpath("//a", Separator::Both), "/");
+        assert_eq!(parse_dirpath("a/b/", Separator::Both), "a/b");
+        assert_eq!(parse_path("/", Separator::Both), vec!["/"]);
+        assert_eq!(parse_path("//a", Separator::Both), vec!["/", "a"]);
+        assert!(parse_path("", Separator::Both).is_empty());
 
         assert_eq!(to_binary("a"), "01100001");
         assert_eq!(from_binary("01100001").as_deref(), Some("a"));
@@ -305,5 +350,24 @@ mod tests {
                 (!s.is_empty()).then_some(s)
             );
         }
+    }
+
+    /// DuckDB's `separator` argument, read from a live DuckDB 1.5 on the same inputs.
+    #[test]
+    fn the_separator_mode_matches_duckdb() {
+        use Separator::{Backslash, Both, Forward};
+        let mixed = "/a/b\\c.txt";
+        assert_eq!(parse_filename(mixed, Both), "c.txt");
+        assert_eq!(parse_filename(mixed, Forward), "b\\c.txt");
+        assert_eq!(parse_filename(mixed, Backslash), "c.txt");
+        assert_eq!(parse_dirname(mixed, Backslash), "/a/b");
+        assert_eq!(parse_dirpath(mixed, Forward), "/a");
+        assert_eq!(parse_path(mixed, Forward), vec!["/", "a", "b\\c.txt"]);
+        assert_eq!(parse_path(mixed, Backslash), vec!["/a/b", "c.txt"]);
+        let windows = "C:\\dir\\f.txt";
+        assert_eq!(parse_filename(windows, Forward), windows);
+        assert_eq!(parse_dirpath(windows, Forward), "");
+        assert_eq!(parse_dirpath("/", Backslash), "");
+        assert_eq!(parse_filename("/", Backslash), "/");
     }
 }

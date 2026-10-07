@@ -37,6 +37,7 @@ from typing import Any
 
 from sqlglot import expressions as exp
 
+from batcher._sql.parser.expressions.lowering.named import keyword_arguments, split_keywords
 from batcher._sql.parser.expressions.lowering.signatures import (
     STRINGS,
     arity,
@@ -90,10 +91,13 @@ def accessor_namespaces() -> tuple[str, ...]:
 #: * ``list_filter``/``list_transform`` take a lambda (``list_filter(l, x -> x > 0)``);
 #: * ``list_unique`` is DuckDB's *count* of distinct elements, and the list itself is
 #:   ``list_distinct``;
-#: * ``.str.join`` is an aggregate, spelled ``string_agg``.
+#: * ``.str.join`` is an aggregate, spelled ``string_agg``;
+#: * ``json_decode`` (and DuckDB's ``json_transform``) takes a type *structure* document;
+#: * ``struct_rename_fields`` takes its ``{old: new}`` mapping as trailing name pairs.
 _CURATED_ELSEWHERE = frozenset(
     {
         "jsonarraylength",
+        "jsondecode",
         "jsonexists",
         "jsonextractstring",
         "jsonkeys",
@@ -102,6 +106,7 @@ _CURATED_ELSEWHERE = frozenset(
         "listtransform",
         "listunique",
         "strjoin",
+        "structrenamefields",
     }
 )
 
@@ -207,6 +212,7 @@ def accessor_function(tr, node) -> Expr | None:
     if entry is None:
         return None
     namespace, method, fn = entry
+    args, keywords = split_keywords(args)
     kinds = parameter_kinds(fn, skip_first=True)
     if kinds is None:  # a method with unclassifiable parameters is not in the vocabulary
         return None
@@ -222,4 +228,7 @@ def accessor_function(tr, node) -> Expr | None:
         )
     subject = tr._scalar(args[0])
     built = build_arguments(tr, fn, list(args[1:]), written_name(node), skip_first=True)
-    return getattr(getattr(subject, namespace), method)(*built)
+    named = keyword_arguments(
+        tr, fn, keywords, written_name(node), skip_first=True, filled=len(built)
+    )
+    return getattr(getattr(subject, namespace), method)(*built, **named)

@@ -14,7 +14,16 @@ from typing import Any
 
 import pyarrow as pa
 
-__all__ = ["RegisteredFunction", "resolve_type", "validate_options"]
+__all__ = [
+    "NULL_HANDLING",
+    "RegisteredFunction",
+    "resolve_type",
+    "validate_null_handling",
+    "validate_options",
+]
+
+#: DuckDB `create_function`'s two `null_handling` modes, accepted by the scalar form.
+NULL_HANDLING = ("special", "default")
 
 
 @dataclass(frozen=True)
@@ -25,7 +34,9 @@ class RegisteredFunction:
     relation in, relation out) when true, else a scalar function ``SELECT f(x)``
     hoisted into a column-materializing `map_batches`. `vectorized` (scalar form)
     chooses whether `fn` receives whole Arrow arrays or one row at a time; `per_row`
-    is the table-form analogue (``ds.map`` vs ``ds.map_batches``).
+    is the table-form analogue (``ds.map`` vs ``ds.map_batches``). `null_handling`
+    (scalar form) is DuckDB's ``create_function`` switch: ``"special"`` hands NULL to `fn`,
+    ``"default"`` answers NULL for any row with a NULL argument without calling `fn`.
     """
 
     name: str
@@ -36,6 +47,7 @@ class RegisteredFunction:
     result_type: pa.DataType | None
     output_columns: tuple[str, ...] | None
     config: dict[str, Any] = field(default_factory=dict)
+    null_handling: str = "special"
 
 
 def resolve_type(result_type: str | pa.DataType | None) -> pa.DataType | None:
@@ -101,3 +113,29 @@ def validate_options(name: str, options: dict[str, Any], *, table: bool, per_row
     from batcher.api.dataset._options import validate_map_options
 
     validate_map_options(f"register_function({name!r})", options, per_row=per_row)
+
+
+def validate_null_handling(name: str, null_handling: object, *, table: bool) -> None:
+    """Reject a `null_handling` that is not DuckDB's, or one the table form cannot honour.
+
+    Args:
+        name: The SQL function name, for the message.
+        null_handling: The requested mode.
+        table: Whether it is being registered as a table function.
+
+    Raises:
+        PlanError: If the mode is unknown, or ``"default"`` is asked of a table function,
+            whose `fn` receives whole rows rather than arguments.
+    """
+    from batcher._internal.errors import PlanError
+
+    if null_handling not in NULL_HANDLING:
+        raise PlanError(
+            f"register_function({name!r}): null_handling must be one of "
+            f"{list(NULL_HANDLING)}, got {null_handling!r}"
+        )
+    if table and null_handling != "special":
+        raise PlanError(
+            f"register_function({name!r}): null_handling applies to a scalar function's "
+            "arguments; a table function receives whole rows. Drop it, or handle NULLs in fn."
+        )

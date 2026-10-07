@@ -77,6 +77,8 @@ class ExprTag:
     STRFTIME: Final = "strftime"
     STRPTIME: Final = "strptime"
     CONVERT_TIMEZONE: Final = "convert_timezone"
+    REPLACE_TIMEZONE: Final = "replace_timezone"
+    BUSINESS_DAY: Final = "business_day"
     LIST: Final = "list"
     LIST_BINARY: Final = "list_binary"
     LIST_JOIN: Final = "list_join"
@@ -92,6 +94,9 @@ class ExprTag:
     LIST_SLICE: Final = "list_slice"
     STRUCT_FIELD: Final = "struct_field"
     MAKE_STRUCT: Final = "make_struct"
+    STRUCT_UPDATE: Final = "struct_update"
+    LIST_ZIP_STRUCT: Final = "list_zip_struct"
+    JSON_DOC: Final = "json_doc"
     MAKE_MAP: Final = "make_map"
     MAKE_TEMPORAL: Final = "make_temporal"
     MAP: Final = "map"
@@ -210,7 +215,12 @@ WINDOW_VALUE: Final = WINDOW_OFFSET_VALUE | WINDOW_FILL
 # require an ORDER BY, exactly as the fills do.
 WINDOW_EWM: Final = frozenset({"ewm_mean", "ewm_var", "ewm_std"})
 WINDOW_SERIES: Final = WINDOW_EWM | frozenset({"interpolate", "rle_id"})
-WINDOW_FUNCS: Final = WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW_SERIES
+# Binning by the partition's own quantiles (`bc_runtime::window::qcut`): the whole partition
+# is read to find the edges, so it takes no frame and ignores any ORDER BY.
+WINDOW_BINNING: Final = frozenset({"qcut"})
+WINDOW_FUNCS: Final = (
+    WINDOW_RANKING | WINDOW_AGGREGATES | WINDOW_VALUE | WINDOW_SERIES | WINDOW_BINNING
+)
 # Functions that honour an explicit frame: the reducing aggregates, plus the
 # positional value functions that pick the frame's first/last/nth row. `lag`/`lead`
 # and the fills carry no frame (theirs is fixed by their own offset / nullness).

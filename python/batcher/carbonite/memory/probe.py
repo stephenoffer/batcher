@@ -5,8 +5,10 @@ them has bitten the engine each way. The host's RAM is not the ceiling when a cg
 is lower. `memory.current` is not usage, because it counts reclaimable page cache. And the
 free figure `psutil` reports is the *machine's*, not the container's.
 
-Each answer is cached at the lifetime it is stable for: host RAM and the cgroup cap cannot
-change for the process, so both are memoized; the live available reading and the reclaimable
+Each answer is cached at the lifetime it is stable for: host RAM cannot change for the
+process, so it is memoized; the cgroup cap is re-read on a one-second TTL, because a
+Kubernetes in-place pod resize rewrites `memory.max` under a running process; the live
+available reading and the reclaimable
 page-cache term are re-sampled on a short (50 ms) TTL; the cgroup's raw charge — the figure
 the OOM-killer acts on — is re-read on a 1 ms window, wide enough only to let the components
 deciding about one query share a read and far too narrow to hide a real change.
@@ -26,6 +28,7 @@ from batcher._internal.hardware.sysfs import read_live_text
 from batcher.config import active_config
 
 __all__ = [
+    "CGROUP_LIMIT_TTL_SECONDS",
     "ROUND_COALESCE_SECONDS",
     "SAMPLE_TTL_SECONDS",
     "available_bytes",
@@ -67,6 +70,16 @@ ROUND_COALESCE_SECONDS = 0.001
 # Single-slot coalescing cache for the raw charge: `(monotonic_deadline, value)`.
 _total_cache: tuple[float, int | None] | None = None
 
+# How long the cgroup memory cap is reused. It is not fixed for a container's lifetime:
+# Kubernetes in-place pod resize (on by default since 1.33) rewrites `memory.max` under a
+# running process, and a cap cached forever kept admission granting against the old, larger
+# limit until the kernel OOM-killed the worker. A second is far longer than any admission
+# decision and far shorter than a resize takes to matter, so the read stays off the hot path.
+CGROUP_LIMIT_TTL_SECONDS = 1.0
+
+# Single-slot TTL cache for the cgroup cap: `(monotonic_deadline, value)`.
+_limit_cache: tuple[float, int | None] | None = None
+
 
 def reset_memory_sampling() -> None:
     """Drop every memoized memory reading, so the next sample re-reads the OS.
@@ -78,13 +91,13 @@ def reset_memory_sampling() -> None:
     silently overrode every later patch — the reset appeared to work while the number it was
     supposed to refresh never moved.
     """
-    global _available_cache, _file_cache_cache, _total_cache
+    global _available_cache, _file_cache_cache, _total_cache, _limit_cache
     from batcher.carbonite.memory.kernel import reset_kernel_sampling
 
     _available_cache = None
     _file_cache_cache = None
     _total_cache = None
-    cgroup_limit_bytes.cache_clear()
+    _limit_cache = None
     # `total_memory_bytes` now delegates to the neutral probe, which memoizes the whole
     # ceiling — so clearing only this module's caches would leave it pinned.
     machine_memory_bytes.cache_clear()
@@ -94,7 +107,6 @@ def reset_memory_sampling() -> None:
     reset_kernel_sampling()
 
 
-@functools.lru_cache(maxsize=1)
 def cgroup_limit_bytes() -> int | None:
     """The container memory limit from cgroup v2 (`memory.max`) or v1
     (`memory.limit_in_bytes`), or `None` when unlimited / not in a cgroup.
@@ -103,15 +115,28 @@ def cgroup_limit_bytes() -> int | None:
     honoring it is what stops the engine over-admitting and getting OOM-killed by
     the kernel.
 
-    Cached for the process: the cgroup cap is fixed for a container's lifetime, while
-    this is read on every admission check — re-opening `memory.max` per query is pure
-    hot-path I/O. (The *current* usage, which does change, is read live and uncached.)
+    Cached on `CGROUP_LIMIT_TTL_SECONDS`: this is read on every admission check, so
+    re-opening `memory.max` per query is pure hot-path I/O, but the cap is *not* fixed for
+    a container's lifetime — an in-place pod resize lowers it under a running process, and
+    a cap memoized forever kept admitting against the old one.
 
     Like the CPU quota, the limit can be set at any level of the cgroup v2 hierarchy — the
     process's own leaf (a namespaced pod), a parent slice (a non-namespaced Ray worker), or
     the mount root — so the effective cap is the tightest `memory.max` across the whole
     ancestry (`cgroup_v2_dirs`), not just the root. v1 keeps its single well-known path.
     """
+    global _limit_cache
+    now = time.monotonic()
+    cached = _limit_cache
+    if cached is not None and now < cached[0]:
+        return cached[1]
+    value = _read_cgroup_limit_bytes()
+    _limit_cache = (now + CGROUP_LIMIT_TTL_SECONDS, value)
+    return value
+
+
+def _read_cgroup_limit_bytes() -> int | None:
+    """One uncached read of the tightest cgroup memory cap; see `cgroup_limit_bytes`."""
     limits = [
         v for d in cgroup_v2_dirs() if (v := read_cgroup_bytes(os.path.join(d, "memory.max")))
     ]

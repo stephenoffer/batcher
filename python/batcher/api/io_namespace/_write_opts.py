@@ -45,6 +45,8 @@ MODE_AWARE_SINKS = frozenset(
         "iceberg",
         "hudi",
         "snowflake",
+        "bigquery",
+        "databricks",
         "clickhouse",
         "adbc",
         "dbapi",
@@ -54,6 +56,7 @@ MODE_AWARE_SINKS = frozenset(
         "redis",
         "elasticsearch",
         "hbase",
+        "google_sheets",
     }
 )
 
@@ -71,12 +74,15 @@ DATABASE_SINKS = frozenset(
         "dbapi",
         "mongo",
         "snowflake",
+        "bigquery",
+        "databricks",
         "clickhouse",
         "dynamodb",
         "cassandra",
         "redis",
         "elasticsearch",
         "hbase",
+        "google_sheets",
     }
 )
 

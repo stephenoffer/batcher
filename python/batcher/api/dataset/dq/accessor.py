@@ -619,6 +619,50 @@ class DatasetDQ:
             temporal.not_in_future(column, tolerance=tolerance), mostly=mostly, severity=severity
         )
 
+    def monotonic(
+        self,
+        column: str,
+        *,
+        order_by: str | list[str],
+        by: str | list[str] | None = None,
+        strict: bool = False,
+        decreasing: bool = False,
+        mostly: float = 1.0,
+        severity: Severity = "error",
+    ) -> DatasetDQ:
+        """Require `column` never to step backwards in `order_by` order (a time-series check).
+
+        A row violates the check when its value is below the previous row's, so a sensor
+        log replayed out of order, or a clock that jumped back, shows up as the rows where
+        it happened. `by` checks each group (each device, each account) on its own. The
+        first row of a group, a null, and the row after a null pass.
+
+        Args:
+            column: The column whose sequence is checked, typically an event timestamp.
+            order_by: The column(s) that define row order; required, because a relation has
+                no order of its own.
+            by: Optional grouping column(s) checked independently.
+            strict: Also reject a value equal to the previous one (a duplicate timestamp).
+            decreasing: Check for a non-increasing sequence instead.
+            mostly: The fraction of rows that must pass for the constraint to pass.
+            severity: `"error"` to enforce, `"warn"` to report only.
+
+        Returns:
+            A new `DatasetDQ` with the constraint added.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"seq": [1, 2, 3, 4], "ts": [10, 20, 15, 30]})
+                >>> ds.dq.monotonic("ts", order_by="seq").validate().violations
+                {'monotonic(ts, increasing)': 1}
+        """
+        check = temporal.monotonic(
+            column, order_by=order_by, by=by, strict=strict, decreasing=decreasing
+        )
+        return self._add(check, mostly=mostly, severity=severity)
+
     def check(
         self,
         predicate: Expr,

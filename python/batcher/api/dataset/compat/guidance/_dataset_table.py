@@ -23,7 +23,7 @@ __all__ = ["DATASET_UNSUPPORTED"]
 _NO_INDEX: dict[str, str] = {
     "index": (
         "Batcher relations have no row index (they are unordered multisets, like SQL). "
-        "For a positional column use ds.with_row_index(); to order rows use ds.sort()."
+        "For a positional column use ds.with_row_index(); to order rows use ds.sort('col')."
     ),
     "set_index": (
         "Batcher relations have no row index. Keep the key as an ordinary column and "
@@ -51,10 +51,12 @@ _NO_INDEX: dict[str, str] = {
         "Batcher has no positional indexer. Use ds.limit(n, offset=offset) "
         "or ds[0:10] for rows, and ds.select(...) for columns."
     ),
-    "at": "Batcher has no scalar indexer. Use ds.filter(...).item() for a single value.",
-    "iat": "Batcher has no scalar indexer. Use ds.filter(...).item() for a single value.",
+    "at": "Batcher has no scalar indexer. Use ds.filter(...).item(column='x') for one value.",
+    "iat": "Batcher has no scalar indexer. Use ds.filter(...).item(column='x') for one value.",
     "xs": "Batcher has no cross-section indexer. Use ds.filter(...) and ds.select(...).",
-    "lookup": "Batcher has no positional lookup. Select the value with ds.filter(...).item().",
+    "lookup": (
+        "Batcher has no positional lookup. Select the value with ds.filter(...).item(column='x')."
+    ),
     "droplevel": (
         "Batcher has no MultiIndex. Columns are flat; use ds.select(...) / ds.rename(...)."
     ),
@@ -63,7 +65,7 @@ _NO_INDEX: dict[str, str] = {
     "nlevels": "Batcher has no MultiIndex; columns are flat. Count them with len(ds.columns).",
     "first_valid_index": (
         "Batcher relations have no row index. Filter for the first match with "
-        "ds.filter(...).head(1)."
+        "ds.filter(...).limit(1)."
     ),
     "last_valid_index": "Batcher relations have no row index. Filter, sort, and take the last row.",
     "keys": "Iterate columns via ds.columns and index a column with ds[name].",
@@ -81,21 +83,24 @@ _NO_TRANSPOSE: dict[str, str] = {
     ),
     "stack": "Reshaping wide-to-long is ds.unpivot(index=[...], on=[...]).",
     "unstack": "Reshaping long-to-wide is ds.pivot(index=[...], on=..., values=...).",
-    "swapaxes": "A relation has no axes to swap. Reshape with ds.unpivot() / ds.pivot().",
+    "swapaxes": (
+        "A relation has no axes to swap. Reshape with ds.unpivot(index=[...], on=[...]) / "
+        "ds.pivot(index=[...], on=..., values=...)."
+    ),
     "to_xarray": "No xarray bridge. Collect first: ds.to_pandas().to_xarray().",
 }
 
-# --- per-row Python never runs on the hot path ---------------------------------------
+# --- per-row Python is opt-in, never the engine's own path ---------------------------
 _NO_PER_ROW: dict[str, str] = {
     "iterrows": (
-        "Batcher never runs per-row Python on the hot path. To consume rows at the "
-        "end of a pipeline use ds.iter_rows(named=True), which streams batches; to "
-        "compute per row use an expression (bt.col('x') * 2) or ds.map_batches()."
+        "Batcher has no row loop inside a pipeline. To consume rows at the end of one use "
+        "ds.iter_rows(named=True), which streams batches; to compute per row use an "
+        "expression (bt.col('x') * 2) or ds.map_batches(fn), which run columnar."
     ),
     "itertuples": (
-        "Batcher never runs per-row Python on the hot path. To consume rows at the "
-        "end of a pipeline use ds.iter_rows(), which streams batches; to compute per "
-        "row use an expression (bt.col('x') * 2) or ds.map_batches()."
+        "Batcher has no row loop inside a pipeline. To consume rows at the end of one use "
+        "ds.iter_rows(), which yields tuples as it streams batches; to compute per row use "
+        "an expression (bt.col('x') * 2) or ds.map_batches(fn), which run columnar."
     ),
     "applymap": (
         "Batcher has no per-cell Python callback. Express the work as an expression "
@@ -229,18 +234,24 @@ _NEEDS_ORDER: dict[str, str] = {
         "Filter on the clock time: ds.filter(bt.col('t').dt.is_between_time('09:00', '17:00')); "
         "it wraps past midnight, which an hour comparison does not."
     ),
-    "tz_convert": "Convert a timezone with bt.col('t').dt.convert_timezone('UTC').",
-    "tz_localize": "Attach a timezone with bt.col('t').dt.convert_timezone('UTC').",
+    "tz_convert": (
+        "Converting between timezones names both ends: "
+        "bt.col('t').dt.convert_timezone('UTC', 'Europe/Paris')."
+    ),
+    "tz_localize": (
+        "Attaching a timezone is a cast: bt.col('t').cast('timestamp(us, UTC)'). To move a "
+        "timestamp between zones use bt.col('t').dt.convert_timezone('UTC', 'Europe/Paris')."
+    ),
     "truncate": (
         "Trim rows by a boundary column with ds.filter(...), or by position with "
         "ds.limit(n, offset=offset)."
     ),
     "idxmax": (
-        "There is no row index. For the row itself use ds.sort('x', descending=True).head(1); "
+        "There is no row index. For the row itself use ds.sort('x', descending=True).limit(1); "
         "for the argmax within a group use bt.col('x').arg_max(order_by=...)."
     ),
     "idxmin": (
-        "There is no row index. For the row itself use ds.sort('x').head(1); "
+        "There is no row index. For the row itself use ds.sort('x').limit(1); "
         "for the argmin within a group use bt.col('x').arg_min(order_by=...)."
     ),
 }
@@ -265,7 +276,7 @@ _PREDICATES: dict[str, str] = {
         "ds.filter(cond)."
     ),
     "mask": "The inverse of where: bt.when(~cond).then(a).otherwise(b), or ds.filter(~cond).",
-    "isin": "Membership is ds.filter(bt.col('x').is_in(['a', 'b'])).",
+    "isin": "Membership is ds.filter(bt.col('k').is_in(['a', 'b'])).",
     "replace": "Value replacement is bt.col('x').replace({old: new}) inside ds.with_columns(...).",
     "duplicated": (
         "Flag repeats with bt.col('key').is_duplicated() inside ds.with_columns(...) or "
@@ -273,10 +284,7 @@ _PREDICATES: dict[str, str] = {
     ),
     "factorize": "Dense integer codes are bt.col('x').label_encode().",
     "cut": "Binning is bt.col('x').cut(breaks=[...]) inside ds.with_columns(...).",
-    "qcut": (
-        "Quantile binning: derive breaks from bt.col('x').quantile(...), then "
-        "bt.col('x').cut(breaks=...)."
-    ),
+    "qcut": "Quantile binning is bt.col('x').qcut(4) inside ds.with_columns(...).",
     "combine_first": (
         "Fill a column's nulls from another via a join, then coalesce: "
         "ds.join(other, on='key').with_columns(x=bt.coalesce(bt.col('x'), bt.col('x_right')))."
@@ -331,7 +339,7 @@ _RESHAPE: dict[str, str] = {
         "Row-wise mean across columns is bt.mean_horizontal('a', 'b') in ds.select(...)."
     ),
     "hash_rows": "A per-row hash column is bt.hash_rows(...) in ds.with_columns(...).",
-    "explode_multiple": "Explode a list column with ds.explode('col').",
+    "explode_multiple": "Explode a list column with ds.explode('tags').",
 }
 
 # --- storage / chunking / execution knobs Batcher manages for you --------------------
@@ -454,8 +462,8 @@ _PANDAS_ONLY: dict[str, str] = {
         "bt.col('t').cast('timestamp(us)'), or bt.col('t').dt.timestamp() from an epoch."
     ),
     "to_gbq": (
-        "Write to BigQuery through the writer façade: ds.write.bigquery(table). "
-        "Every sink lives under ds.write; see the I/O reference."
+        "Spelled ds.write.bigquery('dataset.table', project=...) here: one Parquet load "
+        "job per shard, appending unless mode='overwrite'."
     ),
 }
 

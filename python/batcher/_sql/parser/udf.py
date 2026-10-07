@@ -48,16 +48,24 @@ def _to_array(result: Any, result_type: pa.DataType | None) -> pa.Array:
 
 
 class _SqlUdf:
-    """A registered scalar UDF bound to its argument columns, constants and output column."""
+    """A registered scalar UDF bound to its argument columns, constants and output column.
 
-    __slots__ = ("arg_cols", "const_args", "fn", "out_col", "result_type")
+    `skip_nulls` is ``null_handling="default"``: a row with any NULL argument answers NULL
+    without `fn` being called, which is DuckDB's NULL-in, NULL-out default for
+    `create_function`. Off (``"special"``), `fn` receives the NULLs.
+    """
 
-    def __init__(self, fn, arg_cols, const_args, out_col, result_type) -> None:
+    __slots__ = ("arg_cols", "const_args", "fn", "out_col", "result_type", "skip_nulls")
+
+    def __init__(
+        self, fn, arg_cols, const_args, out_col, result_type, skip_nulls: bool = False
+    ) -> None:
         self.fn = fn
         self.arg_cols = arg_cols  # list[(position, column_name)]
         self.const_args = const_args  # list[(position, value)]
         self.out_col = out_col
         self.result_type = result_type
+        self.skip_nulls = skip_nulls
 
 
 class _SqlUdfBatch(_SqlUdf):
@@ -67,8 +75,29 @@ class _SqlUdfBatch(_SqlUdf):
 
     def __call__(self, batch: pa.RecordBatch) -> pa.RecordBatch:
         args = _ordered_args(batch, self.arg_cols, self.const_args)
-        col = _to_array(self.fn(*args), self.result_type)
+        valid = _all_valid(batch, self.arg_cols, self.const_args) if self.skip_nulls else None
+        if valid is None:
+            col = _to_array(self.fn(*args), self.result_type)
+        else:
+            col = self._call_valid_rows(args, valid, batch.num_rows)
         return batch.append_column(self.out_col, col)
+
+    def _call_valid_rows(self, args: list[Any], valid: pa.Array, n: int) -> pa.Array:
+        """`fn` over only the rows whose arguments are all non-NULL, NULL everywhere else.
+
+        The array arguments are filtered to the valid rows, so `fn` never sees a NULL, and
+        the compact result is scattered back: each valid row takes its position in the
+        compact result, each other row a NULL index, which `take` turns into a NULL.
+        """
+        import pyarrow.compute as pc
+
+        if not pc.any(valid).as_py():  # nothing to call on; an all-NULL column of its type
+            return pa.nulls(n, self.result_type or pa.null())
+        compact = [pc.filter(a, valid) if isinstance(a, pa.Array) else a for a in args]
+        result = _to_array(self.fn(*compact), self.result_type)
+        position = pc.subtract(pc.cumulative_sum(pc.cast(valid, pa.int64())), 1)
+        index = pc.if_else(valid, position, pa.scalar(None, pa.int64()))
+        return result.take(index)
 
 
 class _SqlUdfRow(_SqlUdf):
@@ -86,7 +115,8 @@ class _SqlUdfRow(_SqlUdf):
                 args[pos] = columns[name][row]
             for pos, val in self.const_args:
                 args[pos] = val
-            out.append(self.fn(*args))
+            skip = self.skip_nulls and any(a is None for a in args)
+            out.append(None if skip else self.fn(*args))
         return batch.append_column(self.out_col, pa.array(out, type=self.result_type))
 
 
@@ -100,9 +130,25 @@ def _ordered_args(batch: pa.RecordBatch, arg_cols, const_args) -> list[Any]:
     return args
 
 
+def _all_valid(batch: pa.RecordBatch, arg_cols, const_args) -> pa.Array | None:
+    """Per row, whether every argument is non-NULL; `None` when no row has a NULL."""
+    import pyarrow.compute as pc
+
+    if any(val is None for _, val in const_args):
+        return pa.array([False] * batch.num_rows, pa.bool_())
+    columns = [batch.column(name) for _, name in arg_cols]
+    if not any(c.null_count for c in columns):
+        return None
+    valid = pc.is_valid(columns[0])
+    for column in columns[1:]:
+        valid = pc.and_(valid, pc.is_valid(column))
+    return valid
+
+
 def _make_adapter(rf, arg_cols, const_args, out_col):
     cls = _SqlUdfBatch if rf.vectorized else _SqlUdfRow
-    return cls(rf.fn, arg_cols, const_args, out_col, rf.result_type)
+    skip_nulls = rf.null_handling == "default"
+    return cls(rf.fn, arg_cols, const_args, out_col, rf.result_type, skip_nulls)
 
 
 def _is_registered_scalar(tr, node) -> bool:
@@ -194,3 +240,26 @@ def _apply_table_function(tr, anon, rf):
         # now validates the keys against `Dataset.map`, so forwarding them is safe.
         return src.map(rf.fn, output_columns=out_cols, **rf.config)
     return src.map_batches(rf.fn, output_columns=out_cols, **rf.config)
+
+
+def unknown_function_message(tr, name: str) -> str:
+    """Why `name` did not resolve, and the next action, for the context it was called from.
+
+    A registered Python function lowers to a `map_batches` stage over the query's relation,
+    so it exists only inside a SQL *query*. An expression context -- `bt.call_function`, a
+    SQL-string expression -- translates against no relation and no function registry
+    (`_ExpressionTranslator` binds `_bound` instead), so there a registered name is just as
+    unknown as a misspelled one. Telling that caller to "use bt.register_function" sent them
+    to register a function that already was.
+    """
+    if getattr(tr, "_bound", None) is not None:
+        return (
+            f"unknown function {name!r}: it is not a built-in SQL function. A Python function "
+            "registered with register_function is callable only inside a SQL query (bt.sql, "
+            "Session.sql, Dataset.sql), not from an expression such as bt.call_function; "
+            "call it from a query, or apply it with Dataset.map_batches"
+        )
+    return (
+        f"unknown function {name!r}: it is not a supported SQL function and is not "
+        "registered (use bt.register_function to call a Python function)"
+    )

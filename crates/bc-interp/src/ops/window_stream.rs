@@ -702,6 +702,7 @@ mod tests {
             alpha: None,
             half_life: None,
             ignore_nulls: false,
+            opts: bc_ir::WindowOpts::default(),
             alias: alias.to_string(),
         }
     }

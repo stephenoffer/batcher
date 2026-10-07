@@ -81,7 +81,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `take_batch` | {py:obj}`Dataset.limit <batcher.Dataset.limit>` + {py:obj}`Dataset.to_numpy <batcher.Dataset.to_numpy>` | mismatch | Differs: Ray take\_batch(batch\_size=20) returns one batch in batch\_format='default' (\{col: ndarray\}); Batcher: .limit(20).to\_numpy() returns \{col: ndarray\}; other batch\_format values need to\_arrow()/to\_pandas(). Wave W0. |
 | `to_arrow_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
 | `to_daft` | {py:obj}`Dataset.to_daft <batcher.Dataset.to_daft>` | canonical |  |
-| `to_dask` | n/a | gap | Not yet: export a Dataset to a Dask DataFrame. Wave W8. |
+| `to_dask` | {py:obj}`Dataset.to_dask <batcher.Dataset.to_dask>` | mismatch | Differs: Ray to\_dask(meta=, verify\_meta=) takes a pandas meta; Batcher derives meta from the Arrow schema and instead takes materialize= (arrow/deferred/parquet). Drop meta= and verify\_meta=. Wave W8. |
 | `to_mars` | n/a | out of scope | Declined: Mars (pymars) interop; Batcher has no Mars bridge and converts through pandas (Dataset.to\_pandas). |
 | `to_modin` | n/a | out of scope | Declined: Modin wraps pandas; convert through Dataset.to\_pandas and modin.pandas.DataFrame. |
 | `to_numpy_refs` | n/a | out of scope | Declined: Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs. |
@@ -95,7 +95,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `unique` | {py:obj}`Dataset.select <batcher.Dataset.select>` + {py:obj}`Dataset.distinct <batcher.Dataset.distinct>` + {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | mismatch | Differs: Ray unique(column) is eager and returns a list of the column's distinct values (ignore\_nulls=False keeps None); Batcher Dataset.distinct deduplicates rows and returns a Dataset. Port as: \[r\[c\] for r in ds.select(c).distinct().to\_pylist()\]. Wave W0. |
 | `with_column` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
 | `with_columns` | {py:obj}`Dataset.with_columns <batcher.Dataset.with_columns>` | canonical |  |
-| `write_bigquery` | n/a | gap | Not yet: BigQuery writer (Batcher reads BigQuery via bt.read.bigquery but cannot write it). Wave W13. |
+| `write_bigquery` | `Dataset.write.bigquery` | mismatch | Differs: Ray write\_bigquery(project\_id, dataset) names the table as 'dataset.table' and replaces it per overwrite\_table=; Batcher write.bigquery(table, project=) takes the table first and appends unless mode='overwrite'. Wave W13. |
 | `write_clickhouse` | `Dataset.write.clickhouse` | param | Missing: creating the table (Ray's CREATE mode); Batcher inserts into an existing table. Wave W13. |
 | `write_csv` | `Dataset.write.csv` | mismatch | Differs: Ray write\_csv defaults mode=SaveMode.APPEND and writes a directory of CSV files; Batcher defaults mode='overwrite' (replacing existing output) and supports append only for delta/iceberg/hudi/snowflake. Pass mode explicitly; file-sink append is missing. Wave W2. |
 | `write_datasink` | n/a | gap | Not yet: write through a user Datasink implementation. Wave W11. |
@@ -111,7 +111,7 @@ The following table maps the 96 names on `Dataset`, sorted alphabetically.
 | `write_snowflake` | `Dataset.write.snowflake` | mismatch | Differs: Ray write\_snowflake appends rows to the table; Batcher write.snowflake defaults mode='overwrite'. Pass mode='append'. Wave W0. |
 | `write_sql` | `Dataset.write.sql` | mismatch | Differs: Ray write\_sql(sql, connection\_factory) executes a user INSERT statement per row batch through a DB-API connection factory; Batcher write.sql(table, mode=, key\_columns=) writes a table by name. Wave W13. |
 | `write_tfrecords` | `Dataset.write.tfrecord` | param | Missing: tf\_schema=. Wave W13. |
-| `write_turbopuffer` | n/a | gap | Not yet: Turbopuffer vector-namespace writer. Wave W13. |
+| `write_turbopuffer` | `Dataset.write.turbopuffer` | mismatch | Differs: unverified: not yet run against a live Turbopuffer (tests/PENDING\_VERIFICATION.md). The namespace is the positional argument and there is no namespace\_column= routing; vector\_column defaults to 'embedding' rather than 'vector'; a null or repeated id refuses the write and names the point where Ray drops null-id rows; metric= takes 'cosine'/'euclidean' (sent as cosine\_distance/euclidean\_squared). Wave W13. |
 | `write_webdataset` | `Dataset.write.webdataset` | mismatch | Differs: cells are written as raw bytes, UTF-8 text or decimal numbers rather than through Ray's encoders; a repeated \_\_key\_\_ is refused. Wave W13. |
 | `zip` | {py:obj}`Dataset.zip <batcher.Dataset.zip>` | param | Missing: implicit row order: Batcher's zip needs order\_by. Wave W8. |
 

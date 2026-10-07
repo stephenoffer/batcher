@@ -21,6 +21,7 @@ from collections.abc import Iterator
 
 from batcher._internal.errors import ConfigError
 from batcher.config.config import Config, active_config, config_context, set_config
+from batcher.config.serde import redact
 
 __all__ = [
     "describe_options",
@@ -134,7 +135,10 @@ def get_option(name: str) -> object:
 
 
 def set_option(*args: object, **options: object) -> None:
-    """Set one or more config options process-wide by dotted path.
+    """Set one or more config options for the current context by dotted path.
+
+    Goes through `set_config`, so the change applies to the calling thread and to the
+    asyncio tasks it starts, not to threads started afterwards.
 
     Two spellings, both accepted: positional ``set_option("execution.morsel_rows", 4096)``
     for a single option (the `pandas` and Spark form), or keywords for several at once.
@@ -201,7 +205,7 @@ def option_context(*args: object, **options: object) -> Iterator[None]:
     Same argument forms as `set_option`, and the same all-or-nothing validation. Restores
     on the way out even if the block raises, and nests correctly because it is built on
     the same `ContextVar` as `config_context` — which also makes it safe under asyncio and
-    per-thread rather than process-wide.
+    scoped to the calling thread.
 
     Examples:
         .. doctest::
@@ -287,7 +291,7 @@ def describe_options(pattern: str = "*") -> str:
     for path in matches:
         value = current[path]
         marker = "" if value == defaults[path] else f"   (default {defaults[path]!r})"
-        lines.append(f"{path} = {value!r}{marker}")
+        lines.append(f"{path} = {redact(path, value)!r}{marker}")
     return "\n".join(lines)
 
 

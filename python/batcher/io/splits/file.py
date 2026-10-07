@@ -137,14 +137,34 @@ class IpcFileSplit:
     def read(self, projection: list[str] | None = None) -> list[pa.RecordBatch]:
         with pa.OSFile(self.path, "rb") as src, pa.ipc.open_stream(src) as reader:
             batches = list(reader)
+        self._check_rows(sum(b.num_rows for b in batches))
         if projection is not None:
             batches = [b.select(projection) for b in batches]
         return batches
 
     def iter_batches(self, projection: list[str] | None = None) -> Iterator[pa.RecordBatch]:
+        seen = 0
         with pa.OSFile(self.path, "rb") as src, pa.ipc.open_stream(src) as reader:
             for b in reader:
+                seen += b.num_rows
                 yield b.select(projection) if projection is not None else b
+        self._check_rows(seen)
+
+    def _check_rows(self, seen: int) -> None:
+        """Fail when the file holds fewer (or more) rows than were written to it.
+
+        An Arrow IPC *stream* truncated at a batch boundary reads back cleanly: the reader
+        treats a bare end of file as the end of the stream, so the lost batches simply never
+        appear. `rows` was captured when the file was written, so comparing against it is
+        the one check that turns that silent short read into an error.
+        """
+        if self.rows is not None and seen != self.rows:
+            from batcher._internal.errors import FormatError
+
+            raise FormatError(
+                f"intermediate file {self.path} holds {seen} rows but {self.rows} were "
+                "written to it: it was truncated or replaced after it was written"
+            )
 
     def row_count(self) -> int | None:
         return self.rows

@@ -34,6 +34,7 @@ from batcher.plan.types import logical_bytes
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from typing import TextIO
 
 __all__ = [
     "_collect",
@@ -50,6 +51,9 @@ __all__ = [
     "_to_pylist",
     "_write",
 ]
+
+#: The execution backends `collect(backend=...)` accepts.
+_BACKENDS = ("cpu", "gpu", "auto")
 
 
 def _shortcut(plan: LogicalPlan, route: str, rows: int, started: float) -> None:
@@ -193,7 +197,7 @@ def _collect(
     # size); `backend="auto"` lets Kyber's cost policy decide GPU vs CPU fully. Anything else — an
     # unsupported shape, a GPU-less cluster, or data Kyber routes to the CPU — silently uses the
     # CPU engine, so both are always safe. Same result, different *where*.
-    if backend not in ("cpu", "gpu", "auto"):
+    if backend not in _BACKENDS:
         raise PlanError(f"backend must be 'cpu', 'gpu', or 'auto', got {backend!r}")
     if backend in ("gpu", "auto"):
         from batcher import core
@@ -695,43 +699,97 @@ def _declared_schema(plan: LogicalPlan, sources: list[Source]) -> pa.Schema | No
 
 
 def _schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.Schema:
-    """The output Arrow schema without scanning rows.
+    """The output Arrow schema, scanning no rows unless a callback must be asked.
 
     A bare scan returns its source schema, normalized the way the FFI boundary will
     normalize it. Otherwise the plan's type-carrying `available_schema()` analysis answers
-    without touching the engine when it can infer every output type; anything it leaves
-    uncertain falls back to a zero-row execution (`limit(0)`), which the engine answers
-    without materializing data.
+    without touching the engine when it can infer every output type -- which includes a
+    `map_batches`/`map`/`flat_map` stage whose `output_columns` is a `pyarrow.Schema`, and
+    the callable form of `filter`. Anything it leaves uncertain falls back to a probe run
+    (`_probe_schema`).
 
     The `widen` on the scan arm is what keeps all three arms agreeing. The other two
     already predict the boundary's normalization — `available_schema()` through
-    `plan.types`, and the `limit(0)` fallback by actually executing — while this one
+    `plan.types`, and the probe by actually executing — while this one
     handed back the source's own types. A dictionary-encoded column (what Parquet emits
     natively for a low-cardinality string) was therefore reported as
     `dictionary<values=string, ...>` by `Dataset.schema` when `collect()` returns plain
     `string`, so the cheapest arm was the only one that lied.
     """
-    from batcher.plan.logical import Limit
-
     declared = _declared_schema(plan, sources)
     if declared is not None:
         return declared
-    return _collect(Limit(plan, 0), sources, columns).schema
+    return _probe_schema(plan, sources, columns)
+
+
+def _probe_schema(plan: LogicalPlan, sources: list[Source], columns: list[str]) -> pa.Schema:
+    """Execute just enough of `plan` to learn its output schema.
+
+    A relational plan runs under ``LIMIT 0``, which the engine answers without materializing
+    data. That limit alone does not bound a Python stage: it sits *above* the callback, and
+    the callback ran over every input row before anything was limited -- a `map_batches`
+    over 100,000 rows was called 7 times over all of them, on the driver, for a property
+    read. So each `MapBatches` input is capped as well (`_capped_for_probe`), and a callback
+    sees an empty batch, or one row where an empty batch cannot answer. A class callback is
+    still constructed, which for a load-once model is a model load; declaring
+    `output_columns` as a schema is how to avoid the call.
+
+    Two answers from the empty batch are not answers, and both are asked again on one row
+    (still bounded -- one row per stage): a callback that refuses an empty batch, which it
+    never sees in a real run, and a column that comes back Arrow `null`, which is what a
+    column the callback built from no values is typed as.
+    """
+    from batcher._internal.logging import note_suppressed
+    from batcher.plan.logical import Limit
+
+    try:
+        schema = _collect(Limit(_capped_for_probe(plan), 0), sources, columns).schema
+    except Exception as exc:
+        note_suppressed("api", "probe a callback's output schema on an empty batch", exc)
+    else:
+        if not any(pa.types.is_null(t) for t in schema.types):
+            return schema
+    return _collect(Limit(_capped_for_probe(plan, True), 0), sources, columns).schema
+
+
+def _capped_for_probe(node: LogicalPlan, row_above: bool = False) -> LogicalPlan:
+    """`node` with every callback stage's input limited to zero rows, or one where needed.
+
+    Zero wherever it suffices: a batch callback is called on an empty batch and answers with
+    its types, and an empty batch is the one input whose types cannot depend on the values
+    in it (a NumPy round trip turns a batch of equal-length lists into a tensor). A per-row
+    stage (`map`/`flat_map`) is never called on an empty batch, so it gets one row, and so
+    does every callback beneath it -- a stage that emitted nothing would starve it.
+    """
+    import dataclasses
+
+    from batcher.plan.logical import Limit, MapBatches
+    from batcher.plan.visitor import children, with_children
+
+    if isinstance(node, MapBatches):
+        one = row_above or node.per_row
+        capped = Limit(_capped_for_probe(node.input, one), 1 if one else 0)
+        return dataclasses.replace(node, input=capped)
+    kids = children(node)
+    return with_children(node, [_capped_for_probe(k, row_above) for k in kids]) if kids else node
 
 
 @with_auto_config
-def _stats(plan: LogicalPlan, sources: list[Source], columns: list[str]):
+def _stats(
+    plan: LogicalPlan, sources: list[Source], columns: list[str], *, keep_result: bool = False
+):
     """Execute through the real path (single-node/spill/distributed) and return `RunStats`.
 
     Raises `PlanError` for an unbounded source. A `map_batches`/ML pipeline is measured per
     stage against its logical tree (see `run_profiled`), so it reports rows and time per
-    stage rather than refusing.
+    stage rather than refusing. With `keep_result` the run's own table rides along on
+    `RunStats.result`, so measuring a query does not mean running it a second time.
     """
     from batcher.api.stats import RunStats
-    from batcher.api.terminal.profile import run_profiled
+    from batcher.api.terminal.profile import run_profiled_with_result
 
-    profile = run_profiled(plan, sources, columns)
-    return RunStats.from_profile(profile)
+    table, profile = run_profiled_with_result(plan, sources, columns)
+    return RunStats.from_profile(profile, result=table if keep_result else None)
 
 
 def _sink_owns_its_layout(sink: object, path: str) -> bool:
@@ -905,7 +963,13 @@ def _commit(
 
     if schema is not None and manifest.schema is None:
         manifest = dataclasses.replace(manifest, schema=schema)
-    sink.commit(manifest, path)
+    label = active_config().observability.query_label
+    if label:
+        manifest = dataclasses.replace(manifest, query_label=label)
+    version = sink.commit(manifest, path)
+    manifest = dataclasses.replace(
+        manifest, destination=path, version=version if isinstance(version, int) else None
+    )
     _report_write(manifest, fmt)
     if auto_compact:
         # After the commit, never before: the data is already durable, so a compaction that
@@ -1431,10 +1495,23 @@ def _to_pandas(
     sources: list[Source],
     columns: list[str],
     cache: StorageLevel | None = None,
+    *,
+    dtype_backend: str = "numpy",
 ) -> Any:
-    """Execute and return the result as a pandas `DataFrame` (via Arrow)."""
+    """Execute and return the result as a pandas `DataFrame` (via Arrow).
+
+    `dtype_backend` is checked before the query runs, so a typo costs nothing.
+    """
+    from batcher.interop.arrays import DTYPE_BACKENDS, pandas_types_mapper
+
+    if dtype_backend not in DTYPE_BACKENDS:
+        raise PlanError(
+            f"to_pandas(dtype_backend=...) must be one of {DTYPE_BACKENDS}, got {dtype_backend!r}"
+        )
     require("pandas", feature="Dataset.to_pandas()", provides="pandas", extra="pandas")
-    return _collect(plan, sources, columns, cache=cache).to_pandas()
+    mapper = pandas_types_mapper(dtype_backend)
+    table = _collect(plan, sources, columns, cache=cache)
+    return table.to_pandas() if mapper is None else table.to_pandas(types_mapper=mapper)
 
 
 def _to_polars(
@@ -1448,20 +1525,32 @@ def _to_polars(
     return polars.from_arrow(_collect(plan, sources, columns, cache=cache))
 
 
-def _show(plan: LogicalPlan, sources: list[Source], columns: list[str], limit: int) -> None:
-    """Print a preview of the result.
+def _show(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    limit: int,
+    *,
+    max_width: int,
+    max_cell_width: int,
+    file: TextIO | None = None,
+) -> None:
+    """Print a preview of the result to `file` (stdout when ``None``).
 
     The `limit` is pushed into the PLAN, not applied to a materialized table: `show()`
     on a billion-row dataset must read only enough of the source to produce `limit`
     rows (the streaming early-stop / distributed top-N paths), never collect the whole
-    result to the driver just to slice ten rows off it.
+    result to the driver just to slice ten rows off it. One row past the limit is
+    fetched, so the footer can say whether the preview is the whole result.
 
     What gets printed is a row-oriented table (`terminal.preview`), not pyarrow's own
     column-oriented `Table` repr — see that module for why.
     """
     from batcher.api.terminal.preview import render
 
-    print(render(_collect(_narrowed_limit(plan, limit), sources, columns), limit=limit))
+    table = _collect(_narrowed_limit(plan, limit + 1), sources, columns)
+    text = render(table, limit=limit, max_width=max_width, max_cell_width=max_cell_width)
+    print(text, file=file)
 
 
 def _narrowed_limit(plan: LogicalPlan, limit: int) -> LogicalPlan:

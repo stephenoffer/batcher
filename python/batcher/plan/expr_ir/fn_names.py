@@ -128,7 +128,8 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "json_object_keys", "json_type", "json_value", "json_contains", "json_pretty",
         "json_structure", "chr", "to_base", "bin", "format_bytes", "format_bytes_si",
         "damerau_levenshtein", "jaro_similarity", "jaro_winkler_similarity",
-        "json_extract", "json_extract_string", "l_trim",
+        "json_extract", "json_extract_all", "json_extract_string", "json_extract_string_all",
+        "l_trim",
         "len", "levenshtein", "like", "lower",
         "lpad", "mask", "md5", "minhash", "octet_length", "overlay", "position", "r_trim",
         "regexp_count", "regexp_extract", "regexp_extract_all", "regexp_matches",
@@ -155,6 +156,10 @@ STR_FNS: Final[frozenset[str]] = frozenset(
         "damerau_levenshtein_osa", "from_base64_binary", "initcap_space", "mask_by_class",
         "regexp_extract_all_or_empty", "regexp_extract_or_null", "regexp_replace_all_dollar",
         "regexp_replace_dollar", "unhex_binary", "url_decode_form", "url_encode_form",
+        # Unicode-aware kernels (`eval::str::unicode`), the struct-valued group extract
+        # (`eval::str::groups`) and the offset-keeping chunker.
+        "casefold", "chunk_offsets", "length_grapheme", "normalize", "regexp_extract_groups",
+        "regexp_extract_groups_or_null", "substring_grapheme",
     }
 )  # fmt: skip
 
@@ -169,9 +174,9 @@ would leak a key into a traceback."""
 DATE_FNS: Final[frozenset[str]] = frozenset(
     {
         "century", "day", "day_of_week", "day_of_year", "dayname", "days_in_month",
-        "decade", "epoch", "hour", "is_leap_year", "iso_year", "isodow", "last_day",
-        "millennium", "minute", "month", "monthname", "quarter", "second", "week",
-        "year",
+        "decade", "epoch", "epoch_ns", "hour", "is_leap_year", "iso_year", "isodow",
+        "last_day", "millennium", "minute", "month", "monthname", "nanosecond", "quarter",
+        "second", "week", "year",
     }
 )  # fmt: skip
 
@@ -193,8 +198,8 @@ LIST_FNS: Final[frozenset[str]] = frozenset(
         "l2_norm", "len", "log_softmax",
         "max", "max_abs", "mean", "median", "min", "n_unique", "n_unique_with_nulls",
         "normalize", "product", "reverse", "softmax", "sort", "sort_desc",
-        "sort_desc_nulls_first", "sort_nulls_first", "std", "sum", "unique",
-        "unique_with_nulls", "var",
+        "sort_desc_nulls_first", "sort_nulls_first", "std", "std_pop", "sum", "unique",
+        "unique_with_nulls", "var", "var_pop",
     }
 )  # fmt: skip
 

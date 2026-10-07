@@ -601,6 +601,22 @@ impl PoolCache {
     }
 }
 
+/// Run `f` on the engine's own cached pool of `width` threads -- the pool a query of that width
+/// executes on -- rather than on rayon's global pool.
+///
+/// For work the caller does just before executing (`bc-py` normalizing a query's sources), so
+/// it runs on the threads the query is about to use instead of standing up a second set of
+/// `cores` threads beside them.
+///
+/// # Errors
+/// [`InterpError::ThreadPool`] when the pool cannot be built.
+pub fn install_on_pool<R: Send>(
+    width: usize,
+    f: impl FnOnce() -> R + Send,
+) -> Result<R, InterpError> {
+    Ok(pool_for(width.max(1))?.install(f))
+}
+
 pub(crate) fn pool_for(width: usize) -> Result<Arc<rayon::ThreadPool>, InterpError> {
     static POOLS: OnceLock<Mutex<PoolCache>> = OnceLock::new();
     let pools = POOLS.get_or_init(|| Mutex::new(PoolCache::default()));
@@ -4299,6 +4315,7 @@ mod tests {
                     alpha: None,
                     half_life: None,
                     ignore_nulls: false,
+                    opts: bc_ir::WindowOpts::default(),
                     alias: "s".into(),
                 }],
                 rank_limit: None,
@@ -5762,6 +5779,7 @@ mod tests {
                     alpha: None,
                     half_life: None,
                     ignore_nulls: false,
+                    opts: bc_ir::WindowOpts::default(),
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -5772,6 +5790,7 @@ mod tests {
                     alpha: None,
                     half_life: None,
                     ignore_nulls: false,
+                    opts: bc_ir::WindowOpts::default(),
                     alias: "s".into(),
                 },
             ],
@@ -5821,6 +5840,7 @@ mod tests {
                     alpha: None,
                     half_life: None,
                     ignore_nulls: false,
+                    opts: bc_ir::WindowOpts::default(),
                     alias: "rn".into(),
                 },
                 WindowFunc {
@@ -5831,6 +5851,7 @@ mod tests {
                     alpha: None,
                     half_life: None,
                     ignore_nulls: false,
+                    opts: bc_ir::WindowOpts::default(),
                     alias: "s".into(),
                 },
             ],
@@ -5891,6 +5912,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
                 alias: "rn".into(),
             }],
             rank_limit: Some(2),
@@ -7193,6 +7215,7 @@ mod tests {
                 alpha: None,
                 half_life: None,
                 ignore_nulls: false,
+                opts: bc_ir::WindowOpts::default(),
                 alias: "s".into(),
             }],
             rank_limit: None,

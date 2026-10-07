@@ -70,6 +70,8 @@ _ROWS = pa.table(
         ),
         "m": pa.array([[("a", 1)]] * 4, pa.map_(pa.string(), pa.int64())),
         "bo": pa.array([True, False, True, True], pa.bool_()),
+        # A duration, the one receiver `.dt.total` accepts.
+        "dur": pa.array([3_600_000_000, -90_000_000, 0, 1], pa.duration("us")),
     }
 )
 
@@ -90,6 +92,10 @@ _LITERAL_ARGS: tuple[tuple, ...] = (
     # whose falsy-mapping branch returns the receiver unchanged -- so the sweep checked
     # the identity, not the method. Last, so no other method's shape changes.
     ({1: 2},),
+    # A field-renaming table for `.struct.rename_fields`, after the remap above.
+    ({"x": "z"},),
+    # A duration unit, for `.dt.total`; after the remap so no earlier shape changes.
+    ("h",),
 )  # fmt: skip
 
 #: Columns offered as an argument, before any literal.
@@ -101,7 +107,7 @@ _WINDOW_ARGS = ("2us", "2i", 2)
 
 #: namespace -> the receiver columns to try it on. `""` is the fluent builder itself.
 _NAMESPACES: dict[str, tuple[str, ...]] = {
-    "dt": ("ts", "d"),
+    "dt": ("ts", "d", "dur"),
     "json": ("j",),
     "map": ("m",),
     "struct": ("st",),

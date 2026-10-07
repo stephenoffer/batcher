@@ -353,6 +353,7 @@
   "sarg_mul_const@1",
   "sarg_xor_const@1",
   "sarg_bounded_ordered@1",
+  "align_union_branch_types@2",
   "flatten_nested_union@2",
   "simplify_singleton_union@2",
   "prune_empty_union_branch@2",

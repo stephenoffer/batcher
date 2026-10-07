@@ -31,9 +31,12 @@ __all__ = [
     "CAST_DTYPES",
     "DTYPE_REGISTRY",
     "canonical_dtype_name",
+    "dtype_from_wire",
     "dtype_name",
+    "dtype_to_wire",
     "normalize_dtype_spec",
     "resolve_dtype",
+    "resolve_dtype_spec",
 ]
 
 # Cast dtype name → Arrow type, for the names that take no parameters. Mirrors
@@ -403,3 +406,96 @@ def normalize_dtype_spec(dtype: Any, *, caller: str = "cast") -> str:
         f"{caller}(): cannot interpret {dtype!r} as a dtype; pass a dtype name such as "
         "'int64', a Python type (int/float/str/bool), or a pyarrow DataType"
     )
+
+
+def resolve_dtype_spec(dtype: Any, *, caller: str = "cast") -> pa.DataType | None:
+    """The Arrow type any user dtype spelling names, or ``None`` when nothing parses it.
+
+    The one parser behind every surface that takes a dtype from a user: a schema mapping
+    (``bt.from_pydict(..., schema={"x": "int32"})``), ``match_to_schema`` and the
+    ``by_dtype`` selector. A pyarrow `DataType` passes through untouched, so a nested
+    type the cast grammar cannot spell (``pa.list_(pa.int64())``) is still accepted where
+    no cast is built from it. Anything else goes through `normalize_dtype_spec`,
+    `canonical_dtype_name` and `resolve_dtype`, exactly as ``col("x").cast(...)`` does,
+    so the two surfaces cannot drift apart on what ``"DECIMAL(10,2)"`` means.
+
+    Args:
+        dtype: A pyarrow type, a dtype name, or a Python builtin type.
+        caller: The public method name to quote if `dtype` is not a dtype at all.
+
+    Returns:
+        The Arrow type, or ``None`` when `dtype` is a name the vocabulary does not know.
+
+    Raises:
+        PlanError: If `dtype` is not a name, a Python type, or a self-naming object.
+
+    Examples:
+        .. doctest::
+
+            >>> import pyarrow as pa
+            >>> from batcher.plan.types.registry import resolve_dtype_spec
+            >>> resolve_dtype_spec("DECIMAL(10,2)")
+            Decimal128Type(decimal128(10, 2))
+
+            >>> resolve_dtype_spec(pa.list_(pa.int64()))
+            ListType(list<item: int64>)
+    """
+    if isinstance(dtype, pa.DataType):
+        return dtype
+    return resolve_dtype(canonical_dtype_name(normalize_dtype_spec(dtype, caller=caller)))
+
+
+#: The wire form of a nested type: a flat cast name, or a tagged tuple.
+WireType = str | tuple
+
+
+def dtype_to_wire(dtype: pa.DataType) -> WireType:
+    """The nested-type wire form of `dtype`, which ``bc-expr``'s ``dtype.rs`` reads back.
+
+    A flat type is its cast name; ``("list", T)``, ``("struct", (("a", T), ...))`` and
+    ``("map", K, V)`` nest. Tuples rather than dicts, so a node can hold the form as an
+    ordinary immutable scalar field.
+
+    Args:
+        dtype: The Arrow type to encode.
+
+    Returns:
+        The wire form.
+
+    Raises:
+        PlanError: A type with no wire spelling (a union, an extension type).
+    """
+    if pa.types.is_list(dtype) or pa.types.is_large_list(dtype):
+        return ("list", dtype_to_wire(dtype.value_type))
+    if pa.types.is_struct(dtype):
+        return ("struct", tuple((f.name, dtype_to_wire(f.type)) for f in dtype))
+    if pa.types.is_map(dtype):
+        return ("map", dtype_to_wire(dtype.key_type), dtype_to_wire(dtype.item_type))
+    name = dtype_name(dtype)
+    if name is None:
+        raise PlanError(f"type {dtype} has no nested-type wire spelling")
+    return name
+
+
+def dtype_from_wire(wire: WireType) -> pa.DataType:
+    """The Arrow type a wire form names; the inverse of `dtype_to_wire`.
+
+    Every nested child is nullable, as the engine builds it.
+
+    Args:
+        wire: A wire form from `dtype_to_wire`.
+
+    Returns:
+        The Arrow type.
+    """
+    if isinstance(wire, str):
+        resolved = resolve_dtype(wire)
+        if resolved is None:
+            raise PlanError(f"unknown type name {wire!r} in a nested-type wire form")
+        return resolved
+    tag = wire[0]
+    if tag == "list":
+        return pa.list_(dtype_from_wire(wire[1]))
+    if tag == "struct":
+        return pa.struct([pa.field(n, dtype_from_wire(t)) for n, t in wire[1]])
+    return pa.map_(dtype_from_wire(wire[1]), dtype_from_wire(wire[2]))

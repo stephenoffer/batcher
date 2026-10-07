@@ -76,7 +76,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `summarize` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | mismatch | Differs: Daft summarize() returns one row per column (column, type, min, max, count, count\_nulls, approx\_count\_distinct); Batcher describe() returns one row per statistic with a column per input column. Wave W8. |
 | `to_arrow` | {py:obj}`Dataset.to_arrow <batcher.Dataset.to_arrow>` | canonical |  |
 | `to_arrow_iter` | {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | canonical |  |
-| `to_dask_dataframe` | n/a | gap | Not yet: export to a Dask DataFrame. Wave W13. |
+| `to_dask_dataframe` | {py:obj}`Dataset.to_dask <batcher.Dataset.to_dask>` | mismatch | Differs: Daft to\_dask\_dataframe(meta=) takes a pandas meta; Batcher derives it from the Arrow schema. Rename to to\_dask() and drop meta=. Wave W13. |
 | `to_pandas` | {py:obj}`Dataset.to_pandas <batcher.Dataset.to_pandas>` | canonical |  |
 | `to_pydict` | {py:obj}`Dataset.to_pydict <batcher.Dataset.to_pydict>` | canonical |  |
 | `to_pylist` | {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | canonical |  |
@@ -109,7 +109,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `write_parquet` | `Dataset.write.parquet` | mismatch | Differs: Daft write\_parquet defaults to write\_mode='append' and returns a DataFrame of written paths; Batcher ds.write.parquet defaults to mode='overwrite', a file sink rejects 'append', and it returns a WriteManifest. Param: mode='append' on file sinks; Daft compresses with snappy by default, Batcher with zstd. Wave W13. |
 | `write_sink` | n/a | gap | Not yet: a user DataSink protocol adapter. Wave W13. |
 | `write_sql` | `Dataset.write.sql` | param | Missing: a connection factory callable and write\_mode='fail'. Wave W13. |
-| `write_turbopuffer` | n/a | gap | Not yet: Turbopuffer vector-store sink. Wave W13. |
+| `write_turbopuffer` | `Dataset.write.turbopuffer` | mismatch | Differs: unverified: not yet run against a live Turbopuffer (tests/PENDING\_VERIFICATION.md). The namespace is the positional argument; vector\_column defaults to 'embedding'; a null or repeated id refuses the write and names the point. Wave W13. |
 
 ## `GroupedDataFrame`
 

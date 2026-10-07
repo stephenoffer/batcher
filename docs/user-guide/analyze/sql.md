@@ -28,7 +28,7 @@ print(out.to_pydict())
 # {'category': ['a', 'b', 'c'], 'n': [3, 2, 1]}
 ```
 
-The keyword name (`t` above) is the table identifier used in the `FROM` clause.
+The keyword name (`t` above) is the table identifier used in the `FROM` clause. To put a value into a query, pass it with `params=` and write a `?` or `$name` placeholder where it goes, rather than formatting it into the string. {doc}`sql-parameters` covers binding, checking a query before it runs, and the SQL error types.
 
 ## Supported subset
 
@@ -384,9 +384,9 @@ Constructs Batcher rejects rather than approximates. Each raises a clear error, 
 | `OFFSET` inside a correlated `EXISTS` over `DISTINCT` or `GROUP BY` | Count the groups in a scalar subquery and compare the count. |
 | Frame `EXCLUDE GROUP` / `TIES` under a `ROWS` frame with a bounded edge, any `EXCLUDE` under a `RANGE` frame with a value offset, and `EXCLUDE` on an aggregate other than `sum`, `count`, `avg`, `min`, `max`, `bool_and` or `bool_or` | An exclusion is answered by splitting the frame around what it excludes, and these frames have no exact split. Use a `GROUPS` frame for `GROUP` / `TIES`. Don't subtract the current row from the unexcluded result: that is wrong when the row is NULL, when the exclusion leaves the frame empty, and when a float is infinite. |
 | `STRING_AGG`, `ARRAY_AGG` or `LIST` with `OVER (...)` | The window engine has no list- or string-building aggregate. Aggregate with `GROUP BY` in a subquery and join the result back. |
-| `MERGE INTO` a catalog table | `DELETE` and `UPDATE` on a catalog table rewrite it in full. For an upsert, write the merged rows with `mode="overwrite"`, or keep the table in Delta and use `ds.write.delta(uri, merge_on=[...])`. |
 | A row-valued quantified subquery other than `= ANY` / `<> ALL`, such as `(a, b) > ALL (...)` | A row has no single extreme to compare against. Compare one column at a time. |
-| `INSERT ... ON CONFLICT`, `INSERT ... RETURNING`, `DELETE ... USING`, `DELETE ... RETURNING` | Each raises naming the clause. For an upsert, use `MERGE INTO` on a session table, or `ds.write.delta(uri, merge_on=[...])`. |
+| `INSERT ... ON CONFLICT` without a conflict target, `ON CONFLICT ON CONSTRAINT`, and two inserted rows with the same key | Batcher tables declare no key to infer a target from, and which of two same-key rows wins would depend on row order. Name the key columns, `ON CONFLICT (id)`, and deduplicate the inserted rows first. |
+| `RETURNING` on a catalog table, on `MERGE`, or with `ON CONFLICT` | Query the table after the statement. `RETURNING` on a session table's `INSERT`, `UPDATE` or `DELETE` is supported. |
 | A per-row `ntile` bucket count or `nth_value` N, and per-row `regexp_replace` options | The window operator and the regex kernel fix these per query. A constant expression such as `ntile(2 * 2)` is folded and accepted. |
 | `array_sort` with a comparator lambda | The list kernels sort by value. Sort by a derived key: `list_select(l, list_grade_up(list_transform(l, x -> length(x))))`. |
 | `time_bucket` with a width that doesn't divide a day evenly | Buckets start from the Unix epoch and DuckDB starts them from 2000-01-03, so a width such as `INTERVAL 2 DAY` would put every boundary on a different instant. Use a width that divides a day, such as `1 DAY`, `6 HOUR`, or `15 MINUTE`, or `date_trunc` for calendar buckets. |

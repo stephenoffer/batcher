@@ -420,6 +420,8 @@ DECLINED_EXPRS: dict[str, str] = {
     # common zones and the recent decades, which is exactly the shape of disagreement a test
     # over ordinary data never reaches — the same reason a regex is declined next door.
     "convert_timezone": "three tz databases that agree only where a test would look",
+    "replace_timezone": "the same zone rules as convert_timezone, plus DST-gap policies",
+    "business_day": "a holiday-aware calendar kernel with no dataframe-library equivalent",
     # The per-row-parameter forms. Their constant siblings (`str`, `list_get`) translate,
     # but the engine answers these by grouping rows on the parameter and calling the same
     # kernel per group — a shape with no cuDF equivalent, and one this package will not
@@ -430,6 +432,12 @@ DECLINED_EXPRS: dict[str, str] = {
     "list_zip": "returns a list column, which the host backend cannot construct",
     "make_map": "returns a map column, which the host backend cannot construct",
     "make_struct": "returns a struct column, which the host backend cannot construct",
+    "struct_update": "returns a struct column, which the host backend cannot construct",
+    "list_zip_struct": "returns a list column, which the host backend cannot construct",
+    # Decode builds a typed nested value and encode walks one; both are a Rust kernel
+    # (`bc-expr::eval::str::json::typed`) whose lenient-cast rules a translation would
+    # have to restate, and merge-patch is a recursive document edit with no column form.
+    "json_doc": "a JSON document kernel (`bc-expr::eval::str::json`) with no dataframe form",
     "map": "reads a map column; the construction half is declined, so the pair stays together",
     "sequence": "returns a list column, which the host backend cannot construct",
     # The engine parses with chrono and, when that fails, with a *partial* parse that fills in

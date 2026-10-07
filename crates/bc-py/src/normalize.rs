@@ -469,7 +469,7 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
             normalize_to(col.data_type())
         };
         match normalized {
-            Some(target) => match cast(col, &target) {
+            Some(target) => match par_widen(col, &target).map_or_else(|| cast(col, &target), Ok) {
                 Ok(arr) => {
                     // A lossless widening never introduces a null. The one cast that can
                     // (UInt64 → Int64 overflow, at any nesting depth) would corrupt data
@@ -507,6 +507,56 @@ pub(crate) fn normalize_batch(batch: &RecordBatch) -> PyResult<RecordBatch> {
     }
     Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .unwrap_or_else(|_| batch.clone()))
+}
+
+/// Rows above which a primitive widening is split across the rayon pool (see [`par_widen`]).
+const PAR_WIDEN_ROWS: usize = 1 << 18;
+
+/// `col` widened to `target` across the rayon pool, or `None` to leave it to arrow's `cast`.
+///
+/// A source handed over as one large batch was widened on the calling thread, before the
+/// engine started: TPC-DS sf1 `inventory` is one 11.7M-row batch whose `Int32` quantity
+/// column made `normalize_batch` the longest stretch of q37 and q82, ahead of every operator.
+/// Splitting the batch would make every later breaker re-concatenate it, so the one column is
+/// widened in parallel into one buffer instead.
+///
+/// Only the lossless primitive widenings `normalize_to` asks for (a signed or unsigned integer
+/// of at most 32 bits to `Int64`, `Float32` to `Float64`), each by the same Rust `as`/`From`
+/// conversion arrow's cast applies per value, so the result is the cast's, value for value.
+/// The validity buffer is shared, not copied.
+fn par_widen(col: &ArrayRef, target: &DataType) -> Option<ArrayRef> {
+    use arrow::datatypes::{
+        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type,
+        UInt32Type, UInt8Type,
+    };
+    if col.len() < PAR_WIDEN_ROWS {
+        return None;
+    }
+    match (col.data_type(), target) {
+        (DataType::Int8, DataType::Int64) => widen::<Int8Type, Int64Type>(col, i64::from),
+        (DataType::Int16, DataType::Int64) => widen::<Int16Type, Int64Type>(col, i64::from),
+        (DataType::Int32, DataType::Int64) => widen::<Int32Type, Int64Type>(col, i64::from),
+        (DataType::UInt8, DataType::Int64) => widen::<UInt8Type, Int64Type>(col, i64::from),
+        (DataType::UInt16, DataType::Int64) => widen::<UInt16Type, Int64Type>(col, i64::from),
+        (DataType::UInt32, DataType::Int64) => widen::<UInt32Type, Int64Type>(col, i64::from),
+        (DataType::Float32, DataType::Float64) => widen::<Float32Type, Float64Type>(col, f64::from),
+        _ => None,
+    }
+}
+
+fn widen<I, O>(col: &ArrayRef, f: fn(I::Native) -> O::Native) -> Option<ArrayRef>
+where
+    I: arrow::datatypes::ArrowPrimitiveType,
+    O: arrow::datatypes::ArrowPrimitiveType,
+{
+    use arrow::array::{AsArray, PrimitiveArray};
+    use rayon::prelude::*;
+    let a = col.as_primitive_opt::<I>()?;
+    let values: Vec<O::Native> = a.values().par_iter().map(|v| f(*v)).collect();
+    Some(Arc::new(PrimitiveArray::<O>::new(
+        values.into(),
+        a.nulls().cloned(),
+    )))
 }
 
 /// Unwrap a Python list of pyarrow batches into normalized Arrow record batches.
@@ -854,8 +904,10 @@ mod tests {
         );
     }
 
+    /// A list of floats is a tensor and keeps its element width (`normalize_list_element`); the
+    /// list itself passes through unchanged.
     #[test]
-    fn list_of_narrow_float_widens_child_to_float64() {
+    fn list_of_narrow_float_keeps_its_element_width() {
         let values = Arc::new(Float32Array::from(vec![1.0f32, 2.0, 3.0]));
         let offsets = OffsetBuffer::new(vec![0, 2, 3].into());
         let field = Arc::new(Field::new("item", DataType::Float32, true));
@@ -863,7 +915,7 @@ mod tests {
         let out = normalize_batch(&batch_of("l", Arc::new(list))).unwrap();
         assert_eq!(
             out.schema().field(0).data_type(),
-            &DataType::List(Arc::new(Field::new("item", DataType::Float64, true)))
+            &DataType::List(Arc::new(Field::new("item", DataType::Float32, true)))
         );
     }
 
@@ -976,5 +1028,92 @@ mod tests {
             .unwrap();
         let inner = st.column(0).as_any().downcast_ref::<ListArray>().unwrap();
         assert_eq!(inner.value_offsets()[0], 0);
+    }
+
+    /// The parallel widening is arrow's cast, value for value and null for null, for every
+    /// type it serves -- including each type's extremes and NaN -- and declines below its size.
+    #[test]
+    fn par_widen_equals_cast() {
+        use arrow::array::{
+            Float32Array, Int16Array, Int32Array, Int8Array, UInt16Array, UInt32Array, UInt8Array,
+        };
+        let n = PAR_WIDEN_ROWS + 3;
+        let valid = |i: usize| i % 7 != 3;
+        let cols: Vec<(ArrayRef, DataType)> = vec![
+            (
+                Arc::new(
+                    (0..n)
+                        .map(|i| valid(i).then(|| [i8::MIN, -1, 0, i8::MAX][i % 4]))
+                        .collect::<Int8Array>(),
+                ),
+                DataType::Int64,
+            ),
+            (
+                Arc::new(
+                    (0..n)
+                        .map(|i| valid(i).then(|| [i16::MIN, -1, 0, i16::MAX][i % 4]))
+                        .collect::<Int16Array>(),
+                ),
+                DataType::Int64,
+            ),
+            (
+                Arc::new(
+                    (0..n)
+                        .map(|i| valid(i).then(|| [i32::MIN, -1, 0, i32::MAX][i % 4]))
+                        .collect::<Int32Array>(),
+                ),
+                DataType::Int64,
+            ),
+            (
+                Arc::new(
+                    (0..n)
+                        .map(|i| valid(i).then(|| [0, 1, u8::MAX][i % 3]))
+                        .collect::<UInt8Array>(),
+                ),
+                DataType::Int64,
+            ),
+            (
+                Arc::new(
+                    (0..n)
+                        .map(|i| valid(i).then(|| [0, 1, u16::MAX][i % 3]))
+                        .collect::<UInt16Array>(),
+                ),
+                DataType::Int64,
+            ),
+            (
+                Arc::new(
+                    (0..n)
+                        .map(|i| valid(i).then(|| [0, 1, u32::MAX][i % 3]))
+                        .collect::<UInt32Array>(),
+                ),
+                DataType::Int64,
+            ),
+            (
+                Arc::new(
+                    (0..n)
+                        .map(|i| {
+                            valid(i).then(|| [f32::MIN, -0.0, f32::NAN, f32::INFINITY, 1.5][i % 5])
+                        })
+                        .collect::<Float32Array>(),
+                ),
+                DataType::Float64,
+            ),
+        ];
+        for (col, target) in cols {
+            let fast = par_widen(&col, &target).expect("served at this size");
+            let slow = cast(&col, &target).unwrap();
+            assert_eq!(fast.data_type(), slow.data_type());
+            assert_eq!(fast.nulls(), slow.nulls(), "{:?}", col.data_type());
+            assert_eq!(
+                fast.to_data().buffers()[0],
+                slow.to_data().buffers()[0],
+                "{:?}",
+                col.data_type()
+            );
+            assert!(
+                par_widen(&col.slice(0, 10), &target).is_none(),
+                "a small column keeps the cast"
+            );
+        }
     }
 }

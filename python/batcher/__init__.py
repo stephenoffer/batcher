@@ -2,7 +2,10 @@
 
 The public surface is intentionally small and fluent. Everything in this package
 is the *control plane*: it builds and optimizes plans and hands them to the Rust
-engine (`batcher._native`). No tuple is ever processed in Python on the hot path.
+engine (`batcher._native`). The engine itself never iterates rows in Python:
+expressions such as `bt.col("x") * 2` are the default and run in Rust. Python only
+touches data where you hand it a callable, as with `Dataset.map_batches`, a callable
+`Dataset.filter` predicate, or the per-row `Dataset.map`.
 
     import batcher as bt
 

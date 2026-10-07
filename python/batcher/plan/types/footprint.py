@@ -16,9 +16,13 @@ fails in the one direction a bound must not fail. A working set chunked to 64 Mi
 passes a build side far over it and replicates it to every worker. Both are the OOM those
 checks exist to prevent, arrived at through the check itself.
 
-`retained_bytes` is that figure, and it over-counts where two columns share one buffer (a
-dictionary encoded twice). That is deliberate. A bound that over-counts spills or chunks
-sooner and costs some throughput; one that under-counts costs the process.
+`retained_bytes` is that figure for one object, and it over-counts where two columns share
+one buffer (a dictionary encoded twice). That is deliberate. A bound that over-counts spills
+or chunks sooner and costs some throughput; one that under-counts costs the process.
+
+Across a *sequence*, the same over-count stops being a rounding error. N sibling slices of
+one parent pin that parent once, not N times, so `total_retained_bytes` charges each
+underlying buffer once by address rather than summing per-object figures.
 
 Neutral layer: imports only `pyarrow`.
 """
@@ -152,4 +156,64 @@ def total_retained_bytes(items: Iterable[Any]) -> int:
             >>> total_retained_bytes([window]) > 100_000
             True
     """
-    return sum(retained_bytes(item) for item in items)
+    seen: dict[int, int] = {}
+    unwalkable = 0
+    logical = 0
+    for item in items:
+        logical += logical_bytes(item)
+        arrays = _arrays_of(item)
+        if arrays is None:
+            unwalkable += retained_bytes(item)
+            continue
+        for array in arrays:
+            try:
+                _collect_buffers(array, seen)
+            except (AttributeError, TypeError, ValueError, pa.ArrowException):
+                # A layout `buffers()` cannot walk is charged in full, undeduplicated:
+                # over-counting is the safe direction for a bound.
+                unwalkable += retained_bytes(array)
+    return max(sum(seen.values()) + unwalkable, logical)
+
+
+def _arrays_of(item: Any) -> list[Any] | None:
+    """The `Array` chunks behind an Arrow object, or `None` for anything else."""
+    if isinstance(item, pa.Table):
+        return [chunk for column in item.columns for chunk in column.chunks]
+    if isinstance(item, pa.RecordBatch):
+        return list(item.columns)
+    if isinstance(item, pa.ChunkedArray):
+        return list(item.chunks)
+    if isinstance(item, pa.Array):
+        return [item]
+    return None
+
+
+def _collect_buffers(array: pa.Array, seen: dict[int, int]) -> None:
+    """Record every buffer `array` keeps alive into `seen`, keyed by address.
+
+    `Array.buffers()` already flattens nested children, but it stops at a dictionary: the
+    dictionary's buffers belong to a separate array, so a dictionary column (at the top
+    level or nested inside a list or struct) is walked through its values explicitly.
+    A slice reports its parent's buffers at the parent's address and full size, which is
+    what makes one slice charge the whole parent and N slices charge it once.
+    """
+    if isinstance(array, pa.ExtensionArray):
+        array = array.storage
+    if pa.types.is_dictionary(array.type):
+        _collect_buffers(array.indices, seen)
+        _collect_buffers(array.dictionary, seen)
+        return
+    if _has_nested_dictionary(array.type):
+        raise TypeError("a dictionary below a nested type is not reachable via buffers()")
+    for buffer in array.buffers():
+        if buffer is not None:
+            seen[buffer.address] = max(seen.get(buffer.address, 0), buffer.size)
+
+
+def _has_nested_dictionary(dtype: pa.DataType) -> bool:
+    """Whether a dictionary hides below `dtype`'s children, where `buffers()` skips it."""
+    for i in range(dtype.num_fields):
+        child = dtype.field(i).type
+        if pa.types.is_dictionary(child) or _has_nested_dictionary(child):
+            return True
+    return False

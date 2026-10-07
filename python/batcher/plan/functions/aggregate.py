@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
 
+from batcher.config.option_types import NanPolicy
 from batcher.plan.expr_ir.core import AggExpr, Expr, IntoExpr
 
 __all__ = [
@@ -205,7 +206,7 @@ def min(column: str | Expr) -> AggExpr:
     return _as_column(column).min()
 
 
-def max(column: str | Expr, *, nan_policy: str = "propagate") -> AggExpr | Expr:
+def max(column: str | Expr, *, nan_policy: NanPolicy = "propagate") -> AggExpr | Expr:
     """Maximum of a column — the ``pl.max('x')`` shorthand for ``col('x').max()``.
 
     ``pl.max`` skips NaN; that is ``nan_policy="ignore"`` here (see :meth:`Expr.max`).
@@ -510,6 +511,7 @@ def array_agg(
     descending: bool | Sequence[bool] = False,
     nulls_last: bool | Sequence[bool] = True,
     ignore_nulls: bool = False,
+    distinct: bool = False,
 ) -> AggExpr | Expr:
     """Collect each group's values into a list (SQL ``ARRAY_AGG`` / Spark ``collect_list``).
 
@@ -524,6 +526,8 @@ def array_agg(
             per key.
         ignore_nulls: Whether to leave nulls out of each list, as Spark's ``collect_list``
             and ``array_agg`` do; SQL and DuckDB keep them.
+        distinct: Whether to keep each value once, sorted by the value (SQL
+            ``array_agg(DISTINCT x ORDER BY x)``, Spark ``array_sort(collect_set(x))``).
 
     Returns:
         An aggregate expression producing a `List` column; pass it to ``agg(...)``.
@@ -537,5 +541,9 @@ def array_agg(
             {'g': ['a', 'b'], 'xs': [[3, 2], [4]]}
     """
     return _as_column(column).array_agg(
-        order_by=order_by, descending=descending, nulls_last=nulls_last, ignore_nulls=ignore_nulls
+        order_by=order_by,
+        descending=descending,
+        nulls_last=nulls_last,
+        ignore_nulls=ignore_nulls,
+        distinct=distinct,
     )

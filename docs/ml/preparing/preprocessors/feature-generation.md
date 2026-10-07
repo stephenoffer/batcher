@@ -351,6 +351,8 @@ print(spec.align(scoring).columns)
 Dtype names are the engine's own, as {py:obj}`Dataset.dtypes <batcher.Dataset.dtypes>` renders them, so a float column pins
 as `double`, not `float64`.
 
+Pass the spec straight to scoring as `ds.ml.predict(model, features=spec)`. The feature matrix then follows the pinned order whatever order the frame's columns arrive in, and a retyped feature raises before anything is scored. That is the only order guarantee available for a model trained on a bare array, which records no feature names of its own. See {doc}`/ml/inference/tabular-models`.
+
 ## See also
 
 - {doc}`/ml/preparing/preprocessors/pipelines`: sequencing these steps and saving the fitted result.

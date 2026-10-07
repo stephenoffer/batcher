@@ -7,7 +7,7 @@ The following table summarizes the connector:
 | | |
 | --- | --- |
 | Read | `bt.read.pubsub("projects/<project>/subscriptions/<name>")` |
-| Write | No sink. Write the stream to Delta or another streaming sink. |
+| Write | `ds.write.pubsub(topic_path)`, one message per row. At-least-once; see {doc}`sinks`. |
 | Extra | `pip install 'batcher-engine[pubsub]'` |
 | Parallelism | One split per subscription, since Pub/Sub exposes no partitions |
 | Credentials | The ambient `google.auth` environment; `roles/pubsub.subscriber` |
@@ -187,6 +187,24 @@ micro-batch is recognized by.
 {py:meth}`collect() <batcher.Dataset.collect>` raises {py:exc}`PlanError <batcher.PlanError>` on an unbounded source. Use {py:meth}`iter_batches() <batcher.Dataset.iter_batches>`, a triggered write,
 or {py:meth}`bt.Trigger.available_now() <batcher.Trigger.available_now>` to drain the current backlog and stop.
 
+## Publish to Pub/Sub
+
+:::{warning}
+Not yet verified against a live Pub/Sub; see tests/PENDING_VERIFICATION.md.
+:::
+
+```python
+# docs: skip
+query = events.select(value=bt.col("value"), key=bt.col("account")).write.pubsub(
+    "projects/<project>/topics/clean",
+    ordered=True,
+    dedup_ids="clean-writer",
+    checkpoint="/var/lib/batcher/ckpt/clean",
+)
+```
+
+`headers` become message attributes. Pub/Sub has no message key, so with `ordered=True` the `key` column is the ordering key, and without it a `key` column is refused rather than dropped. The subscription must also enable message ordering. A replayed micro-batch publishes again, because Pub/Sub's exactly-once delivery deduplicates redelivery to a subscriber rather than a republish, so `dedup_ids=` stamps a `batcher-dedup-id` attribute to deduplicate on.
+
 ## Requirements and limitations
 
 A slow sink means duplicates, per the ack deadline above. It's the failure you're most likely to hit.
@@ -202,6 +220,7 @@ Pub/Sub's own topic schemas aren't read. Name the payload format with `value_for
 
 ## See also
 
+- {doc}`Broker sinks </integrations/streams/sinks>`: the column contract and the guarantees every broker sink states.
 - {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, dedup, checkpointing.
 - {doc}`Late data and watermarks </cookbook/streaming/late-data-watermarks>`: the bounded-state
   dedup above, in a full pipeline.

@@ -156,6 +156,9 @@ class IsotonicCalibrator(Preprocessor):
     def fit(self, ds: Dataset) -> IsotonicCalibrator:
         """Bucket the scores, measure each bucket's positive rate, and make it monotone.
 
+        Unlike `transform`, which only builds a lazy plan, `fit` executes: it runs a
+        query over `ds` now and reads the learned state back to the driver.
+
         Examples:
             .. doctest::
 

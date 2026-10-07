@@ -112,8 +112,9 @@ replace one:
 | {py:meth}`.is_finite() <batcher.plan.expr_ir.core.Expr.is_finite>` / {py:meth}`.is_infinite() <batcher.plan.expr_ir.core.Expr.is_infinite>` | true where the float value is finite / ±infinity |
 | `.fill_null(value)` | replace nulls with a value |
 | {py:meth}`.forward_fill() <batcher.plan.expr_ir.core.Expr.forward_fill>` / {py:meth}`.backward_fill() <batcher.plan.expr_ir.core.Expr.backward_fill>` | carry the nearest non-null value along an ordered window ({py:meth}`.over(order_by=...) <batcher.AggExpr.over>` required) |
-| {py:meth}`.interpolate() <batcher.plan.expr_ir.core.Expr.interpolate>` | draw a straight line across an interior gap instead of holding the last value flat (`.over(order_by=...)` required) |
+| {py:meth}`.interpolate(max_gap=None, by=None) <batcher.plan.expr_ir.core.Expr.interpolate>` | draw a straight line across an interior gap instead of holding the last value flat; `by=` weights it by a time column's distance and becomes the order, `max_gap=` leaves a wider gap null (`.over(order_by=...)` required without `by`) |
 | `.cut(breaks, labels=None, left_closed=False)` | bin a numeric column into labeled intervals |
+| {py:meth}`.qcut(q, labels=None, duplicates="raise") <batcher.plan.expr_ir.core.Expr.qcut>` | bin a numeric column by its own quantiles, pandas-exact; the bin number, or a label per bin; `.over(partition_by=...)` bins within each group |
 
 ```python
 nulls = bt.from_pydict({"x": [1, None, 3]})
@@ -185,7 +186,7 @@ the accessor namespaces:
 ## Aggregation methods
 
 Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
-`.var()`, `.std()`, `.median()`, `.quantile(q)`, `.skew()` / `.kurtosis()`
+`.var()`, `.std()`, `.median()`, `.quantile(q)` (or {py:meth}`.quantile([q1, q2, ...]) <batcher.plan.expr_ir.core.Expr.quantile>`, one `List` of the quantiles in the order given, DuckDB `quantile_cont(x, [...])`, with a null list for a group with no value), `.skew()` / `.kurtosis()`
 (third / fourth standardized moment of each group; DuckDB `skewness` / `kurtosis`),
 `.histogram()` (a
 `Map<value, count>` of each group's values, DuckDB `histogram`), `.count()`,
@@ -193,9 +194,11 @@ Used inside `group_by(...).agg(...)`: `.sum()`, `.min()`, `.max()`, `.mean()`,
 `.bit_and()` / `.bit_or()` / `.bit_xor()` (bitwise reduction of the non-null
 `Int64` values in each group), `.array_agg(order_by=…)` (collect each group's values into a
 `List`; SQL `array_agg(x ORDER BY k)` /
-Spark `collect_list`), {py:meth}`.min_by(by) <batcher.plan.expr_ir.core.Expr.min_by>` / {py:meth}`.max_by(by) <batcher.plan.expr_ir.core.Expr.max_by>` (the value at the
+Spark `collect_list`; {py:meth}`distinct=True <batcher.plan.expr_ir.core.Expr.array_agg>` keeps each value once, sorted by the value, SQL `array_agg(DISTINCT x ORDER BY x)`), {py:meth}`.min_by(by) <batcher.plan.expr_ir.core.Expr.min_by>` / {py:meth}`.max_by(by) <batcher.plan.expr_ir.core.Expr.max_by>` (the value at the
 row with the extreme `by` key), {py:meth}`.arg_min(order_by=...) <batcher.plan.expr_ir.core.Expr.arg_min>` / {py:meth}`.arg_max(order_by=...) <batcher.plan.expr_ir.core.Expr.arg_max>` (the 0-based position of the group's extreme value along `order_by`, Polars `arg_min`/`arg_max`), and `.first(order_by=...)` / `.last(order_by=...)`
 (the value at the first or last row in `order_by` order). `order_by` is required for the positions, first and last, because an arrival-order position wouldn't be partition-independent. `array_agg` accepts no `order_by` too, and then returns each group's elements in an unspecified order: the same elements on every execution path, but not the same sequence. Rows that tie on every `order_by` key are ordered by their value, ascending with nulls last, so an ordered list is the same however the rows were partitioned. {py:obj}`bt.count() <batcher.count>` is the top-level `COUNT(*)`. Each of these returns an {py:class}`AggExpr <batcher.AggExpr>`, the aggregate type that {py:meth}`group_by(...).agg(...) <batcher.Dataset.group_by>` and {py:meth}`.over(...) <batcher.AggExpr.over>` consume. You rarely name it directly.
+
+{py:meth}`AggExpr.filter(predicate) <batcher.AggExpr.filter>` restricts one aggregate to the rows where `predicate` is true, SQL's `agg(...) FILTER (WHERE predicate)`, which lowers through the same code. The other aggregates in the same `agg(...)` still see every row, so `bt.count().filter(bt.col("x") > 1)` beside `bt.count()` counts a subset and the total in one pass. A group with no matching row counts `0` and sums to null, as a group with no rows does, and a filtered `array_agg` leaves the rejected rows out instead of collecting them as nulls.
 
 The assembly-contiguity aggregates measure how a set of lengths is distributed *by base*
 rather than by item, the measure genome-assembly quality is judged on:
@@ -321,7 +324,7 @@ A window expression composes with ordinary arithmetic and other windows. The eng
 | `.rolling_sum(k)` / `.rolling_mean(k)` / `.rolling_min(k)` / `.rolling_max(k)` / `.rolling_count(k)` | `agg(x) OVER (ROWS BETWEEN k-1 PRECEDING AND CURRENT ROW)` |
 | {py:meth}`.rolling_var(k, ddof=1) <batcher.plan.expr_ir.core.Expr.rolling_var>` / {py:meth}`.rolling_std(k, ddof=1) <batcher.plan.expr_ir.core.Expr.rolling_std>` | sample (or population, `ddof=0`) variance / stddev over the same trailing frame |
 | {py:meth}`.rolling_sum_by(by, w) <batcher.plan.expr_ir.core.Expr.rolling_sum_by>` / {py:meth}`.rolling_mean_by <batcher.plan.expr_ir.core.Expr.rolling_mean_by>` / {py:meth}`.rolling_min_by <batcher.plan.expr_ir.core.Expr.rolling_min_by>` / {py:meth}`.rolling_max_by <batcher.plan.expr_ir.core.Expr.rolling_max_by>` / {py:meth}`.rolling_count_by <batcher.plan.expr_ir.core.Expr.rolling_count_by>` | the same aggregates over a *time* window: `RANGE BETWEEN w PRECEDING AND CURRENT ROW` ordered by `by`, where `w` may be a duration such as `"5m"` |
-| {py:meth}`.ewm_mean(...) <batcher.plan.expr_ir.core.Expr.ewm_mean>` / {py:meth}`.ewm_std(...) <batcher.plan.expr_ir.core.Expr.ewm_std>` / {py:meth}`.ewm_var(...) <batcher.plan.expr_ir.core.Expr.ewm_var>` | exponentially weighted moving statistics, decayed by `alpha` / `span` / `half_life` / `com` (`.over(order_by=...)` required) |
+| {py:meth}`.ewm_mean(...) <batcher.plan.expr_ir.core.Expr.ewm_mean>` / {py:meth}`.ewm_std(...) <batcher.plan.expr_ir.core.Expr.ewm_std>` / {py:meth}`.ewm_var(...) <batcher.plan.expr_ir.core.Expr.ewm_var>` | exponentially weighted moving statistics, decayed by `alpha` / `span` / `half_life` / `com`, with pandas' `adjust`, `ignore_nulls` and `min_periods` (`.over(order_by=...)` required) |
 | {py:meth}`.ewm_mean_by(by, half_life) <batcher.plan.expr_ir.core.Expr.ewm_mean_by>` | the same smoother decayed by *elapsed* `by` rather than by row position, for an irregularly sampled series |
 | {py:meth}`.rle_id() <batcher.plan.expr_ir.core.Expr.rle_id>` | 0-based index of the current run of equal values (`.over(order_by=...)` required) |
 | {py:meth}`.peak_max(order_by=...) <batcher.plan.expr_ir.core.Expr.peak_max>` / {py:meth}`.peak_min(order_by=...) <batcher.plan.expr_ir.core.Expr.peak_min>` | true at a local extremum, strictly beyond both neighbours; an edge row is never one |
@@ -438,6 +441,7 @@ The {py:class}`.meta <batcher.plan.expr_ir.namespaces.meta._MetaNamespace>` acce
 | `.meta.root_names()` | the input columns it reads, left to right, repeats kept |
 | `.meta.is_column()` | whether it is a bare column reference |
 | `.meta.has_multiple_outputs()` | whether it holds a selector that expands to several columns |
+| `.meta.output_type(schema)` | the Arrow type the expression produces over `schema`, or `None` when undecidable without running |
 | `.meta.tree_format(return_as_string=False)` | a drawing of the engine tree, printed or returned |
 
 ## Data science toolkit and evaluation metrics

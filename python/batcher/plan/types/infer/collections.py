@@ -67,7 +67,9 @@ _LIST_FLOAT_REDUCE = frozenset(
         "median",
         "product",
         "std",
+        "std_pop",
         "var",
+        "var_pop",
         "l2_norm",
         "entropy",
         # The remaining norms, verified the same way: `l1_norm` and `max_abs` reduce an

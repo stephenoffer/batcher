@@ -7,7 +7,7 @@ The following table summarizes the connector:
 | | |
 | --- | --- |
 | Read | {py:meth}`bt.read.eventhubs(hub) <batcher.api.io_namespace.reader.Reader.eventhubs>`, or {py:meth}`bt.read.kafka <batcher.api.io_namespace.reader.Reader.kafka>` against port 9093 |
-| Write | No sink. Write the stream to Delta or another streaming sink. |
+| Write | `ds.write.eventhubs(hub)`, one event per row. At-least-once; see {doc}`sinks`. |
 | Extra | `pip install 'batcher-engine[eventhubs]'` |
 | Parallelism | One split per partition, fixed at hub creation |
 | Auth | Connection string only. No `DefaultAzureCredential`, no managed identity. |
@@ -196,6 +196,21 @@ It is off by default because the nested column costs on every message of every p
 are carried as bytes whatever the client hands back, and a message that carried none reads
 as `null` rather than as an empty list.
 
+## Publish to Event Hubs
+
+:::{warning}
+Not yet verified against a live Event Hubs; see tests/PENDING_VERIFICATION.md.
+:::
+
+```python
+# docs: skip
+query = events.select(value=bt.col("value"), key=bt.col("device")).write.eventhubs(
+    "clean", connection_str="env:EVENTHUBS_CONN", checkpoint="/var/lib/batcher/ckpt/clean"
+)
+```
+
+The `key` column is the partition key and a `partition` column pins the partition id. Rows are packed into `EventDataBatch` objects per routing and split at the hub's maximum batch size. A producer is bound to one hub, so a `topic` column isn't read. The Python SDK has no idempotent producer, so a replayed micro-batch republishes; `dedup_ids=` stamps a `batcher-dedup-id` application property.
+
 ## Requirements and limitations
 
 Azure allows five readers per consumer group per partition. Batcher's split assignment is one reader per partition, so two queries on the same `consumer_group` start crowding that limit. Give each pipeline its own consumer group.
@@ -206,6 +221,7 @@ The native reader authenticates with a connection string only. Pass it as a secr
 
 ## See also
 
+- {doc}`Broker sinks </integrations/streams/sinks>`: the column contract and the guarantees every broker sink states.
 - {doc}`Kafka </integrations/streams/kafka>`: the protocol-compatible path, and the payload-decoding example.
 - {doc}`Streaming </user-guide/moving-data/streaming/index>`: triggers, watermarks, dedup, checkpointing.
 - {doc}`Exactly-once sink </cookbook/streaming/exactly-once-sink>`: the idempotent sink a replayed micro-batch depends on.

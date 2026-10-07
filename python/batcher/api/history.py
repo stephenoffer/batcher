@@ -76,6 +76,8 @@ _COLUMNS: tuple[tuple[str, pa.DataType, str], ...] = (
     ("cpu_utilization", pa.float64(), "cpu_utilization"),
     ("admission", pa.string(), "carbonite_summary"),
     ("machine", pa.string(), "machine"),
+    # `observability.query_label` as the query ran. None for an unlabelled query.
+    ("query_label", pa.string(), "query_label"),
 )
 
 #: Columns read out of the document's nested `usage` block rather than its top level.
@@ -105,7 +107,8 @@ def query_history(path: str | None = None, *, limit: int | None = None) -> Datas
 
     One row per query, with the measurements the engine took. `query_id` sorts
     chronologically, so ``sort("query_id")`` orders the history without parsing a
-    timestamp.
+    timestamp. `query_label` is the `observability.query_label` the query ran under, or
+    None when it had none, so one job's runs are a filter away.
 
     Examples:
         .. doctest::

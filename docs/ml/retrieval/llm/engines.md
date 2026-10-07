@@ -20,7 +20,7 @@ The following table lists the engine factories. Each `Use` cell names what the e
 
 | Engine | Use |
 | --- | --- |
-| `vllm_engine(model, *, chat, system, sampling, guided_json, guided_regex, guided_choice, guided_grammar, lora_path, lora_paths, quantization="auto", **engine_kwargs)` | Local vLLM on a GPU. `sampling` sets max tokens, temperature and the rest. `guided_json`, `guided_regex`, `guided_choice` and `guided_grammar` constrain the output. `lora_path` loads one adapter and `lora_paths` several by name. `engine_kwargs` passes tensor parallelism and the rest of vLLM's engine options through. Prefix caching and chunked prefill are on by default. Needs `batcher-engine[vllm]`. |
+| `vllm_engine(model, *, chat, system, sampling, guided_json, guided_regex, guided_choice, guided_grammar, lora_path, lora_paths, quantization="auto", truncation="head", **engine_kwargs)` | Local vLLM on a GPU. `sampling` sets max tokens, temperature and the rest. `guided_json`, `guided_regex`, `guided_choice` and `guided_grammar` constrain the output. `lora_path` loads one adapter and `lora_paths` several by name. `engine_kwargs` passes tensor parallelism and the rest of vLLM's engine options through. Prefix caching and chunked prefill are on by default. `truncation` decides what happens to a prompt longer than the context window: `"head"` keeps its first tokens, `"tail"` its last, and `"error"` raises. Needs `batcher-engine[vllm]`. |
 | `sglang_engine(model, *, chat, system, sampling, json_schema, regex, ebnf, lora_paths, **engine_kwargs)` | Local SGLang on a GPU. Same shape as `vllm_engine`; its RadixAttention cache reuses whatever prefix the rows happen to share rather than one configured prefix, which is the win on templated batches. `max_tokens` is accepted as an alias for SGLang's `max_new_tokens`, so a `sampling` dict moves between backends unchanged. Needs `batcher-engine[sglang]`. |
 | `http_engine(base_url, model, *, api_key, system, chat=True, max_tokens=512, temperature=0.0, on_error="raise", timeout=60.0)` | An OpenAI-compatible HTTP endpoint (vLLM server, llama.cpp, a hosted API). Applies the chat template server-side; retries on rate limits. `on_error="null"` gives a failed row an empty generation instead of failing the batch. |
 | `anthropic_engine(model, *, api_key, system, max_tokens=1024, temperature=None, on_error="raise", concurrency=8)` | A hosted Claude model over the Anthropic Messages API. Same interchangeable engine contract; `temperature` is omitted unless set (some models reject it). Reads `$ANTHROPIC_API_KEY` when `api_key` is unset. |
@@ -153,7 +153,56 @@ engine = http_engine(
 )
 ```
 
-The limit is per worker on purpose: a fleet-wide limiter would put a synchronous round trip in front of every request. Divide the account quota by the number of workers and leave headroom, because a provider measures arrival at its edge, where two workers' bursts can coincide. Keep `retries` on as well. A limiter smooths your own send rate and can't see the other traffic on the account.
+That limit is per worker, so it costs nothing per request. Divide the account quota by the number of workers and leave headroom, because a provider measures arrival at its edge, where two workers' bursts can coincide. Keep `retries` on as well. A limiter smooths your own send rate and can't see the other traffic on the account.
+
+Dividing by a worker count stops working when nobody knows the count in advance: an autoscaling actor pool, several jobs on one account, or a provider that caps requests in flight rather than per minute. For those, pass a {py:class}`ProviderLimit <batcher.ml.ProviderLimit>` as `shared_limit=`. Every worker naming the same limit draws from one bucket and one pool of concurrency slots. On a Ray cluster the quota lives in a named, detached actor that every worker and every job naming it reaches, for one small actor round trip per request. Without Ray it is shared by the threads of the process. Both limits can be set at once, and a request waits for both.
+
+```python
+import batcher as bt
+
+quota = bt.ml.ProviderLimit("example-account", requests_per_minute=600, max_concurrency=32)
+with quota.lease(estimated_tokens=100) as waited:
+    print(waited)  # a custom client can hold the same quota around its own call
+quota.close()
+# 0.0
+```
+
+```python
+# docs: skip
+engine = bt.ml.http_engine(
+    "https://api.example.com/v1", "some-model", concurrency=16, shared_limit=quota
+)
+out = ds.ml.generate(engine, prompt_column="text").collect(distributed=True, num_workers=8)
+```
+
+The actor outlives the job on purpose, so concurrent jobs share it. Call `quota.close()` when the quota is no longer wanted. A slot that a crashed worker never returned comes back after `lease_seconds`.
+
+:::{warning}
+The cluster path of `ProviderLimit` is not yet verified on a live multi-node Ray cluster; see `tests/PENDING_VERIFICATION.md`. The single-process path and the quota policy are tested.
+:::
+
+(llm-engine-token-budget)=
+### Keeping a batch inside a token budget
+
+A served engine sends a batch's requests concurrently. On ragged text that is 64 short prompts one moment and 64 long documents the next, and a server's KV cache or a gateway's tokens-in-flight ceiling only sees the second. Pass a {py:class}`TokenBudget <batcher.ml.TokenBudget>` as `token_budget=` to `http_engine`, `anthropic_engine`, `bedrock_engine` or `gemini_engine`, and the engine splits each batch into consecutive groups whose prompt tokens stay under `max_batch_tokens`, sending one group at a time. The grouping happens inside the engine's own request loop, so nothing outside it second-guesses what the engine sends.
+
+The counts come from a real tokenizer, through the same code {py:meth}`ds.ml.token_count <batcher.api.dataset.ml.DatasetML.token_count>` uses, under the same `add_special_tokens` policy. `padding="longest"` charges a group its longest prompt times its size, for a server that pads every sequence in a step. A prompt larger than the whole budget follows `oversized`: `"head"` keeps its first tokens, `"tail"` its last, and `"error"` raises before anything is sent, the same vocabulary as `vllm_engine(truncation=...)`.
+
+```python
+import batcher as bt
+
+budget = bt.ml.TokenBudget(str.split, max_batch_tokens=8)
+print(budget.groups([5, 3, 4, 4, 1]))
+# [[0, 1], [2, 3], [4]]
+```
+
+```python
+# docs: skip
+budget = bt.ml.TokenBudget("meta-llama/Llama-3.1-8B-Instruct", max_batch_tokens=32_000)
+engine = bt.ml.http_engine("http://vllm:8000/v1", "llama", concurrency=64, token_budget=budget)
+```
+
+`vllm_engine` takes no `TokenBudget`, because vLLM already schedules by tokens. Its own budget is the `max_num_batched_tokens` engine argument, which passes straight through `engine_kwargs`.
 
 ## Throughput
 

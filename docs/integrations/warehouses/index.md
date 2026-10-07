@@ -52,6 +52,12 @@ Read and write. One query submission, then one parallel split per result chunk.
 Parallel Arrow streams over the Storage Read API, with filters and columns pushed server-side.
 :::
 
+:::{grid-item-card} {octicon}`database;1.1em` Athena
+:link: /integrations/warehouses/athena
+:link-type: doc
+A connection profile over the DB-API reader: region, workgroup and output location, named the way Athena names them.
+:::
+
 :::{grid-item-card} {octicon}`database;1.1em` Databricks
 :link: /integrations/warehouses/databricks
 :link-type: doc
@@ -68,4 +74,5 @@ For Postgres, MySQL, ClickHouse, and other SQL engines reached by a connection U
 snowflake
 bigquery
 databricks
+athena
 ```

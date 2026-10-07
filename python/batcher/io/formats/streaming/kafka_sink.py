@@ -18,29 +18,26 @@ not have and Spark's Kafka sink does not attempt either. What this sink does gua
 that a micro-batch is fully acknowledged before it is reported as written: `write_batch`
 flushes and fails the query if any record was rejected, so a replayed epoch republishes
 its rows rather than losing them. Downstream consumers must be idempotent, or must dedup
-on a key.
+on a key, or on the ``batcher-dedup-id`` header ``dedup_ids=`` attaches.
+
+The column contract, the codecs, the dedup header and the acknowledgement rule are the
+shared `broker_sinks.contract.BrokerStreamSink`; this module is only the librdkafka client.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import pyarrow as pa
-
-from batcher._internal.errors import IOError, PlanError
+from batcher._internal.errors import IOError
 from batcher._internal.optional import require
-from batcher.io.formats.streaming.codecs.base import build_payload_codecs
+from batcher.io.formats.streaming.broker_sinks.contract import (
+    BrokerRecords,
+    BrokerStreamSink,
+    SinkCapabilities,
+)
 from batcher.io.formats.streaming.sinks import STREAM_SINKS
 
 __all__ = ["KafkaStreamSink"]
-
-#: The only column a Kafka write cannot proceed without. `key`, `topic`, `partition` and
-#: `headers` are optional, exactly as in Spark's Kafka sink schema.
-_REQUIRED = ("value",)
-
-#: Arrow types a payload column (`key` / `value`) may have. Kafka carries bytes; a string
-#: column is UTF-8 encoded on the way out, which is what every other client does too.
-_PAYLOAD_TYPES = ("binary", "large_binary", "string", "large_string")
 
 
 def _import_producer() -> Any:
@@ -54,54 +51,8 @@ def _import_producer() -> Any:
     )
 
 
-def _payload_column(table: pa.Table, name: str) -> list[bytes | None]:
-    """A payload column as Python bytes, UTF-8 encoding a string column on the way.
-
-    One vectorized `to_pylist` per column rather than a per-row read: the encode is the
-    user's chosen wire format, not engine work, and `confluent-kafka` takes one record at
-    a time regardless.
-    """
-    column = table.column(name)
-    if pa.types.is_string(column.type) or pa.types.is_large_string(column.type):
-        return [None if v is None else v.encode("utf-8") for v in column.to_pylist()]
-    return column.to_pylist()
-
-
-def _record_headers(value: Any) -> list[tuple[str, bytes | None]]:
-    """One row's `headers` column as the ``[(key, bytes)]`` confluent-kafka wants.
-
-    Two shapes are accepted because both are natural to produce with expressions: a map
-    column arrives as a list of ``(key, value)`` pairs, and a
-    ``list<struct<key, value>>`` column arrives as a list of dicts. Anything else is left
-    to the client to reject, which it does by name.
-    """
-    headers: list[tuple[str, bytes | None]] = []
-    for item in value:
-        if isinstance(item, dict):
-            key, payload = item.get("key"), item.get("value")
-        else:
-            key, payload = item
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        headers.append((str(key), payload))
-    return headers
-
-
-def _check_payload_type(schema: pa.Schema, name: str) -> None:
-    """Reject a `key`/`value` column Kafka cannot carry, naming the column and its type."""
-    index = schema.get_field_index(name)
-    if index < 0:
-        return
-    field_type = schema.field(index).type
-    if str(field_type) not in _PAYLOAD_TYPES:
-        raise PlanError(
-            f"the Kafka sink's {name!r} column must be binary or string, not {field_type}; "
-            f"serialize it first, e.g. .with_columns({name}=col({name}).cast('string'))"
-        )
-
-
 @STREAM_SINKS.register("kafka")
-class KafkaStreamSink:
+class KafkaStreamSink(BrokerStreamSink):
     """Publish each micro-batch's rows to Kafka as one message per row.
 
     Args:
@@ -110,18 +61,23 @@ class KafkaStreamSink:
         bootstrap_servers: The Kafka bootstrap servers, as for the source.
         flush_timeout: Seconds `write_batch` waits for outstanding deliveries before
             declaring the micro-batch failed.
+        dedup_ids: A stable writer name; each record then carries a ``batcher-dedup-id``
+            header ``<name>:<batch id>:<row>``.
         options: Any further ``confluent-kafka`` producer configuration. Underscores
             become dots, so ``compression_type="zstd"`` sets ``compression.type``.
     """
 
-    __slots__ = (
-        "_config",
-        "_flush_timeout",
-        "_key_codec",
-        "_producer",
-        "_reported",
-        "_topic",
-        "_value_codec",
+    capabilities = SinkCapabilities(
+        broker="kafka",
+        display="Kafka",
+        columns=("value", "key", "topic", "partition", "headers"),
+        ordering="per partition; rows with the same key hash to the same partition",
+        batching="librdkafka's client-side batches (linger.ms, batch.size), flushed per "
+        "micro-batch",
+        retry_identity="idempotent producer via enable_idempotence=True (dedups the "
+        "client's own retries within one producer session); dedup_ids= header for replays",
+        null_values=True,
+        max_attempts_option="retries",
     )
 
     def __init__(
@@ -130,39 +86,15 @@ class KafkaStreamSink:
         topic: str | None = None,
         bootstrap_servers: str = "localhost:9092",
         flush_timeout: float = 30.0,
-        value_format: Any = None,
-        value_schema: Any = None,
-        value_subject: str | None = None,
-        key_format: Any = None,
-        key_schema: Any = None,
-        key_subject: str | None = None,
-        schema_registry: Any = None,
-        schema_registry_auth: str | None = None,
-        value_codec_options: dict[str, Any] | None = None,
-        key_codec_options: dict[str, Any] | None = None,
+        dedup_ids: str | None = None,
         **options: Any,
     ) -> None:
-        if flush_timeout <= 0:
-            raise PlanError(f"kafka sink flush_timeout must be > 0, got {flush_timeout}")
-        self._topic = topic
-        self._flush_timeout = flush_timeout
         # The same codec vocabulary the source reads with, so a pipeline that decodes Avro
         # off one topic and writes Avro to another names the format once per side rather
         # than hand-rolling a serializer in a `map_batches`.
-        self._value_codec, self._key_codec = build_payload_codecs(
-            topic or "",
-            {
-                "value_format": value_format,
-                "value_schema": value_schema,
-                "value_subject": value_subject,
-                "key_format": key_format,
-                "key_schema": key_schema,
-                "key_subject": key_subject,
-                "schema_registry": schema_registry,
-                "schema_registry_auth": schema_registry_auth,
-                "value_codec_options": value_codec_options,
-                "key_codec_options": key_codec_options,
-            },
+        codecs = self.split_codec_options(options)
+        super().__init__(
+            topic=topic, flush_timeout=flush_timeout, dedup_ids=dedup_ids, codec_options=codecs
         )
         self._config = {
             "bootstrap.servers": bootstrap_servers,
@@ -174,8 +106,8 @@ class KafkaStreamSink:
         # place a broker-side rejection can be observed.
         self._reported: list[str] = []
 
-    def open(self) -> None:
-        """Construct the producer. Deferred to here so a plan can be built without the extra."""
+    def _connect(self) -> None:
+        """Construct the producer, resolving secret references on this worker."""
         from batcher.io.credentials import resolve_client_secrets
         from batcher.io.formats.streaming.broker.schema import _BROKER_SECRET_HINTS
 
@@ -184,34 +116,27 @@ class KafkaStreamSink:
         )
         self._reported = []
 
-    def write_batch(self, batch_id: int, table: pa.Table) -> str | None:
-        """Publish every row, wait for the acknowledgements, and report what was written.
+    def _publish(self, records: BrokerRecords, batch_id: int) -> None:
+        """Enqueue every record, flush, and fail the epoch on anything unacknowledged.
 
         The flush is what makes the epoch's report honest: `produce` only enqueues, so a
         sink that returned as soon as the loop finished would tell the engine a
         micro-batch was durable while its records were still in a client-side queue that a
         crash discards. Waiting here costs one round trip per micro-batch and turns a
         silent loss into a failed query the checkpoint can replay.
-
-        Args:
-            batch_id: The micro-batch's id, used only in the returned token.
-            table: The micro-batch's output.
-
-        Returns:
-            A ``kafka:<topic>:<batch_id>:<rows>`` receipt for the commit log.
-
-        Raises:
-            PlanError: If the table has no `value` column, or a payload column has a type
-                Kafka cannot carry.
-            IOError: If any record was rejected, or deliveries did not complete within
-                `flush_timeout`.
         """
-        table = self._encode(table)
-        self._validate(table.schema)
-        if table.num_rows == 0:
-            return f"kafka:{self._topic}:{batch_id}:0"
-        self._produce_all(table)
-        remaining = self._producer.flush(self._flush_timeout)
+        producer = self._producer
+        for i, value in enumerate(records.values):
+            record: dict[str, Any] = {"value": value}
+            if records.keys is not None and records.keys[i] is not None:
+                record["key"] = records.keys[i]
+            if records.partitions is not None and records.partitions[i] is not None:
+                record["partition"] = int(records.partitions[i])
+            headers = records.header_pairs(i)
+            if headers:
+                record["headers"] = headers
+            self._produce_one(producer, records.destinations[i], record)
+        remaining = producer.flush(self._flush_timeout)
         if remaining:
             raise IOError(
                 f"kafka sink: {remaining} message(s) of micro-batch {batch_id} were still "
@@ -224,82 +149,13 @@ class KafkaStreamSink:
                 f"kafka sink: {len(failures)} message(s) of micro-batch {batch_id} were "
                 f"rejected by the broker; first: {failures[0]}"
             )
-        return f"kafka:{self._topic}:{batch_id}:{table.num_rows}"
 
-    def close(self) -> None:
+    def _disconnect(self) -> None:
         """Flush anything still queued and drop the producer. Idempotent."""
         if self._producer is None:
             return
         producer, self._producer = self._producer, None
         producer.flush(self._flush_timeout)
-
-    # --- internals --------------------------------------------------------
-    def _encode(self, table: pa.Table) -> pa.Table:
-        """Serialize the payload columns through this sink's codecs, if it has any.
-
-        Before `_validate`, deliberately: with a codec the incoming `value` is a struct,
-        which the payload-type check exists to reject when there is *no* codec to turn it
-        into bytes. Validating first would refuse exactly the shape this feature accepts.
-        """
-        for name, codec in (("value", self._value_codec), ("key", self._key_codec)):
-            if codec is None:
-                continue
-            index = table.schema.get_field_index(name)
-            if index < 0:
-                continue
-            encoded = codec.encode(table.column(name).combine_chunks())
-            table = table.set_column(index, pa.field(name, pa.binary()), encoded)
-        return table
-
-    def _validate(self, schema: pa.Schema) -> None:
-        """Refuse a table Kafka cannot carry, before a single record is enqueued."""
-        missing = [c for c in _REQUIRED if schema.get_field_index(c) < 0]
-        if missing:
-            raise PlanError(
-                f"the Kafka sink needs a {missing[0]!r} column; the write schema is "
-                f"{schema.names}. Project one, e.g. "
-                ".select(value=col('payload').cast('string'))"
-            )
-        if self._topic is None and schema.get_field_index("topic") < 0:
-            raise PlanError(
-                "the Kafka sink needs a destination: pass topic=... to write.kafka(), or "
-                "project a 'topic' column"
-            )
-        for name in ("key", "value"):
-            _check_payload_type(schema, name)
-
-    def _produce_all(self, table: pa.Table) -> None:
-        """Enqueue one record per row, servicing the delivery queue as it fills."""
-        values = _payload_column(table, "value")
-        keys = _payload_column(table, "key") if table.schema.get_field_index("key") >= 0 else None
-        topics = (
-            table.column("topic").to_pylist()
-            if table.schema.get_field_index("topic") >= 0
-            else None
-        )
-        partitions = (
-            table.column("partition").to_pylist()
-            if table.schema.get_field_index("partition") >= 0
-            else None
-        )
-        headers = (
-            table.column("headers").to_pylist()
-            if table.schema.get_field_index("headers") >= 0
-            else None
-        )
-        producer = self._producer
-        for i, value in enumerate(values):
-            record: dict[str, Any] = {"value": value}
-            if keys is not None and keys[i] is not None:
-                record["key"] = keys[i]
-            if partitions is not None and partitions[i] is not None:
-                record["partition"] = int(partitions[i])
-            if headers is not None and headers[i]:
-                record["headers"] = _record_headers(headers[i])
-            destination = self._topic
-            if topics is not None and topics[i] is not None:
-                destination = topics[i]
-            self._produce_one(producer, destination, record)
 
     def _produce_one(self, producer: Any, topic: str, record: dict[str, Any]) -> None:
         """Enqueue one record, draining the client queue when it is full rather than failing.

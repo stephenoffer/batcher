@@ -131,6 +131,23 @@ surface-diff path="/tmp/batcher-surface.json":
 gen-exports:
     python tools/gen_lazy_exports.py
 
+# Regenerate the typing declarations for methods bound onto expression classes at runtime
+# (the parameterless `.str`/`.dt`/`.list` accessors, `AggExpr` math, `CaseBuilder` operators).
+# Run after adding a row to an accessor table; `tests/unit/test_bound_decls.py` gates the drift.
+gen-decls:
+    python tools/gen_bound_decls.py
+
+# Regenerate docs/api/return-types.md from the live return annotations. Run after changing a
+# public signature's return type; `tests/docs/test_return_types_fresh.py` gates the drift.
+return-types-doc:
+    python tools/gen_return_types_doc.py
+
+# Record the public names in tools/public_surface_baseline.txt. Run after adding a public name.
+# It never drops a name that vanished without a renames.toml entry, so it cannot hide a removal;
+# `tests/unit/test_public_surface_ratchet.py` is the gate.
+surface-baseline:
+    python tools/public_surface_baseline.py
+
 # Regenerate MAP.md — the file-level index of what every module is for. It is derived
 # from each module's own docstring and each crate's manifest, so it cannot drift; run
 # this after adding, moving, or re-documenting a module. `--check` runs in CI.

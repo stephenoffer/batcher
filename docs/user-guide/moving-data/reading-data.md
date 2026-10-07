@@ -46,6 +46,18 @@ print(ds.to_pydict())
 # {'x': [1, 2, 3], 'y': ['a', 'b', 'c']}
 ```
 
+File content you already hold in memory, such as an upload in an `io.BytesIO`, goes through Arrow too. The `bt.read.*` readers take paths, because their splits are what lets a read be distributed, and a buffer exists only in this process. Parse it with `pyarrow.csv.read_csv`, `pyarrow.parquet.read_table`, or `pyarrow.json.read_json` and wrap the table. Passing the buffer to a reader raises an error that names this idiom.
+
+```python
+import io
+
+import pyarrow.csv
+
+upload = io.BytesIO(b"id,amount\n1,10\n2,20\n")
+print(bt.from_arrow(pyarrow.csv.read_csv(upload)).to_pydict())
+# {'id': [1, 2], 'amount': [10, 20]}
+```
+
 ### From a streaming factory
 
 {py:func}`from_batches <batcher.from_batches>` builds a streaming source from a callable that returns a fresh
@@ -78,6 +90,29 @@ print(bt.from_items([1, 2, 3]).to_pydict())
 print(bt.date_range("2024-01-01", "2024-01-03").count())
 # 3
 ```
+
+### From rows, with declared types
+
+{py:func}`from_records <batcher.from_records>` takes tuple rows with `columns=`, namedtuples, which name themselves by their `_fields`, dict rows, and dataclass instances. A dataclass is read field by field with `dataclasses.asdict`, so a nested dataclass becomes a struct column. Every in-memory constructor takes the same `schema=`: a `pyarrow.Schema`, or a `{column: dtype}` dict whose dtypes are spelled the way `cast` spells them. An empty input with a schema is a typed empty `Dataset`.
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass
+class Reading:
+    sensor: str
+    value: float | None
+
+
+print(bt.from_records([Reading("a", 1.5), Reading("b", None)]).to_pydict())
+# {'sensor': ['a', 'b'], 'value': [1.5, None]}
+empty = bt.from_pydict({}, schema={"id": "int64", "tags": pa.list_(pa.string())})
+print(empty.count(), [str(t) for t in empty.dtypes])
+# 0 ['int64', 'list<item: string>']
+```
+
+These constructors convert their input when they are called and hold it in memory, so a generator handed to `from_iter` is drained there and then. Only `from_batches` reads at execution. A schema decides the columns, so a key it doesn't name is dropped. For a strict check, build without one and call {py:meth}`match_to_schema(schema, extra_columns="raise") <batcher.Dataset.match_to_schema>`.
 
 ### Python values Arrow cannot type
 
@@ -244,6 +279,20 @@ large = inventory.filter(bt.col("size") > 10_000_000)
 or hold only whitespace, the way Daft's `read_text` does, and the kept rows keep their original
 `line_number`.
 
+Every file reader takes `include_path=True`, which adds a `path` column naming the file each row came from. It's the Batcher spelling of Spark's `input_file_name()` and DuckDB's `filename=true`, and a string names the column instead. The read then runs one file per split, which gives up the row-group and byte-range splits a large file would otherwise get. A Hive-partitioned directory read this way is read flat, without its partition columns.
+
+```python
+import os
+import tempfile
+
+landing = tempfile.mkdtemp()
+bt.from_pydict({"id": [1, 2]}).write.csv(os.path.join(landing, "a.csv"), single_file=True)
+bt.from_pydict({"id": [3]}).write.csv(os.path.join(landing, "b.csv"), single_file=True)
+per_file = bt.read.csv(landing, include_path="source").group_by("source").agg(n=bt.count())
+print(sorted(os.path.basename(p) for p in per_file.to_pydict()["source"]))
+# ['a.csv', 'b.csv']
+```
+
 ## Files whose schemas differ
 
 A directory written over months drifts: a column is added, a type widens, a column is dropped. Every file reader takes `schema_mode=`, which decides what one read of those files returns. The following table lists the three modes.
@@ -282,6 +331,15 @@ print(bt.read.parquet(drift, schema_mode="union").sort("id").to_pydict())
 
 A distributed read answers exactly as a single-node one does in every mode: the same rows and column types, or the same `bt.SchemaError` about a file that breaks the contract. When several files do, which one is named depends on which is read first.
 
+A Hive partition key has no type on disk, so it's inferred from the directory names, and `k=01` reads back as the integer `1`. Pass `partitioning=` a `{column: type}` dict or a `pa.Schema` to declare it, as DuckDB's `hive_types` does. Keys you don't name are still inferred, and naming a column that is not a partition key raises.
+
+```python
+padded = os.path.join(tempfile.mkdtemp(), "t")
+bt.from_pydict({"k": ["01", "02"], "v": [1, 2]}).write.parquet(padded, partition_by=["k"])
+print(bt.read.parquet(padded, partitioning={"k": pa.string()}).sort("v").to_pydict())
+# {'v': [1, 2], 'k': ['01', '02']}
+```
+
 ## CSV options
 
 `read.csv` takes the pandas and Polars spellings of its options. The following table lists them by their canonical name, with the other spellings each one accepts.
@@ -319,102 +377,7 @@ A large local CSV is read in parallel as byte ranges, each starting where a reco
 
 ## Messy input
 
-Real corpora contain members that will not read. Batcher separates three failures that look
-alike and have different fixes, so reaching for the wrong flag cannot quietly delete data.
-
-An **unreadable file** is one whose bytes the format cannot parse at all: a truncated
-upload, a zero-byte object, a JPEG whose trailer never arrived. `on_error="skip"` drops the
-file and reads the rest. Use it when the input is a corpus you do not control.
-
-The source object behind the read keeps the audit trail. `corrupt_files()` names every
-path it dropped, so a short result is explainable rather than mysterious:
-
-```python
-import os
-import tempfile
-
-import batcher as bt
-from batcher.io import ParquetSource
-
-corpus = tempfile.mkdtemp()
-bt.from_pydict({"id": [1, 2]}).write.parquet(os.path.join(corpus, "good.parquet"))
-with open(os.path.join(corpus, "zbad.parquet"), "wb") as f:
-    _ = f.write(b"not a parquet file")
-
-print(bt.read.parquet(corpus, on_error="skip").count())
-# 2
-
-source = ParquetSource(corpus, on_error="skip")
-_ = source.read()
-print([os.path.basename(path) for path in source.corrupt_files()])
-# ['zbad.parquet']
-```
-
-A **malformed row** is one record inside a file that is otherwise fine: a CSV row carrying
-a field the header does not have, or an NDJSON line that is not JSON at all. The file is
-readable, so `on_error` is the wrong answer for it. Dropping the file would discard every
-good row to be rid of one bad line. Pass `on_bad_lines` instead, which drops the record.
-
-```python
-path = os.path.join(tempfile.mkdtemp(), "events.csv")
-with open(path, "w") as f:
-    f.write("id,amount\n1,10\n2,20,stray\n3,30\n")
-
-print(bt.read.csv(path, on_bad_lines="skip").to_pydict())
-# {'id': [1, 3], 'amount': [10, 30]}
-```
-
-`read.json` takes the same flag, for the same reason and with the same three values.
-
-```python
-jsonl = os.path.join(tempfile.mkdtemp(), "events.jsonl")
-with open(jsonl, "w") as f:
-    f.write('{"id": 1}\n<html>gateway timeout</html>\n{"id": 3}\n')
-
-print(bt.read.json(jsonl, on_bad_lines="skip").to_pydict())
-# {'id': [1, 3]}
-```
-
-`on_bad_lines` takes `"error"` (the default, which refuses the read), `"warn"` (drop the
-row and log it with the offending text), or `"skip"` (drop it silently). Dropped rows are
-counted on the metrics export as `malformed_rows_total`, separately from the
-`skipped_total` that counts whole files, because a total mixing rows with files answers
-neither question.
-
-The third failure is **a wrong encoding**: bytes that are readable, but not in the encoding
-you asked for. A text corpus assembled from scrapes, exports and legacy systems is a
-mixture, and a single stray byte is not a reason to lose a file. `read.text` replaces what
-it cannot decode with U+FFFD by default, in both `mode="line"` and `mode="file"`.
-`errors="strict"` turns it into a per-file failure that `on_error="skip"` will then drop:
-
-```python
-d = tempfile.mkdtemp()
-with open(os.path.join(d, "legacy.txt"), "wb") as f:
-    _ = f.write("caf\xe9\n".encode("cp1252"))
-
-print(bt.read.text(d).to_pydict()["text"])
-print(bt.read.text(d, encoding="cp1252").to_pydict()["text"])
-```
-
-Replacement is a fallback, not an answer. If you know what the bytes are, naming the
-`encoding` is the fix.
-
-Coming from another engine, the spellings map as follows.
-
-| Their option | Batcher |
-|---|---|
-| Spark `mode="FAILFAST"` | `on_bad_lines="error"` (the default) |
-| Spark `mode="DROPMALFORMED"` | `on_bad_lines="skip"` |
-| Spark `mode="PERMISSIVE"` | no equivalent; Batcher has no corrupt-record column |
-| pandas `on_bad_lines=` | the same name and the same three values |
-| Polars `ignore_errors=True` | `on_bad_lines="skip"`, plus `schema=` if what you want is an unconvertible value to survive as text |
-
-A value that will not convert to its column's type is a third thing again, and neither flag
-touches it. The schema comes from the file's first block, so a column that is integral for
-a million rows and then holds `"N/A"` is inference having been shown too little. Declare the
-type with `schema=` rather than tolerating the row. `on_bad_lines` deliberately refuses to
-delete such a record: dropping it would remove the very rows that were about to tell you
-the inferred type is wrong.
+A real corpus contains members that will not read. {doc}`messy-input` separates the three failures that look alike, an unreadable file, a malformed row and a malformed value, and shows the flag that handles each without quietly dropping data.
 
 ## Databases, warehouses, and specialized formats
 
@@ -423,7 +386,11 @@ The same {py:obj}`bt.read <batcher.read>` namespace reaches everything else, on 
 Zarr, HDF5, WARC, PDF, LiDAR, and robot logs. {doc}`/integrations/databases/databases` covers a SQL
 database or warehouse, where the interesting part is not the call but the connection: which backend
 serves your scheme, where the credentials come from, and how to split one extract into parallel
-queries.
+queries. {doc}`/integrations/apis/index` covers web APIs: `read.http_json` for any paginated JSON
+API, with `read.graphql`, `read.github`, `read.salesforce`, `read.google_sheets`, `read.sharepoint`,
+and `read.airbyte` built on it. {doc}`/integrations/databases/vendor-matrix` says which write modes and vendor types each
+database's route covers. An Amazon Athena query reads through `bt.read.athena(query, region=...,
+workgroup=...)`, a thin profile over the DB-API reader described on {doc}`/integrations/warehouses/athena`.
 
 ## What you get back
 

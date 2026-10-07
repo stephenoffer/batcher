@@ -92,6 +92,12 @@ Porting from pandas or Polars, feature engineering, and curating a training corp
 What each type means, how casts behave, and why a narrow integer widens at the boundary.
 :::
 
+:::{grid-item-card} {octicon}`circle-slash;1.1em` Nulls and NaN
+:link: /user-guide/transform/columns/null-semantics
+:link-type: doc
+How null and NaN behave in comparisons, logic, membership, aggregates, sorts, and keys.
+:::
+
 :::{grid-item-card} {octicon}`plug;1.1em` User-defined functions
 :link: /user-guide/transform/columns/udfs
 :link-type: doc
@@ -123,6 +129,7 @@ media-accessor
 sequence-accessor
 expression-recipes
 type-system
+null-semantics
 udfs
 udfs-at-scale
 ```

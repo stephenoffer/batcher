@@ -74,6 +74,12 @@ def collection_function(tr, node) -> Expr | None:
         return None
     name = node.name.lower()
     args = list(node.expressions)
+    if name == "struct_rename_fields" and len(args) >= 3 and len(args) % 2 == 1:
+        # `struct_rename_fields(s, 'old', 'new', ...)`: the pairs of `.struct.rename_fields`.
+        names = [_const_str_arg(a, "struct_rename_fields()", "field name") for a in args[1:]]
+        return tr._scalar(args[0]).struct.rename_fields(
+            dict(zip(names[::2], names[1::2], strict=True))
+        )
 
     if name in _LAMBDA_LIST and len(args) == 2:
         # DuckDB's spellings of the same two higher-order functions.

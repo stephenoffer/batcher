@@ -9,11 +9,15 @@ subsystems, and is split out of `terminal.core` to keep that module within size 
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
 from batcher.api.orchestration.logical_profile import (
     _logical_estimates,
     _logical_op_profiles,
 )
 from batcher.io.source import Source
+from batcher.observe.dag.labels import detail_labels, pushdown_labels
 from batcher.plan.logical import LogicalPlan
 from batcher.plan.profile import (
     Decision,
@@ -21,6 +25,9 @@ from batcher.plan.profile import (
     QueryProfile,
     merge_metric_ops,
 )
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 __all__ = [
     "admission_decision",
@@ -31,6 +38,7 @@ __all__ = [
     "record_spill",
     "resource_decision",
     "run_profiled",
+    "run_profiled_with_result",
     "verdict_summary",
 ]
 
@@ -93,123 +101,9 @@ def build_side_decisions(decisions: list) -> list[Decision]:
     return out
 
 
-#: How deep a pushed predicate renders. Higher than the node-subtitle default because the
-#: optimizer brackets a pushed set with derived bounds, and the interesting part — the
-#: column names — sits below the conjunction that adds.
-_PUSHED_MAX_DEPTH = 5
-
-#: Longest pushed-filter label. A conjunction of a dozen terms is a real plan and it must
-#: not wrap the operator tree it annotates.
-_PUSHED_MAX_CHARS = 90
-
-
-def pushdown_labels(opt) -> dict[int, str]:
-    """Per scan `op_id`, what the plan handed that scan's source, for `explain()`.
-
-    `explain()` printed a scan identically whether the plan had pushed a filter into it or
-    was reading the whole relation and filtering above — the two differ by the entire
-    table, and nothing in the output distinguished them. Every comparable engine says this
-    (Spark's ``PushedFilters:``, DuckDB's ``Filters:``), and it is the only way a user can
-    confirm that a filter they expected to prune actually reached the source.
-
-    Read as *offered*, not *applied*: `PhysicalPlan.source_predicates` is what the plan
-    hands down, and each backend then translates the subset it can express (see
-    `io.predicate`). A source that declines still shows the offer here, which is the
-    honest report — the alternative is asking every source what it did, which it cannot
-    answer until it runs. The same holds for the row cap (`source_limits`), which most
-    backends decline: a database is only sent a ``LIMIT`` when its dialect spells one.
-
-    The pushed *projection* is deliberately not shown. Whether a column list is pruning
-    anything is only knowable against the source's own schema, and reading that here would
-    put a probe round trip on the execution path to label a line — while the columns the
-    query keeps are already on the `project` node directly above.
-
-    Args:
-        opt: The `PhysicalPlan`, carrying `source_predicates` and `source_limits` per
-            scan `source_id`.
-
-    Returns:
-        A mapping from scan `op_id` to its label; scans the plan pushed nothing to are
-        absent.
-    """
-    from batcher.observe.dag.describe import expr_text
-    from batcher.plan.profile import walk_ir
-
-    labels: dict[int, str] = {}
-    for op_id, (_depth, node) in enumerate(walk_ir(opt.ir)):
-        if node.get("op") != "scan":
-            continue
-        source_id = node.get("source_id")
-        parts = []
-        predicate = opt.source_predicates.get(source_id)
-        if predicate:
-            parts.append(_elide(expr_text(predicate, max_depth=_PUSHED_MAX_DEPTH)))
-        cap = opt.source_limits.get(source_id)
-        if cap is not None:
-            ordering = opt.source_orderings.get(source_id)
-            parts.append(
-                f"top {cap:,} by {_ordering_text(ordering)}" if ordering else f"max {cap:,} rows"
-            )
-        if parts:
-            labels[op_id] = " · ".join(parts)
-    return labels
-
-
-def _ordering_text(ordering: tuple[tuple[str, bool, bool], ...]) -> str:
-    """A pushed top-N's sort keys, for the scan's label.
-
-    Shown because the ordering is what makes the cap *sound*: "max 2 rows" under a sort
-    reads like an unsound prefix, and naming the order it is taken in is the difference.
-    Null placement is printed only when it is not the default, so the common case stays
-    short while the case that changes which rows come back stays visible.
-    """
-    return ", ".join(
-        f"{column}{' desc' if descending else ''}{' nulls first' if nulls_first else ''}"
-        for column, descending, nulls_first in ordering
-    )
-
-
-def _elide(text: str) -> str:
-    """`text` cut to one readable line."""
-    if len(text) <= _PUSHED_MAX_CHARS:
-        return text
-    return text[: _PUSHED_MAX_CHARS - 1].rstrip() + "…"
-
-
-def detail_labels(ir: dict | None) -> dict[int, str]:
-    """Per `op_id`, what that operator does in its own terms, for `explain()`.
-
-    The join type and keys, the group keys and aggregates, the sort keys, the filter
-    predicate. `explain()` printed none of it, so a plan with four joins printed four
-    identical `hash_join` lines and the reader had no way to tell which was which — the
-    first question anyone asks of a join tree. Every comparable engine prints it
-    (Postgres's ``Hash Cond:``, Spark's ``[id#3 = id#7]``, DuckDB's key list).
-
-    Reuses `observe.dag.describe`, which is the same function the web dashboard labels its
-    plan nodes with, rather than growing a second describer: two of them would drift within
-    a release and show the same operator two ways, which is the failure that makes a reader
-    stop trusting both.
-
-    Args:
-        ir: The optimized plan IR, walked in the pre-order that assigns `op_id`.
-
-    Returns:
-        A mapping from `op_id` to its label; operators with nothing worth naming are absent.
-    """
-    if not ir:
-        return {}
-    from batcher.observe.dag.describe import describe
-    from batcher.plan.profile import walk_ir
-
-    labels: dict[int, str] = {}
-    for op_id, (_depth, node) in enumerate(walk_ir(ir)):
-        text = describe(str(node.get("op", "")), node)
-        if text:
-            labels[op_id] = _elide(text)
-    return labels
-
-
-def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
+def record_plan(
+    prof, opt, plan, distributed: bool, decisions: list, sources: Sequence[Any] = ()
+) -> None:
     """Record the optimized plan + its join decisions into the profile collector."""
     prof.optimized_ir = opt.ir
     prof.logical_ir = plan.to_ir()
@@ -220,7 +114,13 @@ def record_plan(prof, opt, plan, distributed: bool, decisions: list) -> None:
     # execution before this memo: ~0.9 ms profiled per TPC-H q8, for labels that never change.
     # Copied out because the collector owns its dicts.
     prof.source_pushdown = dict(opt.derived("pushdown_labels", pushdown_labels))
-    prof.node_details = dict(opt.derived("detail_labels", lambda o: detail_labels(o.ir)))
+    # Memoized on the plan unless a source names its backend: the label then depends on the
+    # sources, which the plan-cache-shared memo is not keyed on.
+    prof.node_details = (
+        detail_labels(opt.ir, sources)
+        if any(hasattr(s, "explain_label") for s in sources)
+        else dict(opt.derived("detail_labels", lambda o: detail_labels(o.ir)))
+    )
     prof.distributed = distributed
     prof.decisions.extend(build_side_decisions(decisions))
 
@@ -450,7 +350,9 @@ def planned_profile(plan: LogicalPlan, sources: list[Source]) -> QueryProfile:
         plan, sources=sources, hub=hub, source_stats=source_stats
     )
     return QueryProfile(
-        ops=build_op_profiles(opt.ir, opt.ops, None, pushdown_labels(opt), detail_labels(opt.ir)),
+        ops=build_op_profiles(
+            opt.ir, opt.ops, None, pushdown_labels(opt), detail_labels(opt.ir, sources)
+        ),
         decisions=(
             *build_side_decisions(decisions),
             *_io_throughput_decisions(sources, hub),
@@ -468,6 +370,22 @@ def run_profiled(
     query_id: str = "",
 ) -> QueryProfile:
     """Execute the plan through the real (single-node/spill/distributed) path, profiled.
+
+    The profile alone; `run_profiled_with_result` also hands back the table the run made.
+    """
+    return run_profiled_with_result(plan, sources, columns, query_id)[1]
+
+
+def run_profiled_with_result(
+    plan: LogicalPlan,
+    sources: list[Source],
+    columns: list[str],
+    query_id: str = "",
+) -> tuple[pa.Table, QueryProfile]:
+    """Execute the plan through the real (single-node/spill/distributed) path, profiled.
+
+    Returns the result table alongside the profile, so `stats(keep_result=True)` gets the
+    data and its measurements from one run rather than executing twice.
 
     Always executes (no metadata short-circuit — the point is to measure) with a
     `ProfileCollector` attached, then assembles a `QueryProfile`. Runs the *same* path the
@@ -567,7 +485,7 @@ def run_profiled(
     except Exception:  # pragma: no cover - a missing budget just omits the memory-% line
         budget = 0
     if core.has_map_batches(plan):
-        return _udf_measured_profile(
+        return table, _udf_measured_profile(
             plan,
             sources,
             collector,
@@ -576,7 +494,7 @@ def run_profiled(
             query_id=query_id,
             memory_budget_bytes=budget,
         )
-    return collector.to_profile(
+    return table, collector.to_profile(
         total_ms=total_ms, rows=table.num_rows, query_id=query_id, memory_budget_bytes=budget
     )
 

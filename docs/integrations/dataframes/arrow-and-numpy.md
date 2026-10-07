@@ -32,7 +32,15 @@ print(original.address == returned.address)
 # True
 ```
 
-`from_arrow` accepts a `Table`, a single `RecordBatch`, or a sequence of batches. {py:obj}`bt.from_batches <batcher.from_batches>` takes a factory instead, for a source that produces batches lazily rather than a list that is already in memory.
+`from_arrow` accepts a `Table`, a single `RecordBatch`, or a sequence of batches. It also accepts any object exporting `__arrow_c_stream__`, and drains it into a table when called. {py:obj}`bt.from_batches <batcher.from_batches>` takes a factory instead, for a source that produces batches lazily rather than a list that is already in memory. Handed a stream producer such as a `RecordBatchReader`, it reads the stream batch by batch at execution:
+
+```python
+reader = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+print(bt.from_batches(reader).count())
+# 3
+```
+
+A reader is single-shot, so a second execution over that `Dataset` raises rather than reading an exhausted stream as empty. Pass a factory that opens a fresh reader to read it again.
 
 ## NumPy in, NumPy out
 
@@ -63,6 +71,30 @@ print({name: (array.dtype.str, array.tolist()) for name, array in arrays.items()
 ```
 
 Pass `columns=` to take a subset, which also prunes the scan: a column you don't ask for is never read.
+
+### Nulls on the way to NumPy
+
+NumPy has no null, so `to_numpy` has to decide what to put where one was. `nulls=` makes the decision yours. The default, `"nan"`, writes NaN: an integer or Boolean column with a null widens to `float64` and a `UserWarning` says so, a float column's nulls become indistinguishable from its genuine NaNs, and a string column keeps `None` in an object array. `"raise"` raises a `PlanError` naming the first column that holds a null. `"mask"` returns a `numpy.ma.MaskedArray` per column, so an integer column stays integer and a NaN stays distinct from a null:
+
+```python
+gappy = bt.from_pydict({"n": [1, None, 3], "f": [float("nan"), None, 2.0]})
+masked = gappy.to_numpy(nulls="mask")
+print(masked["n"].dtype, masked["n"].mask.tolist())
+# int64 [False, True, False]
+print(masked["f"].mask.tolist(), np.isnan(masked["f"].data[0]))
+# [False, True, False] True
+```
+
+### A 2-D array, and when the conversions run
+
+`np.asarray(ds)` stacks the result into one `(rows, columns)` array through the same conversion, so every column has to share a dtype. The result is always a new array, so `np.asarray(ds, copy=False)` raises a `ValueError`, as NumPy 2's protocol requires of an object that cannot avoid a copy:
+
+```python
+print(np.asarray(bt.from_pydict({"a": [1, 2], "b": [3, 4]})).tolist())
+# [[1, 3], [2, 4]]
+```
+
+`to_numpy`, `to_jax` and `np.asarray(ds)` run single-node, as `iter_batches()` does by default, while `to_arrow()`, `pa.table(ds)` and `to_polars()` route as `collect()` does. {doc}`/api/relational/dataset` has the full table of which conversion executes, routes and copies how.
 
 ## Narrow types widen at the boundary
 

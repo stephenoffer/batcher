@@ -4,6 +4,8 @@
 
 The script maps and filters elements, drops nulls inside a list, and reduces what is left. It then shapes embedding vectors held as lists with `normalize`, `softmax`, `mean`, and `max`, flattens a list of lists, and sorts and de-duplicates inside each row.
 
+Inside either body, {py:obj}`bt.element_index() <batcher.element_index>` is the element's 0-based position in its own list, and any other column is the enclosing row's value, the same for every element of that row. That is how a row-specific threshold filters its own list. DuckDB's two-parameter lambda `(x, i) -> ...` numbers from 1, so its `i` is `element_index() + 1`. The script ends with that scoping, a per-row `get` index, and `zip`, which pairs two lists into `left`/`right` structs.
+
 The whole script, executed on every test run:
 
 ```{literalinclude} ../../../../examples/expressions/lists_transforms.py
