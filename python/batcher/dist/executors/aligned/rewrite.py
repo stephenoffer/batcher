@@ -339,11 +339,15 @@ def _sink_membership(node: Join) -> LogicalPlan | None:
     inner = node.left
     if not (isinstance(inner, Join) and inner.join_type == "inner"):
         return None
-    # Only a membership join that passes its input through unchanged: the moved one returns
-    # the inner join's own output in its place.
-    passthrough = [JoinOutputCol("left", c, c) for c in inner.available_columns()]
-    if list(node.output) != passthrough:
+    # The membership join's own output -- often a pruned subset of the inner join's, which
+    # projection pushdown leaves it to emit -- becomes the inner join's, so nothing above sees
+    # a column it did not see before.
+    emitted = {o.alias: o for o in inner.output}
+    if not all(o.side == "left" and o.name in emitted for o in node.output):
         return None
+    output = tuple(
+        JoinOutputCol(emitted[o.name].side, emitted[o.name].name, o.alias) for o in node.output
+    )
     origin = {o.alias: (o.side, o.name) for o in inner.output}
     sides = {origin[k][0] for k in node.left_keys if k in origin}
     if len(sides) != 1 or not all(k in origin for k in node.left_keys):
@@ -360,7 +364,7 @@ def _sink_membership(node: Join) -> LogicalPlan | None:
         output=tuple(JoinOutputCol("left", c, c) for c in child.available_columns()),
     )
     filtered = _sink_membership(filtered) or filtered
-    return dataclasses.replace(inner, **{side: filtered})
+    return dataclasses.replace(inner, **{side: filtered}, output=output)
 
 
 def group_broadcast_joins(

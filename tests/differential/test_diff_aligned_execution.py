@@ -687,7 +687,10 @@ def test_a_membership_filter_over_a_dimension_join_sinks_to_the_table_it_filters
     moves down to it, and the large orders, their lines and the filter share one cut, with
     `customer` (too large to hold) joined by the residual.
     """
+    import dataclasses
+
     from batcher.dist.executors.aligned import rewrite
+    from batcher.plan.visitor import transform_up
 
     monkeypatch.setattr(aligned_run, "BROADCAST_BYTES", 1)
     li, orders, cust = _read(tables, "lineitem"), _read(tables, "orders"), _read(tables, "customer")
@@ -716,6 +719,27 @@ def test_a_membership_filter_over_a_dimension_join_sinks_to_the_table_it_filters
     assert all_facts_in_one_cut(found)
     got = aligned_run.run_plan(found, ds._sources, workers=2)
     assert got is not None
+    assert_same_for_query(got, _duck(tables, query), query)
+
+    # Projection pushdown prunes what such a semi join emits, so it does not pass the inner
+    # join's output through whole -- the shape the warm SF1000 plan had. Pruned the same way
+    # here: `o_prio`, which nothing above reads, dropped from the semi join and its parent.
+    def prune(node):
+        reads_semi = isinstance(node, Join) and any(
+            isinstance(c, Join) and c.join_type == "semi" for c in (node.left, node.right)
+        )
+        if isinstance(node, Join) and (node.join_type == "semi" or reads_semi):
+            kept = tuple(o for o in node.output if o.alias != "o_prio")
+            if len(kept) < len(node.output):
+                return dataclasses.replace(node, output=kept)
+        return node
+
+    pruned = transform_up(ds._plan, prune)
+    semis = [n for n in _walk(pruned) if isinstance(n, Join) and n.join_type == "semi"]
+    assert semis and len(semis[0].output) < len(semis[0].left.output)
+    found = choose_plan(pruned, ds._sources, strict=False)
+    assert all_facts_in_one_cut(found)
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
     assert_same_for_query(got, _duck(tables, query), query)
     # Positive control: with the semi join left above `customer`, no cut holds all three.
     monkeypatch.setattr(rewrite, "_sink_membership", lambda node: None)
