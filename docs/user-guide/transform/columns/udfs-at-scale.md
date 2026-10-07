@@ -1,6 +1,6 @@
 # Running a UDF at scale
 
-This page covers what changes when a `map_batches` stage runs over a cluster rather than one machine: how a UDF with a pipeline breaker above it is staged, what happens to a device request or a function the cluster cannot take, how to survive a malformed record without losing the job, and the idempotency a distributed retry demands. The callback contract itself is on {doc}`User-defined functions <udfs>`.
+This page covers what changes when a `map_batches` stage runs over a cluster rather than one machine: how a UDF with a pipeline breaker above it is staged, what happens to a device request or a function the cluster cannot take, how to survive a malformed record without losing the job, how many times your function runs, and the idempotency a distributed retry demands. The callback contract itself is on {doc}`User-defined functions <udfs>`.
 
 The examples run against these imports:
 
@@ -54,7 +54,7 @@ print(raw.map_batches(parse, output_columns=["n"], max_errored_rows=10).to_pydic
 The default is 0, which is strict. Set it deliberately and keep it small. A budget of 1,000,000 silently deleted rows is not resilience. It is a deletion policy nobody agreed to.
 :::
 
-The budget is one allowance per worker process, whichever way the stage runs: threads, worker processes, or a streamed window all draw down the same count. Across a cluster the honest bound is therefore `workers x max_errored_rows`. Every drop is published to the observability bus with the running total and the error text, so a long job reports the loss while it happens rather than at the end.
+The budget is one allowance per worker process, whichever way the stage runs: threads, worker processes, or a streamed window all draw down the same count. Across a cluster the honest bound is therefore `workers x max_errored_rows`. The allowance belongs to the function rather than to one query, so a second run of the same function in the same process draws on what the first run left. Every drop is published to the observability bus with the running total and the error text, so a long job reports the loss while it happens rather than at the end.
 
 The row callbacks take it too. `ds.map`, `ds.flat_map`, and a callable `ds.filter` all lower to a `map_batches` stage, so the same budget isolates a raising callback down to the rows that raised:
 
@@ -67,6 +67,29 @@ rows = bt.from_pydict({"s": ["1", "2", "oops", "4"]})
 print(rows.map(parse_row, output_columns=["n"], max_errored_rows=10).to_pydict())
 # {'n': [1, 2, 4]}
 ```
+
+### Keeping the failed rows
+
+A dropped row is gone, and at scale you can't tell afterwards which rows they were. Pass `error_column` to keep them instead. Each row the budget would drop comes out with its output columns null and the error, as `"<ExcType>: <message>"`, in the column you named. Every other row has null there. A kept row still counts against `max_errored_rows`, so the budget still stops a job whose function is simply broken.
+
+The failed row is built without your function's output, so its types have to be known up front. Declare `output_columns` as a `pyarrow.Schema`. A callable `filter` needs no declaration, because its output columns are its input's, and it keeps the failed row with its input values. A column named in `preserves_columns` on `map_batches` keeps its input value too.
+
+```python
+def parse_kept(row):
+    return {"n": int(row["s"])}
+
+
+kept = rows.map(
+    parse_kept,
+    output_columns=pa.schema([("n", pa.int64())]),
+    max_errored_rows=10,
+    error_column="error",
+)
+print(kept.to_pydict())
+# {'n': [1, 2, None, 4], 'error': [None, None, "ValueError: invalid literal for int() with base 10: 'oops'", None]}
+```
+
+Split the result with an ordinary filter, such as `kept.filter(bt.col("error").is_not_null())` for the rows to inspect or write to a quarantine table. An `error_column` stage runs on threads rather than worker processes, because the kept row is assembled in the process that isolated it.
 
 ## Retrying a flaky call
 
@@ -83,7 +106,31 @@ scored = docs.map_batches(
 )
 ```
 
+`map`, `flat_map`, and a callable `filter` take the same four options. The retry unit is the batch, not the row: a row callback that fails on one row re-runs every row of that batch, so a side effect in it must be idempotent.
+
 `retry_on=None`, the default, retries any `Exception` once `max_retries` is set. A retry happens inside the worker that saw the failure, so it behaves the same single-node and under `distributed=True`. A failure that survives every retry falls through to `max_errored_rows` if that is set. When the budget is spent the stage raises the function's own exception, with a note saying the `max_errored_rows` allowance was exceeded and how many rows it already dropped.
+
+## How many times your function runs
+
+Batcher promises the rows your function returns, not the calls it makes to get them. Four things are unspecified and may change between runs, releases, and cluster sizes:
+
+- How many calls a stage makes.
+- How many rows each call gets. With `batch_size` set, a call gets at most that many, and some get fewer, such as the last batch of a partition.
+- Where a batch boundary falls.
+- The order in which batches are called, across threads, async tasks, and workers.
+
+What does hold is order within a call. The rows your function returns for a batch keep their place, and a single-node run returns the batches in input order.
+
+A row can also reach your function more than once. These are the cases that cause it:
+
+- **Each terminal operation runs the plan again.** `collect`, `count`, and a write each call the function anew, unless the dataset was cached.
+- **`schema` probes an undeclared stage.** It calls a batch function on an empty batch, and a `map` or `flat_map` function, which is never called on an empty batch, on one input row. An `INSERT` into a session table does the same to align types. Declare `output_columns` as a `pyarrow.Schema` and neither calls it.
+- **Batcher measures a plain function once.** Over a large input, the first run of a plain function, not a class or a GPU stage, times it on a sample of its first batch to size the batches, and discards the result. The measurement is kept, so later runs skip it.
+- **`max_errored_rows` bisects a failing batch.** The halves are called again until the failing rows are isolated, so the rows around a bad one run several times.
+- **`max_retries` re-runs the whole batch.** Every row in it is called again, including the rows that succeeded.
+- **A preempted worker's partition is recomputed** under `distributed=True`.
+
+So a function whose effect lands outside its return value, such as a write, a POST, or a counter, must be safe to repeat.
 
 ## Retries and idempotency
 
