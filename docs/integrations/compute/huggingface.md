@@ -12,7 +12,7 @@ The following table summarizes the integration:
 | --- | --- |
 | Datasets in | {py:func}`bt.from_huggingface(hf) <batcher.from_huggingface>`, or {py:meth}`bt.read.parquet("hf://...") <batcher.api.io_namespace.reader.Reader.parquet>` |
 | Models | `ds.ml.infer(model_id, ...)`, `ds.ml.embed(model_id, ...)` |
-| Write | Not supported. Batcher does not push datasets to the Hub. |
+| Datasets out | {py:meth}`ds.to_huggingface() <batcher.Dataset.to_huggingface>`, a `datasets.Dataset` or `IterableDataset`. Batcher does not push to the Hub. |
 | Extra | `batcher-engine[huggingface]` for datasets, `[transformers]` or `[st]` for models |
 | Parallelism | {py:func}`from_huggingface <batcher.from_huggingface>` is one in-memory source. `hf://` Parquet splits per row group. |
 
@@ -67,6 +67,29 @@ print(bt.read.parquet(corpus).count())
 That Parquet directory is what you point a training job at. A `bt.read.parquet` scan splits per row
 group, prunes columns and predicates at the file level, and fans out across a cluster. An
 in-memory Hugging Face table can do none of that.
+
+## Datasets out
+
+:::{warning}
+Not yet verified against a live `datasets` install; see tests/PENDING_VERIFICATION.md.
+:::
+
+{py:meth}`ds.to_huggingface() <batcher.Dataset.to_huggingface>` is the return leg. The default `mode="materialized"` runs the query and wraps its Arrow table as a `datasets.Dataset`, sharing the buffers. `mode="iterable"` returns a `datasets.IterableDataset` that runs the query each time it is iterated and yields examples as the consumer pulls them, so the result is never held whole.
+
+```python
+# docs: skip
+import batcher as bt
+
+reviews = bt.from_pydict(
+    {"text": ["good", "bad"], "label": ["pos", "neg"], "poster": [b"\x89PNG...", None]}
+)
+hf = reviews.to_huggingface(class_labels="label", images="poster")
+print(hf.features["label"].names)
+# ['neg', 'pos']
+stream = reviews.to_huggingface("iterable", class_labels={"label": ["neg", "pos"]})
+```
+
+Features come from the Arrow schema, so list and struct columns keep their nesting. Two kinds are translated further. A column in `images` becomes an `Image()` feature, from binary image bytes, string paths, or a `struct<bytes, path>`. A column in `class_labels` becomes a `ClassLabel`. Pass a mapping to fix the label names and their code order, or a bare column name to derive the names from the column's distinct values, sorted, which costs one query per column. A value that isn't one of the names is refused, and an integer column is read as codes and needs explicit names.
 
 ## Hub datasets are mostly Parquet
 

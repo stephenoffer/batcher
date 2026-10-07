@@ -7097,6 +7097,125 @@ class Dataset:
 
         return to_spark(self, spark, max_arrow_bytes=max_arrow_bytes, staging_path=staging_path)
 
+    def to_dask(
+        self,
+        *,
+        materialize: str = "arrow",
+        npartitions: int | None = None,
+        partition_bytes: int | None = None,
+        staging_path: str | None = None,
+    ) -> Any:
+        """Hand the result to Dask as a lazy ``dask.dataframe.DataFrame`` (needs `dask`).
+
+        The return leg of :func:`batcher.from_dask`. The frame is built with
+        ``dd.from_map`` over Arrow partitions, so each partition becomes pandas inside its
+        own Dask task and no pandas frame of the whole result is ever built. `materialize`
+        says when and where the query runs:
+
+        - ``"arrow"`` (the default) runs the query now, once, and holds its output in this
+          process as Arrow partitions of about `partition_bytes` each, which Dask converts
+          to pandas as it computes them. It is the shape `to_daft` and `to_ray_dataset`
+          have, and the right one for a result that fits in this process's memory.
+        - ``"deferred"`` runs nothing now. Each of `npartitions` partitions runs the query
+          when Dask computes it, keeping the rows whose content hash falls in its bucket,
+          so the input is scanned once per partition. Rows are bucketed by their non-nested
+          columns, and equal rows always share a partition.
+        - ``"parquet"`` runs the query now and writes it as Parquet to a new ``to_dask-<id>``
+          directory under `staging_path`, which ``dd.read_parquet`` then reads. It is the
+          path for a result larger than memory or for a Dask cluster, given a staging path
+          the workers can read, such as ``s3://<bucket>/<prefix>``. The staged files are
+          not removed.
+
+        Not yet verified against a live Dask; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            materialize: ``"arrow"``, ``"deferred"`` or ``"parquet"``, as described above.
+            npartitions: Partitions for ``"deferred"``; ``None`` uses the CPU count.
+            partition_bytes: Target Arrow bytes per partition for ``"arrow"``; ``None``
+                uses 128 MiB.
+            staging_path: The directory or URI ``"parquet"`` stages under; ``None`` uses a
+                new local temporary directory.
+
+        Returns:
+            A ``dask.dataframe.DataFrame`` over the result.
+
+        Raises:
+            BackendError: If ``dask[dataframe]`` is not installed.
+            PlanError: If `materialize` or `npartitions` is invalid.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"x": [1, 2, 3]})
+                >>> frame = ds.to_dask()  # doctest: +SKIP
+                >>> int(frame["x"].sum().compute())  # doctest: +SKIP
+                6
+                >>> lazy = ds.to_dask(materialize="deferred", npartitions=2)  # doctest: +SKIP
+        """
+        from batcher.api.dataset._export import to_dask
+
+        return to_dask(
+            self,
+            materialize=materialize,
+            npartitions=npartitions,
+            partition_bytes=partition_bytes,
+            staging_path=staging_path,
+        )
+
+    def to_huggingface(
+        self,
+        mode: str = "materialized",
+        *,
+        class_labels: str | Sequence[str] | Mapping[str, Sequence[str]] | None = None,
+        images: str | Sequence[str] | None = None,
+    ) -> Any:
+        """Hand the result to Hugging Face ``datasets`` (needs `datasets`).
+
+        The return leg of :func:`batcher.from_huggingface`. ``mode="materialized"`` runs
+        the query and returns a ``datasets.Dataset`` over its Arrow table, sharing the
+        buffers rather than copying them. ``mode="iterable"`` returns a
+        ``datasets.IterableDataset`` that runs the query each time it is iterated and
+        yields examples as the consumer pulls them, so the result is never held whole.
+
+        Features come from the Arrow schema, so lists and structs map to HF's nested
+        features. Two columns kinds are translated further. A column named in `images`
+        becomes an ``Image()`` feature: binary values are the encoded image bytes, string
+        values are paths, and a ``struct<bytes, path>`` passes through. A column named in
+        `class_labels` becomes a ``ClassLabel``: a mapping gives each column its label
+        names in code order, and a bare column name derives the names from the column's
+        distinct values, sorted, at the cost of one query per column. String values are
+        stored as their codes, and a value that is not one of the names is refused.
+
+        Not yet verified against a live ``datasets``; see tests/PENDING_VERIFICATION.md.
+
+        Args:
+            mode: ``"materialized"`` or ``"iterable"``.
+            class_labels: Columns to expose as ``ClassLabel``: a name, a list of names, or
+                a mapping from name to label names.
+            images: Columns to expose as ``Image()``: a name or a list of names.
+
+        Returns:
+            A ``datasets.Dataset`` or ``datasets.IterableDataset``.
+
+        Raises:
+            BackendError: If ``datasets`` is not installed.
+            PlanError: If `mode` is unknown or a named column cannot hold its feature.
+
+        Examples:
+            .. doctest::
+
+                >>> import batcher as bt
+                >>> ds = bt.from_pydict({"text": ["good", "bad"], "label": ["pos", "neg"]})
+                >>> hf = ds.to_huggingface(class_labels="label")  # doctest: +SKIP
+                >>> hf.features["label"].names  # doctest: +SKIP
+                ['neg', 'pos']
+                >>> stream = ds.to_huggingface("iterable")  # doctest: +SKIP
+        """
+        from batcher.api.dataset._export import to_huggingface
+
+        return to_huggingface(self, mode=mode, class_labels=class_labels, images=images)
+
     def show(self, limit: int = 10) -> None:
         """Print a preview of the first `limit` result rows to stdout.
 

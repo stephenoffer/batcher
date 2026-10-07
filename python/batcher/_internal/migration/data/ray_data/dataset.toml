@@ -64,7 +64,7 @@ take_all = { status = "mismatch", batcher = "Dataset.to_pylist", note = "Ray tak
 take_batch = { status = "mismatch", batcher = ["Dataset.limit", "Dataset.to_numpy"], note = "Ray take_batch(batch_size=20) returns one batch in batch_format='default' ({col: ndarray}); Batcher: .limit(20).to_numpy() returns {col: ndarray}; other batch_format values need to_arrow()/to_pandas().", wave = "W0" }
 to_arrow_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }
 to_daft = { status = "canonical", batcher = "Dataset.to_daft" }
-to_dask = { status = "gap", need = "export a Dataset to a Dask DataFrame", wave = "W8" }
+to_dask = { status = "mismatch", batcher = "Dataset.to_dask", note = "Ray to_dask(meta=, verify_meta=) takes a pandas meta; Batcher derives meta from the Arrow schema and instead takes materialize= (arrow/deferred/parquet). Drop meta= and verify_meta=.", wave = "W8" }
 to_mars = { status = "out_of_scope", reason = "Mars (pymars) interop; Batcher has no Mars bridge and converts through pandas (Dataset.to_pandas)" }
 to_modin = { status = "out_of_scope", reason = "Modin wraps pandas; convert through Dataset.to_pandas and modin.pandas.DataFrame" }
 to_numpy_refs = { status = "out_of_scope", reason = "Ray object-store block references; Batcher moves Arrow batches over Arrow Flight and exposes no object refs" }

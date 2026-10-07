@@ -2,7 +2,9 @@
 
 `shape_batches` turns `iter_batches`' consumer options (format, shuffle, ragged tail,
 look-ahead) into one stream transform. The rest hand a result to NumPy/JAX arrays or to
-another engine's frame: `to_ray_dataset`, `to_daft` and `to_spark`.
+another engine's frame: `to_ray_dataset`, `to_daft`, `to_spark`, `to_dask` and
+`to_huggingface`. The framework-side conversion of the last two lives in `interop`; what
+stays here is the part that knows about a `Dataset`: how its result is cut into partitions.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import itertools
 import os
 import tempfile
 import uuid
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
@@ -329,3 +332,160 @@ def _stage_parquet(
 def _as_uri(path: str) -> str:
     """`path` as a URI pyarrow can resolve a filesystem from: local paths become absolute."""
     return path if "://" in path else os.path.abspath(path)
+
+
+#: The `to_dask` materialization policies, in the order the docstring describes them.
+DASK_POLICIES = ("arrow", "deferred", "parquet")
+
+#: Target bytes per Dask partition under ``materialize="arrow"``. Dask's own guidance puts
+#: a partition at around 100 MiB of pandas memory; Arrow is somewhat smaller than the pandas
+#: frame it becomes, so this lands near it.
+_DASK_PARTITION_BYTES = 128 * 1024 * 1024
+
+
+def to_dask(
+    ds: Dataset,
+    *,
+    materialize: str,
+    npartitions: int | None,
+    partition_bytes: int | None,
+    staging_path: str | None,
+) -> Any:
+    """Hand the query's result to Dask as a lazy ``dask.dataframe.DataFrame``.
+
+    See `Dataset.to_dask` for the three policies. None of them builds one pandas frame of
+    the whole result: each partition becomes pandas inside its own Dask task.
+    """
+    from batcher._internal.errors import PlanError
+    from batcher.interop.dask_frames import dask_from_arrow_partitions, import_dask_dataframe
+
+    if materialize not in DASK_POLICIES:
+        raise PlanError(
+            f"to_dask(materialize={materialize!r}): expected one of {list(DASK_POLICIES)}"
+        )
+    if materialize == "parquet":
+        dd = import_dask_dataframe()
+        return dd.read_parquet(_stage_dataset(ds, staging_path, "to_dask"))
+    if materialize == "deferred":
+        n = _dask_partition_count(npartitions)
+        return dask_from_arrow_partitions(range(n), _BucketLoader(ds, n), ds.schema)
+    import_dask_dataframe()
+    target = int(partition_bytes) if partition_bytes else _DASK_PARTITION_BYTES
+    tables = list(_coalesced_tables(ds, None, target)) or [_empty_table(ds.schema)]
+    return dask_from_arrow_partitions(tables, _identity, tables[0].schema)
+
+
+def _identity(table: pa.Table) -> pa.Table:
+    return table
+
+
+def _dask_partition_count(npartitions: int | None) -> int:
+    from batcher._internal.errors import PlanError
+
+    n = npartitions if npartitions is not None else (os.cpu_count() or 1)
+    if n < 1:
+        raise PlanError(f"to_dask(npartitions={npartitions}): must be at least 1")
+    return n
+
+
+def _hashable_columns(schema: pa.Schema) -> list[str]:
+    """The columns a content-hash bucket can be computed over: every non-nested one."""
+    nested = (pa.types.is_nested, pa.types.is_null)
+    return [f.name for f in schema if not any(check(f.type) for check in nested)]
+
+
+class _BucketLoader:
+    """One Dask partition of a deferred `to_dask`: the rows whose content hash is `part`.
+
+    The bucket is a hash of the row's own values rather than a row number, because a
+    parallel scan numbers rows differently on every run, and each partition is a separate
+    run: a row-number split could hand a row to two partitions or to none. A content hash
+    puts every row in exactly one bucket however the scan is scheduled.
+    """
+
+    def __init__(self, ds: Dataset, n: int) -> None:
+        from batcher._internal.errors import PlanError
+
+        columns = _hashable_columns(ds.schema)
+        if not columns and n > 1:
+            raise PlanError(
+                "to_dask(materialize='deferred'): every column is nested, so there is no "
+                "value to bucket rows by; use npartitions=1 or materialize='arrow'"
+            )
+        self._ds = ds
+        self._n = n
+        self._columns = columns
+
+    def __call__(self, part: int) -> pa.Table:
+        if self._n == 1:
+            return self._ds.to_arrow()
+        from batcher.plan.expr_ir import Col
+        from batcher.plan.expr_ir.constructors import hash_rows
+
+        digest = hash_rows(*(Col(c) for c in self._columns), seed=0)
+        bucket = ((digest % self._n) + self._n) % self._n
+        return self._ds.filter(bucket == part).to_arrow()
+
+
+def _stage_dataset(ds: Dataset, staging_path: str | None, label: str) -> str:
+    """Write the result as Parquet under a fresh directory and return that directory."""
+    root = staging_path if staging_path is not None else tempfile.mkdtemp(prefix="batcher-")
+    directory = f"{root.rstrip('/')}/{label}-{uuid.uuid4().hex}"
+    ds.write.parquet(directory)
+    return directory
+
+
+#: `to_huggingface` modes.
+HF_MODES = ("materialized", "iterable")
+
+
+def to_huggingface(
+    ds: Dataset,
+    *,
+    mode: str,
+    class_labels: Any,
+    images: Any,
+) -> Any:
+    """Hand the query's result to Hugging Face ``datasets``; see `Dataset.to_huggingface`."""
+    from batcher._internal.errors import PlanError
+    from batcher.interop.huggingface import HuggingFaceSpec, hf_dataset, hf_iterable_dataset
+
+    if mode not in HF_MODES:
+        raise PlanError(f"to_huggingface(mode={mode!r}): expected one of {list(HF_MODES)}")
+    image_columns = [images] if isinstance(images, str) else list(images or ())
+    spec = HuggingFaceSpec(
+        ds.schema, class_labels=_label_names(ds, class_labels), images=image_columns
+    )
+    if mode == "iterable":
+        return hf_iterable_dataset(ds.iter_batches, spec)
+    return hf_dataset(ds.to_arrow(), spec)
+
+
+def _label_names(ds: Dataset, class_labels: Any) -> dict[str, list[str]]:
+    """``{column: names}`` from a mapping, or derived from each named column's values.
+
+    A bare column name (or a list of them) means "the distinct non-null values, sorted",
+    which costs one query per column; a mapping states the names and their code order.
+    """
+    if class_labels is None:
+        return {}
+    if isinstance(class_labels, str):
+        class_labels = [class_labels]
+    if isinstance(class_labels, Mapping):
+        return {str(k): [str(v) for v in names] for k, names in class_labels.items()}
+    from batcher._internal.errors import PlanError
+    from batcher.plan.expr_ir import Col
+
+    names: dict[str, list[str]] = {}
+    for column in class_labels:
+        index = ds.schema.get_field_index(column)
+        if index < 0:
+            continue  # HuggingFaceSpec names the missing column
+        if pa.types.is_integer(ds.schema.field(index).type):
+            raise PlanError(
+                f"to_huggingface(): {column!r} holds integer codes, so its label names cannot "
+                f"be derived from it; pass class_labels={{{column!r}: [name0, name1, ...]}}"
+            )
+        values = ds.select(column).filter(Col(column).is_not_null()).distinct().to_arrow()
+        names[column] = sorted(str(v) for v in values.column(0).to_pylist())
+    return names

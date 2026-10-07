@@ -76,7 +76,7 @@ The following table maps the 92 names on `DataFrame`, sorted alphabetically.
 | `summarize` | {py:obj}`Dataset.describe <batcher.Dataset.describe>` | mismatch | Differs: Daft summarize() returns one row per column (column, type, min, max, count, count\_nulls, approx\_count\_distinct); Batcher describe() returns one row per statistic with a column per input column. Wave W8. |
 | `to_arrow` | {py:obj}`Dataset.to_arrow <batcher.Dataset.to_arrow>` | canonical |  |
 | `to_arrow_iter` | {py:obj}`Dataset.iter_batches <batcher.Dataset.iter_batches>` | canonical |  |
-| `to_dask_dataframe` | n/a | gap | Not yet: export to a Dask DataFrame. Wave W13. |
+| `to_dask_dataframe` | `Dataset.to_dask` | mismatch | Differs: Daft to\_dask\_dataframe(meta=) takes a pandas meta; Batcher derives it from the Arrow schema. Rename to to\_dask() and drop meta=. Wave W13. |
 | `to_pandas` | {py:obj}`Dataset.to_pandas <batcher.Dataset.to_pandas>` | canonical |  |
 | `to_pydict` | {py:obj}`Dataset.to_pydict <batcher.Dataset.to_pydict>` | canonical |  |
 | `to_pylist` | {py:obj}`Dataset.to_pylist <batcher.Dataset.to_pylist>` | canonical |  |
