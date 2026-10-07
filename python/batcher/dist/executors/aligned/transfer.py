@@ -61,10 +61,44 @@ PACK_BYTES = 32 << 20
 
 @dataclasses.dataclass(frozen=True)
 class Packed:
-    """One held broadcast as zstd Arrow IPC, named by its run so a process decodes it once."""
+    """One held broadcast as zstd Arrow IPC, named by its run so a process decodes it once.
+
+    In `parts` independent streams, each a contiguous run of the batches, so both ends can
+    compress and decompress them on several cores at once.
+    """
 
     key: str
-    buffer: pa.Buffer
+    parts: tuple[pa.Buffer, ...]
+
+
+#: Most streams one held broadcast is cut into; each is (de)compressed on its own thread.
+_PACK_PARTS = 8
+
+
+def _write_stream(batches: list[pa.RecordBatch]) -> pa.Buffer:
+    sink = pa.BufferOutputStream()
+    options = pa.ipc.IpcWriteOptions(compression="zstd")
+    with pa.ipc.new_stream(sink, batches[0].schema, options=options) as writer:
+        for batch in batches:
+            writer.write_batch(batch)
+    return sink.getvalue()
+
+
+def _read_stream(buffer: pa.Buffer) -> list[pa.RecordBatch]:
+    return pa.ipc.open_stream(buffer).read_all().to_batches()
+
+
+def _contiguous(batches: list, parts: int) -> list[list]:
+    """`batches` cut into at most `parts` contiguous runs of about equal bytes."""
+    total = sum(b.nbytes for b in batches) or 1
+    runs: list[list] = [[]]
+    filled = 0
+    for batch in batches:
+        if runs[-1] and filled >= total * len(runs) / parts:
+            runs.append([])
+        runs[-1].append(batch)
+        filled += batch.nbytes
+    return runs
 
 
 def pack_held(held: dict[int, object], key: str) -> dict[int, object]:
@@ -75,19 +109,23 @@ def pack_held(held: dict[int, object], key: str) -> dict[int, object]:
     its 100 units spent 11 s waiting on ~5.8 GB leaving one NIC, for 0.36 s of work each.
     Compressed it is 80 MB (sequential keys and a 150-value string column), 0.8 s to pack
     once and 0.4 s to unpack per task.
+
+    Compressed on several threads, a contiguous run of batches each: one stream on one core
+    took 8.8 s of TPC-H q9's 60 s at SF1000 on the driver, and 3-4 s of q8, q10 and q19.
     """
     # A recipe a node evaluates for itself (`local.LocalBroadcast`) travels as it is.
     rows = {sid: v for sid, v in held.items() if isinstance(v, list)}
     if sum(b.nbytes for batches in rows.values() for b in batches) < PACK_BYTES:
         return held
     packed: dict[int, object] = {sid: v for sid, v in held.items() if sid not in rows}
-    options = pa.ipc.IpcWriteOptions(compression="zstd")
-    for sid, batches in rows.items():
-        sink = pa.BufferOutputStream()
-        with pa.ipc.new_stream(sink, batches[0].schema, options=options) as writer:
-            for batch in batches:
-                writer.write_batch(batch)
-        packed[sid] = Packed(f"{key}:{sid}", sink.getvalue())
+    jobs = [
+        (sid, run) for sid, batches in rows.items() for run in _contiguous(batches, _PACK_PARTS)
+    ]
+    with ThreadPoolExecutor(max_workers=_PACK_PARTS) as pool:
+        buffers = list(pool.map(lambda job: _write_stream(job[1]), jobs))
+    for sid in rows:
+        parts = tuple(buf for (owner, _run), buf in zip(jobs, buffers, strict=True) if owner == sid)
+        packed[sid] = Packed(f"{key}:{sid}", parts)
     return packed
 
 
@@ -107,9 +145,17 @@ def unpack_held(held: dict[int, object]) -> dict[int, object]:
         live = {v.key for v in packed.values()}
         for stale in [k for k in _DECODED if k not in live]:
             del _DECODED[stale]
-        for value in packed.values():
-            if value.key not in _DECODED:
-                _DECODED[value.key] = pa.ipc.open_stream(value.buffer).read_all().to_batches()
+        todo = [v for v in packed.values() if v.key not in _DECODED]
+        jobs = [(v.key, part) for v in todo for part in v.parts]
+        with ThreadPoolExecutor(max_workers=max(1, min(_PACK_PARTS, len(jobs)))) as pool:
+            decoded = list(pool.map(lambda job: _read_stream(job[1]), jobs))
+        for v in todo:
+            _DECODED[v.key] = [
+                b
+                for (owner, _part), bs in zip(jobs, decoded, strict=True)
+                if owner == v.key
+                for b in bs
+            ]
         return {sid: _DECODED[v.key] if isinstance(v, Packed) else v for sid, v in held.items()}
 
 

@@ -25,6 +25,8 @@ def test_large_broadcasts_round_trip_compressed(monkeypatch):
     held = {3: table.to_batches(max_chunksize=4096), 4: [empty]}
     packed = transfer.pack_held(held, "run")
     assert all(isinstance(v, transfer.Packed) for v in packed.values())
+    # Cut into several streams (compressed in parallel), and reassembled in order.
+    assert len(packed[3].parts) > 1
     back = transfer.unpack_held(packed)
     assert pa.Table.from_batches(back[3]).equals(table)
     assert pa.Table.from_batches(back[4], schema=empty.schema).num_rows == 0
