@@ -123,6 +123,19 @@ pub(crate) fn flip_output(output: &[bc_ir::JoinOutputCol]) -> Vec<bc_ir::JoinOut
         .collect()
 }
 
+/// Build sides up to this many rows are joined by one shared table and a chunked probe
+/// ([`crate::join_par::broadcast_join`]) rather than by hash-partitioning both sides.
+///
+/// Partitioning copies every column of *both* relations into per-core buckets before a single
+/// key is compared, so its cost is the probe side's size, while what it buys -- a table per
+/// bucket that fits in cache -- only pays once the build side no longer does. A `Full` join
+/// lands here because the per-morsel streaming probe declines it: TPC-H `lineitem` (3M rows,
+/// even keys) `FULL JOIN orders` (500K) partitioned for 19 ms of a 54 ms query on 16 cores,
+/// and the shared table removed it (op-join-full-outer 53.6 -> 47.4 ms). A million rows of
+/// build keeps the table to roughly L3 size on the hosts measured; above it the partitioned
+/// join is unchanged.
+const ORDER_FREE_BROADCAST_MAX_BUILD_ROWS: usize = 1 << 20;
+
 /// [`crate::par::join_partitioned`] over two materialized sides whose join order nothing above
 /// can observe, built on whichever side [`order_free_swap_pays`] picks, as one batch (empty
 /// when the join yields no batch at all).
@@ -148,6 +161,13 @@ pub(crate) fn join_partitioned_order_free(
         } else {
             (probe, build, probe_keys, build_keys, output)
         };
+    if build.num_rows() <= ORDER_FREE_BROADCAST_MAX_BUILD_ROWS
+        && !matches!(strategy, bc_ir::JoinStrategy::SortMerge)
+    {
+        return crate::join_par::broadcast_join(
+            &probe, &build, probe_keys, build_keys, join_type, output,
+        );
+    }
     let (parts, _) = crate::par::join_partitioned(
         std::slice::from_ref(&probe),
         std::slice::from_ref(&build),

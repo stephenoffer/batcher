@@ -81,3 +81,28 @@ def test_an_ordered_limit_over_the_lopsided_full_join_keeps_the_oracle_order(duc
     for t, v in tables.items():
         duck.register(t, v)
     assert_same_ordered(_session(tables).sql(_ORDERED).collect(), duck.sql(_ORDERED))
+
+
+@pytest.mark.parametrize("rows", [0, 1])
+@pytest.mark.parametrize("name", ["global", "reversed", "right", "left"])
+def test_an_empty_or_one_row_small_side_still_matches_duckdb(duck, tables, rows, name) -> None:
+    """The small side can be empty or a single row: every row of the large side is then
+    unmatched (or all but its matches), and the unmatched-build pass sees zero or one row."""
+    cut = {"small": tables["small"].slice(0, rows), "big": tables["big"]}
+    for t, v in cut.items():
+        duck.register(t, v)
+    sql = _QUERIES[name]
+    assert_same(_session(cut).sql(sql).collect(), duck.sql(sql))
+
+
+@pytest.mark.parametrize("mode", ["iter_batches", "spill"])
+def test_the_streamed_and_spilled_full_join_agree_with_duckdb(duck, tables, mode) -> None:
+    for t, v in tables.items():
+        duck.register(t, v)
+    sql = _QUERIES["global"]
+    ds = _session(tables).sql(sql)
+    if mode == "spill":
+        got = ds.collect(spill=True, num_partitions=4)
+    else:
+        got = pa.Table.from_batches(list(ds.iter_batches()))
+    assert_same(got, duck.sql(sql))

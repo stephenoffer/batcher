@@ -17,7 +17,7 @@ import subprocess
 import sys
 from typing import TYPE_CHECKING, Any
 
-from .compare import CompareResult, EngineResult
+from .compare import ENGINE_MARK, CompareResult, EngineResult
 
 if TYPE_CHECKING:  # `summary` imports this module for `cell_status`
     from .summary import Summary
@@ -38,6 +38,8 @@ def cell_status(er: EngineResult) -> str:
     """
     if er.error == "n/a":
         return "n/a"
+    if er.error and er.error.startswith(TIMED_OUT):
+        return "T/O"
     if er.error:
         return "OOM" if any(m in er.error for m in _OOM_MARKERS) else "ERR"
     return "-"
@@ -208,6 +210,9 @@ def print_distribution(results: list[CompareResult], engines: list[str]) -> None
 #: to the same stream after the result is known.
 RESULT_PREFIX = "__BENCH_RESULT__ "
 
+#: The error text of an engine dropped from a case for overrunning ``BENCH_CASE_TIMEOUT_S``.
+TIMED_OUT = "timed out"
+
 
 def case_payload(result: CompareResult) -> dict[str, Any]:
     """One case as plain JSON: its status, note, and every engine's raw timings.
@@ -286,7 +291,7 @@ def _parse_result(line: str) -> CompareResult:
     return result
 
 
-def _child_argv(case: str) -> list[str]:
+def _child_argv(case: str, engines: list[str] | None = None) -> list[str]:
     """This process's command line, aimed at exactly one case.
 
     Rebuilt from ``sys.argv`` rather than from the parsed namespace so every flag the
@@ -295,7 +300,31 @@ def _child_argv(case: str) -> list[str]:
     child would recurse.
     """
     argv = [a for a in sys.argv[1:] if a != "--isolate"]
+    if engines is not None:
+        argv = [*_without_engines(argv), "--engines", ",".join(engines)]
     return [sys.executable, sys.argv[0], *argv, "--isolate-case", case]
+
+
+def _without_engines(argv: list[str]) -> list[str]:
+    """`argv` with any ``--engines X`` / ``--engines=X`` removed."""
+    out: list[str] = []
+    skip = False
+    for a in argv:
+        if skip:
+            skip = False
+        elif a == "--engines":
+            skip = True
+        elif not a.startswith("--engines="):
+            out.append(a)
+    return out
+
+
+def _running_engine(output: str | bytes | None) -> str | None:
+    """The engine a killed child was running: the last ``ENGINE_MARK`` it printed."""
+    if isinstance(output, bytes):
+        output = output.decode(errors="replace")
+    marks = [ln for ln in (output or "").splitlines() if ln.startswith(ENGINE_MARK)]
+    return marks[-1][len(ENGINE_MARK) :].strip() if marks else None
 
 
 def _death(returncode: int) -> str:
@@ -309,7 +338,7 @@ def _death(returncode: int) -> str:
     return f"exited {returncode} without a result"
 
 
-def run_isolated(case_names: list[str]) -> list[CompareResult]:
+def run_isolated(case_names: list[str], engines: list[str] | None = None) -> list[CompareResult]:
     """Run each named case in its own subprocess and collect the results.
 
     A child that dies without printing a result yields a ``KILLED`` row rather than
@@ -317,9 +346,19 @@ def run_isolated(case_names: list[str]) -> list[CompareResult]:
     is where the traceback or the allocator's last words are, and forwarding it always
     would bury the table.
 
+    ``BENCH_CASE_TIMEOUT_S`` bounds each child. A child over budget is killed, and the engine
+    it was running -- each child announces every engine as it starts it -- is dropped from
+    that case, which then runs again without it: the engine's cell reads ``T/O`` and the
+    rest of the lineup still gets a row. Killing the child is what makes this sound where a
+    timer inside one process is not: an abandoned call keeps its threads and its memory
+    (PyArrow's ``group_by`` over 1,024 small files held 65 GB for four hours), and every
+    timing after it would be taken on a machine it was still loading.
+
     Args:
         case_names: Case names to run, in report order. The caller has already applied
             ``--family`` / ``--only`` / ``--skip``, so every name here is meant to run.
+        engines: The resolved lineup, in report order -- what a re-run narrows. Without it
+            an overrunning case is killed whole, as before.
 
     Returns:
         One result per name, in the same order.
@@ -328,31 +367,52 @@ def run_isolated(case_names: list[str]) -> list[CompareResult]:
     # otherwise hold every case after it, and the run reports nothing at all.
     raw = os.environ.get("BENCH_CASE_TIMEOUT_S")
     budget = float(raw) if raw else None
+    env = {**os.environ, "BENCH_ENGINE_MARKS": "1"}
     results: list[CompareResult] = []
     for i, case in enumerate(case_names, start=1):
         print(f"[{i}/{len(case_names)}] {case} ...", flush=True)
-        try:
-            proc = subprocess.run(
-                _child_argv(case),
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=budget,
+        remaining = list(engines or [])
+        dropped: list[str] = []
+        result: CompareResult | None = None
+        while result is None:
+            try:
+                proc = subprocess.run(
+                    _child_argv(case, remaining if dropped else None),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=budget,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired as exc:
+                culprit = _running_engine(exc.stdout)
+                note = f"{TIMED_OUT} after {budget:.0f}s (BENCH_CASE_TIMEOUT_S)"
+                print(f"    {culprit or 'case'} {note}", flush=True)
+                if culprit is None or culprit not in remaining or len(remaining) == 1:
+                    result = CompareResult(name=case, status="KILLED", note=note)
+                    break
+                remaining.remove(culprit)
+                dropped.append(culprit)
+                continue
+            line = next(
+                (ln for ln in proc.stdout.splitlines() if ln.startswith(RESULT_PREFIX)), None
             )
-        except subprocess.TimeoutExpired:
-            note = f"timed out after {budget:.0f}s (BENCH_CASE_TIMEOUT_S)"
-            print(f"    {note}", flush=True)
-            results.append(CompareResult(name=case, status="KILLED", note=note))
-            continue
-        line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(RESULT_PREFIX)), None)
-        if line is None:
-            note = _death(proc.returncode)
-            print(f"    {note}", flush=True)
-            tail = (proc.stdout + proc.stderr).strip().splitlines()[-12:]
-            for entry in tail:
-                print(f"    | {entry}", flush=True)
-            results.append(CompareResult(name=case, status="KILLED", note=note))
-            continue
-        results.append(_parse_result(line))
+            if line is None:
+                note = _death(proc.returncode)
+                print(f"    {note}", flush=True)
+                tail = (proc.stdout + proc.stderr).strip().splitlines()[-12:]
+                for entry in tail:
+                    print(f"    | {entry}", flush=True)
+                result = CompareResult(name=case, status="KILLED", note=note)
+                break
+            result = _parse_result(line)
+        for engine in dropped:
+            result.engines[engine] = EngineResult(
+                error=f"{TIMED_OUT} after {budget:.0f}s (BENCH_CASE_TIMEOUT_S)"
+            )
+        if dropped and result.status == "OK":
+            result.status = "PARTIAL"
+            result.note = "; ".join(filter(None, [result.note, f"timed out: {', '.join(dropped)}"]))
+        results.append(result)
     print()
     return results

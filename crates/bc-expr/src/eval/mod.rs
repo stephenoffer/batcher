@@ -35,6 +35,7 @@ pub(crate) mod cast;
 pub(crate) mod cmp;
 pub(crate) mod coerce;
 mod dispatch;
+pub(crate) mod divmod;
 pub(crate) mod generate;
 pub(crate) mod geo;
 pub(crate) mod hash;

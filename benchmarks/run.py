@@ -291,7 +291,7 @@ def _run_dataset(benchmark: str, args: argparse.Namespace, engines: list) -> lis
         # identical table, which is how a board saved from one gets compared against a board
         # saved from the other.
         print(f"isolated {benchmark} (scale {args.scale}), one process per case")
-        results = run_isolated([c.name for c in cases])
+        results = run_isolated([c.name for c in cases], names)
         print(f"=== {benchmark} ({', '.join(names)}) ===")
         print_table(results, names)
         print()

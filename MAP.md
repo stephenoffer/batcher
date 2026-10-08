@@ -7,7 +7,7 @@
 
 **The index of what every file is for.** Grep this file before you search the tree: it answers *where does X live* and *where does new X go* without opening 690 modules. `CLAUDE.md` holds the invariants (the law); this holds the territory.
 
-Covering 1647 Python modules across 236 packages and 346 Rust files across 14 crates.
+Covering 1647 Python modules across 236 packages and 347 Rust files across 14 crates.
 
 ## How to use this map
 
@@ -1720,7 +1720,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `morsel.py` | 390 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
 | `scheduling.py` | 288 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
-| `spill_advice.py` | 479 | Whether a query goes out of core, and what shape its spilled state takes. |
+| `spill_advice.py` | 508 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 176 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem
@@ -3258,8 +3258,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `distinct_on_spill.rs` | 142 | Bounded-memory `DISTINCT ON` via grace partitioning. |
 | `error.rs` | 188 | The crate's error type: plan-interpretation failures, plus the expression and runtime errors it wraps from the crates below it. |
 | `join_par/asof_stream.rs` | 454 | A keyless ASOF join that does not fit: a merge over two out-of-core sorted streams. |
-| `join_par/mod.rs` | 731 | Parallel join strategies shared by the multi-core executor (`par`). |
-| `join_par/orient.rs` | 163 | Which side of a join to build on, once both sides' true sizes are known. |
+| `join_par/mod.rs` | 742 | Parallel join strategies shared by the multi-core executor (`par`). |
+| `join_par/orient.rs` | 183 | Which side of a join to build on, once both sides' true sizes are known. |
 | `join_par/probe_stream.rs` | 223 | Streaming a join's probe side past a build side that is already resident. |
 | `join_par/range_blocked.rs` | 169 | A range join whose right side does not fit: block-nested over chunks of both sides. |
 | `join_par/sideways.rs` | 243 | Restrict a join's build-side aggregate to the keys its (already materialized) probe side holds. |
@@ -3267,7 +3267,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `metrics.rs` | 387 | Per-operator execution metrics — the measure half of the adaptive loop. |
 | `ops/byte_sort.rs` | 715 | Stable sort permutation for a **byte-lexicographic** sort key: `Utf8`, `LargeUtf8`, `Binary`, `LargeBinary` and `FixedSizeBinary`. |
 | `ops/external_sort.rs` | 465 | Out-of-core sort: spill sorted runs and merge them with bounded fan-in. |
-| `ops/joins.rs` | 657 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
+| `ops/joins.rs` | 699 | Join per-batch primitives: equi (`join_batches`) and ASOF (`asof_join_batches`). |
 | `ops/materialize.rs` | 270 | Concatenating morsels back into one batch — the first step of every pipeline breaker (sort / join / asof / window). |
 | `ops/mixed_spill.rs` | 267 | Bounded out-of-core aggregation for a *mix* of value-list and constant-state aggregates in one `GROUP BY`. |
 | `ops/mod.rs` | 1899 | Per-batch / per-side operator primitives shared by the sequential reference executor (`crate::execute`) and the parallel executor (`crate::par`). |
@@ -3284,10 +3284,10 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `ops/sample_sort/lowcard.rs` | 197 | Rank-routing for a **single low-cardinality string sort key**. |
 | `ops/sample_sort/mod.rs` | 772 | Single-node parallel full sort by **sample-sort**. |
 | `ops/window_stream.rs` | 687 | Bounded-memory window execution for a partition that does not fit the envelope. |
-| `par.rs` | 3712 | The multi-core executor. |
+| `par.rs` | 3741 | The multi-core executor. |
 | `rusage.rs` | 192 | Reading the operating system's own account of what this process consumed. |
 | `spill_split.rs` | 118 | Re-splitting a grace bucket that did not fit — the shared skew guard. |
-| `stream/breaker.rs` | 634 | The breakers: operators that must see all of their input before they can emit any output. |
+| `stream/breaker.rs` | 663 | The breakers: operators that must see all of their input before they can emit any output. |
 | `stream/builds.rs` | 775 | Preparing a hash join's build side once, for every worker that will probe it. |
 | `stream/chunked/drive.rs` | 147 | The chunk-driven entry points: [`execute_chunked`] and its metered twin. |
 | `stream/chunked/mod.rs` | 742 | Stream the driving relation into the executor chunk by chunk, instead of all at once. |
@@ -3345,7 +3345,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `gather/fixed.rs` | 261 | Gathering a **fixed-width** column: one output slot per row, at a stride the type fixes. |
 | `gather/mod.rs` | 770 | Column gather (`take`) and multi-array `concat`, with fast paths for variable-length **byte** columns: `Utf8`, `LargeUtf8`, `Binary` and `LargeBinary`. |
 | `gather/spans.rs` | 136 | Copying a sequence of source byte spans into one output buffer, as few copies as possible. |
-| `join/asof.rs` | 539 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
+| `join/asof.rs` | 603 | ASOF (nearest-match) join: each left row matched to the right row whose `on` key is nearest in a direction within its `by` group. |
 | `join/build.rs` | 237 | Parallel hash-table build — shard the heads by hash so every core builds at once. |
 | `join/dense.rs` | 487 | Dense direct-map join heads — a perfect hash for a small-range integer build key. |
 | `join/key_bits.rs` | 145 | Exact key-range membership bitmap — the probe pre-filter for a mid-range `Int64` build key. |
@@ -3434,7 +3434,8 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/cmp/prim.rs` | 522 | `<integer or temporal column> <cmp> <literal>`, and a two-sided range over one column, a word of mask bits at a time. |
 | `eval/cmp/string.rs` | 409 | `<string column> <cmp> <string literal>` from an 8-byte big-endian prefix. |
 | `eval/coerce.rs` | 229 | Operand coercion — bringing two arrays to a type the arrow kernels will accept. |
-| `eval/dispatch.rs` | 661 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/dispatch.rs` | 667 | The `Expr::eval` dispatch — split out of `lib.rs` so the wire-contract enum definitions stay there and the (large) per-variant dispatch lives here. |
+| `eval/divmod.rs` | 90 | `<integer column> / <integer literal>` and `% <integer literal>` without a per-row check. |
 | `eval/generate.rs` | 83 | Series generation for `Expr::Sequence` (`sequence`/`range`). |
 | `eval/geo/build.rs` | 432 | The geometry-returning functions: constructors, transforms, derived shapes. |
 | `eval/geo/edge_tests.rs` | 276 | Row-local failure versus caller error, and the edge semantics fixed alongside it. |
@@ -3478,7 +3479,7 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | `eval/media/video/mod.rs` | 299 | Video evaluation for `Expr::Video` (the `.video` namespace). |
 | `eval/media/video/sample.rs` | 602 | Turning a clip into pixels: `frames`, `thumbnail`, and `frame_at`. |
 | `eval/mime.rs` | 230 | What a payload is, decided from its bytes — the one magic-number table. |
-| `eval/mod.rs` | 53 | Evaluation bodies for the scalar `Expr` variants. |
+| `eval/mod.rs` | 54 | Evaluation bodies for the scalar `Expr` variants. |
 | `eval/security/crypto.rs` | 101 | Keyed cryptographic primitives: HMAC-SHA-256 pseudonymization and AES-256-GCM-SIV column encryption. |
 | `eval/security/keyref.rs` | 50 | Resolving a crypto key *reference* to the key material, at evaluation time. |
 | `eval/security/mask.rs` | 104 | Character masking — the redaction primitive behind partial-disclosure policies ("show only the last four digits"). |
@@ -3540,11 +3541,11 @@ Crates in dependency order (dependents first). The `depends on` line is read fro
 | file | lines | what it is |
 |---|---|---|
 | `dtype_name.rs` | 226 | The cast dtype-*name* grammar — the one place a wire name becomes an Arrow type. |
-| `float_ident.rs` | 216 | The engine's one definition of **float identity**. |
+| `float_ident.rs` | 246 | The engine's one definition of **float identity**. |
 | `hardware.rs` | 423 | Host CPU capability detection for adaptive execution. |
 | `hash.rs` | 308 | The one hash whose value crosses a process boundary. |
 | `isa.rs` | 231 | The host's instruction-set capabilities, in full. |
-| `lib.rs` | 233 | `bc-arrow` — Arrow building blocks shared across the engine. |
+| `lib.rs` | 234 | `bc-arrow` — Arrow building blocks shared across the engine. |
 | `offset.rs` | 268 | Typed `key ± offset` arithmetic — the one place a temporal distance is applied. |
 | `page_cache.rs` | 69 | Telling the kernel how a spill file is about to be used. |
 | `placement.rs` | 143 | Which CPU a worker thread should run on. |
@@ -3613,7 +3614,7 @@ Native Rust format readers (Parquet over object storage; Avro OCF to Arrow).
 | `bloom.rs` | 166 | Bloom-filter pruning: skip a row group whose bloom proves an equality cannot match. |
 | `footer_stats.rs` | 566 | Aggregate Parquet footer statistics across many files, natively. |
 | `late.rs` | 404 | Late materialization: decode a row group's predicate columns first, evaluate the caller's own filter on them, and decode every other column only for the rows… |
-| `lib.rs` | 795 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
+| `lib.rs` | 796 | Native Rust format readers (Parquet over object storage; Avro OCF to Arrow). |
 | `mapped.rs` | 213 | Serve a local Parquet file's column chunks straight out of a shared memory map. |
 | `page_index.rs` | 287 | Page-level pruning: turn a pushed predicate into a `RowSelection` over one row group. |
 | `predicate.rs` | 328 | Row-group pruning from a pushed predicate's zone maps (footer statistics). |

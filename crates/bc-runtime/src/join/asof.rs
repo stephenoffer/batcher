@@ -6,6 +6,8 @@
 //! ASOFs (the distributed seam).
 
 use arrow::array::{Array, ArrayRef, UInt32Array};
+use arrow::buffer::NullBuffer;
+use arrow::datatypes::DataType;
 use arrow::row::{OwnedRow, RowConverter, SortField};
 use indexmap::IndexMap;
 
@@ -99,8 +101,9 @@ fn int_key(a: &ArrayRef) -> Option<std::borrow::Cow<'_, [i64]>> {
         DataType, Date32Type, Date64Type, Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType,
         TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType,
     };
+    use rayon::prelude::*;
     use std::borrow::Cow;
-    let widen = |v: &[i32]| Cow::Owned(v.iter().map(|&x| i64::from(x)).collect());
+    let widen = |v: &[i32]| Cow::Owned(v.par_iter().map(|&x| i64::from(x)).collect());
     Some(match a.data_type() {
         DataType::Int64 => Cow::Borrowed(a.as_primitive::<Int64Type>().values().as_ref()),
         DataType::Date64 => Cow::Borrowed(a.as_primitive::<Date64Type>().values().as_ref()),
@@ -125,6 +128,40 @@ fn int_key(a: &ArrayRef) -> Option<std::borrow::Cow<'_, [i64]>> {
     })
 }
 
+/// Whether [`asof_join_indices`] takes its parallel integer path for these key types and spec.
+///
+/// That path parallelizes inside one call, over the whole input, so a caller that would
+/// otherwise hash-partition both sides by `by` to get parallelism -- copying every column of
+/// both -- should hand it the whole input instead. Decided from types alone, before any data is
+/// touched; it is exactly the precondition the path itself checks.
+pub fn asof_is_whole_input(
+    left_on: &DataType,
+    right_on: &DataType,
+    left_by: &[DataType],
+    right_by: &[DataType],
+    spec: AsofSpec,
+) -> bool {
+    let int = |t: &DataType| {
+        matches!(
+            t,
+            DataType::Int64
+                | DataType::Int32
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Timestamp(_, _)
+        )
+    };
+    spec.tolerance.is_none()
+        && spec.direction != AsofDirection::Nearest
+        && left_on == right_on
+        && int(left_on)
+        && match (left_by, right_by) {
+            ([], []) => true,
+            ([l], [r]) => l == r && int(l),
+            _ => false,
+        }
+}
+
 /// [`asof_join_indices`] for the shape nearly every ASOF join has: an integer or temporal `on`
 /// key, at most one integer `by` key, a backward or forward match, no tolerance. `None` for any
 /// other shape, which takes the general path.
@@ -133,7 +170,8 @@ fn int_key(a: &ArrayRef) -> Option<std::borrow::Cow<'_, [i64]>> {
 /// row: a heap-allocated group key and an owned `on` row for every right row, a hash lookup
 /// and a key allocation for every left row, all on one thread. Polars joined 1M rows against
 /// 1M in 49 ms where that took 1,054 ms. Here the right side is one flat `(by, on, row)`
-/// array sorted once, and every left row is two binary searches into it, across the pool.
+/// array sorted once, the left side is put in the same order, and the two are merged across
+/// the pool.
 ///
 /// The result is the general path's, row for row. Sorting by `(by, on, row)` orders a group
 /// by `on` with ties in row order, which is exactly what the general path's *stable* sort of
@@ -146,24 +184,26 @@ fn asof_int_fast(
     right_by: &[ArrayRef],
     spec: AsofSpec,
 ) -> Option<JoinIndices> {
+    use arrow::buffer::BooleanBuffer;
     use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    if spec.tolerance.is_some() || spec.direction == AsofDirection::Nearest {
-        return None;
-    }
-    if left_on.data_type() != right_on.data_type() {
+    let types = |a: &[ArrayRef]| a.iter().map(|c| c.data_type().clone()).collect::<Vec<_>>();
+    if !asof_is_whole_input(
+        left_on.data_type(),
+        right_on.data_type(),
+        &types(left_by),
+        &types(right_by),
+        spec,
+    ) {
         return None;
     }
     let (lby, rby) = match (left_by, right_by) {
-        ([], []) => (None, None),
-        ([l], [r]) if l.data_type() == r.data_type() => {
-            (Some((l, int_key(l)?)), Some((r, int_key(r)?)))
-        }
-        _ => return None,
+        ([l], [r]) => (Some((l, int_key(l)?)), Some((r, int_key(r)?))),
+        _ => (None, None),
     };
     let (lon, ron) = (int_key(left_on)?, int_key(right_on)?);
-    let right = key_order(tuples(right_on, &ron, rby.as_ref()));
-    let entries = &right.rows;
+    let entries = &sorted_tuples(right_on, &ron, rby.as_ref());
     let exact = spec.allow_exact_matches;
     let backward = spec.direction == AsofDirection::Backward;
     // The general path's two boundaries, over `on` within one `by` group: `back` takes the
@@ -173,196 +213,220 @@ fn asof_int_fast(
         let at_or_before = if backward == exact { e.1 <= t } else { e.1 < t };
         e.0 < k || (e.0 == k && at_or_before)
     };
-    let pick = |g: &[(i64, i64, u32)], k: i64, t: i64| {
-        let p = g.partition_point(|e| passed(e, k, t));
-        if backward {
-            p.checked_sub(1).map(|q| g[q]).filter(|e| e.0 == k)
-        } else {
-            g.get(p).copied().filter(|e| e.0 == k)
-        }
-        .map(|e| e.2)
-    };
-    let right_idx: Vec<Option<u32>> = if let Some((lo, bounds)) = &right.groups {
-        // Dense keys: the counting sort already knows where every group starts, so a left row
-        // goes straight to its own group -- a hundred-odd entries -- and searches only that,
-        // with no sort of the left side at all.
-        let (l_on, l_by) = (
-            left_on.logical_nulls(),
-            lby.as_ref().and_then(|(a, _)| a.logical_nulls()),
-        );
-        (0..left_on.len())
-            .into_par_iter()
-            .map(|i| {
-                if l_on.as_ref().is_some_and(|n| n.is_null(i))
-                    || l_by.as_ref().is_some_and(|n| n.is_null(i))
-                {
-                    return None;
-                }
-                let k = lby.as_ref().map_or(0, |(_, v)| v[i]);
-                let g = usize::try_from(k.checked_sub(*lo)?).ok()?;
-                let (&start, &end) = (bounds.get(g)?, bounds.get(g + 1)?);
-                pick(&entries[start..end], k, lon[i])
-            })
-            .collect()
-    } else {
-        // Sparse keys: sort the left side on the same `(by, on)` order and merge, rather than
-        // binary-searching the whole right side once per left row -- at a million rows a
-        // probe's three global searches are ~60 cache misses each, which made the probe three
-        // quarters of the join. Each chunk of the sorted left finds its starting right
-        // position once and then walks both sides forward.
-        let probes = key_order(tuples(left_on, &lon, lby.as_ref())).rows;
-        let chunk = probes
-            .len()
-            .div_ceil(rayon::current_num_threads().max(1) * 4)
-            .max(4096);
-        let found: Vec<Vec<(u32, u32)>> = probes
-            .par_chunks(chunk)
-            .map(|part| {
-                let (k0, t0, _) = part[0];
-                let mut p = entries.partition_point(|e| passed(e, k0, t0));
-                let mut out = Vec::with_capacity(part.len());
-                for &(k, t, i) in part {
-                    while p < entries.len() && passed(&entries[p], k, t) {
-                        p += 1;
-                    }
-                    let at = if backward { p.checked_sub(1) } else { Some(p) };
-                    if let Some(e) = at.and_then(|q| entries.get(q)).filter(|e| e.0 == k) {
-                        out.push((i, e.2));
-                    }
-                }
-                out
-            })
-            .collect();
-        let mut right_idx = vec![None; left_on.len()];
-        for (i, j) in found.into_iter().flatten() {
-            right_idx[i as usize] = Some(j);
-        }
-        right_idx
-    };
+    // Sort the left side on the same `(by, on)` order and merge, rather than binary-searching
+    // the right side once per left row. A left side handed in `on` order -- the usual input --
+    // visits a different `by` group on almost every row, so a per-row search is a run of cache
+    // misses through a right side far larger than cache: 70% of a 6M x 5.5M join's CPU went to
+    // it. The counting sort in `sorted_tuples` puts the left side in group order in two linear
+    // passes (no comparisons when `on` is already ordered), and the merge then walks both sides
+    // forward. Each chunk of the sorted left finds its starting right position once.
     let n_left = u32::try_from(left_on.len()).ok()?;
+    // `NONE` marks an unmatched left row; a real right index never reaches it.
+    const NONE: u32 = u32::MAX;
+    if u32::try_from(right_on.len()).ok()? == NONE {
+        return None;
+    }
+    let probes = sorted_tuples(left_on, &lon, lby.as_ref());
+    let chunk = probes
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1) * 4)
+        .max(4096);
+    // Each left row appears in exactly one probe, so every slot is written at most once; the
+    // atomics only make the scattered parallel writes expressible without `unsafe`.
+    let slots: Vec<AtomicU32> = (0..n_left)
+        .into_par_iter()
+        .map(|_| AtomicU32::new(NONE))
+        .collect();
+    probes.par_chunks(chunk).for_each(|part| {
+        let (k0, t0, _) = part[0];
+        let mut p = entries.partition_point(|e| passed(e, k0, t0));
+        for &(k, t, i) in part {
+            while p < entries.len() && passed(&entries[p], k, t) {
+                p += 1;
+            }
+            let at = if backward { p.checked_sub(1) } else { Some(p) };
+            if let Some(e) = at.and_then(|q| entries.get(q)).filter(|e| e.0 == k) {
+                slots[i as usize].store(e.2, Ordering::Relaxed);
+            }
+        }
+    });
+    let mut right_idx: Vec<u32> = slots.into_par_iter().map(AtomicU32::into_inner).collect();
+    let valid = BooleanBuffer::collect_bool(right_idx.len(), |i| right_idx[i] != NONE);
+    let right = if valid.count_set_bits() < right_idx.len() {
+        // A null slot's value is never read, but zero keeps it a valid index regardless.
+        right_idx
+            .par_iter_mut()
+            .filter(|j| **j == NONE)
+            .for_each(|j| *j = 0);
+        UInt32Array::new(right_idx.into(), Some(NullBuffer::new(valid)))
+    } else {
+        UInt32Array::from(right_idx)
+    };
     Some(JoinIndices {
         left: UInt32Array::from((0..n_left).collect::<Vec<_>>()),
-        right: UInt32Array::from(right_idx),
+        right,
     })
 }
 
-/// One side's `(by, on, row)` tuples in row order, skipping a row whose `on` or `by` is null.
+/// One side's `(by, on, row)` tuples in row order, skipping a row `mask` marks null.
 ///
-/// Built in parallel from the decoded slices, and a column with no nulls is never asked about
+/// Built in parallel from the decoded slices, and a side with no nulls is never asked about
 /// validity: a per-row `is_valid` through `ArrayRef` was most of the 34 ms this took serially
 /// over a million rows.
-fn tuples(
+fn tuples(on_v: &[i64], by_v: Option<&[i64]>, mask: Option<&NullBuffer>) -> Vec<(i64, i64, u32)> {
+    use rayon::prelude::*;
+
+    let row = |i: usize| (by_v.map_or(0, |v| v[i]), on_v[i], i as u32);
+    match mask {
+        None => (0..on_v.len()).into_par_iter().map(row).collect(),
+        Some(m) => (0..on_v.len())
+            .into_par_iter()
+            .filter(|&i| m.is_valid(i))
+            .map(row)
+            .collect(),
+    }
+}
+
+/// One side's `(by, on, row)` tuples, a row whose `on` or `by` is null left out, sorted on the
+/// whole tuple -- without a comparison sort where the keys allow it.
+///
+/// Two sorts of a million 24-byte tuples were half of the join once the probe became a merge.
+/// When the `by` keys span a range no wider than a few times the row count, a stable counting
+/// sort ([`counting_sort`]) groups them in linear passes, and because it is stable each group
+/// keeps row order: so when `on` is already non-decreasing -- the input an as-of join is
+/// usually handed -- every group is already ordered on `(on, row)` and nothing is compared at
+/// all. Otherwise only the groups are sorted, each small and independent. Wide or sparse keys
+/// take the plain sort.
+fn sorted_tuples(
     on: &ArrayRef,
     on_v: &[i64],
     by: Option<&(&ArrayRef, std::borrow::Cow<'_, [i64]>)>,
 ) -> Vec<(i64, i64, u32)> {
     use rayon::prelude::*;
 
-    let on_nulls = on.logical_nulls();
     let by_nulls = by.and_then(|(a, _)| a.logical_nulls());
-    let by_v = by.map(|(_, v)| v.as_ref());
-    let kept = |i: usize| {
-        on_nulls.as_ref().is_none_or(|n| n.is_valid(i))
-            && by_nulls.as_ref().is_none_or(|n| n.is_valid(i))
+    let mask = NullBuffer::union(on.logical_nulls().as_ref(), by_nulls.as_ref());
+    let mask = mask.as_ref();
+    let ordered_within_groups = |rows: &[(i64, i64, u32)]| {
+        rows.par_windows(2)
+            .all(|w| w[0].0 != w[1].0 || w[0].1 <= w[1].1)
     };
-    let row = |i: usize| (by_v.map_or(0, |v| v[i]), on_v[i], i as u32);
-    if on_nulls.is_none() && by_nulls.is_none() {
-        (0..on_v.len()).into_par_iter().map(row).collect()
-    } else {
-        (0..on_v.len())
-            .into_par_iter()
-            .filter(|&i| kept(i))
-            .map(row)
-            .collect()
-    }
-}
-
-/// `rows` (`(by, on, row)`, in row order) sorted on the whole tuple, without a comparison
-/// sort where the keys allow it.
-///
-/// Two sorts of a million 24-byte tuples were half of the join once the probe became a merge.
-/// When the `by` keys span a range no wider than a few times the row count, a stable counting
-/// sort groups them in two linear passes, and because it is stable each group keeps row order:
-/// so when `on` is already non-decreasing -- the input an as-of join is usually handed -- every
-/// group is already ordered on `(on, row)` and nothing is compared at all. Otherwise only the
-/// groups are sorted, each small and independent. Wide or sparse keys take the plain sort.
-struct Keyed {
-    /// The tuples, sorted on `(by, on, row)`.
-    rows: Vec<(i64, i64, u32)>,
-    /// For dense keys, the smallest key and each key's start in `rows` (one past the last
-    /// key's end closing the list), so group `k` is `rows[b[k - lo]..b[k - lo + 1]]`.
-    groups: Option<(i64, Vec<usize>)>,
-}
-
-fn key_order(mut rows: Vec<(i64, i64, u32)>) -> Keyed {
-    use rayon::prelude::*;
-
-    let (Some(lo), Some(hi)) = (
-        rows.par_iter().map(|r| r.0).min(),
-        rows.par_iter().map(|r| r.0).max(),
-    ) else {
-        return Keyed { rows, groups: None };
+    let Some(by_v) = by.map(|(_, v)| v.as_ref()) else {
+        let mut rows = tuples(on_v, None, mask);
+        if !ordered_within_groups(&rows) {
+            rows.par_sort_unstable();
+        }
+        return rows;
+    };
+    let kept = |i: &usize| mask.is_none_or(|m| m.is_valid(*i));
+    let Some((lo, hi)) = (0..by_v.len())
+        .into_par_iter()
+        .filter(kept)
+        .map(|i| (by_v[i], by_v[i]))
+        .reduce_with(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+    else {
+        return Vec::new();
     };
     let span = hi.abs_diff(lo);
-    if span > (rows.len() as u64).saturating_mul(4).max(1 << 16) {
+    if span > (by_v.len() as u64).saturating_mul(4).max(1 << 16) {
+        let mut rows = tuples(on_v, Some(by_v), mask);
         rows.par_sort_unstable();
-        return Keyed { rows, groups: None };
+        return rows;
     }
-    let mut starts = vec![0usize; span as usize + 2];
-    for r in &rows {
-        starts[(r.0.abs_diff(lo)) as usize + 1] += 1;
+    let mut rows = counting_sort(on_v, by_v, lo, span as usize + 1, mask);
+    if !ordered_within_groups(&rows) {
+        rows.par_chunk_by_mut(|a, b| a.0 == b.0)
+            .for_each(|g| g.sort_unstable());
     }
-    for g in 1..starts.len() {
-        starts[g] += starts[g - 1];
+    rows
+}
+
+/// The output buffer of [`counting_sort`], shared by its parallel scatter. A method rather than
+/// a public field, so a closure captures the whole wrapper (which is `Send`/`Sync`) and not the
+/// bare pointer inside it.
+struct ScatterTo(*mut (i64, i64, u32));
+// SAFETY: see `counting_sort` -- writes through the pointer never alias across threads.
+unsafe impl Send for ScatterTo {}
+unsafe impl Sync for ScatterTo {}
+impl ScatterTo {
+    fn at(&self, pos: usize) -> *mut (i64, i64, u32) {
+        self.0.wrapping_add(pos)
     }
-    let bounds = starts;
-    let mut out = vec![(0, 0, 0); rows.len()];
-    // The scatter in parallel and still stable: cut the buckets into contiguous ranges of about
-    // equal row count, so each range owns a disjoint slice of `out`, and let each range's thread
-    // read every row in order and place only its own. Each thread re-reads the input, but that
-    // is a sequential scan, where the serial scatter's cost was its random writes.
-    let n_buckets = bounds.len() - 1;
-    let threads = rayon::current_num_threads().clamp(1, 16);
-    let mut cuts: Vec<usize> = (0..=threads)
-        .map(|t| {
-            bounds
-                .partition_point(|&b| b < rows.len() * t / threads)
-                .min(n_buckets)
+}
+
+/// A stable parallel counting sort of the kept rows on `by - lo` (`width` buckets), emitting
+/// `(by, on, row)` straight from the decoded columns.
+///
+/// The textbook parallel form: each contiguous row range counts its own rows per bucket, an
+/// exclusive prefix sum over `(bucket, range)` reserves every range a disjoint slice of every
+/// bucket, and each range then writes its rows into its slices in row order -- so every bucket
+/// holds its rows in row order, exactly as a serial stable scatter would. That is two reads of
+/// the key column and one write of each tuple. The version it replaced first materialized the
+/// tuples, split them by key range into fresh vectors, and counted and scattered those again:
+/// about 45 ms a side for six million rows on sixteen cores, a third of the whole join.
+///
+/// Per-range counts cost `ranges x width` counters, so the range count is capped to keep them
+/// within about two per row; at the widest key span the sort allows that is a single range.
+fn counting_sort(
+    on_v: &[i64],
+    by_v: &[i64],
+    lo: i64,
+    width: usize,
+    mask: Option<&NullBuffer>,
+) -> Vec<(i64, i64, u32)> {
+    use rayon::prelude::*;
+
+    let n = by_v.len();
+    let kept = |i: usize| mask.is_none_or(|m| m.is_valid(i));
+    let bucket = |i: usize| by_v[i].abs_diff(lo) as usize;
+    let n_ranges = rayon::current_num_threads()
+        .min((2 * n / width).max(1))
+        .min(n.div_ceil(1 << 14))
+        .max(1);
+    let step = n.div_ceil(n_ranges).max(1);
+    let ranges: Vec<std::ops::Range<usize>> =
+        (0..n).step_by(step).map(|s| s..(s + step).min(n)).collect();
+    let mut cursors: Vec<Vec<u32>> = ranges
+        .par_iter()
+        .map(|r| {
+            let mut counts = vec![0u32; width];
+            for i in r.clone().filter(|&i| kept(i)) {
+                counts[bucket(i)] += 1;
+            }
+            counts
         })
         .collect();
-    cuts[threads] = n_buckets;
-    cuts.dedup();
-    let mut parts = Vec::with_capacity(cuts.len());
-    let mut rest = out.as_mut_slice();
-    for w in cuts.windows(2) {
-        let (part, tail) = rest.split_at_mut(bounds[w[1]] - bounds[w[0]]);
-        parts.push((part, w[0], w[1]));
-        rest = tail;
+    // Exclusive prefix sum, bucket-major and range-minor: range `c`'s rows of bucket `g` land
+    // after every earlier range's, which is what keeps the scatter stable. Row indices fit
+    // `u32` (the caller's contract), so the running total does too.
+    let mut total = 0u32;
+    for g in 0..width {
+        for counts in &mut cursors {
+            let c = counts[g];
+            counts[g] = total;
+            total += c;
+        }
     }
-    parts.into_par_iter().for_each(|(part, a, b)| {
-        let mut next: Vec<usize> = bounds[a..b].iter().map(|&s| s - bounds[a]).collect();
-        for &r in &rows {
-            let g = r.0.abs_diff(lo) as usize;
-            if (a..b).contains(&g) {
-                part[next[g - a]] = r;
-                next[g - a] += 1;
+    let total = total as usize;
+    let mut out: Vec<(i64, i64, u32)> = Vec::with_capacity(total);
+    let dst = ScatterTo(out.as_mut_ptr());
+    ranges
+        .into_par_iter()
+        .zip(cursors.into_par_iter())
+        .for_each(|(r, mut next)| {
+            for i in r.filter(|&i| kept(i)) {
+                let g = bucket(i);
+                // SAFETY: `next[g]` walks the slice the prefix sum reserved for this range's
+                // rows of bucket `g`, which no other range or bucket addresses and which lies
+                // below `total`, the capacity of `out`. Every reserved slot is written exactly
+                // once, because this pass visits exactly the rows the counting pass counted.
+                unsafe { dst.at(next[g] as usize).write((by_v[i], on_v[i], i as u32)) };
+                next[g] += 1;
             }
-        }
-    });
-    if !rows.windows(2).all(|w| w[0].1 <= w[1].1) {
-        let mut groups = Vec::with_capacity(bounds.len());
-        let mut rest = out.as_mut_slice();
-        for w in bounds.windows(2) {
-            let (g, tail) = rest.split_at_mut(w[1] - w[0]);
-            groups.push(g);
-            rest = tail;
-        }
-        groups.into_par_iter().for_each(|g| g.sort_unstable());
-    }
-    Keyed {
-        rows: out,
-        groups: Some((lo, bounds)),
-    }
+        });
+    // SAFETY: the scatter initialized every one of the `total` slots.
+    unsafe { out.set_len(total) };
+    out
 }
 
 /// [`asof_join_indices`] over arrow row encodings: any key type, every direction, tolerances.
@@ -909,7 +973,7 @@ mod tests {
 
     /// Shapes the fast path does not take go to the general path untouched.
     #[test]
-    fn key_order_matches_a_plain_sort_on_every_route() {
+    fn sorted_tuples_matches_a_plain_sort_on_every_route() {
         let ordered: Vec<(i64, i64, u32)> = (0..500u32)
             .map(|i| (i64::from(i % 7) - 3, i64::from(i / 3), i))
             .collect();
@@ -921,10 +985,64 @@ mod tests {
             .iter()
             .map(|&(k, t, i)| (k * (1 << 40), t, i))
             .collect();
-        for rows in [ordered, unordered, sparse, vec![]] {
-            let mut want = rows.clone();
+        // Large enough to split into several row ranges, ordered and not; a single key; keys at
+        // the top edge of `i64`.
+        let big: Vec<_> = (0..200_000u32)
+            .map(|i| (i64::from(i % 997) * 3, i64::from(i / 7), i))
+            .collect();
+        let big_unordered: Vec<_> = (0..200_000u32)
+            .map(|i| (i64::from(i % 997) * 3, i64::from((i * 7919) % 1000), i))
+            .collect();
+        let one_key: Vec<_> = (0..50_000u32)
+            .map(|i| (5, i64::from((i * 31) % 777), i))
+            .collect();
+        let edges: Vec<_> = (0..5_000u32)
+            .map(|i| (i64::MAX - i64::from(i % 3), i64::from(i / 2), i))
+            .collect();
+        let cases = [
+            ordered,
+            unordered,
+            sparse,
+            big,
+            big_unordered,
+            one_key,
+            edges,
+            vec![],
+        ];
+        for (c, rows) in cases.into_iter().enumerate() {
+            // Every third row of the larger cases gets a null `by` or `on`, which must drop it.
+            let null_at = |i: usize, m: usize| c % 2 == 1 && i % 3 == m;
+            let by: ArrayRef = i64s(
+                rows.iter()
+                    .enumerate()
+                    .map(|(i, r)| (!null_at(i, 0)).then_some(r.0))
+                    .collect(),
+            );
+            let on: ArrayRef = i64s(
+                rows.iter()
+                    .enumerate()
+                    .map(|(i, r)| (!null_at(i, 1)).then_some(r.1))
+                    .collect(),
+            );
+            let mut want: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| !null_at(i, 0) && !null_at(i, 1))
+                .map(|(_, r)| *r)
+                .collect();
             want.sort_unstable();
-            assert_eq!(key_order(rows).rows, want);
+            let (on_v, by_v) = (int_key(&on).unwrap(), int_key(&by).unwrap());
+            let got = sorted_tuples(&on, &on_v, Some(&(&by, by_v)));
+            assert_eq!(got, want, "case {c}");
+            // Keyless: every row is one group.
+            let mut want_keyless: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| !null_at(i, 1))
+                .map(|(_, r)| (0, r.1, r.2))
+                .collect();
+            want_keyless.sort_unstable();
+            assert_eq!(sorted_tuples(&on, &on_v, None), want_keyless, "case {c}");
         }
     }
 
