@@ -91,6 +91,7 @@ def eval_binary(ir, df, be, eval_expr):
                 # The engine casts the literal with Arrow, which *nulls* what it cannot parse —
                 # so the comparison is against a null and every row is unknown.
                 return be.null_column(df, "bool")
+        left, right = _day_literal_as_midnight(left, right)
     if op in COMPARISON_OPS and (be.is_float(left) or be.is_float(right)):
         return compare(op, be.column(left, df), be.column(right, df))
     if op in ("and", "or"):
@@ -291,6 +292,28 @@ def _temporal_literal(left, right, be):
         parsed = _parse_temporal(literal, target)
         return (column, parsed) if not flipped else (parsed, column)
     return None
+
+
+def _day_literal_as_midnight(left, right):
+    """`(left, right)` with a `date` literal compared against a datetime64 column made a midnight.
+
+    A DATE column has no calendar-day dtype inside either library. On the host it stays an
+    Arrow-backed `date32`, which compares with a `datetime.date` directly; on the device cuDF
+    holds it as `datetime64[s]`, and cuDF 26.08 refuses the comparison outright --
+    `TypeError: Invalid comparison between dtype=datetime64[s] and date` -- so a TPC-H fan-out
+    filtering a date column against a date literal failed on the device and the query fell
+    back to the CPU engine (job c5g-gpu10, 4x A10G, TPC-H sf10). A date literal *is* that day's
+    midnight in this representation, so comparing against the midnight is the same comparison,
+    and a column that is not datetime64 is left alone.
+    """
+    import datetime as _dt
+
+    def as_midnight(column, literal):
+        if type(literal) is _dt.date and getattr(getattr(column, "dtype", None), "kind", "") == "M":
+            return _dt.datetime.combine(literal, _dt.time())
+        return literal
+
+    return as_midnight(right, left), as_midnight(left, right)
 
 
 def _parse_temporal(literal: str, target):

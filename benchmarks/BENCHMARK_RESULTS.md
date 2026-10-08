@@ -84,6 +84,22 @@ The same suite timed without verification (1 cold + best of 3): CPU 16.28 s, GPU
 (1.28x), `backend="auto"` 10.81 s (1.51x). Per query on the device: q22 29.8x, q9 4.4x, q21 3.7x,
 q18 3.5x, q6 2.8x, q2 2.3x, q11 2.2x, q17 1.9x, q1 1.2x, q19 1.0x, q16 0.98x.
 
+**Then a date literal against a device DATE column.** The decline log for those eleven
+(job `c5g-gpu10`) showed the fan-outs raising `TypeError: Invalid comparison between
+dtype=datetime64[s] and date`: cuDF keeps a DATE column as `datetime64[s]` and 26.08 refuses a
+`datetime.date` operand. `1e2df2c0` compares such a literal as that day's midnight. Recorded
+`gpu_shadow_verify=True` run, job `c5g-gpu12`, code `6293043f` (main `9ade4ecb` plus that
+commit), same fleet:
+
+    reached a device     17 of 22  (q1 q2 q5 q6 q7 q8 q9 q10 q11 q12 q14 q16 q17 q18 q19 q21 q22)
+    matched the CPU      17 of 17
+    total cpu / gpu s    18.58 / 12.64  (1.47x)
+
+Timed without verification: CPU 16.53 s, GPU 9.80 s (1.69x), `backend="auto"` 9.76 s (1.69x),
+per-query speedup 0.91x to 30.8x, median 2.45x. Still on the CPU: q3, whose device result is
+refused by the schema contract (`o_orderdate` came back `timestamp[s]`, where the engine declares
+`date32[day]`), and q4, q13, q15 and q20, which still report `untranslatable shape`.
+
 The other eleven queries are reported as `untranslatable shape`. The driver's rehearsal accepts
 all 22 plans (sf1, zero-row frames, run on a CPU node), so for these queries the label describes
 the fan-out declining. It does not mean the plan failed to translate. Open.

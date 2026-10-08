@@ -412,6 +412,40 @@ def test_typed_literal_survives_the_wire_form(be):
     _assert_matches(got, exp, be)
 
 
+@pytest.mark.parametrize("op", ["lt", "le", "gt", "ge", "eq", "ne"])
+def test_a_date_literal_compares_with_a_datetime64_column(be, op):
+    """The device's form of a DATE column: cuDF holds it as `datetime64[s]`, not `date32`.
+
+    cuDF 26.08 raises `Invalid comparison between dtype=datetime64[s] and date` for a
+    `datetime.date` operand (as pandas does for an ordering comparison), so every TPC-H fan-out
+    with a date filter fell back to the CPU engine on a real device while the host suite --
+    which keeps the column `date32` -- never saw it. Held here on pandas by giving the frame the
+    device's dtype, and checked against the plain datetime comparison it must equal.
+    """
+    import operator
+
+    import pandas as pd
+
+    from batcher.core.gpu_plan.exprs import eval_expr
+
+    days = pd.Series(
+        pd.to_datetime(["2020-01-01", "2020-06-01", "2021-06-01"]).astype("datetime64[s]")
+    )
+    df = pd.DataFrame({"d": days})
+    epoch_days = (dt.date(2020, 6, 1) - dt.date(1970, 1, 1)).days
+    ir = {
+        "e": "binary",
+        "op": op,
+        "left": {"e": "col", "name": "d"},
+        "right": {"e": "lit", "value": {"date": epoch_days}},
+    }
+    got = eval_expr(ir, df, be)
+    fn = {"lt": operator.lt, "le": operator.le, "gt": operator.gt, "ge": operator.ge}.get(op)
+    fn = fn or {"eq": operator.eq, "ne": operator.ne}[op]
+    expected = fn(days, pd.Timestamp(2020, 6, 1))
+    assert list(got) == list(expected)
+
+
 def test_nested_case_matches_cpu_engine(be):
     got, exp = _run(
         lambda ds: ds.select(

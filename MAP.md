@@ -1812,7 +1812,7 @@ The translator's *named* vocabularies, one module per family — package façade
 |---|---|---|
 | `dates.py` | 149 | What the engine types as a calendar day, and how a temporal value is built from numbers. |
 | `lists.py` | 415 | List and vector expressions, built from the two primitives both dataframe libraries have. |
-| `operators.py` | 312 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
+| `operators.py` | 335 | The operators: arithmetic, comparison, the bit family, and the three the engine redefines. |
 | `regex.py` | 241 | The regular-expression functions, for the patterns three regex engines agree on. |
 | `strings.py` | 237 | The string function family — one entry per named function the engine ships. |
 

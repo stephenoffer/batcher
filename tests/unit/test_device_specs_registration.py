@@ -38,7 +38,14 @@ def _restore_table():
     resolve_device_name.cache_clear()
 
 
-def _spec(name: str = "acme-x9", **overrides) -> DeviceSpec:
+# Not "ACME_X9": the GPU-fleet docs page registers that part in its executed example, and
+# `tests/docs/test_doc_examples.py` runs the page in the same process -- under xdist, the same
+# worker -- so the "unknown until registered" premise was false whenever the page ran first
+# (4 failures on gate c5g-gate-m2). A name no page uses keeps the premise this file's own.
+_PART = "ACME_UNIT_X9"
+
+
+def _spec(name: str = "acme-unit-x9", **overrides) -> DeviceSpec:
     fields = {
         "name": name,
         "vendor": "acme",
@@ -58,14 +65,14 @@ def _spec(name: str = "acme-x9", **overrides) -> DeviceSpec:
 
 
 def test_an_unknown_part_reports_unknown_until_it_is_registered():
-    assert device_spec("ACME_X9") is None
-    assert device_tdp_watts("ACME_X9") == 0.0
-    stored = register_device_spec(_spec(), aliases=("X9",))
-    assert stored.name == "ACME_X9"
-    assert device_tdp_watts("ACME_X9") == 450.0
-    assert device_memory_bandwidth_gbps("X9") == 2000.0
+    assert device_spec(_PART) is None
+    assert device_tdp_watts(_PART) == 0.0
+    stored = register_device_spec(_spec(), aliases=("UX9",))
+    assert stored.name == _PART
+    assert device_tdp_watts(_PART) == 450.0
+    assert device_memory_bandwidth_gbps("UX9") == 2000.0
     # The driver-name resolver sees the new row too, not only exact lookups.
-    assert resolve_device_name("Acme X9 64GB") == "ACME_X9"
+    assert resolve_device_name("Acme Unit X9 64GB") == _PART
 
 
 def test_a_measured_row_replaces_the_nameplate_one():
@@ -79,4 +86,4 @@ def test_a_measured_row_replaces_the_nameplate_one():
 def test_an_invalid_row_is_refused(bad):
     with pytest.raises(ConfigError):
         register_device_spec(_spec(**bad))
-    assert device_spec("ACME_X9") is None
+    assert device_spec(_PART) is None
