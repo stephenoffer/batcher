@@ -85,6 +85,10 @@ _ROUTE_ARMS: tuple[str, ...] = ("one_shot", "staged")
 # run of the losing arm. (The floor is compared against a *discounted* count, so 2 would not
 # even be reached by two observations: `_ARM_DISCOUNT` makes them sum to 1.975.)
 _MIN_ROUTE_TOTAL = 1
+# How many times slower than another route's measured mean a route's cold sample must be for it
+# to count rather than be discarded (`record_adaptive_route`). Measured cold penalties for the
+# second route tried were 1.06-1.2x, so 3x leaves a wide margin either side.
+_DECISIVE_COLD_RATIO = 3.0
 
 # UCB exploration weight (dimensionless — the radius is scaled by the measured reward spread)
 # and the warm-up floor below which the bandit defers to the cost model.
@@ -406,6 +410,16 @@ def record_adaptive_route(
     arms were tried in rather than the routes themselves. Discarding it symmetrically costs one
     extra run per arm and makes the first *recorded* number a steady-state one.
 
+    **Except when it is decisive.** The 25x is the cost of a shape's *first execution*, which
+    only the first arm tried pays; the second arm is explored after the first has warmed the
+    sketches, the plan and the bandits beneath it, so its cold run carries only its own plan
+    derivation. Measured on TPC-DS at sf10, a staged cold run was 1.06x its warm successor on
+    q72 (7,177 vs 6,756 ms) and 1.2x on q4 (4,717 vs 3,946 ms) -- and both were 10-20x the
+    one-shot route's 0.35 and 0.6 s. Discarding such a sample buys nothing: no cold penalty in
+    that range could reverse the ranking, and the price was a second multi-second run of the
+    losing route. So a cold sample more than `_DECISIVE_COLD_RATIO` times the other arm's
+    measured mean is recorded, and staging is tried once rather than twice.
+
     Args:
         hub: The metadata hub to record into; `None` is a no-op.
         signature: The plan signature — the bandit key.
@@ -419,11 +433,24 @@ def record_adaptive_route(
         if not spent.get(route):
             spent[route] = 1
             hub.put_keyed_param(scoped(_NS_ROUTE_COLD), signature, spent)
-            return
+            if not _decisively_slower(hub, signature, route, wall_ms):
+                return
     except Exception as exc:  # pragma: no cover - learning must never break a query
         note_suppressed("kyber", "read the route cold-sample marker", exc)
         return
     record_arm(hub, _NS_ROUTE, signature, route, wall_ms, invalidates_plans=False)
+
+
+def _decisively_slower(hub: MetadataHub, signature: str, route: str, wall_ms: float) -> bool:
+    """Whether a cold `route` sample loses to another measured route by more than any cold cost."""
+    stats = hub.get_keyed_param(scoped(_NS_ROUTE), signature) or {}
+    return any(
+        isinstance(s, dict)
+        and float(s.get("n", 0.0)) > 0.0
+        and 0.0 < float(s.get("mean", 0.0)) * _DECISIVE_COLD_RATIO < wall_ms
+        for arm, s in stats.items()
+        if arm != route
+    )
 
 
 def learned_adaptive_route(hub: MetadataHub | None, signature: str) -> str | None:
