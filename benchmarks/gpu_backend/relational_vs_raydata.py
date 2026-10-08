@@ -190,6 +190,21 @@ def _time(fn, *a) -> tuple[dict, float]:
     return out, time.perf_counter() - t
 
 
+#: Warm repeats after each arm's first call. One cold call per arm used to be the whole
+#: measurement, so the device arm's figure was mostly the first GPU task's start-up (a cuDF
+#: import and an RMM pool per worker, 3.3 s on a T4) -- 14.6 s against 1.7 s for the CPU
+#: engine on 4x A10G, where the arm after it, warm, answered in 81 ms. Both are real numbers
+#: and they answer different questions, so both are printed.
+_WARM_RUNS = int(os.environ.get("BENCH_RR_RUNS", "3"))
+
+
+def _cold_and_warm(fn, *a) -> tuple[dict, float, float]:
+    """`(result, first-call seconds, best of the warm repeats)`; the result is the first's."""
+    out, cold = _time(fn, *a)
+    warm = min((_time(fn, *a)[1] for _ in range(_WARM_RUNS)), default=cold)
+    return out, cold, warm
+
+
 def _agree(ref: dict, other: dict) -> bool:
     if other is None or len(ref) != len(other):
         return False
@@ -211,9 +226,10 @@ def main() -> int:
     path = _ensure_data()
     print(f"\nN={_N / 1e6:.0f}M rows  groups={_GROUPS}  files={_FILES}\n")
 
-    # Correctness reference: Batcher CPU.
-    ref, cpu_s = _time(_batcher, path, "cpu")
-    print(f"{'batcher cpu':22s} {cpu_s * 1000:8.0f} ms   (reference)")
+    # Correctness reference: Batcher CPU. Ratios are against its warm best.
+    ref, cpu_cold, cpu_s = _cold_and_warm(_batcher, path, "cpu")
+    print(f"{'arm':22s} {'cold ms':>8s} {'warm ms':>8s}")
+    print(f"{'batcher cpu':22s} {cpu_cold * 1000:8.0f} {cpu_s * 1000:8.0f}   (reference)")
 
     results = []
     for name, fn, args in [
@@ -223,13 +239,13 @@ def main() -> int:
         ("ray data cpu", _raydata_cpu, (path,)),
     ]:
         try:
-            out, secs = _time(fn, *args)
+            out, cold, secs = _cold_and_warm(fn, *args)
             ok = _agree(ref, out)
             results.append((name, secs, ok))
             ratio = cpu_s / secs if secs else 0.0
             print(
-                f"{name:22s} {secs * 1000:8.0f} ms   {ratio:5.2f}x vs batcher-cpu   "
-                f"[{'OK' if ok else 'MISMATCH'}]"
+                f"{name:22s} {cold * 1000:8.0f} {secs * 1000:8.0f}   {ratio:5.2f}x vs "
+                f"batcher-cpu (warm)   [{'OK' if ok else 'MISMATCH'}]"
             )
         except Exception as e:
             print(f"{name:22s} FAILED: {type(e).__name__}: {str(e)[:80]}")
