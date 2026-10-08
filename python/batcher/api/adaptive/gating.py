@@ -10,11 +10,15 @@ means the gate stays pure and unit-testable without executing a query.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
+
 from batcher._internal.logging import note_suppressed
 from batcher.api.adaptive.plan_surgery import BREAKERS, joins, walk
 from batcher.api.source_stats import build_estimator
 from batcher.io.source import Source
+from batcher.plan.ids import OpId
 from batcher.plan.logical import LogicalPlan, Scan, is_streamable
+from batcher.plan.physical import PhysicalPlan
 from batcher.plan.stats import Provenance
 
 __all__ = ["aligned_claims", "record_adaptive_route", "resolve_adaptive"]
@@ -67,6 +71,7 @@ def resolve_adaptive(
     star/snowflake query), which used to raise `PlanError`. There staging is not an
     optimization but the only distributed path. Explicit ``adaptive=False`` still wins.
     """
+    _ROUTED.set(None)
     if adaptive != "auto":
         return bool(adaptive)
     if distributed:
@@ -445,6 +450,10 @@ def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:
     plan_joins = joins(plan)
     if not plan_joins:
         return False
+    routed = _routing_key(plan, sources, hub)
+    _ROUTED.set(routed)
+    if _ran_and_held_up(routed, hub):
+        return False
     # The estimator half is memoized on what it reads, as `_input_size` is: it built an
     # estimator and sized every join operand on each execution of the same plan, ~5 ms of a
     # 25 ms JOB query to reach the answer the previous run reached. The q-error half is not:
@@ -460,6 +469,125 @@ def _adaptive_would_help(plan: LogicalPlan, sources: list[Source], hub) -> bool:
             while len(_WOULD_HELP) > _INPUT_SIZES_MAX:
                 _WOULD_HELP.pop(next(iter(_WOULD_HELP)))
     return any(not _estimate_has_held_up(operand, hub) for operand in unsized)
+
+
+# Per routed plan, `(signature, planned rows)` for each stageable join operand its last one-shot
+# run had to guess (`note_one_shot_ops`), bounded like `_INPUT_SIZES`.
+_RAN_GUESSED: dict[str, tuple[tuple[str, float], ...]] = {}
+# The routed plan's key for the query in flight. The plan the router sees is not the plan the
+# one-shot run executes (common-subplan reuse rewrites it in between), so the key is carried
+# from the one to the other rather than recomputed.
+_ROUTED: ContextVar[str | None] = ContextVar("batcher_routed_plan", default=None)
+
+
+def _routing_key(plan: LogicalPlan, sources: list[Source], hub) -> str | None:
+    """The routed plan's identity: its content over these sources, this config and this hub.
+
+    The plan memo's key without the learned fields (`kyber.plan_cache.cache_key`), so the same
+    query over other data, or under another config, does not inherit this one's record. `None`
+    for a plan keyed by object identity (`map_batches`), whose recycled `id()` could match.
+    """
+    from batcher.config import active_config
+    from batcher.core.udf import has_map_batches
+    from batcher.kyber import plan_cache
+
+    if has_map_batches(plan):
+        return None
+    try:
+        return plan_cache.cache_key(
+            plan.content_key(), sources, active_config(), hub, kind="route", learned=False
+        )
+    except Exception:  # an unkeyable plan has no remembered run
+        return None
+
+
+def note_one_shot_ops(phys: PhysicalPlan) -> None:
+    """Record which stageable join operands a one-shot run's executed plan had to guess.
+
+    Read off the executed plan's own annotations -- an operand of a join that a breaker
+    produces, whose estimate is a default guess -- so it costs a walk of the operator list.
+    Each is kept with the row count the plan was built on, under the signature Core reports
+    that operator's measured rows by. Recorded under the plan the router asked about for this
+    query, and only when it asked; a materialized common subplan closes its own run first and
+    the outer query last, so the outer plan's record is the one kept.
+
+    Args:
+        phys: The physical plan the run executed.
+    """
+    key = _ROUTED.get()
+    if key is None:
+        return
+    by_id = {op.op_id: op for op in phys.ops}
+    breaker_below: dict[OpId, bool] = {}
+
+    def produced_by_breaker(op_id: OpId) -> bool:
+        # The executed plan's form of `is_streamable`: an operand is one a stage boundary can
+        # measure when anything at or beneath it materializes.
+        if op_id not in breaker_below:
+            op = by_id.get(op_id)
+            breaker_below[op_id] = op is not None and (
+                op.bounds.materializes or any(produced_by_breaker(i) for i in op.inputs)
+            )
+        return breaker_below[op_id]
+
+    guessed = {
+        child.properties.signature: child.properties.est_rows
+        for op in phys.ops
+        if op.kind.endswith("Join")  # `kyber.annotate` names an op by its node class
+        for child in (by_id.get(i) for i in op.inputs)
+        if child is not None
+        and child.properties.provenance >= Provenance.DEFAULT
+        and child.properties.signature
+        and produced_by_breaker(child.op_id)
+    }
+    _RAN_GUESSED.pop(key, None)
+    _RAN_GUESSED[key] = tuple(guessed.items())
+    while len(_RAN_GUESSED) > _INPUT_SIZES_MAX:
+        _RAN_GUESSED.pop(next(iter(_RAN_GUESSED)))
+
+
+def _ran_and_held_up(key: str | None, hub) -> bool:
+    """Whether the plan's last one-shot run left a stage boundary nothing to correct.
+
+    `_unsized_operands` asks about the operands of the plan *as written*, while Core records a
+    measured cardinality against the operators that *ran* -- the optimized plan's, whose
+    signatures the written plan's operands never share. So the history it consults was never
+    found, every operand of a multi-join query read as unproven however many runs had measured
+    it, and the route bandit explored staging on every such query: TPC-DS q72 at sf10 ran its
+    one-shot plan in ~0.35 s and then staged explorations of 6-7 s.
+
+    This asks the executed plan instead (`note_one_shot_ops`), and asks it the question a stage
+    boundary would: is the row count the plan was built on within `optimizer.reoptimize_error`
+    of what the operand measured (`kyber.learning.measured_rows`)? That is the test on which
+    the adaptive loop re-plans, so when every guessed operand passes it a staged run would
+    re-plan nothing. It is deliberately not the structural estimator's q-error history
+    (`kyber.estimate_is_reliable`): a guess the learned correction has since brought onto its
+    measured size leaves a plan with nothing to correct, while its uncorrected q-error stays as
+    large as it ever was. A plan never run one-shot in this process leaves the question to the
+    written-plan check below.
+    """
+    guessed = _RAN_GUESSED.get(key) if key is not None else None
+    if guessed is None or hub is None:
+        return False
+    if not guessed:
+        return True
+    try:
+        from batcher.config import active_config
+        from batcher.kyber.learning import measured_rows
+
+        tolerance = float(active_config().optimizer.reoptimize_error)
+        measured = measured_rows(hub)
+    except Exception as exc:  # pragma: no cover - a learned read must never break routing
+        note_suppressed("api", "read measured operand rows", exc)
+        return False
+    return all(_within(planned, measured.get(sig), tolerance) for sig, planned in guessed)
+
+
+def _within(planned: float, actual: float | None, tolerance: float) -> bool:
+    """Whether a planned row count sits within `tolerance` (a ratio) of the measured one."""
+    if actual is None or actual <= 0.0 or not 0.0 < planned < float("inf"):
+        return False
+    return max(planned, actual) / min(planned, actual) <= tolerance
 
 
 # `_unsized_operands` results, keyed and trimmed exactly like `_INPUT_SIZES`.

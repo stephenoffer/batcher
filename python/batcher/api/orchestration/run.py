@@ -13,6 +13,7 @@ import pyarrow as pa
 from batcher._internal.errors import PlanError
 from batcher._internal.logging import get_logger, log_kv, note_suppressed
 from batcher.api._join_helpers import _empty_result_schema
+from batcher.api.adaptive.gating import note_one_shot_ops
 from batcher.api.orchestration import chunked as _chunked
 from batcher.api.orchestration import phases
 from batcher.api.orchestration.chunked import run_chunked
@@ -626,14 +627,13 @@ def _run_relational_scoped(
                     plan, logical_opt, ctx, rm, sources, rows, decisions, started=started
                 )
                 return spilled, decisions
-        # The phase a reader came for. Everything recorded above it is *planning*, so the
-        # log could say the control plane spent 23 ms deciding and not whether the engine
-        # then ran for 2 ms or two minutes. See `orchestration.phases`.
+        # The phase a reader came for: everything above it is planning (`orchestration.phases`).
         phases.begin("core.execute")
         mark = time.perf_counter()
         table = _execute_in_memory(logical_opt, plan, opt, ctx, resolved)
         phases.record("core.execute", elapsed := time.perf_counter() - mark)
         kyber.plan_cache.record_outcome(opt, elapsed * 1e3)  # the memo's regret guard
+        note_one_shot_ops(opt)  # what the run had to guess, for the staging gate
 
     _close_learning_loops(
         plan, logical_opt, ctx, rm, sources, resolved, table, decisions, started=started
