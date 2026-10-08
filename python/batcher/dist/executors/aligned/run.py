@@ -130,8 +130,20 @@ def unit_plan(
 _UNIT_CPUS = env_int("BATCHER_ALIGNED_UNIT_CPUS", 8, floor=1)
 
 
-def _unit_slots(workers: int) -> tuple[int, int]:
-    """Cores per unit task, and how many such tasks the cluster runs at once."""
+#: Held broadcast bytes past which a node runs one wide unit task instead of two: each unit
+#: task process decodes the held broadcasts for itself and every unit rebuilds their hash
+#: tables, so a large broadcast is paid once per process and once per unit. Measured on 8 x
+#: 16-core nodes at SF1000, warm, best of two (c5d-ab23, 8 against 16 cores per unit): TPC-H
+#: q9 (1.1-2.7 GB held) 65.7 -> 52.2 s, q19 (0.95 GB) 23.5 -> 21.7 s, q8 (1.2 GB) 30.6 -> 29.8 s;
+#: below it the narrow tasks won or tied -- q10 (0.7 GB) 26.4 vs 27.7 s, q7 (0.4 GB) 20.9 vs
+#: 22.1 s, q21 34.5 vs 40.0 s, q12 8.5 vs 10.2 s, q18 17.1 vs 18.9 s.
+_WIDE_HELD_BYTES = env_int("BATCHER_ALIGNED_WIDE_HELD_BYTES", 900 << 20, floor=0)
+#: Cores per unit task when the held broadcasts are past `_WIDE_HELD_BYTES`: a whole node.
+_WIDE_UNIT_CPUS = 16
+
+
+def _unit_slots(workers: int, want: int = _UNIT_CPUS) -> tuple[int, int]:
+    """Cores per unit task (at most `want`), and how many such tasks the cluster runs at once."""
     try:
         import ray
 
@@ -141,14 +153,31 @@ def _unit_slots(workers: int) -> tuple[int, int]:
         # Never more than one node has: a task asking for more cores than any node holds is
         # never placed, and the gather waits on it forever (a 4-worker test cluster of
         # 2-CPU nodes hung here on 8-CPU units).
-        unit_cpus = min(_UNIT_CPUS, max(per_node, default=0))
+        unit_cpus = min(want, max(per_node, default=0))
         if unit_cpus >= 1:
             return unit_cpus, sum(cpus // unit_cpus for cpus in per_node)
     except Exception as exc:
         from batcher._internal.logging import note_suppressed
 
         note_suppressed("dist", "read cluster cores for aligned units", exc)
-    return _UNIT_CPUS, max(1, workers)
+    return want, max(1, workers)
+
+
+def _pruned(body: LogicalPlan, cut: AlignedCut) -> LogicalPlan:
+    """`body` with every join emitting only the columns something above it reads.
+
+    Moving a broadcast join down (`group_broadcast_joins`) carries the moved side's columns
+    up under fresh names, and a join above that nothing reads them through still emits them.
+    They are then part of what a hoisted broadcast holds: on warm runs of TPC-H q9 at SF1000
+    `partsupp`, joined to `supplier JOIN nation`, was held with four such columns, 2.6 GB where
+    the cold plan held 1.0 GB, and packing it took 9 s on the driver. The cut's own output
+    is what is needed above it: the aggregate's inputs when it feeds one, else every column.
+    """
+    from batcher.kyber.rules.projections import rewrite_projection
+
+    if cut.aggregate is None:
+        return rewrite_projection(body)
+    return rewrite_projection(dataclasses.replace(cut.aggregate, input=body)).input
 
 
 def _aligned_units_task(calls: list[tuple], held: dict, empties: dict) -> list[tuple]:
@@ -310,7 +339,26 @@ def run_cut(
             return None
         bounds[sid] = found
         shares[sid] = projected_share(sources[sid], cut.pushdown(cut.body, sid)[0])
-    unit_cpus, slots = _unit_slots(workers)
+
+    started = time.perf_counter()
+    held_tables: dict[int, pa.Table] = {}
+    local: dict[int, LogicalPlan] = {}
+    from batcher.dist.executors.aligned.route import unbroadcastable
+
+    grouped = _pruned(
+        group_broadcast_joins(
+            cut.body, cut.aligned, reduce=lambda side: unbroadcastable(side, sources)
+        ),
+        cut,
+    )
+    body = hoist_broadcasts(grouped, cut, sources, held_tables, workers, local, oversized)
+    if body is None:
+        return None
+    # The units are cut after the broadcasts are known, because how wide a unit task should be
+    # depends on what each one holds (`_WIDE_HELD_BYTES`).
+    held_bytes = sum(t.nbytes for t in held_tables.values())
+    want = _WIDE_UNIT_CPUS if held_bytes > _WIDE_HELD_BYTES else _UNIT_CPUS
+    unit_cpus, slots = _unit_slots(workers, want)
     # Several units per slot: a unit's cost follows its files, not a fixed share, so a
     # cluster cut into exactly one wave per slot finishes at the pace of its slowest; with
     # ~6 per slot the tail is a sixth of a unit, and each unit holds less memory.
@@ -323,18 +371,6 @@ def run_cut(
     # Cores alone said how many tasks a node runs; a large unit's memory may say fewer.
     fit = fit_units_to_cluster(unit_cpus, slots, max((u.nbytes for u in units), default=0))
     unit_cpus, slots = fit.unit_cpus, fit.slots
-
-    started = time.perf_counter()
-    held_tables: dict[int, pa.Table] = {}
-    local: dict[int, LogicalPlan] = {}
-    from batcher.dist.executors.aligned.route import unbroadcastable
-
-    grouped = group_broadcast_joins(
-        cut.body, cut.aligned, reduce=lambda side: unbroadcastable(side, sources)
-    )
-    body = hoist_broadcasts(grouped, cut, sources, held_tables, workers, local, oversized)
-    if body is None:
-        return None
     reduce_broadcasts(body, held_tables, local)
     body = prefer_hash_joins(body)
     sliced = sliceable_broadcasts(body, cut, held_tables)

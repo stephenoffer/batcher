@@ -178,7 +178,7 @@ The public, fluent, lazy, expression-first API surface.
 | `multi_group.py` | 473 | Multi-level grouped aggregation — `ROLLUP`, `CUBE` and `GROUPING SETS`. |
 | `source_stats.py` | 739 | Per-source statistics collection for the conductor. |
 | `stats.py` | 543 | `RunStats` — measured per-operator execution metrics for a `Dataset` run. |
-| `subplan_reuse.py` | 669 | Compute a repeated subplan once and read it back (control plane, `api`). |
+| `subplan_reuse.py` | 703 | Compute a repeated subplan once and read it back (control plane, `api`). |
 
 ### `batcher/api/adaptive/` — 5 · conductor
 
@@ -974,7 +974,7 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 3300 | The distributed executor — the dispatcher. |
+| `executor.py` | 3312 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 903 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 637 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
@@ -1023,11 +1023,11 @@ Key-range-aligned distributed execution: joins over tables laid out in key order
 | `local.py` | 273 | Broadcasts each node reads for itself: a large input that no filter shrinks. |
 | `memory_fit.py` | 95 | How many aligned units a node may run at once, from its memory as well as its cores. |
 | `reduce.py` | 278 | Shrink what every unit joins: hash joins, and broadcasts cut to the keys that can match. |
-| `rewrite.py` | 465 | Push each join against a broadcast input down to the broadcast input it keys on. |
-| `route.py` | 535 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
-| `run.py` | 514 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
-| `transfer.py` | 399 | Moving an aligned run's inputs and results between the driver and the fleet. |
-| `units.py` | 295 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
+| `rewrite.py` | 572 | Push each join against a broadcast input down to the broadcast input it keys on. |
+| `route.py` | 561 | Choose the alignment key for a plan and route it to the aligned executor, or decline. |
+| `run.py` | 550 | Run an `AlignedCut`: one engine call per key-range unit, then combine on the driver. |
+| `transfer.py` | 407 | Moving an aligned run's inputs and results between the driver and the fleet. |
+| `units.py` | 339 | Cut the key domain into units from the files' footer ranges, and prove the layout holds. |
 
 ### `batcher/dist/executors/partition_io/` — 4 · backend
 
@@ -1048,13 +1048,13 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 |---|---|---|
 | `accelerators.py` | 161 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 200 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
-| `capacity.py` | 595 | How many workers a cluster can actually *place*, as opposed to afford. |
+| `capacity.py` | 636 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `fleet_health.py` | 340 | Live device health across the fleet — every accelerator node, never cached. |
 | `hardware_probe.py` | 568 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 724 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 233 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
-| `readiness.py` | 502 | Bounded waits for a Ray cluster that is not ready yet. |
+| `readiness.py` | 546 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 432 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 331 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 796 | What the live cluster is, and what of it a query may use. |

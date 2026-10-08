@@ -118,3 +118,23 @@ def test_bounds_compose(monkeypatch):
     _nodes(monkeypatch, [(64, 0, 32 * _GIB), (64, 8, 512 * _GIB)])
     # CPU-only node: 64 cores / 8 = 8 by cores, 32 GiB / 16 GiB = 2 by memory.
     assert capacity.placeable_workers(8.0, memory_bytes=16 * _GIB, cpu_only=True) == 2
+
+
+class TestMemoryGrantThatPlaces:
+    """A grant no node holds is lowered to what the nodes hold; the fan-out stays."""
+
+    def test_an_oversized_share_is_capped_not_the_fan_out(self, monkeypatch):
+        # Cold TPC-H q1 at SF1000: 98 GB a worker asked of 64 GB nodes placed one worker.
+        _nodes(monkeypatch, [(16, 0, 45 * _GIB)] * 8)
+        assert capacity.placeable_workers(15.0, memory_bytes=98 * _GIB) == 0
+        grant = capacity.placeable_memory_grant(8, 15.0, 98 * _GIB)
+        assert 44 * _GIB < grant <= 45 * _GIB
+        assert capacity.placeable_workers(15.0, memory_bytes=grant) == 8
+
+    def test_a_grant_that_places_is_unchanged(self, monkeypatch):
+        _nodes(monkeypatch, [(16, 0, 45 * _GIB)] * 8)
+        assert capacity.placeable_memory_grant(8, 15.0, 20 * _GIB) == 20 * _GIB
+
+    def test_when_cores_bind_the_grant_is_left_to_the_clamp(self, monkeypatch):
+        _nodes(monkeypatch, [(16, 0, 45 * _GIB)] * 4)
+        assert capacity.placeable_memory_grant(8, 15.0, 98 * _GIB) == 98 * _GIB

@@ -34,6 +34,7 @@ __all__ = [
     "fleet_task_headroom",
     "fleet_worker_cpus",
     "free_cpus_by_node",
+    "placeable_memory_grant",
     "placeable_workers",
     "preferred_fleet_zone",
     "slot_actor_options",
@@ -167,6 +168,46 @@ def placeable_workers(
     # right now — the fan-out is sized before the fleet is placed, and a co-tenant that
     # finishes in the meantime must not have shrunk it.
     return sum(workers_per_node(node, demand, nameplate=True) * node["count"] for node in nodes)
+
+
+def placeable_memory_grant(
+    workers: int, num_cpus: float, memory_bytes: int, *, cpu_only: bool = False
+) -> int:
+    """The per-worker memory grant, lowered just enough that `workers` workers still place.
+
+    A memory grant is the worker's share of an *estimated* peak, so it grows as the fan-out
+    shrinks: halving the workers doubles each one's share. Clamping the fan-out to a grant
+    no node can host therefore never converges, and it collapsed whole queries onto one
+    worker: on a cold run (no learned peak) TPC-H q1 at SF1000 asked 98 GB a worker of 64 GB
+    nodes, `clamp_workers` placed one, and the scan took 68 s on one node where eight took 9.
+    A share no node can hold is what spilling exists for, so the grant is capped at what
+    the nodes hold and the fan-out stays. Unchanged when it already places, when cores rather
+    than memory are what bind, or when the topology is unreadable.
+
+    Args:
+        workers: The fan-out to keep placeable.
+        num_cpus: CPU shares each worker requests.
+        memory_bytes: The grant as estimated.
+        cpu_only: Count only non-accelerator nodes, as `placeable_workers` does.
+
+    Returns:
+        The largest grant at or below `memory_bytes` that places `workers` workers, or
+        `memory_bytes` itself.
+    """
+    if memory_bytes <= 0 or workers <= 0:
+        return memory_bytes
+    fits = placeable_workers(num_cpus, memory_bytes=memory_bytes, cpu_only=cpu_only)
+    if fits is None or fits >= workers:
+        return memory_bytes
+    by_cores = placeable_workers(num_cpus, memory_bytes=0, cpu_only=cpu_only)
+    if by_cores is None or by_cores < workers:
+        return memory_bytes  # cores bind: lowering the grant would not place them
+    lo, hi = 0, memory_bytes  # `lo` always places, `hi` never does
+    while hi - lo > (1 << 20):
+        mid = (lo + hi) // 2
+        placed = placeable_workers(num_cpus, memory_bytes=mid, cpu_only=cpu_only)
+        lo, hi = (mid, hi) if placed is not None and placed >= workers else (lo, mid)
+    return lo
 
 
 @dataclass(frozen=True, slots=True)

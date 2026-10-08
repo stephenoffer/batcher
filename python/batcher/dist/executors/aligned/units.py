@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import itertools
+import operator
 from typing import Any
 
 from batcher._internal.logging import note_suppressed
@@ -26,6 +27,8 @@ from batcher.io.source import Source
 __all__ = [
     "Unit",
     "clustered",
+    "footer_columns",
+    "implied_by_bounds",
     "plan_units",
     "projected_bytes",
     "projected_share",
@@ -293,3 +296,44 @@ def splits_by_file(source: Source, projection, predicate) -> dict[str, list] | N
         for path in files:
             out.setdefault(path, []).append(split)
     return out
+
+
+def footer_columns(source: Source | None) -> dict:
+    """The per-column statistics `source` declares, or an empty mapping when it has none."""
+    if source is None:
+        return {}
+    try:
+        stats = source.statistics()
+    except Exception as exc:
+        note_suppressed("dist", "read source statistics for a broadcast filter", exc)
+        return {}
+    return dict(getattr(stats, "columns", None) or {})
+
+
+#: `column <op> literal` holds for every row when the column's bound on that side does:
+#: (which bound, the comparison it must pass).
+_IMPLIED_BY = {
+    "ge": ("min", operator.ge),
+    "gt": ("min", operator.gt),
+    "le": ("max", operator.le),
+    "lt": ("max", operator.lt),
+}
+
+
+def implied_by_bounds(ir: dict, columns: dict) -> bool:
+    """Whether a `column <op> literal` range conjunct holds for every row of the source.
+
+    Only an integer literal against an integer bound is judged, so no type coercion is
+    guessed at; anything else is taken to filter, which is the old, conservative answer.
+    """
+    if ir.get("e") != "binary" or ir.get("op") not in _IMPLIED_BY:
+        return False
+    left, right = ir.get("left", {}), ir.get("right", {})
+    if left.get("e") != "col" or right.get("e") != "lit":
+        return False
+    side, passes = _IMPLIED_BY[ir["op"]]
+    bound = getattr(columns.get(left.get("name")), side, None)
+    value = (right.get("value") or {}).get("int")
+    if not all(isinstance(x, int) and not isinstance(x, bool) for x in (value, bound)):
+        return False
+    return passes(bound, value)
