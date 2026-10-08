@@ -343,6 +343,18 @@ def execute_distributed(
             envelope is not None
             and node_class_selector(envelope.prefer_cpu_only_nodes, workers, num_cpus)
         )
+        if fill is not None and envelope is not None and envelope.memory_bytes:
+            # The fill chose one worker per node; a memory share no node can hold would
+            # otherwise shrink it, and fewer workers only hold larger shares.
+            from batcher.dist.executors.ray_runtime.capacity import placeable_memory_grant
+
+            held = placeable_memory_grant(
+                workers, num_cpus, int(envelope.memory_bytes), cpu_only=restricted
+            )
+            if held != envelope.memory_bytes:
+                envelope = dataclasses.replace(envelope, memory_bytes=held)
+                reset_scheduling_envelope(token)
+                token = set_scheduling_envelope(envelope)
         clamped = clamp_workers(
             workers,
             num_cpus,

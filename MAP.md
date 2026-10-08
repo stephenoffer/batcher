@@ -974,7 +974,7 @@ Window-function translation for the SQL front-end.
 
 | module | lines | what it is |
 |---|---|---|
-| `executor.py` | 3300 | The distributed executor — the dispatcher. |
+| `executor.py` | 3312 | The distributed executor — the dispatcher. |
 | `flight_aggregate.py` | 903 | Distributed aggregation over an Arrow Flight shuffle (object store bypassed). |
 | `flight_broadcast.py` | 637 | Broadcast (replicated build side) equi-join on the Flight transport — no exchange. |
 | `flight_join.py` | 580 | Distributed hash join over an Arrow Flight shuffle (object store bypassed). |
@@ -1048,13 +1048,13 @@ Ray lifecycle, scheduling envelope, autoscaling, and fault policies for the
 |---|---|---|
 | `accelerators.py` | 161 | Cluster-wide accelerator facts, for callers that would otherwise probe the driver. |
 | `autoscale_request.py` | 200 | The autoscaler request lifecycle: scale a cluster up for a query, reclaim after. |
-| `capacity.py` | 595 | How many workers a cluster can actually *place*, as opposed to afford. |
+| `capacity.py` | 636 | How many workers a cluster can actually *place*, as opposed to afford. |
 | `fleet_health.py` | 340 | Live device health across the fleet — every accelerator node, never cached. |
 | `hardware_probe.py` | 568 | Worker-side hardware facts Ray's topology cannot report, collected by a probe. |
 | `lifecycle.py` | 724 | Ray lifecycle + single-node fallback for the distributed executor. |
 | `metering.py` | 233 | Worker-side metering — the seam that closes the Core→Kyber loop on the distributed path. |
 | `node_markers.py` | 95 | Which custom resource names a cluster's node *classes*. |
-| `readiness.py` | 502 | Bounded waits for a Ray cluster that is not ready yet. |
+| `readiness.py` | 546 | Bounded waits for a Ray cluster that is not ready yet. |
 | `reduce.py` | 432 | The shared bucket-reduce driver for every Flight shuffle (join, sort, window). |
 | `reducers.py` | 331 | How finely a shuffle divides its work — on both sides of the exchange. |
 | `scaling.py` | 796 | What the live cluster is, and what of it a query may use. |

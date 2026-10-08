@@ -228,11 +228,45 @@ _reachable_gpu_ceiling: float = float("inf")
 _ceiling_lock = threading.Lock()
 
 
+#: Where the CPU ceiling is shared with every other driver of the same cluster (Ray's GCS
+#: key-value store). Learned per process only, every new driver paid the startup grace again:
+#: a benchmark running each query in its own process spent ~15 s of every first run waiting
+#: on a fixed cluster for cores a previous process had already proved were not coming.
+_CEILING_KEY = b"batcher:autoscale_cpu_ceiling"
+
+
+def _shared_ceiling() -> float:
+    """The CPU ceiling another driver of this cluster recorded, or infinity."""
+    try:
+        from ray.experimental.internal_kv import _internal_kv_get
+
+        raw = _internal_kv_get(_CEILING_KEY)
+        return float(raw) if raw else float("inf")
+    except Exception as exc:  # an unreadable store only costs this driver its own probe
+        note_suppressed("dist", "read the shared autoscale ceiling", exc)
+        return float("inf")
+
+
+def _share_ceiling(cpus: float | None) -> None:
+    """Record `cpus` as the cluster's CPU ceiling for every driver (`None` forgets it)."""
+    try:
+        from ray.experimental.internal_kv import _internal_kv_del, _internal_kv_put
+
+        if cpus is None:
+            _internal_kv_del(_CEILING_KEY)
+        else:
+            _internal_kv_put(_CEILING_KEY, str(int(cpus)).encode(), overwrite=True)
+    except Exception as exc:
+        note_suppressed("dist", "share the autoscale ceiling", exc)
+
+
 def _note_ceiling(best_cpus: int) -> None:
     """Record that the autoscaler stalled at `best_cpus` — the cluster will not exceed it."""
     global _reachable_ceiling
     with _ceiling_lock:
         _reachable_ceiling = min(_reachable_ceiling, float(best_cpus))
+        learned = _reachable_ceiling
+    _share_ceiling(learned)
 
 
 def _note_gpu_ceiling(best_gpus: float) -> None:
@@ -258,8 +292,11 @@ def _note_reached(cpus: int) -> None:
     """Lift a stale ceiling once capacity has climbed past it (the cluster grew/recovered)."""
     global _reachable_ceiling
     with _ceiling_lock:
-        if cpus > _reachable_ceiling:
+        lifted = cpus > _reachable_ceiling
+        if lifted:
             _reachable_ceiling = float("inf")
+    if lifted:
+        _share_ceiling(None)
 
 
 def _note_gpus_reached(gpus: float) -> None:
@@ -276,6 +313,7 @@ def _reset_capacity_ceiling() -> None:
     with _ceiling_lock:
         _reachable_ceiling = float("inf")
         _reachable_gpu_ceiling = float("inf")
+    _share_ceiling(None)
 
 
 def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
@@ -290,6 +328,7 @@ def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
     (`_reachable_ceiling`) — so a fixed cluster pays the startup grace once, not per query.
     Pure scheduling — the result is identical whether it waits or not.
     """
+    global _reachable_ceiling
     if active_config().distributed.autoscale_wait_s <= 0 or target_cpus <= 0:
         return
     import ray
@@ -308,6 +347,11 @@ def await_autoscale(target_cpus: int, target_gpus: float = 0.0) -> None:
     gpus = float(topo["gpus"])
     with _ceiling_lock:
         ceiling, gpu_ceiling = _reachable_ceiling, _reachable_gpu_ceiling
+    if ceiling == float("inf") and avail < target_cpus:
+        ceiling = _shared_ceiling()
+        if ceiling != float("inf"):
+            with _ceiling_lock:
+                _reachable_ceiling = min(_reachable_ceiling, ceiling)
     if avail > ceiling:
         _note_reached(avail)  # capacity climbed past the old ceiling — it is stale
         ceiling = float("inf")

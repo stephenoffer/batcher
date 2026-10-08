@@ -169,6 +169,49 @@ def test_reached_target_lifts_a_stale_ceiling(monkeypatch):
         readiness._reset_capacity_ceiling()
 
 
+def _shared_store(monkeypatch) -> dict:
+    """Stand Ray's cluster key-value store in with a dict every "driver" here shares."""
+    from ray.experimental import internal_kv
+
+    store: dict = {}
+    monkeypatch.setattr(internal_kv, "_internal_kv_get", store.get)
+    monkeypatch.setattr(
+        internal_kv, "_internal_kv_put", lambda k, v, overwrite=True: store.__setitem__(k, v)
+    )
+    monkeypatch.setattr(internal_kv, "_internal_kv_del", lambda k: store.pop(k, None))
+    return store
+
+
+def _forget_in_this_process() -> None:
+    """What a new driver process starts with: no ceiling of its own."""
+    with readiness._ceiling_lock:
+        readiness._reachable_ceiling = float("inf")
+
+
+def test_a_ceiling_one_driver_learned_spares_the_next_drivers_wait(monkeypatch):
+    # Learned per process, the ceiling saved nothing for a workload of short-lived drivers:
+    # a benchmark running each query in its own process paid the startup grace on every
+    # query's first run, on a fixed cluster a previous process had already measured.
+    store = _shared_store(monkeypatch)
+    _r1, e1 = _run(monkeypatch, lambda _t: 8, target=32, wait=180.0, poll=5.0, startup=12.0)
+    assert e1 > 0.0
+    assert store[readiness._CEILING_KEY] == b"8"
+    _forget_in_this_process()
+    _r2, e2 = _run(monkeypatch, lambda _t: 8, target=64, wait=180.0, poll=5.0, startup=12.0)
+    assert e2 == 0.0
+
+
+def test_a_grown_cluster_lifts_the_shared_ceiling(monkeypatch):
+    store = _shared_store(monkeypatch)
+    _run(monkeypatch, lambda _t: 8, target=32, wait=180.0, poll=5.0, startup=12.0)
+    _forget_in_this_process()
+    # Grown past the shared ceiling but short of this target: the wait probes again, and the
+    # bound every other driver would read is dropped.
+    _r, e = _run(monkeypatch, lambda _t: 40, target=64, wait=180.0, poll=5.0, startup=12.0)
+    assert e > 0.0
+    assert store.get(readiness._CEILING_KEY) in (None, b"40")
+
+
 def test_disabled_wait_is_immediate(monkeypatch):
     # `autoscale_wait_s == 0` keeps the non-blocking behavior: clamp to current capacity.
     result, elapsed = _run(monkeypatch, lambda _t: 8, target=32, wait=0.0)
