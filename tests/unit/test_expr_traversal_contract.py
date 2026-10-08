@@ -316,5 +316,13 @@ def test_an_unregistered_node_breaks_projection_merging(monkeypatch) -> None:
     # The negative control. Without it this test passes for any node, registered or not.
     monkeypatch.delitem(_EXPR_KIDS, MakeMap)
     monkeypatch.delitem(_EXPR_REBUILD, MakeMap)
+    # The same query was planned a moment ago, and NORMALIZE -- where the projections merge --
+    # is memoized on the plan's content (`kyber.plan_cache.normalized`), a key that cannot
+    # see these two tables. Without forgetting it, the second collect is served the plan the
+    # registered node produced, the merge never runs, and the control passes for the wrong
+    # reason: it did, from 3a4bdec2 on.
+    from batcher.kyber import plan_cache
+
+    plan_cache.clear()
     with pytest.raises(ColumnNotFoundError, match=r"unknown column"):
         query(data).collect()
