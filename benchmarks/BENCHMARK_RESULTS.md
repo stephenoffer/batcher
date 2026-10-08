@@ -1,5 +1,36 @@
 # Batcher CPU benchmark results
 
+## The device tier reached a device again: the staged RAPIDS tree is cuDF's whole closure (2026-10-07)
+
+On four A10Gs (one `g5.12xlarge`, the `anyscale/ray:2.58.0-py311-cu128` image with driver 580 /
+CUDA 13, `cudf-cu13` 26.08.01), TPC-H sf10 through `collect(backend="gpu")`
+(`benchmarks/gpu_backend/cluster_suite.py`) reached a device on **2 of 22** queries in three
+consecutive jobs. Every other fan-out task died importing cuDF from the tree
+`dist.gpu.cudf_probe.stage_rapids_env` had staged on `/mnt/cluster_storage`:
+`ImportError: libcudf.so: cannot open shared object file`, raised in `pylibcudf`. With staging
+switched off (`BENCH_RAPIDS_DIR=`) and cuDF in the workers' own site-packages, the same release
+ran a device join. The fixed staging list had been written for an earlier install. Against this
+one it missed `libkvikio_cu13.libs`, `numba_cuda_mlir`, and `cupy`/`cupyx`/`cupy_backends`.
+Staging now adds every top-level entry owned by a distribution in cuDF's installed requirement
+closure, read from `importlib.metadata`, and still never stages numpy, pyarrow or a `.pth` file.
+
+**The recorded `gpu_shadow_verify=True` run.** Job `c5g-gpu9`, code `104c71e5`, staging on.
+The workers import `cudf`, `rmm` and `pylibcudf` from `/mnt/cluster_storage/rapids_env`.
+`distributed.gpu_shadow_verify = true` comes from a `BATCHER_CONFIG_FILE`, so every device
+result is re-run on the CPU engine and compared:
+
+    reached a device     11 of 22  (q1 q2 q6 q9 q11 q16 q17 q18 q19 q21 q22)
+    matched the CPU      11 of 11
+    total cpu / gpu s    18.94 / 14.57  (1.30x)
+
+The same suite timed without verification (1 cold + best of 3): CPU 16.28 s, GPU 12.68 s
+(1.28x), `backend="auto"` 10.81 s (1.51x). Per query on the device: q22 29.8x, q9 4.4x, q21 3.7x,
+q18 3.5x, q6 2.8x, q2 2.3x, q11 2.2x, q17 1.9x, q1 1.2x, q19 1.0x, q16 0.98x.
+
+The other eleven queries are reported as `untranslatable shape`. The driver's rehearsal accepts
+all 22 plans (sf1, zero-row frames, run on a CPU node), so for these queries the label describes
+the fan-out declining. It does not mean the plan failed to translate. Open.
+
 ## Distributed TPC-H SF1000 on eight m5d.4xlarge: 638 s plus an OOM -> 426 s, every query correct (2026-10-07)
 
 The aligned executor (`dist/executors/aligned/`) declined or was mis-planned on the queries
