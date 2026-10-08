@@ -324,6 +324,28 @@ def test_a_repeat_the_aligned_executor_runs_is_left_to_it_unless_it_aggregates(
         assert plan is q._plan
 
 
+@pytest.mark.parametrize("distributed", [True, False])
+def test_a_shared_subplan_on_the_distributed_route_attaches_to_ray_before_routing(
+    monkeypatch, distributed
+):
+    """On a query's first run the shared subplan is routed before the query attaches to Ray,
+    and `auto` reads an unattached process as single-node: TPC-H q15 at SF1000 computed its
+    revenue view on the driver for 129 s. The single-node route must not attach."""
+    from batcher.api import subplan_reuse
+    from batcher.api.terminal import routing
+    from batcher.core import ExecutionContext, default_hub
+    from batcher.dist.executors import ray_runtime
+
+    attached: list[int] = []
+    monkeypatch.setattr(ray_runtime, "_ensure_ray", lambda workers: attached.append(workers))
+    monkeypatch.setattr(routing, "resolve_distributed", lambda *a, **k: False)
+    ds = _ds()
+    ctx = ExecutionContext(columns=list(ds._plan.available_columns()), hub=default_hub())
+    table = subplan_reuse._materialize(ds._plan, list(ds._sources), ctx, distributed)
+    assert table is not None and table.num_rows == ds.collect().num_rows
+    assert bool(attached) is distributed
+
+
 def _repeated_multiway_join():
     """A query repeating a multi-way join whose `WHERE` sits above it, as SQL writes it.
 

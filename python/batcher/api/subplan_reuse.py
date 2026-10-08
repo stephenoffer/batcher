@@ -654,6 +654,17 @@ def _materialize(
     from batcher.api.terminal.routing import resolve_distributed
 
     sub_ctx = dataclasses.replace(ctx, columns=target.available_columns(), cache=False)
+    if distributed:
+        # `auto` answers single-node whenever this process has not attached to Ray yet, and on
+        # a query's first run in a process the shared subplan is materialized *before* the
+        # query's own distributed run attaches. TPC-H q15 at SF1000 then computed its revenue
+        # view on the driver, out of core, for 129 s of a 156 s first run (17 s once attached).
+        from batcher.dist.executors.ray_runtime import _ensure_ray
+
+        try:
+            _ensure_ray(1)
+        except Exception as exc:  # `auto` then decides on what it can see, as before
+            note_suppressed("api", "attach to Ray before routing a shared subplan", exc)
     cluster = distributed and resolve_distributed("auto", target, sources)
     # The target is a plan in its own right, and what repeats *inside* it is invisible from
     # the outer analysis: a subtree nested in an accepted candidate is dropped there, because
