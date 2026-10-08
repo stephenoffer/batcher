@@ -323,10 +323,13 @@ class SpillAdvisor:
         # the input twice and reports the widest intermediate as the largest table in the
         # query. On q4 that read 13.4 GiB where the real widest is 6.5 GiB -- right verdict,
         # wrong reason, and wrong on any plan where the double-count is what tipped it.
+        folded = _folded_by_an_aggregate(plan)
         above = [
             op.properties.est_rows
             for op in plan.ops
-            if op.kind.lower() != "scan" and op.properties.est_rows == op.properties.est_rows
+            if op.kind.lower() != "scan"
+            and op.op_id not in folded
+            and op.properties.est_rows == op.properties.est_rows
         ]
         scan_rows = sum(scans)
         widest_rows = max(above, default=0.0)
@@ -477,3 +480,29 @@ class SpillAdvisor:
         if ceiling <= 0:
             return SPILL_BYTES_PER_PARTITION
         return min(SPILL_BYTES_PER_PARTITION, ceiling)
+
+
+def _folded_by_an_aggregate(plan: PhysicalPlan) -> frozenset[int]:
+    """Operators whose whole output an aggregate consumes, so that going out of core cannot
+    shrink it.
+
+    `_widest_intermediate` charges the largest operator output as resident, and for most
+    shapes that is a real argument for the out-of-core path. It is not for an output an
+    aggregate reduces. The streaming executor folds that output morsel by morsel and never
+    holds it, while the out-of-core route holds *all* of it: `spill_collect` peels an
+    `Aggregate` to the breaker beneath it, runs that breaker out of core, and aggregates its
+    complete result. A high fan-out join under an aggregate -- a self-join with 800 rows per
+    key, `max(|b - b_right|)` over 3.2 billion pairs -- was therefore sent to the one path that
+    materializes those pairs, and OOM-killed a 64 GB node where the in-memory path peaks at
+    0.4 GB. Neither path holds such an output for less, so it cannot decide between them.
+
+    Args:
+        plan: The annotated physical plan.
+
+    Returns:
+        The op ids whose consumer is an aggregate.
+    """
+    kinds = {op.op_id: op.kind.lower() for op in plan.ops}
+    return frozenset(
+        child for op in plan.ops if kinds[op.op_id] == "aggregate" for child in op.inputs
+    )

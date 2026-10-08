@@ -1720,7 +1720,7 @@ Carbonite's resource policies — admission, flow control, scheduling, and sizin
 | `morsel.py` | 390 | How big a morsel should be, given memory pressure and the rows' measured width. |
 | `rate_control.py` | 208 | Adaptive ingestion rate for a streaming query — the micro-batch loop's backpressure. |
 | `scheduling.py` | 288 | Scheduling: turn Kyber's per-operator bounds into a per-Ray-task resource envelope. |
-| `spill_advice.py` | 479 | Whether a query goes out of core, and what shape its spilled state takes. |
+| `spill_advice.py` | 508 | Whether a query goes out of core, and what shape its spilled state takes. |
 | `spill_shape.py` | 176 | How wide and how compressed a spilled state should be. |
 
 ### `batcher/carbonite/resilience/` — 3 · subsystem

@@ -154,3 +154,47 @@ def test_a_plan_with_no_row_estimates_contributes_nothing():
 
     assert advisor.widest(64 << 20, plan) == 0
     assert not advisor.exceeds(64 << 20, plan)
+
+
+def _linked(kind: str, est_rows: float, op_id: int, inputs: tuple[int, ...]) -> PhysicalOp:
+    """`_op` with its inputs wired, which is what tells the gate who consumes an output."""
+    return PhysicalOp(
+        op_id=OpId(op_id),
+        kind=kind,
+        backend="interp",
+        algorithm="",
+        bounds=ResourceBounds(m_max_bytes=0, c_max_credits=0, n_max_parallelism=0),
+        inputs=tuple(OpId(i) for i in inputs),
+        properties=PlanProperties(est_rows=est_rows, row_size=8.0),
+    )
+
+
+def _self_join_plan(top: str) -> PhysicalPlan:
+    """`ds.join(ds, on="a").agg(max(|b - b_right|))` at 4M rows and 800 rows per key a side:
+    3.2 billion joined rows, reduced to one. With `top="Project"` the join's output is the
+    result instead, and is held whatever executor runs it."""
+    return PhysicalPlan(
+        ir={"op": "scan", "source_id": 0},
+        output_schema=None,
+        ops=(
+            _linked(top, 1 if top == "Aggregate" else 3.2e9, 0, (1,)),
+            _linked("Join", 3.2e9, 1, (2, 3)),
+            _linked("Scan", 4e6, 2, ()),
+            _linked("Scan", 4e6, 3, ()),
+        ),
+    )
+
+
+def test_a_join_an_aggregate_reduces_does_not_send_the_query_out_of_core():
+    """The out-of-core route materializes a join beneath an aggregate in full (it peels the
+    aggregate and aggregates the spilled join's result), so the join's output cannot argue for
+    that route: on a 64 GB node it OOM-killed a self-join the streaming path ran in 0.4 GB.
+
+    The control is the same join with nothing reducing it, which must still read as too big.
+    """
+    input_bytes = 64 << 20
+    advisor = _Advisor(peak=32 << 20, budget=8 * _GIB)
+
+    assert not advisor.exceeds(input_bytes, _self_join_plan("Aggregate"))
+    assert advisor.widest(input_bytes, _self_join_plan("Aggregate")) <= input_bytes
+    assert advisor.exceeds(input_bytes, _self_join_plan("Project"))

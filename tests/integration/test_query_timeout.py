@@ -86,6 +86,22 @@ class TestCollect:
         query = ds.join(ds, on="a").agg(m=(bt.col("b") - bt.col("b_right")).abs().max())
         _assert_times_out(query.collect, stage="core.execute")
 
+    def test_a_high_fan_out_join_under_an_aggregate_is_cancelled_too(self) -> None:
+        """The shape the comment above warns off, now that it no longer OOMs.
+
+        800 rows a side per key was routed out of core by the spill gate's widest-intermediate
+        term -- the 3.2 billion joined rows -- and the out-of-core path materializes exactly
+        those, so the process died before the timer's cancellation landed. The aggregate folds
+        them on the streaming executor (0.6 GB at 4M rows, measured), which polls the
+        cancellation per morsel. 800 million pairs here: ~1.8 s uncancelled on 16 cores.
+        """
+        rows = 1_000_000
+        ds = bt.from_pydict(
+            {"a": [i % 1_250 for i in range(rows)], "b": [i * 0.5 for i in range(rows)]}
+        )
+        query = ds.join(ds, on="a").agg(m=(bt.col("b") - bt.col("b_right")).abs().max())
+        _assert_times_out(query.collect, stage="core.execute")
+
 
 def test_a_cancelled_process_stage_does_not_disable_the_process_pool(monkeypatch) -> None:
     """A timeout is not a broken pool: no thread fallback, and processes stay enabled.
