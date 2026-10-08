@@ -1,5 +1,62 @@
 # Batcher CPU benchmark results
 
+## Distributed TPC-H SF1000, round two: 426 s -> 391 s warm, cold runs 1134 s -> 835 s, and Daft measured on the same clusters (2026-10-07)
+
+This uses the same harness, cluster shape and data as the section below (8 x m5d.4xlarge
+workers, an m6i.2xlarge head, zstd Parquet on S3, `--scan --isolate`, `BENCH_BATCHER_DISTRIBUTED=1`).
+"First" is each query's first run in a fresh driver process. "Best" is the best warm run.
+Every query passed the correctness check in all three runs.
+
+| Run | Commit | Best, total s | First, total s |
+|---|---|---:|---:|
+| c5d-suite2 | fe036eb9 | 425.9 | |
+| c5d-suite3 | da2c673e | 393.2 | 1133.8 |
+| c5d-suite4 | 5e2cfb0c (on main e222564d) | 391.3 | 834.8 |
+| Photon, warm / cold Delta | | 340.3 | 328 |
+
+The warm gain came from the aligned executor. Each change below was A/B'd on the cluster:
+
+- A cut whose held broadcasts are past 900 MB runs one 16-core unit task per node instead of
+  two 8-core ones. On c5d-ab23, q9 went from 65.7 to 52.2 s, q3 from 19.0 to 15.6 s and q19
+  from 23.5 to 21.7 s. q21 is narrow and stays at 8 cores, where it was faster (34.5 s against
+  40.0 s).
+- A cut body's join columns that nothing above it reads are pruned before the broadcast is
+  hoisted. q8's held broadcast went from 1210 MB to 491 MB.
+- q17's two joins to the same filtered `part` now share one semi-join cut, so `lineitem` is
+  read once. Warm q17 went from 20.6 s to 14.0 s.
+- A semi join counts as a broadcast's filter, so warm q20 aligns. Shared-subplan reuse no
+  longer runs ahead of a plan the aligned executor takes, which had added about 8 s to warm q20.
+
+The cold gain is mostly one scheduling defect, in `f5a20a29`. With no learned peak, a cold
+query's per-worker memory share was the estimate spread over the per-node fill: 98.4 GB per
+worker for q1. No 64 GB node can host that, so `clamp_workers` cut the fan-out to one worker,
+and q1's scan ran 68 s on a single node. The grant is now capped at what the nodes hold
+(`capacity.placeable_memory_grant`). Separately, the autoscale ceiling a driver learns is shared
+through Ray's GCS key-value store, so a fresh driver on a fixed cluster stops paying a 12 s
+startup grace. q1 cold went from 102.9 s to 44.9 s, q4 from 35.2 s to 18.5 s and q12 from 31.8 s
+to 17.2 s. suite4 also picked up main's `bc-io` mmap-eviction fix, so the cold totals are not
+a clean A/B of this change alone. Two cold times rose: q8 from 57.0 s to 71.8 s, and q6 from
+18.7 s to 23.1 s.
+
+Warm, Batcher beats Photon on q3, q4, q18 and q21. The largest remaining gaps, in seconds, are
+q9 (46.7 against 20.5), q13 (27.4 against 13.3), q20 (26.2 against 5.8), q14 (19.6 against
+6.0), q19 (17.4 against 6.1) and q15 (15.4 against 5.5).
+
+**Rivals on the same clusters.** Daft 0.7.26 was run distributed through the harness, with the
+same S3 data, `--scan --isolate` and `BENCH_DISTRIBUTED=1`, on job `c5d-rivals2`:
+
+| Cluster | Daft, 20 queries, best s | Batcher, same 20, best s | Daft failures |
+|---|---:|---:|---|
+| 8 x m5d.4xlarge | 1267.7 | 348.0 (c5d-suite3) | q21, q22 error; q15 returns 0 rows |
+| 5 x m5d.4xlarge | q9 316.0, q17 287.0, q8 234.1 | total 550.1 on all 22 (2fbc6145) | q21, q22 error |
+| 3 x m5d.4xlarge | q9 and q17 time out at 1800 s | total 880.2 on all 22 (2fbc6145) | q21, q22 error |
+
+Ray Data showed `n/a` on every query in scan mode, because the harness registered its
+pipelines only over in-memory tables. `5e2cfb0c` adds the scan path. The first run with it,
+`c5d-rivals3-db8`, was in progress at the time of writing: q2 timed out at 1800 s. Spark could
+not be measured multi-node. The harness's `SparkEngine` is a local `SparkSession`, and the
+cluster image has no JVM.
+
 ## The device tier reached a device again: the staged RAPIDS tree is cuDF's whole closure (2026-10-07)
 
 On four A10Gs (one `g5.12xlarge`, the `anyscale/ray:2.58.0-py311-cu128` image with driver 580 /

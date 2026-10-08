@@ -104,6 +104,12 @@ impl Expr {
                 if let Some(out) = try_scalar_binary(*op, left, right, batch)? {
                     return Ok(out);
                 }
+                // And an integer divided by, or taken modulo, a literal: no per-row check.
+                if let Some(out) =
+                    crate::eval::divmod::try_int_div_mod_literal(*op, left, right, batch)?
+                {
+                    return Ok(out);
+                }
                 let l = left.eval(batch)?;
                 let r = right.eval(batch)?;
                 eval_binary(*op, &l, &r)

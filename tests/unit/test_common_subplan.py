@@ -288,6 +288,42 @@ def test_a_recorded_verdict_is_served_instead_of_re_analyzing():
     assert plan is q._plan and len(srcs) == len(q._sources)
 
 
+@pytest.mark.parametrize("aggregates", [False, True])
+def test_a_repeat_the_aligned_executor_runs_is_left_to_it_unless_it_aggregates(
+    monkeypatch, aggregates
+):
+    """Distributed, a repeat the aligned executor will run is not materialized first (TPC-H
+    q20 warm spent ~8 s doing so); a repeat holding an aggregate still is, since its float
+    reduction must be computed once (TPC-H q15)."""
+    from batcher.api import subplan_reuse
+    from batcher.core import ExecutionContext, default_hub
+    from batcher.plan.logical import Aggregate
+    from batcher.plan.visitor import walk
+
+    ds = _ds()
+    if aggregates:
+        q = _shared_agg_join(ds)
+        shared = next(n for n in walk(q._plan) if isinstance(n, Aggregate))
+    else:
+        hot = ds.filter(bt.col("v") > 15)
+        q = hot.join(hot.select(bt.col("k").alias("hk")), left_on="k", right_on="hk")
+        shared = q._plan.left
+    nodes = list(walk(q._plan))
+    positions = tuple(i for i, n in enumerate(nodes) if n == shared)
+    assert len(positions) >= 1
+    monkeypatch.setattr(subplan_reuse, "_known_verdict", lambda key, sources: (positions,))
+    monkeypatch.setattr(subplan_reuse, "_aligned_runs_it", lambda plan, sources, ctx: True)
+    ran: list[int] = []
+    monkeypatch.setattr(subplan_reuse, "_materialize", lambda *a, **k: ran.append(1))
+    ctx = ExecutionContext(columns=list(q._plan.available_columns()), hub=default_hub())
+    plan, _srcs = subplan_reuse.reuse_common_subplans(
+        q._plan, list(q._sources), ctx, distributed=True
+    )
+    assert bool(ran) is aggregates
+    if not aggregates:
+        assert plan is q._plan
+
+
 def _repeated_multiway_join():
     """A query repeating a multi-way join whose `WHERE` sits above it, as SQL writes it.
 

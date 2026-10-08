@@ -215,6 +215,38 @@ def reuse_common_subplans(
         return plan, sources
 
 
+def _aggregates_in(verdict, nodes: list[LogicalPlan]) -> bool:
+    """Whether a chosen subplan aggregates: a float reduction must be computed once, not twice.
+
+    TPC-H q15 keeps the supplier whose `sum` equals the `max` of the same sums; run twice the
+    two sums can differ in the last bits (see the module note), and the aligned executor is
+    asked only of the plan before optimization, which can still route elsewhere.
+    """
+    from batcher.plan.logical import Aggregate
+
+    return any(
+        isinstance(n, Aggregate) for positions in verdict for i in positions for n in walk(nodes[i])
+    )
+
+
+def _aligned_runs_it(plan: LogicalPlan, sources: list[Source], ctx) -> bool:
+    """Whether the aligned executor will run `plan` whole, which already computes a repeat once.
+
+    It evaluates each cut once however many identical appearances it has, and each broadcast
+    subtree once per cut, so materializing a shared subplan first only adds a distributed run
+    in front of it. On warm runs of TPC-H q20 at SF1000 that run -- the distinct keys of the
+    `forest%` parts -- spawned the shuffle fleet for ~8 s of a 33 s query whose cuts took the
+    same 23 s as the cold run that skipped it. Asked only once something repeats.
+    """
+    from batcher.api.adaptive.gating import aligned_claims
+
+    try:
+        return aligned_claims(plan, sources, ctx.hub)
+    except Exception as exc:  # a routing probe must never fail the query
+        note_suppressed("api", "ask the aligned executor about a shared subplan", exc)
+        return False
+
+
 def _reuse(
     plan: LogicalPlan, sources: list[Source], ctx, distributed: bool
 ) -> tuple[LogicalPlan, list[Source]]:
@@ -246,6 +278,8 @@ def _reuse(
         # identity (the result-cache key, learned-stats signatures) for no gain at all.
         return plan, sources
     nodes = list(walk(plan))
+    if distributed and not _aggregates_in(verdict, nodes) and _aligned_runs_it(plan, sources, ctx):
+        return plan, sources
     srcs = list(sources)
     # The estimator bounded each candidate on its own; this bounds what they hold *together*,
     # which is the quantity that actually competes with the running query for memory. Three

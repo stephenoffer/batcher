@@ -50,6 +50,20 @@ def test_a_range_the_footers_imply_does_not_count_as_a_filter(predicate, filtere
     assert _filtered(body, 1, frozenset({0}), _source(1, 100)) is filtered
 
 
+def test_a_semi_join_to_a_set_of_keys_counts_as_a_filter():
+    """TPC-H q20 warm: `partsupp SEMI <in-memory part keys>`, the shared subplan's result.
+
+    The keys' own filter ran before, in another plan; what this subtree shows is a semi join,
+    which can only drop rows. Without one -- the broadcast scanned bare -- nothing filters it.
+    """
+    keep = (JoinOutputCol("left", "k", "k"),)
+    reduced = Join(Scan(1, _SCHEMA), Scan(2, _SCHEMA), ("k",), ("k",), "semi", keep)
+    body = Join(Scan(0, _SCHEMA), reduced, ("k",), ("k",), "inner", keep)
+    assert _filtered(body, 1, frozenset({0})) is True
+    bare = Join(Scan(0, _SCHEMA), Scan(1, _SCHEMA), ("k",), ("k",), "inner", keep)
+    assert _filtered(bare, 1, frozenset({0})) is False
+
+
 def test_without_bounds_any_range_still_counts():
     body = _body((col("k") >= 1) & (col("k") <= 100))
     assert _filtered(body, 1, frozenset({0})) is True

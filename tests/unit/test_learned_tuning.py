@@ -233,6 +233,26 @@ def test_the_first_observation_of_each_route_is_discarded():
     assert lt.learned_adaptive_route(hub, "q") == "staged"
 
 
+def test_a_decisively_slower_cold_sample_is_kept():
+    """TPC-DS q72 at sf10: a 7 s staged cold run against a 0.35 s one-shot route.
+
+    No cold penalty could reverse that ranking, so the sample counts and staging is tried once.
+    A cold sample within the margin is still discarded, as is the first route's, which is the
+    one that pays a shape's first-execution cost.
+    """
+    hub = _hub()
+    lt.record_adaptive_route(hub, "q", "one_shot", 9000.0)  # the shape's first run: discarded
+    lt.record_adaptive_route(hub, "q", "one_shot", 350.0)
+    lt.record_adaptive_route(hub, "q", "staged", 7177.0)  # cold, but 20x: kept
+    assert lt.learned_adaptive_route(hub, "q") == "one_shot"
+
+    near = _hub()
+    lt.record_adaptive_route(near, "q", "one_shot", 9000.0)
+    lt.record_adaptive_route(near, "q", "one_shot", 350.0)
+    lt.record_adaptive_route(near, "q", "staged", 700.0)  # cold and only 2x: discarded
+    assert lt.learned_adaptive_route(near, "q") == "staged", "the untried arm is explored again"
+
+
 def test_adaptive_route_converges_on_the_faster_arm():
     """TPC-H q8 at sf10: 887 ms staged against 142 ms one-shot."""
     hub = _hub()

@@ -36,7 +36,7 @@ mod slots;
 mod sort_merge;
 mod stream;
 
-pub use asof::{asof_join_indices, AsofDirection, AsofSpec};
+pub use asof::{asof_is_whole_input, asof_join_indices, AsofDirection, AsofSpec};
 pub use key_filter::KeyFilter;
 pub use range::{range_join_indices, RangeOp};
 pub use sort_merge::sort_merge_join_indices;

@@ -214,31 +214,32 @@ pub fn read_parquet_filtered(
     ))
 }
 
-/// How many whole files to read concurrently in a batched multi-file read. A
-/// many-small-files scan is latency-bound on per-file footer+chunk GETs, so overlapping
-/// files (on top of each file's own row-group concurrency) is the throughput lever.
-///
-/// **This is a latency budget, not a CPU one, and a flat 64 was leaving most of it unspent.**
-/// Each file costs about two sequential round trips (footer, then its column chunks) and
-/// almost no CPU, so the useful concurrency is set by how many requests are needed to cover
-/// the round-trip time — far more than the core count. Measured reading the 1,024-file
-/// `small-parquet/1GiB` corpus from S3 on a 96-core node, one column: **803 ms at 64, 411 ms
-/// at 256, 167 ms at 512** — 4.8x for a number, on the layout the scan benchmark measures as
-/// Batcher's largest gap.
-///
-/// Scaled by the core count rather than pinned at the measured best, because the figure that
-/// is right here is a property of this link and this host size, and a small pod raising 64 to
-/// 512 would spend memory and sockets it does not have on requests its bandwidth cannot
-/// carry. The floor keeps every host at least as concurrent as it was.
+/// How many whole files a batched multi-file read keeps in flight. A file costs about two
+/// sequential round trips (footer, then column chunks) and almost no CPU, so this is a latency
+/// budget, not a CPU one, and the round trip does not shrink with the host. Measured over S3:
+/// 1,024 files on 96 cores, 803 ms at 64 / 411 at 256 / 167 at 512; 10,240 files on 16 cores
+/// (count / `GROUP BY`), 6,226 / 6,428 ms at 64, 1,351 / 1,445 at 256, 1,139 / 1,359 at 512.
+/// An in-flight file holds its column chunks; `iter_chunks` bounds a read to about a GiB.
 fn file_concurrency() -> usize {
     static C: OnceLock<usize> = OnceLock::new();
     *C.get_or_init(|| {
-        std::env::var("BATCHER_PARQUET_FILE_CONCURRENCY")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| bc_arrow::usable_cores().saturating_mul(4).clamp(64, 512))
+        concurrency_override()
+            .unwrap_or_else(|| bc_arrow::usable_cores().saturating_mul(16).clamp(256, 512))
     })
+}
+
+/// Footers loaded at once by [`load_metadata_many`]: a few KB each and no decode, so the host
+/// size does not matter and the sweep's best, 512, applies everywhere.
+fn footer_concurrency() -> usize {
+    concurrency_override().unwrap_or(512)
+}
+
+/// `BATCHER_PARQUET_FILE_CONCURRENCY`, when set to a positive count.
+fn concurrency_override() -> Option<usize> {
+    std::env::var("BATCHER_PARQUET_FILE_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
 }
 
 /// Read many whole Parquet objects in ONE runtime pass, returning per-file batches in URI
@@ -292,7 +293,7 @@ pub(crate) fn load_metadata_many(
     uris: &[String],
 ) -> Result<Vec<Option<ArrowReaderMetadata>>, IoError> {
     runtime().block_on(async {
-        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(file_concurrency()));
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(footer_concurrency()));
         let handles: Vec<_> = uris
             .iter()
             .map(|uri| {

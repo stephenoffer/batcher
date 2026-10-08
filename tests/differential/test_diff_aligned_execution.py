@@ -236,6 +236,81 @@ def test_a_residual_top_n_is_kept_per_unit(tables, monkeypatch):
     assert tops and all(t.limit == 7 for t in tops)
 
 
+def test_a_cut_body_emits_only_what_its_aggregate_reads(tables):
+    """Columns a cut never reads are pruned from its joins before broadcasts are hoisted.
+
+    A held broadcast carrying them costs the driver its packing and every node its copy:
+    warm TPC-H q9 held `partsupp` with four such columns, 2.6 GB against 1.0 GB.
+    """
+    from batcher.dist.executors.aligned.run import _pruned
+
+    li, orders, cust = _read(tables, "lineitem"), _read(tables, "orders"), _read(tables, "customer")
+    ds = (
+        li.join(orders, left_on="l_ok", right_on="o_ok")
+        .join(cust, left_on="o_ck", right_on="c_ck")
+        .group_by("l_flag")
+        .agg(rev=col("l_price").sum())
+    )
+    found = choose_plan(ds._plan, ds._sources, strict=False)
+    (cut,) = [c for c in found.cuts if c.aggregate is not None]
+    pruned = _pruned(cut.body, cut)
+    emitted = {o.alias for n in _walk(pruned) if isinstance(n, Join) for o in n.output}
+    before = {o.alias for n in _walk(cut.body) if isinstance(n, Join) for o in n.output}
+    # Positive control: the plan as written emits columns nothing reads (`o_prio`, `c_seg`).
+    assert {"o_prio", "c_seg"} <= before
+    assert not ({"o_prio", "c_seg"} & emitted)
+    query = (
+        "SELECT l_flag, sum(l_price) AS rev FROM lineitem JOIN orders ON l_ok = o_ok "
+        "JOIN customer ON o_ck = c_ck GROUP BY l_flag"
+    )
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert_same_for_query(got, _duck(tables, query), query)
+
+
+def test_two_joins_to_one_filtered_dimension_read_the_table_once(tables, monkeypatch):
+    """TPC-H q17's shape: a per-key average over `facts SEMI dim`, compared with the rows of
+    `facts JOIN dim`. Both are the semi join underneath, so one cut reads the facts once."""
+    from batcher.dist.executors.aligned import route
+
+    def dim():
+        return _read(tables, "flag").filter(col("f_name") != "romeo")
+
+    avg = (
+        _read(tables, "lineitem")
+        .join(dim(), left_on="l_flag", right_on="f_flag", how="semi")
+        .group_by("l_flag")
+        .agg(a=col("l_qty").mean())
+        .select(a_flag=col("l_flag"), a=col("a"))
+    )
+    ds = (
+        _read(tables, "lineitem")
+        .join(dim(), left_on="l_flag", right_on="f_flag")
+        .join(avg, left_on="l_flag", right_on="a_flag")
+        .filter(col("l_qty") < col("a") * 0.5)
+        .agg(s=col("l_price").sum(), n=bt.count())
+    )
+    query = (
+        "WITH d AS (SELECT * FROM flag WHERE f_name <> 'romeo'), "
+        "a AS (SELECT l_flag AS a_flag, avg(l_qty) AS a FROM lineitem "
+        "WHERE l_flag IN (SELECT f_flag FROM d) GROUP BY l_flag) "
+        "SELECT sum(l_price) AS s, count(*) AS n FROM lineitem JOIN d ON l_flag = f_flag "
+        "JOIN a ON l_flag = a_flag WHERE l_qty < a * 0.5"
+    )
+    found = choose_plan(ds._plan, ds._sources, strict=False)
+    assert found is not None and len(found.cuts) == 1
+    assert isinstance(found.cuts[0].body, Join) and found.cuts[0].body.join_type == "semi"
+    got = aligned_run.run_plan(found, ds._sources, workers=2)
+    assert_same_for_query(got, _duck(tables, query), query)
+    # Positive control: without the shared scan the plan reads the table in two cuts, and
+    # that plan still runs; reading twice only ranks it below the one-pass plan.
+    monkeypatch.setattr(route, "shared_semi_scan", lambda plan, sources, identity: None)
+    other = choose_plan(ds._plan, ds._sources, strict=False)
+    assert other is not None and len(other.cuts) == 2
+    assert_same_for_query(
+        aligned_run.run_plan(other, ds._sources, workers=2), _duck(tables, query), query
+    )
+
+
 def test_left_join_keeps_unmatched_rows(tables):
     """Fact keys 2900-2999 have no order, so the left join emits them null-padded."""
     li, orders = _read(tables, "lineitem"), _read(tables, "orders")

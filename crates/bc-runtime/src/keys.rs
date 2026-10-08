@@ -23,8 +23,8 @@ use rayon::prelude::*;
 // The engine's single definition of float identity: `-0.0` folds into `0.0` and every NaN
 // bit-pattern into one. It lives in `bc-arrow`, the lowest crate this and `bc-expr` share,
 // exactly so the grouping keys here and the scalar comparisons there cannot drift apart.
+use bc_arrow::{any_needs_canon_f32, any_needs_canon_f64};
 pub(crate) use bc_arrow::{canon_f32, canon_f64_bits as canon_f64, float_total_cmp};
-use bc_arrow::{needs_canon_f32, needs_canon_f64};
 
 /// A fixed hash for null keys so every null row lands in one partition — and therefore one
 /// group. Grouping inside the partition still compares keys, so a non-null value that
@@ -101,7 +101,7 @@ fn canon_array(arr: &ArrayRef) -> Option<ArrayRef> {
             // 6M rows, serially) before anything else in the operator starts. Slots under a
             // null are read here too; a null's payload is arbitrary, so at worst it triggers a
             // rewrite that was not needed, which is still correct.
-            if !f.values().iter().any(|x| needs_canon_f64(*x)) {
+            if !any_needs_canon_f64(f.values()) {
                 return None;
             }
             // `canon_f64` returns hash bits; map back to the f64 they denote so the column
@@ -114,7 +114,7 @@ fn canon_array(arr: &ArrayRef) -> Option<ArrayRef> {
         }
         DataType::Float32 => {
             let f = arr.as_any().downcast_ref::<Float32Array>()?;
-            if !f.values().iter().any(|x| needs_canon_f32(*x)) {
+            if !any_needs_canon_f32(f.values()) {
                 return None;
             }
             let canon: Float32Array = f.iter().map(|v| v.map(canon_f32)).collect();
