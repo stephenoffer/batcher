@@ -70,7 +70,12 @@ def case_with_ray(name: str, query: str) -> Callable[[Context], EngineQueries]:
                 handles = {t: ctx.handle(t, engine) for t in TPCH_TABLES if t in ctx.tables}
                 fns[engine] = lambda: impl(handles)
 
-        native("ray", ray_impl(name))
+        rimpl = ray_impl(name)
+        native("ray", rimpl)
+        if rimpl is not None and "ray" in ctx.names() and not ctx.tables and ctx.uris:
+            # Scan mode, as for Polars below: Ray Data reads each table's parquet lazily.
+            # Without this Ray was `n/a` on all 22 at sf1000, the one scale it exists for.
+            fns["ray"] = lambda: rimpl(_ray_scans(ctx))
         native("batcher", bt_impl)
         native("polars", pl_impl)
         if pl_impl is not None and "polars" in ctx.names() and not ctx.tables and ctx.uris:
@@ -82,6 +87,19 @@ def case_with_ray(name: str, query: str) -> Callable[[Context], EngineQueries]:
         return fns
 
     return build
+
+
+def _ray_scans(ctx: Context) -> dict[str, Any]:
+    """A lazy, canonically-renamed `ray.data.read_parquet` per TPC-H table."""
+    import ray.data
+
+    scans = {}
+    for table, uri in ctx.uris.items():
+        # Ray Data takes a directory, not a glob.
+        scan = ray.data.read_parquet(uri.removesuffix("/*.parquet"))
+        cols = ctx.rename.get(table)
+        scans[table] = scan.rename_columns(cols) if cols else scan
+    return scans
 
 
 def _polars_scans(ctx: Context) -> dict[str, Any]:
