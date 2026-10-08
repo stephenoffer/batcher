@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import time
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, TypeVar
 
@@ -22,6 +23,16 @@ _R = TypeVar("_R")
 # See `resolve_auto_config` for why the *same object* is handed back when the envelope has
 # not meaningfully moved.
 _RESOLVED: tuple[Config, int, Config] | None = None
+# The engine's resident bytes when `_RESOLVED`'s envelope was last confirmed, and when the
+# last terminal finished: what `_retained_credit` measures a drop against.
+_HELD_AT_SENSE: int | None = None
+_LAST_END: float | None = None
+# How long after a query ends a drop in free RAM that the engine's own resident set accounts
+# for is read as retained arena rather than pressure. The allocator holds freed regions for
+# `bc-py`'s `PURGE_DELAY_MS` (10 s) before returning them, so three of those is past the
+# point where anything still held is retention: after it, the drop is real and the envelope
+# follows it.
+_RETENTION_WINDOW_S = 30.0
 # Re-derive the resolved config only when the sensed envelope moves by more than this
 # fraction. Free RAM jitters by a few pages between two back-to-back queries; that jitter
 # cannot change a spill decision, and honoring it would rebuild (and re-validate) the whole
@@ -70,18 +81,79 @@ def resolve_auto_config(config: Config | None = None) -> Config:
     # `api` may consult Carbonite (it is the conductor); `config` may not.
     from batcher.carbonite.memory.pressure import PressureMonitor
 
+    global _HELD_AT_SENSE
     sensed = PressureMonitor(cfg).envelope_bytes()
     if sensed <= 0:
         return cfg  # could not sense — keep the safe unbounded fallback
+    held = _engine_held_bytes()
     cached = _RESOLVED
-    if cached is not None and cached[0] is cfg and _within_tolerance(sensed, cached[1]):
-        return cached[2]
+    credit = 0
+    if cached is not None and cached[0] is cfg:
+        credit = _retained_credit(cached[1] - sensed, held)
+        sensed += credit
+        if _within_tolerance(sensed, cached[1]):
+            if not credit:
+                _HELD_AT_SENSE = held
+            return cached[2]
     resolved = dataclasses.replace(
         cfg,
         memory=dataclasses.replace(mem, max_memory_bytes=sensed, max_memory_bytes_sensed=True),
     )
     _RESOLVED = (cfg, sensed, resolved)
+    if not credit:
+        # Growth is measured from an envelope sensed without retention in it, so a credited
+        # one does not move the baseline.
+        _HELD_AT_SENSE = held
     return resolved
+
+
+def _retained_credit(drop: int, held: int | None) -> int:
+    """How much of a `drop` in free RAM is the engine's own retained arena, not pressure.
+
+    mimalloc keeps the pages a query freed for its purge delay, so the query after a large
+    one senses less free RAM by roughly what that one allocated -- memory this process holds
+    and will reuse on its next allocation, not memory anything else took. Read as pressure,
+    it changed the plan: on TPC-DS sf10 at 16 cores (64 GB, tables preloaded) a staged run
+    left 5.4 GB resident, the next query's envelope fell from 14.7 to 8.7 GB, its common
+    -subplan budget halved from 512 to 256 MB, the cached reuse verdict keyed on that budget
+    missed, and q4 ran 2.1 s without its shared CTE against 0.6 s with it. The run after
+    that sensed 10.5 GB, found the old verdict again, and was back to 0.7 s.
+
+    So the drop is credited back, as far as the engine's resident set grew since the envelope
+    was last sensed without a credit, and only within `_RETENTION_WINDOW_S` of the last query's
+    end. Real pressure is not hidden: a drop another process caused does not grow this
+    resident set, so it is never credited, and anything this process still holds once the
+    allocator would have purged it is live, so the first query past the window sees the
+    envelope fall. The cost of the bound is that a large result the caller still holds from
+    the query before is credited as if retained for up to that window: a planning figure
+    that high spills later rather than sooner, and Carbonite's live pressure reading, which
+    this does not touch, still sees the process's real resident set.
+
+    Args:
+        drop: Bytes the sensed envelope fell below the cached one.
+        held: The engine's resident bytes now, `None` when unreadable.
+
+    Returns:
+        Bytes to add back to the sensed envelope; `0` when none of the drop is retention.
+    """
+    if drop <= 0 or held is None or _HELD_AT_SENSE is None or _LAST_END is None:
+        return 0
+    if time.monotonic() - _LAST_END > _RETENTION_WINDOW_S:
+        return 0
+    return max(0, min(drop, held - _HELD_AT_SENSE))
+
+
+def _engine_held_bytes() -> int | None:
+    """The process's resident set less pyarrow's pool: the engine's arena, live or retained."""
+    from batcher.carbonite.memory.probe import process_rss_bytes
+
+    rss = process_rss_bytes()
+    if rss is None:
+        return None
+    try:
+        return rss - int(pa.total_allocated_bytes())
+    except Exception:  # a reading must never fail a query
+        return rss
 
 
 def _within_tolerance(sensed: int, previous: int) -> bool:
@@ -104,12 +176,16 @@ def with_auto_config(fn: Callable[..., _R]) -> Callable[..., _R]:
 
     @functools.wraps(fn)
     def wrapper(*args: object, **kwargs: object) -> _R:
+        global _LAST_END
         resolved = resolve_auto_config()
-        if resolved is active_config():
-            with timed_terminal():
+        try:
+            if resolved is active_config():
+                with timed_terminal():
+                    return fn(*args, **kwargs)
+            with config_context(resolved), timed_terminal():
                 return fn(*args, **kwargs)
-        with config_context(resolved), timed_terminal():
-            return fn(*args, **kwargs)
+        finally:
+            _LAST_END = time.monotonic()  # when the allocator's retention window opens
 
     return wrapper
 
