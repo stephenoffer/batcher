@@ -301,7 +301,7 @@ def stage_rapids_env(dest: str = "", *, force: bool = False) -> str:
         return ""
     site = os.path.dirname(os.path.dirname(os.path.abspath(cudf.__file__)))
     os.makedirs(root, exist_ok=True)
-    for name in _RAPIDS_STAGE:
+    for name in _stage_entries():
         src = os.path.join(site, name)
         dst = os.path.join(root, name)
         if not os.path.exists(src) or (os.path.exists(dst) and not force):
@@ -315,6 +315,71 @@ def stage_rapids_env(dest: str = "", *, force: bool = False) -> str:
             note_suppressed("dist", f"stage {name} for the workers", exc)
     _graft_numba_cuda(root)
     return root
+
+
+#: Top-level entries never copied out of cuDF's dependency closure, whatever it requires:
+#: the worker's own numpy and pyarrow (see `_RAPIDS_STAGE`), and the start-up hooks a
+#: `PYTHONPATH` entry never runs (`_graft_numba_cuda` does the one that matters).
+_NEVER_STAGE = frozenset({"numpy", "numpy.libs", "pyarrow", "pyarrow.libs"})
+
+
+def _stage_entries() -> list[str]:
+    """`_RAPIDS_STAGE`, plus every other top-level entry cuDF's installed dependencies own.
+
+    The fixed list is what an earlier cuDF install needed, and a wheel release can add a
+    top-level entry without renaming anything in it. Against cuDF 26.08 for CUDA 13 the list
+    missed `libkvikio_cu13.libs` (the shared libraries auditwheel vendors beside `libkvikio`),
+    `numba_cuda_mlir`, and `cupy`/`cupyx`/`cupy_backends`, and a worker importing the staged
+    tree died in `pylibcudf` on `libcudf.so: cannot open shared object file`. Measured on 4x
+    A10G (`benchmarks/gpu_backend/cluster_suite.py`): 2 of 22 TPC-H queries reached a device,
+    every other fan-out task failing that import, while the same workers importing the same
+    release from their own site-packages ran a device join. Walking the installed
+    distributions' requirements finds such entries from the metadata rather than from a list
+    written for the previous release.
+    """
+    names = list(_RAPIDS_STAGE)
+    try:
+        closure = _closure_top_levels("cudf")
+    except Exception as exc:  # metadata is advisory here; the fixed list still stages
+        note_suppressed("dist", "read cuDF's dependency closure for staging", exc)
+        closure = set()
+    names += sorted(
+        n for n in closure - set(names) - _NEVER_STAGE if not n.endswith((".pth", ".dist-info"))
+    )
+    return names
+
+
+def _closure_top_levels(module: str) -> set[str]:
+    """The site-packages top-level entries of `module`'s distribution and its requirements.
+
+    Optional extras are skipped, and so is a requirement whose environment marker excludes this
+    interpreter, so the walk stages what this install actually resolved.
+    """
+    from importlib import metadata
+
+    from packaging.requirements import Requirement
+
+    todo = list(metadata.packages_distributions().get(module, ()))
+    seen: set[str] = set()
+    tops: set[str] = set()
+    while todo:
+        name = todo.pop().lower()
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            dist = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            continue
+        for path in dist.files or ():
+            first = str(path).split("/", 1)[0]
+            if first not in ("..", "__pycache__") and not first.endswith(".dist-info"):
+                tops.add(first)
+        for raw in dist.requires or ():
+            req = Requirement(raw)
+            if req.marker is None or req.marker.evaluate({"extra": ""}):
+                todo.append(req.name)
+    return tops
 
 
 def _graft_numba_cuda(root: str) -> None:

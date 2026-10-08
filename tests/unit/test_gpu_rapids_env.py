@@ -110,3 +110,88 @@ def test_staging_is_idempotent_when_the_tree_is_already_there(tmp_path):
 def test_staging_nowhere_is_a_no_op():
     with _with_path(""):
         assert stage_rapids_env() == ""
+
+
+# --- what gets staged ----------------------------------------------------------
+
+
+class _Dist:
+    def __init__(self, files: list[str], requires: list[str]) -> None:
+        self.files = files
+        self.requires = requires
+
+
+_FAKE = {
+    "cudf-cu13": _Dist(
+        ["cudf/__init__.py", "cudf_cu13-26.8.1.dist-info/METADATA"],
+        [
+            "pylibcudf-cu13==26.8.*",
+            "numpy>=1.23",
+            "cupy-cuda13x>=13",
+            "pytest; extra == 'test'",
+            "pywin32; sys_platform == 'win32'",
+        ],
+    ),
+    "pylibcudf-cu13": _Dist(["pylibcudf/__init__.py", "lib64/x.so"], ["libkvikio-cu13"]),
+    "libkvikio-cu13": _Dist(["libkvikio/__init__.py", "libkvikio_cu13.libs/libcufile.so"], []),
+    "numpy": _Dist(["numpy/__init__.py", "numpy.libs/libopenblas.so"], []),
+    "cupy-cuda13x": _Dist(["cupy/__init__.py", "cupyx/__init__.py", "x.pth"], []),
+    "pytest": _Dist(["pytest/__init__.py"], []),
+    "pywin32": _Dist(["win32/__init__.py"], []),
+}
+
+
+@pytest.fixture
+def fake_metadata(monkeypatch):
+    from importlib import metadata
+
+    monkeypatch.setattr(metadata, "packages_distributions", lambda: {"cudf": ["cudf-cu13"]})
+
+    def distribution(name: str):
+        if name not in _FAKE:
+            raise metadata.PackageNotFoundError(name)
+        return _FAKE[name]
+
+    monkeypatch.setattr(metadata, "distribution", distribution)
+
+
+def test_the_closure_follows_requirements_and_keeps_vendored_libs(fake_metadata):
+    """`libkvikio_cu13.libs` is the shape a fixed list misses: a sibling of the package that
+    auditwheel creates, holding shared libraries the package's own `.so` links against."""
+    from batcher.dist.gpu.cudf_probe import _closure_top_levels
+
+    tops = _closure_top_levels("cudf")
+    assert {"cudf", "pylibcudf", "lib64", "libkvikio", "libkvikio_cu13.libs", "cupy"} <= tops
+    assert "pytest" not in tops, "an optional extra is not part of the install"
+    assert "win32" not in tops, "a requirement whose marker excludes this platform is skipped"
+    assert not any(t.endswith(".dist-info") for t in tops)
+
+
+def test_staging_adds_the_closure_but_never_the_workers_numpy_or_a_pth(fake_metadata):
+    from batcher.dist.gpu.cudf_probe import _RAPIDS_STAGE, _stage_entries
+
+    entries = _stage_entries()
+    assert entries[: len(_RAPIDS_STAGE)] == list(_RAPIDS_STAGE)
+    assert "libkvikio_cu13.libs" in entries
+    assert "cupyx" in entries
+    assert not {"numpy", "numpy.libs"} & set(entries)
+    assert "x.pth" not in entries
+
+
+def test_a_staged_tree_copies_the_closure_entries(fake_metadata, tmp_path, monkeypatch):
+    """End to end on the copy: the vendored `.libs` directory lands in the staged tree."""
+    import sys
+    import types
+
+    site = tmp_path / "site"
+    for rel in ("cudf/__init__.py", "libkvikio_cu13.libs/libcufile.so", "numpy/__init__.py"):
+        (site / rel).parent.mkdir(parents=True, exist_ok=True)
+        (site / rel).write_text("")
+    fake_cudf = types.ModuleType("cudf")
+    fake_cudf.__file__ = str(site / "cudf" / "__init__.py")
+    monkeypatch.setitem(sys.modules, "cudf", fake_cudf)
+    dest = tmp_path / "staged"
+    assert stage_rapids_env(str(dest), force=True) == str(dest)
+    assert (dest / "libkvikio_cu13.libs" / "libcufile.so").exists()
+    assert (dest / "cudf" / "__init__.py").exists()
+    assert not (dest / "numpy").exists()
