@@ -75,25 +75,105 @@ fn enabled() -> bool {
     *E.get_or_init(|| std::env::var("BATCHER_IO_MMAP").map_or(true, |v| v != "0"))
 }
 
-/// The most mappings the cache keeps between reads. A scan of more files than this still maps
-/// each one; it only stops the cache from holding every file a long-lived process ever read.
-const MAX_CACHED_FILES: usize = 4096;
+/// The most mappings the cache keeps between reads: a quarter of the kernel's per-process limit
+/// on mappings (`vm.max_map_count`, 65,530 by default, so 16,382), and never fewer than 1,024.
+///
+/// A scan of more files than this still maps each one; the cap only stops the cache holding
+/// every file a long-lived process ever read. It was a flat 4,096, which TPC-H sf1000 crosses
+/// in one query -- 1,000 files in each of six tables, so q8 opens 5,002 -- and every crossing
+/// cleared the whole cache under its lock (see [`open`]).
+fn max_cached_files() -> usize {
+    static C: OnceLock<usize> = OnceLock::new();
+    *C.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/vm/max_map_count")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map_or(16_382, |n| n / 4)
+            .max(1024)
+    })
+}
 
 /// A file's `(length, modification time)`, which a cached mapping must still match.
 type Stamp = (u64, Option<SystemTime>);
-/// Every mapping currently shared, by absolute path.
-type MapCache = Mutex<HashMap<PathBuf, (Stamp, Arc<MappedFile>)>>;
 
-fn cache() -> &'static MapCache {
-    static C: OnceLock<MapCache> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+/// Every mapping currently shared, by absolute path, with the tick of its last open.
+#[derive(Default)]
+struct MapCache {
+    files: HashMap<PathBuf, (Stamp, Arc<MappedFile>, u64)>,
+    tick: u64,
+}
+
+impl MapCache {
+    /// The cached mapping of `path` if it still matches `stamp`, marked as just used.
+    fn get(&mut self, path: &Path, stamp: Stamp) -> Option<Arc<MappedFile>> {
+        self.tick += 1;
+        let tick = self.tick;
+        let (seen, file, used) = self.files.get_mut(path)?;
+        if *seen != stamp {
+            return None;
+        }
+        *used = tick;
+        Some(Arc::clone(file))
+    }
+
+    /// Cache `file` for `path`, keeping at most `cap` entries, and return what it displaced.
+    ///
+    /// A full cache gives up its least recently opened quarter, not everything: the files a
+    /// running query is reading stay mapped, where clearing the lot made every reader of them
+    /// map them again. The displaced mappings are handed back rather than dropped here, so
+    /// their unmapping -- which for a large, populated mapping is the kernel tearing down every
+    /// page-table entry -- runs after the caller has released the lock (see [`open`]).
+    fn insert(
+        &mut self,
+        path: &Path,
+        stamp: Stamp,
+        file: &Arc<MappedFile>,
+        cap: usize,
+    ) -> Vec<Arc<MappedFile>> {
+        let mut displaced = Vec::new();
+        self.tick += 1;
+        let entry = (stamp, Arc::clone(file), self.tick);
+        if let Some((_, old, _)) = self.files.insert(path.to_path_buf(), entry) {
+            displaced.push(old);
+        }
+        if self.files.len() > cap {
+            let mut by_age: Vec<(u64, PathBuf)> = self
+                .files
+                .iter()
+                .map(|(p, (_, _, used))| (*used, p.clone()))
+                .collect();
+            by_age.sort_unstable_by_key(|(used, _)| *used);
+            let evict = self.files.len() - cap * 3 / 4;
+            for (_, p) in by_age.into_iter().take(evict) {
+                if let Some((_, f, _)) = self.files.remove(&p) {
+                    displaced.push(f);
+                }
+            }
+        }
+        displaced
+    }
+}
+
+fn cache() -> &'static Mutex<MapCache> {
+    static C: OnceLock<Mutex<MapCache>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(MapCache::default()))
 }
 
 /// The shared mapping of `path`, or `None` when it cannot or should not be mapped.
 ///
 /// `size` is the length the caller's metadata says the file has; a mapping of any other
 /// length is not the file the caller planned against, so it is refused.
+///
+/// The cache's lock is held only to look up and to insert. Mapping a file and unmapping the
+/// ones an insert displaces both happen outside it: an unmap of a large, populated mapping is
+/// the kernel tearing down every page-table entry, and run under one global lock it serialized
+/// every reader on the machine -- TPC-H sf1000 q8 at 64 cores sat at 2% occupancy for 1.6 s,
+/// almost every sample in `zap_pte_range` under this function.
 pub(crate) fn open(path: &Path, size: u64) -> Option<Arc<MappedFile>> {
+    open_in(cache(), path, size, max_cached_files())
+}
+
+fn open_in(cache: &Mutex<MapCache>, path: &Path, size: u64, cap: usize) -> Option<Arc<MappedFile>> {
     if !enabled() {
         return None;
     }
@@ -102,11 +182,8 @@ pub(crate) fn open(path: &Path, size: u64) -> Option<Arc<MappedFile>> {
         return None;
     }
     let stamp: Stamp = (meta.len(), meta.modified().ok());
-    let mut guard = cache().lock().ok()?;
-    if let Some((seen, file)) = guard.get(path) {
-        if *seen == stamp {
-            return Some(Arc::clone(file));
-        }
+    if let Some(file) = cache.lock().ok()?.get(path, stamp) {
+        return Some(file);
     }
     let handle = std::fs::File::open(path).ok()?;
     // SAFETY: the mapping is read-only and never written through. Its one hazard is the file
@@ -117,14 +194,20 @@ pub(crate) fn open(path: &Path, size: u64) -> Option<Arc<MappedFile>> {
     if map.len() as u64 != size {
         return None;
     }
-    let file = Arc::new(MappedFile { map });
-    if guard.len() >= MAX_CACHED_FILES {
-        // A mapping pins its file's pages, and a deleted file's disk space, for as long as it
-        // is held. Readers keep their own `Arc`s, so dropping the cache's copies unmaps only
-        // the files nobody is reading; the next open of any of them maps it again.
-        guard.clear();
-    }
-    guard.insert(path.to_path_buf(), (stamp, Arc::clone(&file)));
+    let mapped = Arc::new(MappedFile { map });
+    let (file, displaced) = {
+        let mut guard = cache.lock().ok()?;
+        // Another reader may have mapped the same file meanwhile: share theirs, drop ours.
+        match guard.get(path, stamp) {
+            Some(theirs) => (theirs, vec![mapped]),
+            None => {
+                let displaced = guard.insert(path, stamp, &mapped, cap);
+                (mapped, displaced)
+            }
+        }
+    };
+    // Unmapped here, outside the lock; a mapping a reader still holds lives on until it is done.
+    drop(displaced);
     Some(file)
 }
 
@@ -164,6 +247,60 @@ mod tests {
     fn a_length_other_than_the_planned_one_is_not_mapped() {
         let path = temp_file(&[1u8; 32]);
         assert!(open(&path, 31).is_none());
+    }
+
+    #[test]
+    fn a_full_cache_evicts_the_least_recently_opened_and_keeps_the_rest() {
+        // Twelve files through a cache of eight: the cache never holds more than eight, the
+        // files opened most recently stay shared, and a mapping a reader still holds keeps
+        // reading after the cache has let it go.
+        let dir = std::env::temp_dir().join(format!("bc-io-mapped-evict-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = Mutex::new(MapCache::default());
+        let paths: Vec<PathBuf> = (0..12u8)
+            .map(|i| {
+                let p = dir.join(format!("f{i}.bin"));
+                std::fs::File::create(&p)
+                    .unwrap()
+                    .write_all(&[i; 100])
+                    .unwrap();
+                p
+            })
+            .collect();
+        let held = open_in(&cache, &paths[0], 100, 8).unwrap();
+        let first: Vec<Arc<MappedFile>> = paths[1..8]
+            .iter()
+            .map(|p| open_in(&cache, p, 100, 8).unwrap())
+            .collect();
+        // Reopen file 1 so it is recent; file 0 (held) and 2.. are older.
+        let again = open_in(&cache, &paths[1], 100, 8).unwrap();
+        assert!(
+            Arc::ptr_eq(&again, &first[0]),
+            "a cached file is shared, not remapped"
+        );
+        for p in &paths[8..] {
+            open_in(&cache, p, 100, 8).unwrap();
+            assert!(cache.lock().unwrap().files.len() <= 8);
+        }
+        let guard = cache.lock().unwrap();
+        assert!(
+            !guard.files.contains_key(&paths[0]),
+            "the oldest file is evicted"
+        );
+        for p in [&paths[1], &paths[9], &paths[10], &paths[11]] {
+            assert!(
+                guard.files.contains_key(p),
+                "a recent file stays cached: {p:?}"
+            );
+        }
+        drop(guard);
+        assert_eq!(held.slice(0..1).unwrap().as_ref(), &[0u8]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_cap_follows_the_kernel_mapping_limit() {
+        assert!(max_cached_files() >= 1024);
     }
 
     #[test]

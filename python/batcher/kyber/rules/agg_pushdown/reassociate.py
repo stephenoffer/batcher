@@ -398,11 +398,16 @@ def _push_under(node: Aggregate, upper: Join) -> Aggregate | None:
     to meet `customer`. `pre_aggregate_join_measures` makes the same move on a *measured*
     reduction; this one takes the string-key licence the re-association does.
     """
-    if _already_pushed(upper):
-        return None
     sides = _sides(upper)
     for f_side in ("left", "right"):
         d_side = "right" if f_side == "left" else "left"
+        # Only the side the partial would go beneath is asked whether it is grouped already.
+        # Asked of the whole join, a partial inside the *dimension* refused the push: TPC-DS
+        # q70's ROLLUP joins its facts to `store` semi-joined to a ranking subquery whose own
+        # aggregate this rule had pre-aggregated, so the finest level kept grouping 5.3M joined
+        # rows by two `store` strings instead of ~50 per-store partials.
+        if _already_pushed(upper.left if f_side == "left" else upper.right):
+            continue
         d_aliases = {a for a, (side, _) in sides.items() if side == d_side}
         f_aliases = {a for a, (side, _) in sides.items() if side == f_side}
         # Strings on the fact side too mean a dimension is still in it: pushing under this

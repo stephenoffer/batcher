@@ -111,6 +111,9 @@ def clear() -> None:
         _PRIOR.clear()
         _SETTLED.clear()
         _REPRODUCED.clear()
+    from batcher.kyber.plan_cache import normalized
+
+    normalized.clear()
 
 
 def lookup(key: str | None, holds: Callable[[Any, int], bool] | None = None) -> Any | None:
