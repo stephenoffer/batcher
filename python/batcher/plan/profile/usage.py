@@ -24,10 +24,14 @@ Every field is `0` where the platform cannot report it, and `0` means **unmeasur
 
 from __future__ import annotations
 
-import resource
 import sys
 import time
 from pathlib import Path
+
+try:
+    import resource
+except ImportError:  # Windows has no `resource`; every field then reads as unmeasured.
+    resource = None
 
 __all__ = ["UsageStopwatch"]
 
@@ -81,6 +85,8 @@ def _sample() -> dict[str, int]:
         ),
         0,
     )
+    if resource is None:
+        return out
     try:
         usage = resource.getrusage(resource.RUSAGE_SELF)
     except (OSError, ValueError):  # pragma: no cover - getrusage does not fail in practice

@@ -127,6 +127,29 @@ def test_usage_stopwatch_reports_nonnegative_deltas_shaped_like_the_engine_block
     assert QueryUsage.from_metrics(reading).wall_ms > 0
 
 
+def test_usage_stopwatch_reads_zero_where_the_platform_has_no_resource_module(monkeypatch):
+    from batcher.plan.profile import usage as usage_mod
+
+    # Windows has no `resource` module. Importing the engine must not fail there, and every
+    # counter the OS cannot report reads 0, which means unmeasured.
+    monkeypatch.setattr(usage_mod, "resource", None)
+    reading = usage_mod.UsageStopwatch().finish()
+    assert reading["wall_ns"] > 0
+    assert {name: value for name, value in reading.items() if name != "wall_ns"} == dict.fromkeys(
+        (
+            "cpu_ns",
+            "peak_rss_bytes",
+            "minor_faults",
+            "major_faults",
+            "vol_ctx_switches",
+            "invol_ctx_switches",
+            "io_read_bytes",
+            "io_write_bytes",
+        ),
+        0,
+    )
+
+
 # --- WorkCounters -----------------------------------------------------------
 
 

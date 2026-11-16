@@ -47,6 +47,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      # `just build` is `maturin develop`, which refuses to run outside a virtualenv. Create
+      # one and put it first on PATH so every later `pip`, `maturin`, `pytest` and `just`
+      # step installs into and runs from the same environment.
+      - name: Create a virtualenv
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/venv" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
